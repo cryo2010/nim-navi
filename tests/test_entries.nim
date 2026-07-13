@@ -280,6 +280,23 @@ suite "sync entry end to end":
     check res.body == "http://example.test/path?q=1"  # proxy saw the absolute URI
     joinThread(th)
 
+  test "parallel fetches multiple same-origin URLs over one connection":
+    const port = 8993
+    var accepts = 0
+    var th: Thread[KeepAliveCtx]
+    startKeepAlive(th, port, requests = 3, accepts = addr accepts)
+
+    let api = newNavi()
+    let base = "http://127.0.0.1:" & $port
+    let res = api.parallel(@[base & "/a", base & "/b", base & "/c"])
+    check res.len == 3
+    check res[0].status == 200
+    check res[0].body == "n=0"
+    check res[1].body == "n=1"
+    check res[2].body == "n=2"
+    joinThread(th)
+    check accepts == 1  # all three reused the one connection
+
   test "extend layers headers and prefixUrl":
     let base = newNavi(NaviOptions(headers: initHeaders({"x-base": "1"})))
     let child = base.extend(NaviOptions(prefixUrl: "http://api.test"))
