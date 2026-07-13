@@ -35,6 +35,15 @@ proc `[]=`*(h: var Headers, name, value: string) =
   if not written:
     h.fields.add((name, value))
 
+proc del*(h: var Headers, name: string) =
+  ## Remove all fields matching `name` (case-insensitive).
+  var i = 0
+  while i < h.fields.len:
+    if cmpIgnoreCase(h.fields[i][0], name) == 0:
+      h.fields.delete(i)
+    else:
+      inc i
+
 proc contains*(h: Headers, name: string): bool =
   for (k, _) in h.fields:
     if cmpIgnoreCase(k, name) == 0:

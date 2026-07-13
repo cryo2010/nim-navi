@@ -1,6 +1,6 @@
 # navi
 
-A sugary HTTP client for Nim, with a minimalist [ky](https://github.com/sindresorhus/ky)-inspired API. One request surface, three interchangeable engines: synchronous, `std/asyncdispatch`, or `chronos`. You pick the engine by which module you import.
+An HTTP client for Nim, with a minimalist [ky](https://github.com/sindresorhus/ky)-inspired API. One request surface, three interchangeable engines: synchronous, `std/asyncdispatch`, or `chronos`. You pick the engine by which module you import.
 
 ```nim
 import navi

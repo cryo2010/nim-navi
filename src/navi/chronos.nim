@@ -24,11 +24,7 @@ proc newNavi*(options = defaultOptions()): Navi =
   Navi(options: options, pool: newPool[Conn]())
 
 proc extend*(client: Navi, options: NaviOptions): Navi =
-  var merged = client.options
-  if options.prefixUrl.len > 0: merged.prefixUrl = options.prefixUrl
-  merged.headers = merge(client.options.headers, options.headers)
-  if options.http.card > 0: merged.http = options.http
-  Navi(options: merged, pool: newPool[Conn]())
+  Navi(options: mergeOptions(client.options, options), pool: newPool[Conn]())
 
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = "",

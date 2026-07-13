@@ -12,6 +12,11 @@ type
     headers*: Headers
     body*: string
 
+  HttpError* = object of CatchableError
+    ## Raised for non-2xx responses when `throwHttpErrors` is on (the default).
+    ## The full response is attached for inspection.
+    response*: Response
+
 proc ok*(r: Response): bool {.inline.} =
   ## True for 2xx status codes.
   r.status >= 200 and r.status < 300

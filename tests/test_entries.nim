@@ -103,6 +103,54 @@ suite "sync entry end to end":
     check res.json()["ok"].getBool()
     joinThread(th)
 
+  test "transparently decompresses a gzip response body":
+    const port = 8978
+    # gzip -n of {"ok":true}
+    let gz = hexToBytes("1f8b0800000000000003ab56cacf56b22a292a4dad0500905fd4a70b000000")
+    let payload = "HTTP/1.1 200 OK\r\n" &
+                  "Content-Encoding: gzip\r\n" &
+                  "Content-Length: " & $gz.len & "\r\n" &
+                  "Connection: close\r\n\r\n" & gz
+    var th: Thread[ServerCtx]
+    startRaw(th, port, payload)
+
+    let api = newNavi()
+    let res = api.get("http://127.0.0.1:" & $port & "/")
+    check res.status == 200
+    check res.body == """{"ok":true}"""       # decoded
+    check res.json()["ok"].getBool()
+    check not res.headers.contains("content-encoding")  # header dropped
+    joinThread(th)
+
+  test "raises HttpError on a non-2xx response":
+    const port = 8979
+    let payload = "HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\nConnection: close\r\n\r\nno!"
+    var th: Thread[ServerCtx]
+    startRaw(th, port, payload)
+
+    let api = newNavi()
+    var raised = false
+    try:
+      discard api.get("http://127.0.0.1:" & $port & "/")
+    except HttpError as e:
+      raised = true
+      check e.response.status == 404
+      check e.response.body == "no!"
+    check raised
+    joinThread(th)
+
+  test "throwHttpErrors = false returns the non-2xx response":
+    const port = 8980
+    let payload = "HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\nConnection: close\r\n\r\nno!"
+    var th: Thread[ServerCtx]
+    startRaw(th, port, payload)
+
+    let api = newNavi(NaviOptions(throwHttpErrors: some(false)))
+    let res = api.get("http://127.0.0.1:" & $port & "/")
+    check res.status == 404
+    check res.body == "no!"
+    joinThread(th)
+
   test "extend layers headers and prefixUrl":
     let base = newNavi(NaviOptions(headers: initHeaders({"x-base": "1"})))
     let child = base.extend(NaviOptions(prefixUrl: "http://api.test"))

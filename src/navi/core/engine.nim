@@ -10,8 +10,13 @@
 ## pool may have been closed by the server in the meantime, so a failed reused
 ## attempt is retried once on a fresh connection.
 
-import ./url, ./request, ./response, ./pool
+import ./url, ./request, ./response, ./pool, ./decompress
 import ../proto/h1
+
+proc raiseHttpError(req: Request, resp: Response) =
+  raise (ref HttpError)(
+    msg: $req.verb & " " & $req.url & " -> " & $resp.status & " " & resp.reason,
+    response: resp)
 
 template sendRequest(conn, req: typed) =
   ## Write the request, streaming the body as chunked transfer-encoding when a
@@ -67,10 +72,21 @@ template run(client, req, sink: typed): Response =
     resp
 
 template performRequest*(client, req: typed): Response =
-  ## Buffered request: the whole body is read into `Response.body`.
-  run(client, req, BodySink(nil))
+  ## Buffered request: body read into `Response.body`, decompressed per
+  ## Content-Encoding, then a non-2xx raises HttpError unless disabled.
+  block:
+    var resp = run(client, req, BodySink(nil))
+    decodeBody(resp, client.options)
+    if client.options.wantsThrow and not resp.ok:
+      raiseHttpError(req, resp)
+    resp
 
 template performStream*(client, req, sink: typed): Response =
   ## Streaming request: body chunks are delivered to `sink` as they arrive and
-  ## `Response.body` is left empty.
-  run(client, req, sink)
+  ## `Response.body` is left empty. Chunks are delivered as received (not
+  ## decompressed); a non-2xx still raises HttpError unless disabled.
+  block:
+    let resp = run(client, req, sink)
+    if client.options.wantsThrow and not resp.ok:
+      raiseHttpError(req, resp)
+    resp

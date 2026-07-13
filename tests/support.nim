@@ -7,6 +7,36 @@ type ServerCtx* = object
   port: int
   ready: ptr bool
   ipv6: bool
+  payload: string
+
+proc hexToBytes*(hex: string): string =
+  for i in countup(0, hex.len - 2, 2):
+    result.add char(parseHexInt(hex[i .. i + 1]))
+
+proc serveRaw(ctx: ServerCtx) {.thread.} =
+  ## Read one request, then send `payload` verbatim and close.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.listen()
+  ctx.ready[] = true
+  var client: Socket
+  server.accept(client)
+  var req = ""
+  while true:
+    let c = client.recv(1)
+    if c.len == 0: break
+    req.add c
+    if req.len >= 4 and req[^4 .. ^1] == "\r\n\r\n": break
+  client.send(ctx.payload)
+  client.close()
+  server.close()
+
+proc startRaw*(th: var Thread[ServerCtx], port: int, payload: string) =
+  ## Serve a single connection that replies with `payload`.
+  var ready = false
+  createThread(th, serveRaw, ServerCtx(port: port, ready: addr ready, payload: payload))
+  while not ready: discard
 
 proc serveOnce(ctx: ServerCtx) {.thread.} =
   var server = newSocket(if ctx.ipv6: AF_INET6 else: AF_INET)
