@@ -1,6 +1,6 @@
 ## Asynchronous transport backend built on std/asyncnet.
 
-import std/[asyncdispatch, asyncnet]
+import std/[asyncdispatch, asyncnet, net]
 import ./api
 
 export api, asyncdispatch
@@ -10,7 +10,18 @@ type
     socket: AsyncSocket
 
 proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig): Future[Conn] {.async.} =
-  result.socket = await asyncnet.dial(host, Port(port))
+  ## Dial `host:port`, upgrading to TLS for https. TLS requires `-d:ssl`.
+  let socket = await asyncnet.dial(host, Port(port))
+  if tls:
+    when defined(ssl):
+      let ctx = newContext(
+        verifyMode = if cfg.verify: CVerifyPeer else: CVerifyNone,
+        caFile = cfg.caFile)
+      ctx.wrapConnectedSocket(socket, handshakeAsClient, host)
+    else:
+      raise newException(ValueError,
+        "navi: https requires compiling with -d:ssl")
+  result.socket = socket
 
 proc sendAll*(c: Conn, data: string): Future[void] =
   c.socket.send(data)

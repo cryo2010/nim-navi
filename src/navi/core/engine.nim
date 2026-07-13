@@ -6,7 +6,7 @@
 ## instantiation site: real await in async backends, an identity template in
 ## the sync one.
 
-import ./url, ./request, ./response
+import ./url, ./response
 import ../proto/h1
 
 template performRequest*(client, req: typed): Response =

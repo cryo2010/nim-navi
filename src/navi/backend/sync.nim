@@ -15,8 +15,18 @@ type
 template await*(x: untyped): untyped = x
 
 proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig): Conn =
-  ## Dial `host:port` (IPv4 or IPv6, resolved by std/net). TLS lands next.
+  ## Dial `host:port` (IPv4 or IPv6, resolved by std/net), upgrading to TLS for
+  ## https. TLS requires compiling with `-d:ssl` (OpenSSL).
   result.socket = dial(host, Port(port))
+  if tls:
+    when defined(ssl):
+      let ctx = newContext(
+        verifyMode = if cfg.verify: CVerifyPeer else: CVerifyNone,
+        caFile = cfg.caFile)
+      ctx.wrapConnectedSocket(result.socket, handshakeAsClient, host)
+    else:
+      raise newException(ValueError,
+        "navi: https requires compiling with -d:ssl")
 
 proc sendAll*(c: Conn, data: string) =
   c.socket.send(data)
