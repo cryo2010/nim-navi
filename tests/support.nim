@@ -38,6 +38,38 @@ proc startRaw*(th: var Thread[ServerCtx], port: int, payload: string) =
   createThread(th, serveRaw, ServerCtx(port: port, ready: addr ready, payload: payload))
   while not ready: discard
 
+proc serveRedirect(ctx: ServerCtx) {.thread.} =
+  ## First request gets a 302 to /final (relative), the second gets 200.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.listen()
+  ctx.ready[] = true
+  var client: Socket
+  server.accept(client)
+  for i in 0 .. 1:
+    var req = ""
+    while true:
+      let c = client.recv(1)
+      if c.len == 0: break
+      req.add c
+      if req.len >= 4 and req[^4 .. ^1] == "\r\n\r\n": break
+    if req.len == 0: break
+    if i == 0:
+      client.send("HTTP/1.1 302 Found\r\nLocation: /final\r\n" &
+                  "Content-Length: 0\r\nConnection: keep-alive\r\n\r\n")
+    else:
+      let body = "arrived"
+      client.send("HTTP/1.1 200 OK\r\nContent-Length: " & $body.len &
+                  "\r\nConnection: close\r\n\r\n" & body)
+  client.close()
+  server.close()
+
+proc startRedirect*(th: var Thread[ServerCtx], port: int) =
+  var ready = false
+  createThread(th, serveRedirect, ServerCtx(port: port, ready: addr ready))
+  while not ready: discard
+
 proc serveOnce(ctx: ServerCtx) {.thread.} =
   var server = newSocket(if ctx.ipv6: AF_INET6 else: AF_INET)
   server.setSockOpt(OptReuseAddr, true)

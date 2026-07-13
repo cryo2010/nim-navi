@@ -151,6 +151,31 @@ suite "sync entry end to end":
     check res.body == "no!"
     joinThread(th)
 
+  test "follows a 302 redirect to the final response":
+    const port = 8981
+    var th: Thread[ServerCtx]
+    startRedirect(th, port)
+
+    let api = newNavi()
+    let res = api.get("http://127.0.0.1:" & $port & "/start")
+    check res.status == 200
+    check res.body == "arrived"
+    joinThread(th)
+
+  test "maxRedirects = 0 does not follow and surfaces the 3xx":
+    const port = 8982
+    let payload = "HTTP/1.1 302 Found\r\nLocation: /final\r\n" &
+                  "Content-Length: 0\r\nConnection: close\r\n\r\n"
+    var th: Thread[ServerCtx]
+    startRaw(th, port, payload)
+
+    let api = newNavi(NaviOptions(
+      maxRedirects: some(0), throwHttpErrors: some(false)))
+    let res = api.get("http://127.0.0.1:" & $port & "/start")
+    check res.status == 302
+    check res.headers.get("location") == "/final"
+    joinThread(th)
+
   test "extend layers headers and prefixUrl":
     let base = newNavi(NaviOptions(headers: initHeaders({"x-base": "1"})))
     let child = base.extend(NaviOptions(prefixUrl: "http://api.test"))

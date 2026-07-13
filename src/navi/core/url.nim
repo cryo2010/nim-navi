@@ -44,6 +44,11 @@ proc join*(prefix: string, target: string): Url =
   if not base.endsWith('/'): base.add('/')
   return parseUrl(base & target.strip(leading = true, trailing = false, chars = {'/'}))
 
+proc resolve*(base: Url, location: string): Url =
+  ## Resolve a redirect target (absolute or relative) against `base`, per
+  ## RFC 3986. An absolute `location` replaces the base outright.
+  Url(raw: combine(base.raw, parseUri(location)))
+
 proc withQuery*(u: Url, params: openArray[(string, string)]): Url =
   ## Return a copy of `u` with `params` appended to the query string.
   result = u

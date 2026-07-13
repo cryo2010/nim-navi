@@ -10,7 +10,7 @@
 ## pool may have been closed by the server in the meantime, so a failed reused
 ## attempt is retried once on a fresh connection.
 
-import ./url, ./request, ./response, ./pool, ./decompress
+import ./url, ./request, ./response, ./pool, ./decompress, ./redirect
 import ../proto/h1
 
 proc raiseHttpError(req: Request, resp: Response) =
@@ -71,12 +71,24 @@ template run(client, req, sink: typed): Response =
       resp = roundTrip(client, req, conn, key, sink)
     resp
 
-template performRequest*(client, req: typed): Response =
-  ## Buffered request: body read into `Response.body`, decompressed per
-  ## Content-Encoding, then a non-2xx raises HttpError unless disabled.
+template performRequest*(client, req0: typed): Response =
+  ## Buffered request: follow redirects, read the body into `Response.body`,
+  ## decompress per Content-Encoding, then raise HttpError on a non-2xx unless
+  ## disabled.
   block:
-    var resp = run(client, req, BodySink(nil))
-    decodeBody(resp, client.options)
+    var req = req0
+    var resp: Response
+    var hops = 0
+    let limit = client.options.redirectLimit
+    while true:
+      resp = run(client, req, BodySink(nil))
+      decodeBody(resp, client.options)
+      let location = resp.headers.get("location")
+      if limit > 0 and hops < limit and isRedirect(resp.status) and location.len > 0:
+        req = redirectRequest(req, resp.status, location)
+        inc hops
+      else:
+        break
     if client.options.wantsThrow and not resp.ok:
       raiseHttpError(req, resp)
     resp

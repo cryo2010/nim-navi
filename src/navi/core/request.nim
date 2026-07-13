@@ -32,6 +32,7 @@ type
     tls*: TlsConfig
     decompress*: Option[bool]      ## decode gzip/deflate bodies (default on)
     throwHttpErrors*: Option[bool]  ## raise HttpError on non-2xx (default on)
+    maxRedirects*: Option[int]      ## redirects to follow, 0 disables (default 20)
 
   BodyProducer* = proc(): string {.closure, raises: [CatchableError].}
     ## Pull-based upload source: returns the next chunk, or "" at end of body.
@@ -51,6 +52,7 @@ proc defaultOptions*(): NaviOptions =
 
 proc wantsDecompress*(opts: NaviOptions): bool = opts.decompress.get(true)
 proc wantsThrow*(opts: NaviOptions): bool = opts.throwHttpErrors.get(true)
+proc redirectLimit*(opts: NaviOptions): int = opts.maxRedirects.get(20)
 
 proc mergeOptions*(base, overrides: NaviOptions): NaviOptions =
   ## Layer `overrides` over `base` for `.extend`. Only fields the caller set
@@ -62,6 +64,7 @@ proc mergeOptions*(base, overrides: NaviOptions): NaviOptions =
   if overrides.decompress.isSome: result.decompress = overrides.decompress
   if overrides.throwHttpErrors.isSome:
     result.throwHttpErrors = overrides.throwHttpErrors
+  if overrides.maxRedirects.isSome: result.maxRedirects = overrides.maxRedirects
 
 proc buildRequest*(opts: NaviOptions, verb: HttpVerb, target: string,
                    headers: Headers = initHeaders(), body = "",
