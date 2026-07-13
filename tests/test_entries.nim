@@ -92,6 +92,17 @@ suite "sync entry end to end":
     check res.body == "hello streaming world"
     joinThread(th)
 
+  test "connects over IPv6 loopback":
+    const port = 8977
+    var th: Thread[ServerCtx]
+    startServer(th, port, ipv6 = true)
+
+    let api = newNavi()
+    let res = api.get("http://[::1]:" & $port & "/")
+    check res.status == 200
+    check res.json()["ok"].getBool()
+    joinThread(th)
+
   test "extend layers headers and prefixUrl":
     let base = newNavi(NaviOptions(headers: initHeaders({"x-base": "1"})))
     let child = base.extend(NaviOptions(prefixUrl: "http://api.test"))

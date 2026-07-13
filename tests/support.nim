@@ -6,11 +6,12 @@ import std/[net, strutils]
 type ServerCtx* = object
   port: int
   ready: ptr bool
+  ipv6: bool
 
 proc serveOnce(ctx: ServerCtx) {.thread.} =
-  var server = newSocket()
+  var server = newSocket(if ctx.ipv6: AF_INET6 else: AF_INET)
   server.setSockOpt(OptReuseAddr, true)
-  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.bindAddr(Port(ctx.port), if ctx.ipv6: "::1" else: "127.0.0.1")
   server.listen()
   ctx.ready[] = true
   var client: Socket
@@ -28,10 +29,10 @@ proc serveOnce(ctx: ServerCtx) {.thread.} =
   client.close()
   server.close()
 
-proc startServer*(th: var Thread[ServerCtx], port: int) =
+proc startServer*(th: var Thread[ServerCtx], port: int, ipv6 = false) =
   ## Launch the one-shot server and block until it is listening.
   var ready = false
-  createThread(th, serveOnce, ServerCtx(port: port, ready: addr ready))
+  createThread(th, serveOnce, ServerCtx(port: port, ready: addr ready, ipv6: ipv6))
   while not ready: discard
 
 type KeepAliveCtx* = object
