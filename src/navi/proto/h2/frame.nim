@@ -62,7 +62,7 @@ proc u32(n: uint32): string =
 proc readU24(s: openArray[char], i: int): int =
   (int(uint8(s[i])) shl 16) or (int(uint8(s[i + 1])) shl 8) or int(uint8(s[i + 2]))
 
-proc readU32(s: openArray[char], i: int): uint32 =
+proc readU32*(s: openArray[char], i: int): uint32 =
   (uint32(uint8(s[i])) shl 24) or (uint32(uint8(s[i + 1])) shl 16) or
   (uint32(uint8(s[i + 2])) shl 8) or uint32(uint8(s[i + 3]))
 
