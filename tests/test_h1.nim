@@ -7,12 +7,12 @@ import navi/core/[headers, url, request, response]
 import navi/proto/h1
 
 suite "h1 serialize":
-  test "GET adds Host and Connection":
+  test "GET adds Host and keeps the connection alive by default":
     var req = Request(verb: GET, url: parseUrl("http://example.com/path?q=1"))
     let wire = serializeRequest(req)
     check wire.startsWith("GET /path?q=1 HTTP/1.1\r\n")
     check "Host: example.com\r\n" in wire
-    check "Connection: close\r\n" in wire
+    check "Connection: close" notin wire
 
   test "body sets Content-Length":
     var req = Request(verb: POST, url: parseUrl("http://h/"), body: "hello")

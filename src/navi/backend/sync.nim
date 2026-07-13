@@ -17,7 +17,12 @@ template await*(x: untyped): untyped = x
 proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig): Conn =
   ## Dial `host:port` (IPv4 or IPv6, resolved by std/net), upgrading to TLS for
   ## https. TLS requires compiling with `-d:ssl` (OpenSSL).
-  result.socket = dial(host, Port(port))
+  ##
+  ## The socket is unbuffered: std/net's buffered `recv(pointer, size)` blocks
+  ## until it fills the whole buffer, which deadlocks on a kept-alive connection
+  ## where the response is smaller than the buffer. Unbuffered recv returns
+  ## whatever bytes are available, which is the chunk semantics the engine wants.
+  result.socket = dial(host, Port(port), buffered = false)
   if tls:
     when defined(ssl):
       let ctx = newContext(

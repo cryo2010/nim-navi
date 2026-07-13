@@ -21,6 +21,10 @@ proc port*(u: Url): int =
     return parseInt(u.raw.port)
   if u.isTls: 443 else: 80
 
+proc originKey*(u: Url): string =
+  ## Pool key identifying a reusable connection: scheme, host, and port.
+  (if u.isTls: "https" else: "http") & "://" & u.host & ":" & $u.port
+
 proc requestTarget*(u: Url): string =
   ## The origin-form target sent on the request line: path plus query.
   result = if u.raw.path.len == 0: "/" else: u.raw.path

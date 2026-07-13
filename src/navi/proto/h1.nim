@@ -22,8 +22,7 @@ proc serializeRequest*(req: Request): string =
     result.add(k & ": " & v & "\r\n")
   if req.body.len > 0 and not req.headers.contains("content-length"):
     result.add("Content-Length: " & $req.body.len & "\r\n")
-  if not req.headers.contains("connection"):
-    result.add("Connection: close\r\n")
+  # HTTP/1.1 keeps connections alive by default; we rely on that for pooling.
   result.add("\r\n")
   result.add(req.body)
 
@@ -156,6 +155,14 @@ proc eof*(p: var H1Parser) =
   ## Signal connection close. Completes a body that runs until close.
   if p.state == stBody and p.bodyMode == bmUntilClose:
     p.state = stDone
+
+proc keepAliveAfter*(p: H1Parser): bool =
+  ## Whether the connection can be reused once this response is fully read.
+  ## Requires a self-delimited body (a body that ends only at connection close
+  ## cannot be pooled) and an HTTP/1.1 peer that did not ask to close.
+  if p.bodyMode == bmUntilClose: return false
+  if p.version != "HTTP/1.1": return false
+  "close" notin p.headers.get("connection").toLowerAscii
 
 proc toResponse*(p: H1Parser): Response =
   result.status = p.status

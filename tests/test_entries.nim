@@ -3,6 +3,8 @@
 import unittest
 import std/[net, os, strutils]
 import navi
+import navi/core/pool
+import ./support
 
 var serverReady: bool
 
@@ -38,6 +40,25 @@ suite "sync entry end to end":
     check res.headers.get("content-type") == "application/json"
     check res.json()["ok"].getBool()
     joinThread(th)
+
+  test "reuses a pooled connection for the same origin":
+    const port = 8974
+    var accepts = 0
+    var th: Thread[KeepAliveCtx]
+    startKeepAlive(th, port, requests = 2, accepts = addr accepts)
+
+    let api = newNavi()
+    let key = "http://127.0.0.1:" & $port
+    let first = api.get(key & "/")
+    check first.status == 200
+    check first.body == "n=0"
+    check api.pool.idleCount(key) == 1  # connection returned to the pool
+
+    let second = api.get(key & "/")
+    check second.status == 200
+    check second.body == "n=1"
+    joinThread(th)
+    check accepts == 1  # both requests used the one connection
 
   test "extend layers headers and prefixUrl":
     let base = newNavi(NaviOptions(headers: initHeaders({"x-base": "1"})))

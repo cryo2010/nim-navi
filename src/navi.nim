@@ -10,7 +10,7 @@
 
 import navi/private/entryguard
 import navi/core/public
-import navi/core/engine
+import navi/core/[engine, pool]
 import navi/backend/sync
 
 claimEntry("navi")
@@ -19,10 +19,11 @@ export public
 type
   Navi* = object
     options*: NaviOptions
+    pool*: Pool[Conn]
 
 proc newNavi*(options = defaultOptions()): Navi =
   ## Create a client. `options` supplies defaults (prefixUrl, headers, TLS, …).
-  Navi(options: options)
+  Navi(options: options, pool: newPool[Conn]())
 
 proc extend*(client: Navi, options: NaviOptions): Navi =
   ## Derive a new client, layering `options` over this client's defaults.
@@ -30,7 +31,7 @@ proc extend*(client: Navi, options: NaviOptions): Navi =
   if options.prefixUrl.len > 0: merged.prefixUrl = options.prefixUrl
   merged.headers = merge(client.options.headers, options.headers)
   if options.http.card > 0: merged.http = options.http
-  Navi(options: merged)
+  Navi(options: merged, pool: newPool[Conn]())
 
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = ""): Response =

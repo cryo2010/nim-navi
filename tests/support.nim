@@ -33,3 +33,44 @@ proc startServer*(th: var Thread[ServerCtx], port: int) =
   var ready = false
   createThread(th, serveOnce, ServerCtx(port: port, ready: addr ready))
   while not ready: discard
+
+type KeepAliveCtx* = object
+  port: int
+  requests: int
+  ready: ptr bool
+  accepts: ptr int
+
+proc serveKeepAlive(ctx: KeepAliveCtx) {.thread.} =
+  ## Accept exactly one connection and answer `requests` keep-alive responses
+  ## on it. If the client reuses its pooled connection, every request lands
+  ## here and `accepts` stays 1.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.listen()
+  ctx.ready[] = true
+  var client: Socket
+  server.accept(client)
+  ctx.accepts[] = 1
+  for i in 0 ..< ctx.requests:
+    var req = ""
+    while true:
+      let c = client.recv(1)
+      if c.len == 0: break
+      req.add c
+      if req.len >= 4 and req[^4 .. ^1] == "\r\n\r\n": break
+    if req.len == 0: break
+    let body = "n=" & $i
+    client.send("HTTP/1.1 200 OK\r\n" &
+                "Content-Length: " & $body.len & "\r\n" &
+                "Connection: keep-alive\r\n\r\n" & body)
+  client.close()
+  server.close()
+
+proc startKeepAlive*(th: var Thread[KeepAliveCtx], port, requests: int,
+                     accepts: ptr int) =
+  ## Launch the keep-alive server and block until it is listening.
+  var ready = false
+  createThread(th, serveKeepAlive,
+    KeepAliveCtx(port: port, requests: requests, ready: addr ready, accepts: accepts))
+  while not ready: discard
