@@ -16,16 +16,38 @@ claimEntry("navi/chronos")
 export public, chronos
 
 type
+  Hook* = proc(ctx: HookCtx): Future[void] {.closure.}
+    ## Lifecycle callback; may be async. Mutate `ctx.request` (beforeRequest),
+    ## read/mutate `ctx.response` (afterResponse), or read `ctx.attempt`.
+  Hooks* = object
+    beforeRequest*: seq[Hook]
+    afterResponse*: seq[Hook]
+    beforeRetry*: seq[Hook]
+
   Navi* = object
     options*: NaviOptions
+    hooks*: Hooks
     pool*: Pool[PooledConn[Conn]]
     jar*: CookieJar
 
-proc newNavi*(options = defaultOptions()): Navi =
-  Navi(options: options, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
+proc mergeHooks(base, add: Hooks): Hooks =
+  Hooks(beforeRequest: base.beforeRequest & add.beforeRequest,
+        afterResponse: base.afterResponse & add.afterResponse,
+        beforeRetry: base.beforeRetry & add.beforeRetry)
 
-proc extend*(client: Navi, options: NaviOptions): Navi =
+proc runHook(hook: Hook, ctx: HookCtx): Future[void] =
+  # See the asyncdispatch entry: the call returns a Future without raising.
+  {.cast(gcsafe).}:
+    {.cast(raises: []).}:
+      result = hook(ctx)
+
+proc newNavi*(options = defaultOptions(), hooks = Hooks()): Navi =
+  Navi(options: options, hooks: hooks,
+       pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
+
+proc extend*(client: Navi, options: NaviOptions, hooks = Hooks()): Navi =
   Navi(options: mergeOptions(client.options, options),
+       hooks: mergeHooks(client.hooks, hooks),
        pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
 proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =

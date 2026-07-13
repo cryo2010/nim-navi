@@ -57,24 +57,12 @@ type
     maxRedirects*: Option[int]      ## redirects to follow, 0 disables (default 20)
     maxRetries*: Option[int]        ## retry attempts for transient failures (default 2)
     auth*: Auth                     ## Authorization applied to every request
-    hooks*: Hooks                    ## request/response lifecycle callbacks
     proxy*: Option[string]          ## proxy URL; none falls back to env vars
 
   BodyProducer* = proc(): string {.closure, raises: [CatchableError].}
     ## Pull-based upload source: returns the next chunk, or "" at end of body.
   BodySink* = proc(data: openArray[byte]) {.closure, raises: [CatchableError].}
     ## Download sink: receives response body chunks as they arrive.
-
-  BeforeRequestHook* = proc(req: var Request) {.closure, raises: [CatchableError].}
-  AfterResponseHook* = proc(req: Request, resp: var Response)
-    {.closure, raises: [CatchableError].}
-  BeforeRetryHook* = proc(req: Request, attempt: int)
-    {.closure, raises: [CatchableError].}
-
-  Hooks* = object
-    beforeRequest*: seq[BeforeRequestHook]  ## mutate the request before sending
-    afterResponse*: seq[AfterResponseHook]   ## inspect/mutate the final response
-    beforeRetry*: seq[BeforeRetryHook]       ## observe each retry
 
   Request* = object
     verb*: HttpVerb
@@ -83,6 +71,15 @@ type
     body*: string
     bodyStream*: BodyProducer  ## when set, the body is streamed chunked
     absoluteForm*: bool         ## use absolute-URI on the request line (http proxy)
+
+  HookCtx* = ref object
+    ## Mutable context passed to lifecycle hooks. A ref so async hooks can hold
+    ## it across an `await` and still mutate it (a `var` param cannot be
+    ## captured). beforeRequest edits `request`; afterResponse edits `response`;
+    ## beforeRetry sees `attempt`.
+    request*: Request
+    response*: Response
+    attempt*: int
 
 proc defaultOptions*(): NaviOptions =
   result.http = {H1, H2} # negotiate h2 over TLS via ALPN, fall back to h1
@@ -110,9 +107,6 @@ proc mergeOptions*(base, overrides: NaviOptions): NaviOptions =
   if overrides.maxRetries.isSome: result.maxRetries = overrides.maxRetries
   if overrides.auth.kind != akNone: result.auth = overrides.auth
   if overrides.proxy.isSome: result.proxy = overrides.proxy
-  result.hooks.beforeRequest = base.hooks.beforeRequest & overrides.hooks.beforeRequest
-  result.hooks.afterResponse = base.hooks.afterResponse & overrides.hooks.afterResponse
-  result.hooks.beforeRetry = base.hooks.beforeRetry & overrides.hooks.beforeRetry
 
 proc buildRequest*(opts: NaviOptions, verb: HttpVerb, target: string,
                    headers: Headers = initHeaders(), body = "",

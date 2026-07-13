@@ -150,11 +150,13 @@ template performRequest*(client, req0: typed): Response =
   ## Buffered request with the full policy layer: beforeRequest hooks, retries
   ## with backoff, redirect following, decompression, afterResponse hooks, and
   ## throw-on-non-2xx.
-  mixin sleep
+  mixin sleep, runHook
   block:
     var req = req0
-    for hook in client.options.hooks.beforeRequest:
-      {.cast(gcsafe).}: hook(req)
+    block:
+      let ctx = HookCtx(request: req)
+      for hook in client.hooks.beforeRequest: await runHook(hook, ctx)
+      req = ctx.request
     var resp: Response
     var attempt = 0
     let maxRetries = client.options.retryLimit
@@ -171,11 +173,15 @@ template performRequest*(client, req0: typed): Response =
               isRetryableStatus(resp.status)):
         break
       inc attempt
-      for hook in client.options.hooks.beforeRetry:
-        {.cast(gcsafe).}: hook(req, attempt)
+      block:
+        let ctx = HookCtx(request: req, attempt: attempt)
+        for hook in client.hooks.beforeRetry: await runHook(hook, ctx)
+        req = ctx.request
       await sleep(backoffMs(attempt, resp))
-    for hook in client.options.hooks.afterResponse:
-      {.cast(gcsafe).}: hook(req, resp)
+    block:
+      let ctx = HookCtx(request: req, response: resp)
+      for hook in client.hooks.afterResponse: await runHook(hook, ctx)
+      resp = ctx.response
     if client.options.wantsThrow and not resp.ok:
       raiseHttpError(req, resp)
     resp
