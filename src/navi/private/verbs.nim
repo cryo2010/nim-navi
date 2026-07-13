@@ -14,6 +14,9 @@ proc head*(client: Navi, target: string, headers = initHeaders()): auto =
 proc delete*(client: Navi, target: string, headers = initHeaders()): auto =
   client.request(DELETE, target, headers)
 
+proc options*(client: Navi, target: string, headers = initHeaders()): auto =
+  client.request(OPTIONS, target, headers)
+
 proc post*(client: Navi, target: string, body = "", json: JsonNode = nil,
            form: seq[(string, string)] = @[], headers = initHeaders()): auto =
   client.request(POST, target, headers, body, json, form)

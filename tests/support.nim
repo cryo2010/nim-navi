@@ -61,13 +61,15 @@ proc serveBodyEcho(ctx: ServerCtx) {.thread.} =
     if c.len == 0: break
     head.add c
     if head.len >= 4 and head[^4 .. ^1] == "\r\n\r\n": break
-  let n = parseInt(headerValue(head, "content-length"))
+  let cl = headerValue(head, "content-length")
+  let n = if cl.len > 0: parseInt(cl) else: 0
   var body = ""
   while body.len < n:
     let part = client.recv(n - body.len)
     if part.len == 0: break
     body.add part
   client.send("HTTP/1.1 200 OK\r\n" &
+              "x-echo-method: " & head.split(' ')[0] & "\r\n" &
               "x-echo-content-type: " & headerValue(head, "content-type") & "\r\n" &
               "x-echo-authorization: " & headerValue(head, "authorization") & "\r\n" &
               "Content-Length: " & $body.len & "\r\n" &

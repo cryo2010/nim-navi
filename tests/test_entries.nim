@@ -297,6 +297,17 @@ suite "sync entry end to end":
     joinThread(th)
     check accepts == 1  # all three reused the one connection
 
+  test "options sends an OPTIONS request":
+    const port = 8994
+    var th: Thread[ServerCtx]
+    startBodyEcho(th, port)
+
+    let api = newNavi()
+    let res = api.options("http://127.0.0.1:" & $port & "/")
+    check res.status == 200
+    check res.headers.get("x-echo-method") == "OPTIONS"
+    joinThread(th)
+
   test "extend layers headers and prefixUrl":
     let base = newNavi(NaviOptions(headers: initHeaders({"x-base": "1"})))
     let child = base.extend(NaviOptions(prefixUrl: "http://api.test"))
