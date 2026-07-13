@@ -16,6 +16,13 @@ suite "hpack decode (RFC 7541 Appendix C.3, without Huffman)":
       (":method", "GET"), (":scheme", "http"), (":path", "/"),
       (":authority", "www.example.com")]
 
+  test "C.4.1 decodes a request with Huffman-coded values":
+    var dec = initHpackDecoder()
+    let headers = dec.decode(hex("828684418cf1e3c2e5f23a6ba0ab90f4ff"))
+    check headers == @[
+      (":method", "GET"), (":scheme", "http"), (":path", "/"),
+      (":authority", "www.example.com")]
+
   test "C.3.2 second request resolves a dynamic-table reference":
     var dec = initHpackDecoder()
     discard dec.decode(hex("828684410f7777772e6578616d706c652e636f6d"))

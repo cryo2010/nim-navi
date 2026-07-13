@@ -19,6 +19,7 @@ task test, "Run the test suite":
   exec "nim c -r --hints:off tests/test_h1.nim"
   exec "nim c -r --hints:off tests/test_h2_frame.nim"
   exec "nim c -r --hints:off tests/test_h2_hpack.nim"
+  exec "nim c -r --hints:off tests/test_h2_huffman.nim"
   exec "nim c -r --hints:off tests/test_entries.nim"
   exec "nim c -r --hints:off tests/test_async.nim"
   exec "nim c -r --hints:off tests/test_chronos.nim"
