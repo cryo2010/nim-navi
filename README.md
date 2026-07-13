@@ -25,7 +25,11 @@ waitFor main()
 
 navi is under active development. What works today:
 
-- **HTTP/1.1** over http and https, IPv4 and IPv6
+- **HTTP/1.1 and HTTP/2** over http and https, IPv4 and IPv6. h2 is native (own
+  frames + HPACK + Huffman), ALPN-negotiated with automatic h1 fallback.
+- **HTTP/2 multiplexing**: concurrent async requests to one origin share a
+  single connection (transparent on asyncdispatch); a `parallel` batch API does
+  the same on the sync backend.
 - **Sync and async** from one API, via three mutually exclusive entry modules
 - **TLS** on all three backends (OpenSSL for sync/asyncdispatch, BearSSL for chronos), with certificate verification on by default
 - **Connection pooling / keep-alive**, with automatic retry on a stale pooled connection
@@ -40,7 +44,9 @@ navi is under active development. What works today:
 - **Response helpers**: `.status`, `.headers`, `.text()`, `.bytes()`, `.json()`, `.ok`
 - **Reusable clients** with default options and `.extend()`
 
-Not built yet (planned): **HTTP/2** and **HTTP/3**. See [Roadmap](#roadmap).
+HTTP/2 currently runs on the sync and asyncdispatch backends; chronos stays
+http/1.1 (its bundled TLS exposes no client ALPN). Not built yet: **HTTP/3**.
+See [Roadmap](#roadmap).
 
 ## Requirements
 
@@ -191,6 +197,55 @@ let api = newNavi(NaviOptions(hooks: Hooks(
 
 Responses are decoded transparently: clients send `Accept-Encoding: gzip, deflate` and decode the body per `Content-Encoding` (via the system zlib). Disable with `decompress: some(false)`.
 
+### HTTP/2
+
+HTTP/2 is transparent: over https navi offers `h2` via ALPN and, if the server
+agrees, speaks h2; otherwise it falls back to HTTP/1.1. Your code is unchanged;
+check `res.httpVersion` if you care which was used.
+
+```nim
+let res = api.get("https://nghttp2.org/")
+echo res.httpVersion   # "HTTP/2" or "HTTP/1.1"
+```
+
+Concurrent async requests to the same origin **multiplex over one connection**.
+Just start them and await together (like `Promise.all`):
+
+```nim
+import navi/asyncdispatch
+
+proc main() {.async.} =
+  let api = newNavi()
+  let results = await all(@[
+    api.get("https://nghttp2.org/httpbin/get"),
+    api.get("https://nghttp2.org/httpbin/ip"),
+    api.get("https://nghttp2.org/httpbin/user-agent"),
+  ])                       # three streams, one connection
+  for r in results: echo r.status
+
+waitFor main()
+```
+
+On the sync backend (which can't have requests in flight at once), the same
+multiplexing is available through a batch call:
+
+```nim
+import navi
+
+let api = newNavi()
+let results = api.parallel(@[
+  "https://nghttp2.org/httpbin/get",
+  "https://nghttp2.org/httpbin/ip",
+])   # multiplexed over one h2 connection; each result still goes through the
+     # policy layer (redirects, retries, decompression, cookies, hooks)
+```
+
+`parallel` collects every response (it does not raise on non-2xx); inspect
+`.ok` per result.
+
+HTTP/2 runs on the sync and asyncdispatch backends. To disable it and force
+HTTP/1.1, set `http: {H1}` in `NaviOptions`.
+
 ### Keep-alive
 
 Connection reuse is automatic. Each client keeps an idle-connection pool keyed by origin; responses that are self-delimited (content-length or chunked) and not marked `Connection: close` return their connection to the pool. A pooled connection that the server has since closed is transparently retried on a fresh connection.
@@ -219,12 +274,16 @@ discard api.request(POST, "https://example.com/upload", bodyStream = proc(): str
 
 ## Roadmap
 
-HTTP/1.1 with the full transport feature set and the policy layer (retries, redirects, hooks, cookies, auth, proxy, decompression, body helpers, throw-on-non-2xx) is done.
+HTTP/1.1 and HTTP/2 with the full policy layer (retries, redirects, hooks,
+cookies, auth, proxy, decompression, body helpers, throw-on-non-2xx) are done.
 
-- **HTTP/2**: a native HPACK + framing implementation over the shared transport, negotiated via ALPN with HTTP/1.1 fallback.
 - **HTTP/3**: reserved for when a usable QUIC stack lands on the chronos backend.
 
-Known follow-ups: brotli/zstd decompression, streaming-response decompression, `caFile` on the chronos backend, and fuller cookie expiry.
+Known follow-ups: HTTP/2 on the chronos backend (its bundled TLS exposes no
+client ALPN), send-side flow control for very large request bodies and the
+per-connection concurrent-stream cap, brotli/zstd decompression,
+streaming-response decompression, `caFile` on the chronos backend, and fuller
+cookie expiry.
 
 ## Testing
 
@@ -232,7 +291,13 @@ Known follow-ups: brotli/zstd decompression, streaming-response decompression, `
 nimble test
 ```
 
-The suite covers the sans-io HTTP/1.1 parser deterministically and exercises all three backends end to end against in-process servers (keep-alive reuse, streaming, IPv6). Tests do not touch the network. The `examples/` directory holds manual smoke tests that do (for example, a real HTTPS GET).
+The suite runs the sans-io protocol cores deterministically (HTTP/1.1 parser;
+HTTP/2 frames, HPACK, and Huffman against RFC 7541 vectors; the h2 connection
+against simulated server frames) and exercises all three backends end to end
+against in-process servers (keep-alive reuse, streaming, IPv6, redirects,
+retries, cookies, auth, parallel). Tests do not touch the network. The
+`examples/` directory holds manual smoke tests that do, including real HTTP/2
+requests and concurrent multiplexing.
 
 ## License
 

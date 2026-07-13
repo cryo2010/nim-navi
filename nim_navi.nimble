@@ -2,7 +2,7 @@
 
 version       = "0.1.0"
 author        = "Craig Younker"
-description   = "A sugary HTTP client for Nim (HTTP/1.1 + HTTP/2, sync and async)"
+description   = "An HTTP client for Nim: HTTP/1.1 and HTTP/2, sync and async, ky-inspired API"
 license       = "MIT"
 srcDir        = "src"
 installExt    = @["nim"]
