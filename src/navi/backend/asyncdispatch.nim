@@ -10,6 +10,8 @@ type
     socket: AsyncSocket
     protocol*: string   ## ALPN-negotiated protocol ("h2" or "", meaning http/1.1)
 
+var openedConnections*: int  ## diagnostic: TCP connections opened by this backend
+
 proc proxyConnect(socket: AsyncSocket, host: string, port: int) {.async.} =
   let target = host & ":" & $port
   await socket.send("CONNECT " & target & " HTTP/1.1\r\nHost: " & target & "\r\n\r\n")
@@ -28,6 +30,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   ## Dial `host:port` (or the proxy), upgrading to TLS for https with a CONNECT
   ## tunnel when proxied. Unbuffered so recv returns the available chunk instead
   ## of blocking to fill the buffer. TLS requires `-d:ssl`.
+  inc openedConnections
   when defined(ssl):
     if tls and not proxy.isSet:
       # Direct TLS: connect a wrapped socket so the handshake completes here and

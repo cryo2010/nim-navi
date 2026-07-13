@@ -37,7 +37,7 @@ template sendRequest(conn, req: typed) =
   else:
     await sendAll(conn, serializeRequest(req))
 
-template h1Exchange(transport, req, sink, keep: typed): Response =
+template h1Exchange*(transport, req, sink, keep: typed): Response =
   ## One HTTP/1.1 request/response over `transport`. Sets `keep` to whether the
   ## connection may be reused; does not pool or close.
   block:
@@ -71,11 +71,13 @@ template h2Stream(transport, h2, req, sink: typed): Response =
       r.body = ""
     r
 
-template run(client, req, sink: typed): Response =
+template poolTransport*(client, req, sink: typed): Response =
+  ## Pool-based transport: reuse a pooled connection (http/1.1 or a persistent
+  ## h2 connection) or open a fresh one, negotiating the protocol via ALPN.
+  ## One request at a time per connection. Used by the sync and chronos entries.
   mixin connect, sendAll, recvSome, close, await
   block:
     var rq = req
-    applyCookies(client.jar, rq)
     let proxy = resolveProxy(client.options, rq.url)
     rq.absoluteForm = proxy.isSet and not rq.url.isTls
     let alpn = if client.options.wantsH2 and rq.url.isTls:
@@ -84,7 +86,6 @@ template run(client, req, sink: typed): Response =
     var resp: Response
     var served = false
 
-    # 1. Reuse a pooled connection (http/1.1 or a persistent h2 connection).
     var (found, pc) = popIdle(client.pool, key)
     if found:
       try:
@@ -101,7 +102,6 @@ template run(client, req, sink: typed): Response =
       except CatchableError:
         await close(pc.transport)  # pooled connection was stale; fall through
 
-    # 2. Open a fresh connection, negotiating the protocol via ALPN.
     if not served:
       let transport = await connect(rq.url.host, rq.url.port, rq.url.isTls,
                                     client.options.tls, proxy, alpn)
@@ -117,7 +117,16 @@ template run(client, req, sink: typed): Response =
         resp = h1Exchange(transport, rq, sink, keep)
         if not (keep and pushIdle(client.pool, key, npc)):
           await close(transport)
+    resp
 
+template run(client, req, sink: typed): Response =
+  ## Cookie handling around the backend's transport step. `transport` is
+  ## resolved per entry: pool-based for sync/chronos, mux-based for asyncdispatch.
+  mixin transport, await
+  block:
+    var rq = req
+    applyCookies(client.jar, rq)
+    var resp = await transport(client, rq, sink)
     storeCookies(client.jar, rq.url, resp)
     resp
 

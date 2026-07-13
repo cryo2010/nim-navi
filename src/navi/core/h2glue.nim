@@ -28,3 +28,9 @@ proc toResponse*(r: H2Response): Response =
   result.body = r.body
   for (name, value) in r.headers:
     result.headers.add(name, value)
+
+proc applySink*(r: var Response, sink: BodySink) =
+  ## For streaming requests, hand the (buffered) body to the sink and clear it.
+  if not sink.isNil and r.body.len > 0:
+    {.cast(gcsafe).}: sink(r.body.toOpenArrayByte(0, r.body.high))
+    r.body = ""

@@ -130,6 +130,11 @@ proc streamDone*(c: H2Conn, streamId: uint32): bool =
   let s = c.streams.getOrDefault(streamId)
   s != nil and s.ended
 
+proc streamEnded*(c: H2Conn, streamId: uint32): bool =
+  ## The stream itself received END_STREAM or RST_STREAM (independent of GOAWAY).
+  let s = c.streams.getOrDefault(streamId)
+  s != nil and s.ended
+
 proc streamReset*(c: H2Conn, streamId: uint32): bool =
   let s = c.streams.getOrDefault(streamId)
   s != nil and s.reset

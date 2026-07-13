@@ -28,6 +28,10 @@ proc extend*(client: Navi, options: NaviOptions): Navi =
   Navi(options: mergeOptions(client.options, options),
        pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
+proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
+  ## Pool-based transport (http/1.1; chronos has no h2).
+  result = poolTransport(client, req, sink)
+
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = "", json: JsonNode = nil,
               form: seq[(string, string)] = @[],

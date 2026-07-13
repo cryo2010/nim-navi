@@ -35,6 +35,10 @@ proc extend*(client: Navi, options: NaviOptions): Navi =
   Navi(options: mergeOptions(client.options, options),
        pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
+proc transport(client: Navi, req: Request, sink: BodySink): Response =
+  ## Pool-based transport (one request per connection at a time).
+  poolTransport(client, req, sink)
+
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = "", json: JsonNode = nil,
               form: seq[(string, string)] = @[],
