@@ -8,6 +8,7 @@ export api, asyncdispatch
 type
   Conn* = object
     socket: AsyncSocket
+    protocol*: string   ## ALPN protocol; always "" here (this backend is http/1.1)
 
 proc proxyConnect(socket: AsyncSocket, host: string, port: int) {.async.} =
   let target = host & ":" & $port
@@ -17,7 +18,7 @@ proc proxyConnect(socket: AsyncSocket, host: string, port: int) {.async.} =
     raise newException(ValueError, "navi: proxy CONNECT failed: " & resp.splitLines()[0])
 
 proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
-              proxy: ProxyTarget): Future[Conn] {.async.} =
+              proxy: ProxyTarget, alpn: seq[string] = @[]): Future[Conn] {.async.} =
   ## Dial `host:port` (or the proxy), upgrading to TLS for https with a CONNECT
   ## tunnel when proxied. Unbuffered so recv returns the available chunk instead
   ## of blocking to fill the buffer. TLS requires `-d:ssl`.

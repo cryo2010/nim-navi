@@ -4,6 +4,8 @@
 ## body compiles to straight-line blocking code.
 
 import std/[net, os, strutils]
+when defined(ssl):
+  import std/openssl
 import ./api
 
 export api
@@ -11,6 +13,21 @@ export api
 type
   Conn* = object
     socket: Socket
+    protocol*: string   ## ALPN-negotiated protocol ("h2" or "", meaning http/1.1)
+
+proc alpnWire(protos: openArray[string]): string =
+  for p in protos:
+    result.add char(p.len)
+    result.add p
+
+when defined(ssl):
+  proc negotiatedProtocol(ssl: SslPtr): string =
+    var data: cstring
+    var length: cuint
+    SSL_get0_alpn_selected(ssl, addr data, addr length)
+    if length > 0:
+      result = newString(int(length))
+      copyMem(addr result[0], data, int(length))
 
 template await*(x: untyped): untyped = x
 
@@ -27,7 +44,7 @@ proc proxyConnect(socket: Socket, host: string, port: int) =
     raise newException(ValueError, "navi: proxy CONNECT failed: " & resp.splitLines()[0])
 
 proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
-              proxy: ProxyTarget): Conn =
+              proxy: ProxyTarget, alpn: seq[string] = @[]): Conn =
   ## Dial `host:port` (IPv4 or IPv6, resolved by std/net), upgrading to TLS for
   ## https. Through a proxy, https targets get a CONNECT tunnel and http targets
   ## are dialed directly to the proxy (the engine sends an absolute-URI).
@@ -47,7 +64,11 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
       let ctx = newContext(
         verifyMode = if cfg.verify: CVerifyPeer else: CVerifyNone,
         caFile = cfg.caFile)
+      if alpn.len > 0:
+        let wire = alpnWire(alpn)
+        discard SSL_CTX_set_alpn_protos(ctx.context, wire.cstring, cuint(wire.len))
       ctx.wrapConnectedSocket(result.socket, handshakeAsClient, host)
+      result.protocol = negotiatedProtocol(result.socket.sslHandle)
     else:
       raise newException(ValueError,
         "navi: https requires compiling with -d:ssl")

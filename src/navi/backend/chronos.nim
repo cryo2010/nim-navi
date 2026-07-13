@@ -18,6 +18,7 @@ type
     reader: AsyncStreamReader
     writer: AsyncStreamWriter
     tls: TLSAsyncStream  ## kept alive for the connection's lifetime; nil if plaintext
+    protocol*: string    ## ALPN protocol; always "" here (this backend is http/1.1)
 
 proc proxyConnect(transport: StreamTransport, host: string, port: int) {.async.} =
   let target = host & ":" & $port
@@ -30,7 +31,7 @@ proc proxyConnect(transport: StreamTransport, host: string, port: int) {.async.}
     raise newException(ValueError, "navi: proxy CONNECT failed: " & buf.splitLines()[0])
 
 proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
-              proxy: ProxyTarget): Future[Conn] {.async.} =
+              proxy: ProxyTarget, alpn: seq[string] = @[]): Future[Conn] {.async.} =
   let dialAddr =
     if proxy.isSet: resolveTAddress(proxy.host, Port(proxy.port))[0]
     else: resolveTAddress(host, Port(port))[0]

@@ -85,13 +85,16 @@ type
     absoluteForm*: bool         ## use absolute-URI on the request line (http proxy)
 
 proc defaultOptions*(): NaviOptions =
-  result.http = {H1} # protocol negotiation lands with ALPN in phase 4
+  result.http = {H1, H2} # negotiate h2 over TLS via ALPN, fall back to h1
   result.tls = defaultTls()
 
 proc wantsDecompress*(opts: NaviOptions): bool = opts.decompress.get(true)
 proc wantsThrow*(opts: NaviOptions): bool = opts.throwHttpErrors.get(true)
 proc redirectLimit*(opts: NaviOptions): int = opts.maxRedirects.get(20)
 proc retryLimit*(opts: NaviOptions): int = opts.maxRetries.get(2)
+proc wantsH2*(opts: NaviOptions): bool =
+  ## An unset `http` (empty set) means "negotiate h2 where possible".
+  opts.http.card == 0 or H2 in opts.http
 
 proc mergeOptions*(base, overrides: NaviOptions): NaviOptions =
   ## Layer `overrides` over `base` for `.extend`. Only fields the caller set

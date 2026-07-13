@@ -92,21 +92,24 @@ proc buildTree(): Node =
 
 let decodeTree = buildTree()
 
-proc huffmanDecode*(data: string): string =
-  var node = decodeTree
-  for ch in data:
-    let b = uint8(ch)
-    for k in countdown(7, 0):
-      let bit = int((b shr k) and 1)
-      node = node.child[bit]
-      if node == nil:
-        raise newException(ValueError, "hpack: invalid Huffman code")
-      if node.sym >= 0:
-        result.add char(node.sym)
-        node = decodeTree
-  # A dangling partial path is the 1-bit EOS padding; anything else is malformed.
-  if node != decodeTree and node.child[1] == nil and node.child[0] != nil:
-    raise newException(ValueError, "hpack: truncated Huffman code")
+proc huffmanDecode*(data: string): string {.gcsafe.} =
+  # `decodeTree` is built once and never mutated, so reading it from a gcsafe
+  # (chronos async) context is safe.
+  {.cast(gcsafe).}:
+    var node = decodeTree
+    for ch in data:
+      let b = uint8(ch)
+      for k in countdown(7, 0):
+        let bit = int((b shr k) and 1)
+        node = node.child[bit]
+        if node == nil:
+          raise newException(ValueError, "hpack: invalid Huffman code")
+        if node.sym >= 0:
+          result.add char(node.sym)
+          node = decodeTree
+    # A dangling partial path is the 1-bit EOS padding; anything else is malformed.
+    if node != decodeTree and node.child[1] == nil and node.child[0] != nil:
+      raise newException(ValueError, "hpack: truncated Huffman code")
 
 proc huffmanEncode*(s: string): string =
   var acc: uint64 = 0

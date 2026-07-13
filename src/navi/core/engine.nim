@@ -10,14 +10,41 @@
 ## pool may have been closed by the server in the meantime, so a failed reused
 ## attempt is retried once on a fresh connection.
 
-import ./url, ./request, ./response, ./pool, ./decompress, ./redirect, ./retry,
-       ./cookies, ./proxy
+import std/strutils
+import ./headers, ./url, ./request, ./response, ./pool, ./decompress, ./redirect,
+       ./retry, ./cookies, ./proxy
 import ../proto/h1
+import ../proto/h2/[conn, hpack]
 
 proc raiseHttpError(req: Request, resp: Response) =
   raise (ref HttpError)(
     msg: $req.verb & " " & $req.url & " -> " & $resp.status & " " & resp.reason,
     response: resp)
+
+proc h2HeaderList(req: Request): seq[HeaderPair] =
+  ## Pseudo-headers first, then regular headers (lowercased, connection-specific
+  ## fields dropped, Host replaced by :authority).
+  result.add((":method", $req.verb))
+  result.add((":scheme", if req.url.isTls: "https" else: "http"))
+  result.add((":path", req.url.requestTarget))
+  var authority = req.url.host
+  let p = req.url.port
+  if not ((req.url.isTls and p == 443) or (not req.url.isTls and p == 80)):
+    authority.add(":" & $p)
+  result.add((":authority", authority))
+  for (name, value) in req.headers.pairs:
+    let lower = name.toLowerAscii
+    if lower in ["host", "connection", "keep-alive", "proxy-connection",
+                 "transfer-encoding", "upgrade"]:
+      continue
+    result.add((lower, value))
+
+proc toResponse(r: H2Response): Response =
+  result.status = r.status
+  result.httpVersion = "HTTP/2"
+  result.body = r.body
+  for (name, value) in r.headers:
+    result.headers.add(name, value)
 
 template sendRequest(conn, req: typed) =
   ## Write the request, streaming the body as chunked transfer-encoding when a
@@ -53,6 +80,25 @@ template roundTrip(client, req, conn, key, sink: typed): Response =
       await close(conn)
     resp
 
+template h2Exchange(conn, req, sink: typed): Response =
+  ## One HTTP/2 request/response on a single stream (no reuse/multiplexing yet).
+  block:
+    var h2 = initH2Client()
+    await sendAll(conn, h2.clientPreamble())
+    await sendAll(conn, h2.encodeRequest(h2HeaderList(req), req.body))
+    while not h2.done:
+      let chunk = await recvSome(conn)
+      if chunk.len == 0: break
+      let toSend = h2.feed(chunk)
+      if toSend.len > 0: await sendAll(conn, toSend)
+    if h2.failed:
+      raise newException(IOError, "navi: http/2 " & h2.failMsg)
+    var r = toResponse(h2.response())
+    if not sink.isNil and r.body.len > 0:
+      {.cast(gcsafe).}: sink(r.body.toOpenArrayByte(0, r.body.high))
+      r.body = ""
+    r
+
 template run(client, req, sink: typed): Response =
   mixin connect, sendAll, recvSome, close, await
   block:
@@ -60,9 +106,11 @@ template run(client, req, sink: typed): Response =
     applyCookies(client.jar, rq)
     let proxy = resolveProxy(client.options, rq.url)
     rq.absoluteForm = proxy.isSet and not rq.url.isTls
+    let alpn = if client.options.wantsH2 and rq.url.isTls:
+                 @["h2", "http/1.1"] else: @[]
     let key = originKey(rq.url)
     var resp: Response
-    var (reused, conn) = popIdle(client.pool, key)
+    var (reused, conn) = popIdle(client.pool, key)  # pooled conns are http/1.1
     var needFresh = not reused
     if reused:
       try:
@@ -72,8 +120,12 @@ template run(client, req, sink: typed): Response =
         needFresh = true  # pooled connection was stale; try once more
     if needFresh:
       conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
-                           client.options.tls, proxy)
-      resp = roundTrip(client, rq, conn, key, sink)
+                           client.options.tls, proxy, alpn)
+      if conn.protocol == "h2":
+        resp = h2Exchange(conn, rq, sink)
+        await close(conn)
+      else:
+        resp = roundTrip(client, rq, conn, key, sink)
     storeCookies(client.jar, rq.url, resp)
     resp
 
