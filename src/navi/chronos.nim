@@ -7,10 +7,10 @@
 ## Requires the `chronos` package. Only compiled when this module is imported,
 ## so sync/asyncdispatch users never pull chronos in.
 
-import pkg/chronos, pkg/chronos/transports/stream
 import navi/private/entryguard
 import navi/core/public
-import navi/proto/h1
+import navi/core/engine
+import navi/backend/chronos
 
 claimEntry("navi/chronos")
 export public, chronos
@@ -32,21 +32,7 @@ proc extend*(client: Navi, options: NaviOptions): Navi =
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = ""): Future[Response] {.async.} =
   let req = buildRequest(client.options, verb, target, headers, body)
-  let addresses = resolveTAddress(req.url.host, Port(req.url.port))
-  let tr = await connect(addresses[0])
-  try:
-    discard await tr.write(serializeRequest(req))
-    var parser = initH1Parser()
-    var buf = newString(4096)
-    while not parser.finished:
-      let n = await tr.readOnce(addr buf[0], buf.len)
-      if n == 0:
-        parser.eof()
-        break
-      parser.feed(buf.toOpenArray(0, n - 1))
-    result = parser.toResponse()
-  finally:
-    await tr.closeWait()
+  result = performRequest(client, req)
 
 proc get*(client: Navi, target: string, headers = initHeaders()): Future[Response] =
   client.request(GET, target, headers)

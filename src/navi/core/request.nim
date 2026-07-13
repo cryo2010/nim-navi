@@ -4,6 +4,7 @@
 ## per-call arguments into a concrete `Request` that any backend can execute.
 
 import ./headers, ./url
+import ../backend/api
 
 type
   HttpVerb* = enum
@@ -26,6 +27,7 @@ type
     prefixUrl*: string
     headers*: Headers
     http*: set[HttpVersion]
+    tls*: TlsConfig
 
   Request* = object
     verb*: HttpVerb
@@ -34,7 +36,8 @@ type
     body*: string
 
 proc defaultOptions*(): NaviOptions =
-  result.http = {H1} # protocol negotiation lands with TLS/ALPN in phase 2
+  result.http = {H1} # protocol negotiation lands with ALPN in phase 4
+  result.tls = defaultTls()
 
 proc buildRequest*(opts: NaviOptions, verb: HttpVerb, target: string,
                    headers: Headers = initHeaders(), body = ""): Request =

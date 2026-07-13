@@ -8,10 +8,10 @@
 ## For async, import `navi/asyncdispatch` or `navi/chronos` instead (exactly
 ## one entry module per program).
 
-import std/net
 import navi/private/entryguard
 import navi/core/public
-import navi/proto/h1
+import navi/core/engine
+import navi/backend/sync
 
 claimEntry("navi")
 export public
@@ -21,7 +21,7 @@ type
     options*: NaviOptions
 
 proc newNavi*(options = defaultOptions()): Navi =
-  ## Create a client. `options` supplies defaults (prefixUrl, headers, …).
+  ## Create a client. `options` supplies defaults (prefixUrl, headers, TLS, …).
   Navi(options: options)
 
 proc extend*(client: Navi, options: NaviOptions): Navi =
@@ -34,20 +34,9 @@ proc extend*(client: Navi, options: NaviOptions): Navi =
 
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = ""): Response =
-  ## Perform a request and return the response. (Phase 1: plaintext HTTP/1.1.)
+  ## Perform a request and return the response.
   let req = buildRequest(client.options, verb, target, headers, body)
-  let sock = dial(req.url.host, Port(req.url.port))
-  defer: sock.close()
-  sock.send(serializeRequest(req))
-  var parser = initH1Parser()
-  var buf = newString(4096)
-  while not parser.finished:
-    let n = sock.recv(addr buf[0], buf.len)
-    if n <= 0:
-      parser.eof()
-      break
-    parser.feed(buf.toOpenArray(0, n - 1))
-  parser.toResponse()
+  performRequest(client, req)
 
 proc get*(client: Navi, target: string, headers = initHeaders()): Response =
   client.request(GET, target, headers)

@@ -4,10 +4,10 @@
 ##   let api = newNavi()
 ##   let res = await api.get("http://example.com")
 
-import std/[asyncdispatch, asyncnet]
 import navi/private/entryguard
 import navi/core/public
-import navi/proto/h1
+import navi/core/engine
+import navi/backend/asyncdispatch
 
 claimEntry("navi/asyncdispatch")
 export public, asyncdispatch
@@ -29,17 +29,7 @@ proc extend*(client: Navi, options: NaviOptions): Navi =
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = ""): Future[Response] {.async.} =
   let req = buildRequest(client.options, verb, target, headers, body)
-  let sock = await asyncnet.dial(req.url.host, Port(req.url.port))
-  defer: sock.close()
-  await sock.send(serializeRequest(req))
-  var parser = initH1Parser()
-  while not parser.finished:
-    let chunk = await sock.recv(4096)
-    if chunk.len == 0:
-      parser.eof()
-      break
-    parser.feed(chunk)
-  return parser.toResponse()
+  result = performRequest(client, req)
 
 proc get*(client: Navi, target: string, headers = initHeaders()): Future[Response] =
   client.request(GET, target, headers)
