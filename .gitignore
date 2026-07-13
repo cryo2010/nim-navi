@@ -1,0 +1,11 @@
+# Nim build artifacts
+nimcache/
+*.exe
+# Compiled test/example binaries (source has .nim/.nims extensions)
+tests/test_h1
+tests/test_entries
+tests/test_async
+tests/test_chronos
+
+# nimble
+nimblecache/
