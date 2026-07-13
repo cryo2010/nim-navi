@@ -3,11 +3,32 @@
 ## Nothing here performs I/O: `buildRequest` merges instance defaults with
 ## per-call arguments into a concrete `Request` that any backend can execute.
 
-import std/[options, json]
+import std/[options, json, base64]
 from std/uri import encodeQuery
 import ./headers, ./url
 import ../backend/api
 export options
+
+type
+  AuthKind* = enum akNone, akBasic, akBearer
+  Auth* = object
+    case kind*: AuthKind
+    of akBasic:
+      user*, pass*: string
+    of akBearer:
+      token*: string
+    of akNone: discard
+
+proc basicAuth*(user, pass: string): Auth =
+  Auth(kind: akBasic, user: user, pass: pass)
+proc bearerAuth*(token: string): Auth =
+  Auth(kind: akBearer, token: token)
+
+proc header(a: Auth): string =
+  case a.kind
+  of akBasic: "Basic " & encode(a.user & ":" & a.pass)
+  of akBearer: "Bearer " & a.token
+  of akNone: ""
 
 type
   HttpVerb* = enum
@@ -34,6 +55,7 @@ type
     decompress*: Option[bool]      ## decode gzip/deflate bodies (default on)
     throwHttpErrors*: Option[bool]  ## raise HttpError on non-2xx (default on)
     maxRedirects*: Option[int]      ## redirects to follow, 0 disables (default 20)
+    auth*: Auth                     ## Authorization applied to every request
 
   BodyProducer* = proc(): string {.closure, raises: [CatchableError].}
     ## Pull-based upload source: returns the next chunk, or "" at end of body.
@@ -66,6 +88,7 @@ proc mergeOptions*(base, overrides: NaviOptions): NaviOptions =
   if overrides.throwHttpErrors.isSome:
     result.throwHttpErrors = overrides.throwHttpErrors
   if overrides.maxRedirects.isSome: result.maxRedirects = overrides.maxRedirects
+  if overrides.auth.kind != akNone: result.auth = overrides.auth
 
 proc buildRequest*(opts: NaviOptions, verb: HttpVerb, target: string,
                    headers: Headers = initHeaders(), body = "",
@@ -88,5 +111,7 @@ proc buildRequest*(opts: NaviOptions, verb: HttpVerb, target: string,
       result.headers.add("content-type", "application/x-www-form-urlencoded")
   else:
     result.body = body
+  if opts.auth.kind != akNone and not result.headers.contains("authorization"):
+    result.headers.add("authorization", opts.auth.header)
   if opts.wantsDecompress and not result.headers.contains("accept-encoding"):
     result.headers.add("accept-encoding", "gzip, deflate")

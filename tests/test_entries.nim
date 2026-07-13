@@ -199,6 +199,26 @@ suite "sync entry end to end":
     check res.headers.get("x-echo-content-type") == "application/x-www-form-urlencoded"
     joinThread(th)
 
+  test "bearer auth sets the Authorization header":
+    const port = 8985
+    var th: Thread[ServerCtx]
+    startBodyEcho(th, port)
+
+    let api = newNavi(NaviOptions(auth: bearerAuth("secret-token")))
+    let res = api.post("http://127.0.0.1:" & $port & "/", body = "x")
+    check res.headers.get("x-echo-authorization") == "Bearer secret-token"
+    joinThread(th)
+
+  test "basic auth base64-encodes credentials":
+    const port = 8986
+    var th: Thread[ServerCtx]
+    startBodyEcho(th, port)
+
+    let api = newNavi(NaviOptions(auth: basicAuth("user", "pass")))
+    let res = api.post("http://127.0.0.1:" & $port & "/", body = "x")
+    check res.headers.get("x-echo-authorization") == "Basic dXNlcjpwYXNz"
+    joinThread(th)
+
   test "extend layers headers and prefixUrl":
     let base = newNavi(NaviOptions(headers: initHeaders({"x-base": "1"})))
     let child = base.extend(NaviOptions(prefixUrl: "http://api.test"))

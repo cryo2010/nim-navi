@@ -68,6 +68,7 @@ proc serveBodyEcho(ctx: ServerCtx) {.thread.} =
     body.add part
   client.send("HTTP/1.1 200 OK\r\n" &
               "x-echo-content-type: " & headerValue(head, "content-type") & "\r\n" &
+              "x-echo-authorization: " & headerValue(head, "authorization") & "\r\n" &
               "Content-Length: " & $body.len & "\r\n" &
               "Connection: close\r\n\r\n" & body)
   client.close()
