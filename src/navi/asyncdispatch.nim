@@ -24,9 +24,11 @@ proc extend*(client: Navi, options: NaviOptions): Navi =
   Navi(options: mergeOptions(client.options, options), pool: newPool[Conn]())
 
 proc request*(client: Navi, verb: HttpVerb, target: string,
-              headers = initHeaders(), body = "",
+              headers = initHeaders(), body = "", json: JsonNode = nil,
+              form: seq[(string, string)] = @[],
               bodyStream: BodyProducer = nil): Future[Response] {.async.} =
-  let req = buildRequest(client.options, verb, target, headers, body, bodyStream)
+  let req = buildRequest(client.options, verb, target, headers, body, json,
+                         form, bodyStream)
   result = performRequest(client, req)
 
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
@@ -35,15 +37,4 @@ proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
   let req = buildRequest(client.options, verb, target, headers)
   result = performStream(client, req, sink)
 
-proc get*(client: Navi, target: string, headers = initHeaders()): Future[Response] =
-  client.request(GET, target, headers)
-proc post*(client: Navi, target: string, body = "", headers = initHeaders()): Future[Response] =
-  client.request(POST, target, headers, body)
-proc put*(client: Navi, target: string, body = "", headers = initHeaders()): Future[Response] =
-  client.request(PUT, target, headers, body)
-proc patch*(client: Navi, target: string, body = "", headers = initHeaders()): Future[Response] =
-  client.request(PATCH, target, headers, body)
-proc delete*(client: Navi, target: string, headers = initHeaders()): Future[Response] =
-  client.request(DELETE, target, headers)
-proc head*(client: Navi, target: string, headers = initHeaders()): Future[Response] =
-  client.request(HEAD, target, headers)
+include navi/private/verbs

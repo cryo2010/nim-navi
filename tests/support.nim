@@ -38,6 +38,46 @@ proc startRaw*(th: var Thread[ServerCtx], port: int, payload: string) =
   createThread(th, serveRaw, ServerCtx(port: port, ready: addr ready, payload: payload))
   while not ready: discard
 
+proc headerValue(head, name: string): string =
+  for line in head.split("\r\n"):
+    let idx = line.find(':')
+    if idx > 0 and cmpIgnoreCase(line[0 ..< idx].strip, name) == 0:
+      return line[idx + 1 .. ^1].strip
+
+proc serveBodyEcho(ctx: ServerCtx) {.thread.} =
+  ## Read a Content-Length body and echo it back, reflecting the request's
+  ## Content-Type in an x-echo-content-type response header.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.listen()
+  ctx.ready[] = true
+  var client: Socket
+  server.accept(client)
+  var head = ""
+  while true:
+    let c = client.recv(1)
+    if c.len == 0: break
+    head.add c
+    if head.len >= 4 and head[^4 .. ^1] == "\r\n\r\n": break
+  let n = parseInt(headerValue(head, "content-length"))
+  var body = ""
+  while body.len < n:
+    let part = client.recv(n - body.len)
+    if part.len == 0: break
+    body.add part
+  client.send("HTTP/1.1 200 OK\r\n" &
+              "x-echo-content-type: " & headerValue(head, "content-type") & "\r\n" &
+              "Content-Length: " & $body.len & "\r\n" &
+              "Connection: close\r\n\r\n" & body)
+  client.close()
+  server.close()
+
+proc startBodyEcho*(th: var Thread[ServerCtx], port: int) =
+  var ready = false
+  createThread(th, serveBodyEcho, ServerCtx(port: port, ready: addr ready))
+  while not ready: discard
+
 proc serveRedirect(ctx: ServerCtx) {.thread.} =
   ## First request gets a 302 to /final (relative), the second gets 200.
   var server = newSocket()

@@ -30,11 +30,13 @@ proc extend*(client: Navi, options: NaviOptions): Navi =
   Navi(options: mergeOptions(client.options, options), pool: newPool[Conn]())
 
 proc request*(client: Navi, verb: HttpVerb, target: string,
-              headers = initHeaders(), body = "",
+              headers = initHeaders(), body = "", json: JsonNode = nil,
+              form: seq[(string, string)] = @[],
               bodyStream: BodyProducer = nil): Response =
-  ## Perform a request and return the response. Pass `bodyStream` to upload a
-  ## chunked body from a pull-based producer.
-  let req = buildRequest(client.options, verb, target, headers, body, bodyStream)
+  ## Perform a request and return the response. `json`/`form` encode the body;
+  ## `bodyStream` uploads a chunked body from a pull-based producer.
+  let req = buildRequest(client.options, verb, target, headers, body, json,
+                         form, bodyStream)
   performRequest(client, req)
 
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
@@ -44,15 +46,4 @@ proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
   let req = buildRequest(client.options, verb, target, headers)
   performStream(client, req, sink)
 
-proc get*(client: Navi, target: string, headers = initHeaders()): Response =
-  client.request(GET, target, headers)
-proc post*(client: Navi, target: string, body = "", headers = initHeaders()): Response =
-  client.request(POST, target, headers, body)
-proc put*(client: Navi, target: string, body = "", headers = initHeaders()): Response =
-  client.request(PUT, target, headers, body)
-proc patch*(client: Navi, target: string, body = "", headers = initHeaders()): Response =
-  client.request(PATCH, target, headers, body)
-proc delete*(client: Navi, target: string, headers = initHeaders()): Response =
-  client.request(DELETE, target, headers)
-proc head*(client: Navi, target: string, headers = initHeaders()): Response =
-  client.request(HEAD, target, headers)
+include navi/private/verbs

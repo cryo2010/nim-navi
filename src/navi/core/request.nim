@@ -3,7 +3,8 @@
 ## Nothing here performs I/O: `buildRequest` merges instance defaults with
 ## per-call arguments into a concrete `Request` that any backend can execute.
 
-import std/options
+import std/[options, json]
+from std/uri import encodeQuery
 import ./headers, ./url
 import ../backend/api
 export options
@@ -68,12 +69,24 @@ proc mergeOptions*(base, overrides: NaviOptions): NaviOptions =
 
 proc buildRequest*(opts: NaviOptions, verb: HttpVerb, target: string,
                    headers: Headers = initHeaders(), body = "",
+                   json: JsonNode = nil, form: seq[(string, string)] = @[],
                    bodyStream: BodyProducer = nil): Request =
-  ## Resolve `target` against the client's prefixUrl and merge headers.
+  ## Resolve `target` against the client's prefixUrl, merge headers, and encode
+  ## the body. `json` and `form` take precedence over `body` and set a matching
+  ## Content-Type unless the caller supplied one.
   result.verb = verb
   result.url = join(opts.prefixUrl, target)
   result.headers = merge(opts.headers, headers)
-  result.body = body
   result.bodyStream = bodyStream
+  if json != nil:
+    result.body = $json
+    if not result.headers.contains("content-type"):
+      result.headers.add("content-type", "application/json")
+  elif form.len > 0:
+    result.body = encodeQuery(form)
+    if not result.headers.contains("content-type"):
+      result.headers.add("content-type", "application/x-www-form-urlencoded")
+  else:
+    result.body = body
   if opts.wantsDecompress and not result.headers.contains("accept-encoding"):
     result.headers.add("accept-encoding", "gzip, deflate")

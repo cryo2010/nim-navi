@@ -176,6 +176,29 @@ suite "sync entry end to end":
     check res.headers.get("location") == "/final"
     joinThread(th)
 
+  test "post json= encodes the body and sets content-type":
+    const port = 8983
+    var th: Thread[ServerCtx]
+    startBodyEcho(th, port)
+
+    let api = newNavi()
+    let res = api.post("http://127.0.0.1:" & $port & "/", json = %*{"a": 1})
+    check res.body == """{"a":1}"""
+    check res.headers.get("x-echo-content-type") == "application/json"
+    joinThread(th)
+
+  test "post form= url-encodes the body and sets content-type":
+    const port = 8984
+    var th: Thread[ServerCtx]
+    startBodyEcho(th, port)
+
+    let api = newNavi()
+    let res = api.post("http://127.0.0.1:" & $port & "/",
+                       form = @[("a", "1"), ("b", "two words")])
+    check res.body == "a=1&b=two+words"
+    check res.headers.get("x-echo-content-type") == "application/x-www-form-urlencoded"
+    joinThread(th)
+
   test "extend layers headers and prefixUrl":
     let base = newNavi(NaviOptions(headers: initHeaders({"x-base": "1"})))
     let child = base.extend(NaviOptions(prefixUrl: "http://api.test"))
