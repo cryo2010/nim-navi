@@ -25,6 +25,9 @@ proc originKey*(u: Url): string =
   ## Pool key identifying a reusable connection: scheme, host, and port.
   (if u.isTls: "https" else: "http") & "://" & u.host & ":" & $u.port
 
+proc path*(u: Url): string =
+  if u.raw.path.len == 0: "/" else: u.raw.path
+
 proc requestTarget*(u: Url): string =
   ## The origin-form target sent on the request line: path plus query.
   result = if u.raw.path.len == 0: "/" else: u.raw.path

@@ -10,7 +10,8 @@
 ## pool may have been closed by the server in the meantime, so a failed reused
 ## attempt is retried once on a fresh connection.
 
-import ./url, ./request, ./response, ./pool, ./decompress, ./redirect, ./retry
+import ./url, ./request, ./response, ./pool, ./decompress, ./redirect, ./retry,
+       ./cookies
 import ../proto/h1
 
 proc raiseHttpError(req: Request, resp: Response) =
@@ -55,20 +56,23 @@ template roundTrip(client, req, conn, key, sink: typed): Response =
 template run(client, req, sink: typed): Response =
   mixin connect, sendAll, recvSome, close, await
   block:
-    let key = originKey(req.url)
+    var rq = req
+    applyCookies(client.jar, rq)
+    let key = originKey(rq.url)
     var resp: Response
     var (reused, conn) = popIdle(client.pool, key)
     var needFresh = not reused
     if reused:
       try:
-        resp = roundTrip(client, req, conn, key, sink)
+        resp = roundTrip(client, rq, conn, key, sink)
       except CatchableError:
         await close(conn)
         needFresh = true  # pooled connection was stale; try once more
     if needFresh:
-      conn = await connect(req.url.host, req.url.port, req.url.isTls,
+      conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
                            client.options.tls)
-      resp = roundTrip(client, req, conn, key, sink)
+      resp = roundTrip(client, rq, conn, key, sink)
+    storeCookies(client.jar, rq.url, resp)
     resp
 
 template followRedirects(client, startReq, resp: typed) =

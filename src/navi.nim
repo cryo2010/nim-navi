@@ -20,14 +20,17 @@ type
   Navi* = object
     options*: NaviOptions
     pool*: Pool[Conn]
+    jar*: CookieJar
 
 proc newNavi*(options = defaultOptions()): Navi =
   ## Create a client. `options` supplies defaults (prefixUrl, headers, TLS, …).
-  Navi(options: options, pool: newPool[Conn]())
+  Navi(options: options, pool: newPool[Conn](), jar: newCookieJar())
 
 proc extend*(client: Navi, options: NaviOptions): Navi =
   ## Derive a new client, layering `options` over this client's defaults.
-  Navi(options: mergeOptions(client.options, options), pool: newPool[Conn]())
+  ## The derived client gets its own connection pool and cookie jar.
+  Navi(options: mergeOptions(client.options, options),
+       pool: newPool[Conn](), jar: newCookieJar())
 
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = "", json: JsonNode = nil,

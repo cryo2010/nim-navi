@@ -11,6 +11,7 @@ proc redirectRequest*(req: Request, status: int, location: string): Request =
   result = req
   let previousOrigin = req.url.originKey
   result.url = resolve(req.url, location)
+  result.headers.del("cookie") # recomputed from the jar for the new target
   if result.url.originKey != previousOrigin:
     result.headers.del("authorization")
   case status

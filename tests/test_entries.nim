@@ -258,6 +258,17 @@ suite "sync entry end to end":
     check observed == 200
     joinThread(th)
 
+  test "stores a Set-Cookie and replays it on the next request":
+    const port = 8990
+    var th: Thread[ServerCtx]
+    startCookies(th, port)
+
+    let api = newNavi()
+    discard api.get("http://127.0.0.1:" & $port & "/")       # receives Set-Cookie
+    let res = api.get("http://127.0.0.1:" & $port & "/page")  # should send Cookie
+    check res.body == "sid=abc123"
+    joinThread(th)
+
   test "extend layers headers and prefixUrl":
     let base = newNavi(NaviOptions(headers: initHeaders({"x-base": "1"})))
     let child = base.extend(NaviOptions(prefixUrl: "http://api.test"))

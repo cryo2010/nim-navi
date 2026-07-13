@@ -80,6 +80,40 @@ proc startBodyEcho*(th: var Thread[ServerCtx], port: int) =
   createThread(th, serveBodyEcho, ServerCtx(port: port, ready: addr ready))
   while not ready: discard
 
+proc serveCookies(ctx: ServerCtx) {.thread.} =
+  ## First request gets a Set-Cookie; the second echoes back whatever Cookie
+  ## header it received in the response body. One kept-alive connection.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.listen()
+  ctx.ready[] = true
+  var client: Socket
+  server.accept(client)
+  for i in 0 .. 1:
+    var head = ""
+    while true:
+      let c = client.recv(1)
+      if c.len == 0: break
+      head.add c
+      if head.len >= 4 and head[^4 .. ^1] == "\r\n\r\n": break
+    if head.len == 0: break
+    if i == 0:
+      client.send("HTTP/1.1 200 OK\r\nSet-Cookie: sid=abc123; Path=/\r\n" &
+                  "Content-Length: 0\r\nConnection: keep-alive\r\n\r\n")
+    else:
+      let body = headerValue(head, "cookie")
+      client.send("HTTP/1.1 200 OK\r\nContent-Length: " & $body.len &
+                  "\r\nConnection: close\r\n\r\n" & body)
+      break
+  client.close()
+  server.close()
+
+proc startCookies*(th: var Thread[ServerCtx], port: int) =
+  var ready = false
+  createThread(th, serveCookies, ServerCtx(port: port, ready: addr ready))
+  while not ready: discard
+
 proc serveRetry(ctx: ServerCtx) {.thread.} =
   ## Answer `failures` requests with 503, then one with 200, on a single
   ## kept-alive connection.
