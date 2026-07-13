@@ -11,7 +11,10 @@ type
 
 proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig): Future[Conn] {.async.} =
   ## Dial `host:port`, upgrading to TLS for https. TLS requires `-d:ssl`.
-  let socket = await asyncnet.dial(host, Port(port))
+  ## Unbuffered so recv returns the available chunk instead of blocking to fill
+  ## the buffer, which would deadlock on a kept-alive connection (same reason as
+  ## the sync backend).
+  let socket = await asyncnet.dial(host, Port(port), buffered = false)
   if tls:
     when defined(ssl):
       let ctx = newContext(
@@ -32,3 +35,5 @@ proc recvSome*(c: Conn): Future[string] =
 
 proc close*(c: Conn): Future[void] {.async.} =
   c.socket.close()
+
+proc sleep*(ms: int): Future[void] = sleepAsync(ms)

@@ -8,6 +8,7 @@ type ServerCtx* = object
   ready: ptr bool
   ipv6: bool
   payload: string
+  failures: int
 
 proc hexToBytes*(hex: string): string =
   for i in countup(0, hex.len - 2, 2):
@@ -77,6 +78,43 @@ proc serveBodyEcho(ctx: ServerCtx) {.thread.} =
 proc startBodyEcho*(th: var Thread[ServerCtx], port: int) =
   var ready = false
   createThread(th, serveBodyEcho, ServerCtx(port: port, ready: addr ready))
+  while not ready: discard
+
+proc serveRetry(ctx: ServerCtx) {.thread.} =
+  ## Answer `failures` requests with 503, then one with 200, on a single
+  ## kept-alive connection.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.listen()
+  ctx.ready[] = true
+  var client: Socket
+  server.accept(client)
+  var i = 0
+  while true:
+    var req = ""
+    while true:
+      let c = client.recv(1)
+      if c.len == 0: break
+      req.add c
+      if req.len >= 4 and req[^4 .. ^1] == "\r\n\r\n": break
+    if req.len == 0: break
+    if i < ctx.failures:
+      client.send("HTTP/1.1 503 Service Unavailable\r\n" &
+                  "Content-Length: 0\r\nConnection: keep-alive\r\n\r\n")
+    else:
+      let body = "recovered"
+      client.send("HTTP/1.1 200 OK\r\nContent-Length: " & $body.len &
+                  "\r\nConnection: close\r\n\r\n" & body)
+      break
+    inc i
+  client.close()
+  server.close()
+
+proc startRetry*(th: var Thread[ServerCtx], port, failures: int) =
+  var ready = false
+  createThread(th, serveRetry,
+    ServerCtx(port: port, ready: addr ready, failures: failures))
   while not ready: discard
 
 proc serveRedirect(ctx: ServerCtx) {.thread.} =

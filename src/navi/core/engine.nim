@@ -10,7 +10,7 @@
 ## pool may have been closed by the server in the meantime, so a failed reused
 ## attempt is retried once on a fresh connection.
 
-import ./url, ./request, ./response, ./pool, ./decompress, ./redirect
+import ./url, ./request, ./response, ./pool, ./decompress, ./redirect, ./retry
 import ../proto/h1
 
 proc raiseHttpError(req: Request, resp: Response) =
@@ -71,24 +71,52 @@ template run(client, req, sink: typed): Response =
       resp = roundTrip(client, req, conn, key, sink)
     resp
 
+template followRedirects(client, startReq, resp: typed) =
+  ## Issue `startReq`, following redirects into `resp`. Expands inline so its
+  ## `await`s run in the caller's async proc.
+  var rreq = startReq
+  var hops = 0
+  let limit = client.options.redirectLimit
+  while true:
+    resp = run(client, rreq, BodySink(nil))
+    decodeBody(resp, client.options)
+    let location = resp.headers.get("location")
+    if limit > 0 and hops < limit and isRedirect(resp.status) and location.len > 0:
+      rreq = redirectRequest(rreq, resp.status, location)
+      inc hops
+    else:
+      break
+
 template performRequest*(client, req0: typed): Response =
-  ## Buffered request: follow redirects, read the body into `Response.body`,
-  ## decompress per Content-Encoding, then raise HttpError on a non-2xx unless
-  ## disabled.
+  ## Buffered request with the full policy layer: beforeRequest hooks, retries
+  ## with backoff, redirect following, decompression, afterResponse hooks, and
+  ## throw-on-non-2xx.
+  mixin sleep
   block:
     var req = req0
+    for hook in client.options.hooks.beforeRequest:
+      {.cast(gcsafe).}: hook(req)
     var resp: Response
-    var hops = 0
-    let limit = client.options.redirectLimit
+    var attempt = 0
+    let maxRetries = client.options.retryLimit
     while true:
-      resp = run(client, req, BodySink(nil))
-      decodeBody(resp, client.options)
-      let location = resp.headers.get("location")
-      if limit > 0 and hops < limit and isRedirect(resp.status) and location.len > 0:
-        req = redirectRequest(req, resp.status, location)
-        inc hops
-      else:
+      var gotResp = false
+      try:
+        followRedirects(client, req, resp)
+        gotResp = true
+      except CatchableError:
+        if not (attempt < maxRetries and isRetryableVerb(req.verb)):
+          raise # not retryable: propagate the transport error
+      if gotResp and
+         not (attempt < maxRetries and isRetryableVerb(req.verb) and
+              isRetryableStatus(resp.status)):
         break
+      inc attempt
+      for hook in client.options.hooks.beforeRetry:
+        {.cast(gcsafe).}: hook(req, attempt)
+      await sleep(backoffMs(attempt, resp))
+    for hook in client.options.hooks.afterResponse:
+      {.cast(gcsafe).}: hook(req, resp)
     if client.options.wantsThrow and not resp.ok:
       raiseHttpError(req, resp)
     resp

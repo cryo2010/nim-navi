@@ -55,3 +55,6 @@ proc close*(c: Conn): Future[void] {.async.} =
   await c.writer.closeWait()
   await c.reader.closeWait()
   await c.transport.closeWait()
+
+proc sleep*(ms: int): Future[void] {.async.} =
+  await sleepAsync(ms.milliseconds)

@@ -5,7 +5,7 @@
 
 import std/[options, json, base64]
 from std/uri import encodeQuery
-import ./headers, ./url
+import ./headers, ./url, ./response
 import ../backend/api
 export options
 
@@ -55,12 +55,25 @@ type
     decompress*: Option[bool]      ## decode gzip/deflate bodies (default on)
     throwHttpErrors*: Option[bool]  ## raise HttpError on non-2xx (default on)
     maxRedirects*: Option[int]      ## redirects to follow, 0 disables (default 20)
+    maxRetries*: Option[int]        ## retry attempts for transient failures (default 2)
     auth*: Auth                     ## Authorization applied to every request
+    hooks*: Hooks                    ## request/response lifecycle callbacks
 
   BodyProducer* = proc(): string {.closure, raises: [CatchableError].}
     ## Pull-based upload source: returns the next chunk, or "" at end of body.
   BodySink* = proc(data: openArray[byte]) {.closure, raises: [CatchableError].}
     ## Download sink: receives response body chunks as they arrive.
+
+  BeforeRequestHook* = proc(req: var Request) {.closure, raises: [CatchableError].}
+  AfterResponseHook* = proc(req: Request, resp: var Response)
+    {.closure, raises: [CatchableError].}
+  BeforeRetryHook* = proc(req: Request, attempt: int)
+    {.closure, raises: [CatchableError].}
+
+  Hooks* = object
+    beforeRequest*: seq[BeforeRequestHook]  ## mutate the request before sending
+    afterResponse*: seq[AfterResponseHook]   ## inspect/mutate the final response
+    beforeRetry*: seq[BeforeRetryHook]       ## observe each retry
 
   Request* = object
     verb*: HttpVerb
@@ -76,6 +89,7 @@ proc defaultOptions*(): NaviOptions =
 proc wantsDecompress*(opts: NaviOptions): bool = opts.decompress.get(true)
 proc wantsThrow*(opts: NaviOptions): bool = opts.throwHttpErrors.get(true)
 proc redirectLimit*(opts: NaviOptions): int = opts.maxRedirects.get(20)
+proc retryLimit*(opts: NaviOptions): int = opts.maxRetries.get(2)
 
 proc mergeOptions*(base, overrides: NaviOptions): NaviOptions =
   ## Layer `overrides` over `base` for `.extend`. Only fields the caller set
@@ -88,7 +102,11 @@ proc mergeOptions*(base, overrides: NaviOptions): NaviOptions =
   if overrides.throwHttpErrors.isSome:
     result.throwHttpErrors = overrides.throwHttpErrors
   if overrides.maxRedirects.isSome: result.maxRedirects = overrides.maxRedirects
+  if overrides.maxRetries.isSome: result.maxRetries = overrides.maxRetries
   if overrides.auth.kind != akNone: result.auth = overrides.auth
+  result.hooks.beforeRequest = base.hooks.beforeRequest & overrides.hooks.beforeRequest
+  result.hooks.afterResponse = base.hooks.afterResponse & overrides.hooks.afterResponse
+  result.hooks.beforeRetry = base.hooks.beforeRetry & overrides.hooks.beforeRetry
 
 proc buildRequest*(opts: NaviOptions, verb: HttpVerb, target: string,
                    headers: Headers = initHeaders(), body = "",

@@ -219,6 +219,45 @@ suite "sync entry end to end":
     check res.headers.get("x-echo-authorization") == "Basic dXNlcjpwYXNz"
     joinThread(th)
 
+  test "retries a 503 then succeeds":
+    const port = 8987
+    var th: Thread[ServerCtx]
+    startRetry(th, port, failures = 1)
+
+    let api = newNavi()
+    let res = api.get("http://127.0.0.1:" & $port & "/")
+    check res.status == 200
+    check res.body == "recovered"
+    joinThread(th)
+
+  test "maxRetries = 0 returns the failing response without retrying":
+    const port = 8988
+    let payload = "HTTP/1.1 503 Service Unavailable\r\n" &
+                  "Content-Length: 0\r\nConnection: close\r\n\r\n"
+    var th: Thread[ServerCtx]
+    startRaw(th, port, payload)
+
+    let api = newNavi(NaviOptions(maxRetries: some(0), throwHttpErrors: some(false)))
+    let res = api.get("http://127.0.0.1:" & $port & "/")
+    check res.status == 503
+    joinThread(th)
+
+  test "hooks mutate the request and observe the response":
+    const port = 8989
+    var th: Thread[ServerCtx]
+    startBodyEcho(th, port)
+
+    var observed = 0
+    let api = newNavi(NaviOptions(hooks: Hooks(
+      beforeRequest: @[proc(req: var Request) {.closure.} =
+        req.headers["authorization"] = "Hooked"],
+      afterResponse: @[proc(req: Request, resp: var Response) {.closure.} =
+        observed = resp.status])))
+    let res = api.post("http://127.0.0.1:" & $port & "/", body = "x")
+    check res.headers.get("x-echo-authorization") == "Hooked"
+    check observed == 200
+    joinThread(th)
+
   test "extend layers headers and prefixUrl":
     let base = newNavi(NaviOptions(headers: initHeaders({"x-base": "1"})))
     let child = base.extend(NaviOptions(prefixUrl: "http://api.test"))

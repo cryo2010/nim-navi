@@ -3,7 +3,7 @@
 ## `await` is an identity template here so the shared engine's `await`-shaped
 ## body compiles to straight-line blocking code.
 
-import std/net
+import std/[net, os]
 import ./api
 
 export api
@@ -13,6 +13,8 @@ type
     socket: Socket
 
 template await*(x: untyped): untyped = x
+
+proc sleep*(ms: int) = os.sleep(ms)
 
 proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig): Conn =
   ## Dial `host:port` (IPv4 or IPv6, resolved by std/net), upgrading to TLS for
