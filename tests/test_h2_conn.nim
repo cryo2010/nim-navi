@@ -4,22 +4,33 @@ import unittest
 import std/strutils
 import navi/proto/h2/[conn, frame, hpack]
 
+proc serverResponse(streamId: uint32, status: string, headers: seq[HeaderPair],
+                    body: string): string =
+  ## Build a server-side HEADERS + DATA frame sequence for one stream.
+  let enc = HpackEncoder()
+  result = encodeHeaders(streamId,
+    enc.encode(@[(":status", status)] & headers),
+    endStream = false, endHeaders = true)
+  result.add encodeData(streamId, body, endStream = true)
+
 suite "h2 client connection":
   test "sends preface and SETTINGS":
-    var c = initH2Client()
-    let pre = c.clientPreamble()
+    let c = initH2Conn()
+    let pre = c.preamble()
     check pre.startsWith(connectionPreface)
     var d: FrameDecoder
     d.feed(pre[connectionPreface.len ..< pre.len])
     var f: Frame
     check d.next(f)
     check f.typ == uint8(ftSettings)
-    check d.next(f)                       # the WINDOW_UPDATE
+    check d.next(f)
     check f.typ == uint8(ftWindowUpdate)
 
   test "encodes a request as a HEADERS frame with pseudo-headers":
-    var c = initH2Client()
-    let wire = c.encodeRequest(@[
+    let c = initH2Conn()
+    let id = c.openStream()
+    check id == 1'u32
+    let wire = c.encodeRequest(id, @[
       (":method", "GET"), (":scheme", "https"), (":path", "/"),
       (":authority", "example.com")], body = "")
     var d: FrameDecoder
@@ -27,36 +38,26 @@ suite "h2 client connection":
     var f: Frame
     check d.next(f)
     check f.typ == uint8(ftHeaders)
-    check (f.flags and flagEndStream) != 0   # no body -> END_STREAM on HEADERS
+    check (f.flags and flagEndStream) != 0
     check (f.flags and flagEndHeaders) != 0
     var dec = initHpackDecoder()
     check dec.decode(f.payload) == @[
       (":method", "GET"), (":scheme", "https"), (":path", "/"),
       (":authority", "example.com")]
 
-  test "assembles a response from server frames and acks control frames":
-    var c = initH2Client()
-    discard c.clientPreamble()
-    discard c.encodeRequest(@[(":method", "GET"), (":scheme", "https"),
-                             (":path", "/"), (":authority", "example.com")], "")
-
-    # Build a server-side frame stream: SETTINGS, HEADERS(:status 200, ct), DATA.
-    let enc = HpackEncoder()
+  test "assembles a response and acks control frames":
+    let c = initH2Conn()
+    let id = c.openStream()
     var server = encodeSettings([])
-    server.add encodeHeaders(1,
-      enc.encode(@[(":status", "200"), ("content-type", "text/plain")]),
-      endStream = false, endHeaders = true)
-    server.add encodeData(1, "hello", endStream = true)
+    server.add serverResponse(id, "200", @[("content-type", "text/plain")], "hello")
 
     let toSend = c.feed(server)
-    check c.done
-    check not c.failed
-    let resp = c.response()
+    check c.streamDone(id)
+    let resp = c.takeResponse(id)
     check resp.status == 200
     check resp.body == "hello"
     check resp.headers == @[("content-type", "text/plain")]
 
-    # The client should have acked SETTINGS and replenished flow-control windows.
     var d: FrameDecoder
     d.feed(toSend)
     var f: Frame
@@ -64,15 +65,36 @@ suite "h2 client connection":
     check f.typ == uint8(ftSettings)
     check (f.flags and flagAck) != 0
 
-  test "reports a stream reset as a failure":
-    var c = initH2Client()
-    let server = encodeRstStream(1, 1)  # PROTOCOL_ERROR
-    discard c.feed(server)
-    check c.done
-    check c.failed
+  test "assigns odd, incrementing stream ids and reuses one connection":
+    let c = initH2Conn()
+    let a = c.openStream()
+    let b = c.openStream()
+    check a == 1'u32
+    check b == 3'u32
+    # Two independent responses on the same connection.
+    discard c.feed(serverResponse(a, "200", @[], "first"))
+    discard c.feed(serverResponse(b, "201", @[], "second"))
+    check c.streamDone(a)
+    check c.streamDone(b)
+    check c.takeResponse(a).body == "first"
+    check c.takeResponse(b).body == "second"
+
+  test "reports a stream reset":
+    let c = initH2Conn()
+    let id = c.openStream()
+    discard c.feed(encodeRstStream(id, 1))
+    check c.streamDone(id)
+    check c.streamReset(id)
+
+  test "GOAWAY marks the connection unreusable":
+    let c = initH2Conn()
+    check c.canReuse()
+    discard c.feed(encodeFrame(ftGoAway, 0, 0, "\x00\x00\x00\x00\x00\x00\x00\x00"))
+    check c.goneAway
+    check not c.canReuse()
 
   test "responds to a server PING with an ACK":
-    var c = initH2Client()
+    let c = initH2Conn()
     let toSend = c.feed(encodePing("01234567"))
     var d: FrameDecoder
     d.feed(toSend)

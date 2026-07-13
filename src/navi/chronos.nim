@@ -9,7 +9,7 @@
 
 import navi/private/entryguard
 import navi/core/public
-import navi/core/[engine, pool]
+import navi/core/[engine, pool, session]
 import navi/backend/chronos
 
 claimEntry("navi/chronos")
@@ -18,15 +18,15 @@ export public, chronos
 type
   Navi* = object
     options*: NaviOptions
-    pool*: Pool[Conn]
+    pool*: Pool[PooledConn[Conn]]
     jar*: CookieJar
 
 proc newNavi*(options = defaultOptions()): Navi =
-  Navi(options: options, pool: newPool[Conn](), jar: newCookieJar())
+  Navi(options: options, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
 proc extend*(client: Navi, options: NaviOptions): Navi =
   Navi(options: mergeOptions(client.options, options),
-       pool: newPool[Conn](), jar: newCookieJar())
+       pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = "", json: JsonNode = nil,

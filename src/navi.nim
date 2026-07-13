@@ -10,7 +10,7 @@
 
 import navi/private/entryguard
 import navi/core/public
-import navi/core/[engine, pool]
+import navi/core/[engine, pool, session]
 import navi/backend/sync
 
 claimEntry("navi")
@@ -19,18 +19,18 @@ export public
 type
   Navi* = object
     options*: NaviOptions
-    pool*: Pool[Conn]
+    pool*: Pool[PooledConn[Conn]]
     jar*: CookieJar
 
 proc newNavi*(options = defaultOptions()): Navi =
   ## Create a client. `options` supplies defaults (prefixUrl, headers, TLS, …).
-  Navi(options: options, pool: newPool[Conn](), jar: newCookieJar())
+  Navi(options: options, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
 proc extend*(client: Navi, options: NaviOptions): Navi =
   ## Derive a new client, layering `options` over this client's defaults.
   ## The derived client gets its own connection pool and cookie jar.
   Navi(options: mergeOptions(client.options, options),
-       pool: newPool[Conn](), jar: newCookieJar())
+       pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = "", json: JsonNode = nil,

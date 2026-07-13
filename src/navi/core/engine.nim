@@ -12,7 +12,7 @@
 
 import std/strutils
 import ./headers, ./url, ./request, ./response, ./pool, ./decompress, ./redirect,
-       ./retry, ./cookies, ./proxy
+       ./retry, ./cookies, ./proxy, ./session
 import ../proto/h1
 import ../proto/h2/[conn, hpack]
 
@@ -62,38 +62,35 @@ template sendRequest(conn, req: typed) =
   else:
     await sendAll(conn, serializeRequest(req))
 
-template roundTrip(client, req, conn, key, sink: typed): Response =
-  ## Send one request over `conn`, read the response (body to `sink` if set,
-  ## else buffered), then pool or close the connection. Expands inline so its
-  ## `await`s run in the caller's async proc.
+template h1Exchange(transport, req, sink, keep: typed): Response =
+  ## One HTTP/1.1 request/response over `transport`. Sets `keep` to whether the
+  ## connection may be reused; does not pool or close.
   block:
-    sendRequest(conn, req)
+    sendRequest(transport, req)
     var parser = initH1Parser(sink)
     while not parser.finished:
-      let chunk = await recvSome(conn)
+      let chunk = await recvSome(transport)
       if chunk.len == 0:
         parser.eof()
         break
       parser.feed(chunk)
-    let resp = parser.toResponse()
-    if not (parser.keepAliveAfter() and pushIdle(client.pool, key, conn)):
-      await close(conn)
-    resp
+    keep = parser.keepAliveAfter()
+    parser.toResponse()
 
-template h2Exchange(conn, req, sink: typed): Response =
-  ## One HTTP/2 request/response on a single stream (no reuse/multiplexing yet).
+template h2Stream(transport, h2, req, sink: typed): Response =
+  ## One HTTP/2 request/response on a new stream of the shared connection `h2`.
   block:
-    var h2 = initH2Client()
-    await sendAll(conn, h2.clientPreamble())
-    await sendAll(conn, h2.encodeRequest(h2HeaderList(req), req.body))
-    while not h2.done:
-      let chunk = await recvSome(conn)
+    let sid = h2.openStream()
+    await sendAll(transport, h2.encodeRequest(sid, h2HeaderList(req), req.body))
+    while not h2.streamDone(sid):
+      let chunk = await recvSome(transport)
       if chunk.len == 0: break
       let toSend = h2.feed(chunk)
-      if toSend.len > 0: await sendAll(conn, toSend)
-    if h2.failed:
-      raise newException(IOError, "navi: http/2 " & h2.failMsg)
-    var r = toResponse(h2.response())
+      if toSend.len > 0: await sendAll(transport, toSend)
+    let wasReset = h2.streamReset(sid)
+    var r = toResponse(h2.takeResponse(sid))
+    if wasReset or r.status == 0:  # reset, or gone away before a response
+      raise newException(IOError, "navi: http/2 request did not complete")
     if not sink.isNil and r.body.len > 0:
       {.cast(gcsafe).}: sink(r.body.toOpenArrayByte(0, r.body.high))
       r.body = ""
@@ -110,22 +107,42 @@ template run(client, req, sink: typed): Response =
                  @["h2", "http/1.1"] else: @[]
     let key = originKey(rq.url)
     var resp: Response
-    var (reused, conn) = popIdle(client.pool, key)  # pooled conns are http/1.1
-    var needFresh = not reused
-    if reused:
+    var served = false
+
+    # 1. Reuse a pooled connection (http/1.1 or a persistent h2 connection).
+    var (found, pc) = popIdle(client.pool, key)
+    if found:
       try:
-        resp = roundTrip(client, rq, conn, key, sink)
+        if pc.h2 != nil:
+          resp = h2Stream(pc.transport, pc.h2, rq, sink)
+          if not (pc.h2.canReuse and pushIdle(client.pool, key, pc)):
+            await close(pc.transport)
+        else:
+          var keep = false
+          resp = h1Exchange(pc.transport, rq, sink, keep)
+          if not (keep and pushIdle(client.pool, key, pc)):
+            await close(pc.transport)
+        served = true
       except CatchableError:
-        await close(conn)
-        needFresh = true  # pooled connection was stale; try once more
-    if needFresh:
-      conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
-                           client.options.tls, proxy, alpn)
-      if conn.protocol == "h2":
-        resp = h2Exchange(conn, rq, sink)
-        await close(conn)
+        await close(pc.transport)  # pooled connection was stale; fall through
+
+    # 2. Open a fresh connection, negotiating the protocol via ALPN.
+    if not served:
+      let transport = await connect(rq.url.host, rq.url.port, rq.url.isTls,
+                                    client.options.tls, proxy, alpn)
+      var npc = PooledConn[typeof(transport)](transport: transport)
+      if transport.protocol == "h2":
+        npc.h2 = initH2Conn()
+        await sendAll(transport, npc.h2.preamble())
+        resp = h2Stream(transport, npc.h2, rq, sink)
+        if not (npc.h2.canReuse and pushIdle(client.pool, key, npc)):
+          await close(transport)
       else:
-        resp = roundTrip(client, rq, conn, key, sink)
+        var keep = false
+        resp = h1Exchange(transport, rq, sink, keep)
+        if not (keep and pushIdle(client.pool, key, npc)):
+          await close(transport)
+
     storeCookies(client.jar, rq.url, resp)
     resp
 
