@@ -11,7 +11,7 @@
 ## attempt is retried once on a fresh connection.
 
 import ./url, ./request, ./response, ./pool, ./decompress, ./redirect, ./retry,
-       ./cookies
+       ./cookies, ./proxy
 import ../proto/h1
 
 proc raiseHttpError(req: Request, resp: Response) =
@@ -58,6 +58,8 @@ template run(client, req, sink: typed): Response =
   block:
     var rq = req
     applyCookies(client.jar, rq)
+    let proxy = resolveProxy(client.options, rq.url)
+    rq.absoluteForm = proxy.isSet and not rq.url.isTls
     let key = originKey(rq.url)
     var resp: Response
     var (reused, conn) = popIdle(client.pool, key)
@@ -70,7 +72,7 @@ template run(client, req, sink: typed): Response =
         needFresh = true  # pooled connection was stale; try once more
     if needFresh:
       conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
-                           client.options.tls)
+                           client.options.tls, proxy)
       resp = roundTrip(client, rq, conn, key, sink)
     storeCookies(client.jar, rq.url, resp)
     resp

@@ -80,6 +80,33 @@ proc startBodyEcho*(th: var Thread[ServerCtx], port: int) =
   createThread(th, serveBodyEcho, ServerCtx(port: port, ready: addr ready))
   while not ready: discard
 
+proc serveProxy(ctx: ServerCtx) {.thread.} =
+  ## Minimal HTTP proxy: echoes back the absolute-URI request target so a test
+  ## can confirm the client dialed the proxy and used absolute form.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.listen()
+  ctx.ready[] = true
+  var client: Socket
+  server.accept(client)
+  var head = ""
+  while true:
+    let c = client.recv(1)
+    if c.len == 0: break
+    head.add c
+    if head.len >= 4 and head[^4 .. ^1] == "\r\n\r\n": break
+  let target = head.split(' ')[1]  # request-target from the request line
+  client.send("HTTP/1.1 200 OK\r\nContent-Length: " & $target.len &
+              "\r\nConnection: close\r\n\r\n" & target)
+  client.close()
+  server.close()
+
+proc startProxy*(th: var Thread[ServerCtx], port: int) =
+  var ready = false
+  createThread(th, serveProxy, ServerCtx(port: port, ready: addr ready))
+  while not ready: discard
+
 proc serveCookies(ctx: ServerCtx) {.thread.} =
   ## First request gets a Set-Cookie; the second echoes back whatever Cookie
   ## header it received in the response body. One kept-alive connection.

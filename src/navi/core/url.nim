@@ -35,6 +35,15 @@ proc requestTarget*(u: Url): string =
     result.add('?')
     result.add(u.raw.query)
 
+proc absoluteTarget*(u: Url): string =
+  ## The absolute-form target sent to an HTTP proxy: scheme://host[:port]/path.
+  let scheme = if u.isTls: "https" else: "http"
+  var authority = u.host
+  let p = u.port
+  if not ((u.isTls and p == 443) or (not u.isTls and p == 80)):
+    authority.add(":" & $p)
+  scheme & "://" & authority & u.requestTarget
+
 proc join*(prefix: string, target: string): Url =
   ## Resolve `target` against `prefix` (ky's prefixUrl semantics). An absolute
   ## `target` (has a scheme) wins outright; otherwise it is appended to prefix.

@@ -5,6 +5,7 @@
 ## chronos's BearSSL streams, which verify against the bundled Mozilla trust
 ## anchors by default (no system CA sourcing needed).
 
+import std/strutils
 import pkg/chronos, pkg/chronos/transports/stream
 import pkg/chronos/streams/[asyncstream, tlsstream]
 import ./api
@@ -18,9 +19,25 @@ type
     writer: AsyncStreamWriter
     tls: TLSAsyncStream  ## kept alive for the connection's lifetime; nil if plaintext
 
-proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig): Future[Conn] {.async.} =
-  let transport = await connect(resolveTAddress(host, Port(port))[0])
+proc proxyConnect(transport: StreamTransport, host: string, port: int) {.async.} =
+  let target = host & ":" & $port
+  discard await transport.write(
+    "CONNECT " & target & " HTTP/1.1\r\nHost: " & target & "\r\n\r\n")
+  var buf = newString(1024)
+  let n = await transport.readOnce(addr buf[0], buf.len)
+  buf.setLen(n)
+  if not (buf.startsWith("HTTP/1.1 200") or buf.startsWith("HTTP/1.0 200")):
+    raise newException(ValueError, "navi: proxy CONNECT failed: " & buf.splitLines()[0])
+
+proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
+              proxy: ProxyTarget): Future[Conn] {.async.} =
+  let dialAddr =
+    if proxy.isSet: resolveTAddress(proxy.host, Port(proxy.port))[0]
+    else: resolveTAddress(host, Port(port))[0]
+  let transport = await connect(dialAddr)
   result.transport = transport
+  if proxy.isSet and tls:
+    await proxyConnect(transport, host, port)
   if tls:
     # caFile is not yet honored here; chronos/BearSSL uses its bundled Mozilla
     # anchors. Custom CA support for this backend is a follow-up.

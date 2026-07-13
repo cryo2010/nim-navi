@@ -13,7 +13,8 @@ proc serializeHead*(req: Request, chunked = false): string =
   ## when missing, and either Transfer-Encoding: chunked (streaming upload) or
   ## Content-Length. HTTP/1.1 keeps connections alive by default, which pooling
   ## relies on.
-  result = $req.verb & " " & req.url.requestTarget & " HTTP/1.1\r\n"
+  let target = if req.absoluteForm: req.url.absoluteTarget else: req.url.requestTarget
+  result = $req.verb & " " & target & " HTTP/1.1\r\n"
   if not req.headers.contains("host"):
     var hostLine = req.url.host
     let p = req.url.port

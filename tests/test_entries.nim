@@ -269,6 +269,17 @@ suite "sync entry end to end":
     check res.body == "sid=abc123"
     joinThread(th)
 
+  test "routes an http request through a proxy with an absolute-URI":
+    const port = 8991
+    var th: Thread[ServerCtx]
+    startProxy(th, port)
+
+    let api = newNavi(NaviOptions(proxy: some("http://127.0.0.1:" & $port)))
+    let res = api.get("http://example.test/path?q=1")
+    check res.status == 200
+    check res.body == "http://example.test/path?q=1"  # proxy saw the absolute URI
+    joinThread(th)
+
   test "extend layers headers and prefixUrl":
     let base = newNavi(NaviOptions(headers: initHeaders({"x-base": "1"})))
     let child = base.extend(NaviOptions(prefixUrl: "http://api.test"))

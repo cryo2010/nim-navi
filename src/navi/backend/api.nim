@@ -18,5 +18,14 @@ type
     verify*: bool     ## verify the server certificate chain and hostname
     caFile*: string   ## custom CA bundle path; "" uses the system trust store
 
+  ProxyTarget* = object
+    ## The HTTP proxy to dial through. An empty `host` means a direct
+    ## connection. For https targets the backend issues a CONNECT tunnel.
+    host*: string
+    port*: int
+
 proc defaultTls*(): TlsConfig =
   TlsConfig(verify: true)
+
+proc direct*(): ProxyTarget = ProxyTarget()
+proc isSet*(p: ProxyTarget): bool = p.host.len > 0

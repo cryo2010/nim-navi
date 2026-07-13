@@ -58,6 +58,7 @@ type
     maxRetries*: Option[int]        ## retry attempts for transient failures (default 2)
     auth*: Auth                     ## Authorization applied to every request
     hooks*: Hooks                    ## request/response lifecycle callbacks
+    proxy*: Option[string]          ## proxy URL; none falls back to env vars
 
   BodyProducer* = proc(): string {.closure, raises: [CatchableError].}
     ## Pull-based upload source: returns the next chunk, or "" at end of body.
@@ -81,6 +82,7 @@ type
     headers*: Headers
     body*: string
     bodyStream*: BodyProducer  ## when set, the body is streamed chunked
+    absoluteForm*: bool         ## use absolute-URI on the request line (http proxy)
 
 proc defaultOptions*(): NaviOptions =
   result.http = {H1} # protocol negotiation lands with ALPN in phase 4
@@ -104,6 +106,7 @@ proc mergeOptions*(base, overrides: NaviOptions): NaviOptions =
   if overrides.maxRedirects.isSome: result.maxRedirects = overrides.maxRedirects
   if overrides.maxRetries.isSome: result.maxRetries = overrides.maxRetries
   if overrides.auth.kind != akNone: result.auth = overrides.auth
+  if overrides.proxy.isSome: result.proxy = overrides.proxy
   result.hooks.beforeRequest = base.hooks.beforeRequest & overrides.hooks.beforeRequest
   result.hooks.afterResponse = base.hooks.afterResponse & overrides.hooks.afterResponse
   result.hooks.beforeRetry = base.hooks.beforeRetry & overrides.hooks.beforeRetry
