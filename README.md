@@ -30,10 +30,17 @@ navi is under active development. What works today:
 - **TLS** on all three backends (OpenSSL for sync/asyncdispatch, BearSSL for chronos), with certificate verification on by default
 - **Connection pooling / keep-alive**, with automatic retry on a stale pooled connection
 - **Streaming** uploads (chunked) and downloads (chunk sink)
+- **Retries** with capped exponential backoff, honoring `Retry-After`
+- **Redirect following** with method rewrites and cross-origin `Authorization` stripping
+- **Throw-on-non-2xx** by default (`HttpError`), opt-out available
+- **Automatic decompression** (gzip/deflate) via the system zlib
+- **Hooks**: `beforeRequest` / `afterResponse` / `beforeRetry`
+- **Cookie jar**, **basic/bearer auth**, **proxy** (http absolute-URI and https CONNECT)
+- **Body helpers**: `json=` and `form=`
 - **Response helpers**: `.status`, `.headers`, `.text()`, `.bytes()`, `.json()`, `.ok`
 - **Reusable clients** with default options and `.extend()`
 
-Not built yet (planned): HTTP/2 and HTTP/3, retries with backoff, redirect following, hooks/interceptors, cookies, auth helpers, proxy support, automatic decompression, and throw-on-non-2xx. See [Roadmap](#roadmap).
+Not built yet (planned): **HTTP/2** and **HTTP/3**. See [Roadmap](#roadmap).
 
 ## Requirements
 
@@ -86,6 +93,8 @@ let authed = api.extend(NaviOptions(headers: initHeaders({"x-api-key": "..."})))
 ```nim
 discard api.get("path", headers = initHeaders({"accept": "application/json"}))
 discard api.post("path", body = """{"name":"navi"}""")
+discard api.post("path", json = %*{"name": "navi"})          # sets application/json
+discard api.post("path", form = @[("a", "1"), ("b", "2")])   # url-encoded
 discard api.put("path", body = payload)
 discard api.delete("path")
 discard api.head("path")
@@ -130,6 +139,58 @@ let api = newNavi(NaviOptions(
 
 `verify` defaults to on. `caFile` is honored by the sync and asyncdispatch backends; the chronos backend verifies against its bundled Mozilla trust anchors and negotiates up to TLS 1.2.
 
+### Errors
+
+By default a non-2xx response raises `HttpError`, which carries the full response:
+
+```nim
+try:
+  discard api.get("https://example.com/missing")
+except HttpError as e:
+  echo e.response.status      # e.g. 404
+  echo e.response.text()
+
+# Opt out to handle status codes yourself:
+let api = newNavi(NaviOptions(throwHttpErrors: some(false)))
+```
+
+### Retries and redirects
+
+Idempotent requests that hit a transient failure (network error or 408/413/429/500/502/503/504) are retried with capped exponential backoff, honoring `Retry-After`. Redirects are followed by default.
+
+```nim
+let api = newNavi(NaviOptions(
+  maxRetries: some(3),    # default 2
+  maxRedirects: some(5),  # default 20; 0 disables
+))
+```
+
+### Auth, cookies, and proxy
+
+```nim
+let api = newNavi(NaviOptions(
+  auth: bearerAuth("token"),          # or basicAuth("user", "pass")
+  proxy: some("http://proxy:8080"),   # else HTTP(S)_PROXY / NO_PROXY env
+))
+```
+
+Each client keeps a cookie jar: cookies from `Set-Cookie` are stored and replayed on later requests to the same client (matched by domain, path, and Secure).
+
+### Hooks
+
+```nim
+let api = newNavi(NaviOptions(hooks: Hooks(
+  beforeRequest: @[proc(req: var Request) {.closure.} =
+    req.headers["x-trace-id"] = newTraceId()],
+  afterResponse: @[proc(req: Request, resp: var Response) {.closure.} =
+    log(req.verb, resp.status)],
+)))
+```
+
+### Decompression
+
+Responses are decoded transparently: clients send `Accept-Encoding: gzip, deflate` and decode the body per `Content-Encoding` (via the system zlib). Disable with `decompress: some(false)`.
+
 ### Keep-alive
 
 Connection reuse is automatic. Each client keeps an idle-connection pool keyed by origin; responses that are self-delimited (content-length or chunked) and not marked `Connection: close` return their connection to the pool. A pooled connection that the server has since closed is transparently retried on a fresh connection.
@@ -158,11 +219,12 @@ discard api.request(POST, "https://example.com/upload", bodyStream = proc(): str
 
 ## Roadmap
 
-navi is being built in phases. HTTP/1.1 with the full transport feature set (above) is done.
+HTTP/1.1 with the full transport feature set and the policy layer (retries, redirects, hooks, cookies, auth, proxy, decompression, body helpers, throw-on-non-2xx) is done.
 
-- **Policy layer**: retries with backoff, redirect following, hooks (beforeRequest / afterResponse / beforeRetry), cookie jar, basic/bearer auth, proxy support, automatic gzip/deflate/zstd decompression, `json`/`form`/`multipart` body helpers, and throw-on-non-2xx by default.
 - **HTTP/2**: a native HPACK + framing implementation over the shared transport, negotiated via ALPN with HTTP/1.1 fallback.
 - **HTTP/3**: reserved for when a usable QUIC stack lands on the chronos backend.
+
+Known follow-ups: brotli/zstd decompression, streaming-response decompression, `caFile` on the chronos backend, and fuller cookie expiry.
 
 ## Testing
 
