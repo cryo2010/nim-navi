@@ -1,7 +1,7 @@
 ## Shared test helper: a one-shot in-process HTTP/1.1 server on a thread.
 ## Filename has no leading 't' so `nimble test` does not treat it as a suite.
 
-import std/net
+import std/[net, strutils]
 
 type ServerCtx* = object
   port: int
@@ -66,6 +66,49 @@ proc serveKeepAlive(ctx: KeepAliveCtx) {.thread.} =
                 "Connection: keep-alive\r\n\r\n" & body)
   client.close()
   server.close()
+
+proc recvUntil(c: Socket, terminator: string): string =
+  while not result.endsWith(terminator):
+    let ch = c.recv(1)
+    if ch.len == 0: break
+    result.add ch
+
+proc serveUploadEcho(ctx: ServerCtx) {.thread.} =
+  ## Read a chunked request body and echo the decoded bytes back as the
+  ## response body. Used to verify streaming uploads.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.listen()
+  ctx.ready[] = true
+  var client: Socket
+  server.accept(client)
+  discard client.recvUntil("\r\n\r\n") # request head
+  var body = ""
+  while true:
+    let sizeLine = client.recvUntil("\r\n").strip()
+    if sizeLine.len == 0: break
+    let n = parseHexInt(sizeLine)
+    if n == 0:
+      discard client.recv(2) # final CRLF
+      break
+    var chunk = ""
+    while chunk.len < n:
+      let part = client.recv(n - chunk.len)
+      if part.len == 0: break
+      chunk.add part
+    discard client.recv(2)  # CRLF after the chunk
+    body.add chunk
+  client.send("HTTP/1.1 200 OK\r\n" &
+              "Content-Length: " & $body.len & "\r\n" &
+              "Connection: close\r\n\r\n" & body)
+  client.close()
+  server.close()
+
+proc startUploadEcho*(th: var Thread[ServerCtx], port: int) =
+  var ready = false
+  createThread(th, serveUploadEcho, ServerCtx(port: port, ready: addr ready))
+  while not ready: discard
 
 proc startKeepAlive*(th: var Thread[KeepAliveCtx], port, requests: int,
                      accepts: ptr int) =

@@ -34,10 +34,19 @@ proc extend*(client: Navi, options: NaviOptions): Navi =
   Navi(options: merged, pool: newPool[Conn]())
 
 proc request*(client: Navi, verb: HttpVerb, target: string,
-              headers = initHeaders(), body = ""): Response =
-  ## Perform a request and return the response.
-  let req = buildRequest(client.options, verb, target, headers, body)
+              headers = initHeaders(), body = "",
+              bodyStream: BodyProducer = nil): Response =
+  ## Perform a request and return the response. Pass `bodyStream` to upload a
+  ## chunked body from a pull-based producer.
+  let req = buildRequest(client.options, verb, target, headers, body, bodyStream)
   performRequest(client, req)
+
+proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
+             headers = initHeaders()): Response =
+  ## Perform a request and deliver the response body to `sink` as it arrives.
+  ## The returned Response carries status and headers but an empty body.
+  let req = buildRequest(client.options, verb, target, headers)
+  performStream(client, req, sink)
 
 proc get*(client: Navi, target: string, headers = initHeaders()): Response =
   client.request(GET, target, headers)

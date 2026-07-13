@@ -60,6 +60,38 @@ suite "sync entry end to end":
     joinThread(th)
     check accepts == 1  # both requests used the one connection
 
+  test "stream delivers the response body to a sink and leaves body empty":
+    const port = 8975
+    var th: Thread[ServerCtx]
+    startServer(th, port)  # responds with {"ok":true}, content-length 11
+
+    let api = newNavi()
+    var collected = ""
+    let res = api.stream(GET, "http://127.0.0.1:" & $port & "/",
+      sink = proc(data: openArray[byte]) =
+        for b in data: collected.add char(b))
+    check res.status == 200
+    check res.body == ""            # not buffered
+    check collected == """{"ok":true}"""
+    joinThread(th)
+
+  test "streaming upload sends a chunked body the server reassembles":
+    const port = 8976
+    var th: Thread[ServerCtx]
+    startUploadEcho(th, port)
+
+    let api = newNavi()
+    let parts = @["hello ", "streaming ", "world"]
+    var i = 0
+    let res = api.request(POST, "http://127.0.0.1:" & $port & "/",
+      bodyStream = proc(): string =
+        if i < parts.len:
+          result = parts[i]
+          inc i)
+    check res.status == 200
+    check res.body == "hello streaming world"
+    joinThread(th)
+
   test "extend layers headers and prefixUrl":
     let base = newNavi(NaviOptions(headers: initHeaders({"x-base": "1"})))
     let child = base.extend(NaviOptions(prefixUrl: "http://api.test"))

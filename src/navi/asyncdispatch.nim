@@ -28,9 +28,16 @@ proc extend*(client: Navi, options: NaviOptions): Navi =
   Navi(options: merged, pool: newPool[Conn]())
 
 proc request*(client: Navi, verb: HttpVerb, target: string,
-              headers = initHeaders(), body = ""): Future[Response] {.async.} =
-  let req = buildRequest(client.options, verb, target, headers, body)
+              headers = initHeaders(), body = "",
+              bodyStream: BodyProducer = nil): Future[Response] {.async.} =
+  let req = buildRequest(client.options, verb, target, headers, body, bodyStream)
   result = performRequest(client, req)
+
+proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
+             headers = initHeaders()): Future[Response] {.async.} =
+  ## Deliver the response body to `sink` as it arrives; Response.body is empty.
+  let req = buildRequest(client.options, verb, target, headers)
+  result = performStream(client, req, sink)
 
 proc get*(client: Navi, target: string, headers = initHeaders()): Future[Response] =
   client.request(GET, target, headers)

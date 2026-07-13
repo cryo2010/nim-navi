@@ -29,20 +29,28 @@ type
     http*: set[HttpVersion]
     tls*: TlsConfig
 
+  BodyProducer* = proc(): string {.closure, raises: [CatchableError].}
+    ## Pull-based upload source: returns the next chunk, or "" at end of body.
+  BodySink* = proc(data: openArray[byte]) {.closure, raises: [CatchableError].}
+    ## Download sink: receives response body chunks as they arrive.
+
   Request* = object
     verb*: HttpVerb
     url*: Url
     headers*: Headers
     body*: string
+    bodyStream*: BodyProducer  ## when set, the body is streamed chunked
 
 proc defaultOptions*(): NaviOptions =
   result.http = {H1} # protocol negotiation lands with ALPN in phase 4
   result.tls = defaultTls()
 
 proc buildRequest*(opts: NaviOptions, verb: HttpVerb, target: string,
-                   headers: Headers = initHeaders(), body = ""): Request =
+                   headers: Headers = initHeaders(), body = "",
+                   bodyStream: BodyProducer = nil): Request =
   ## Resolve `target` against the client's prefixUrl and merge headers.
   result.verb = verb
   result.url = join(opts.prefixUrl, target)
   result.headers = merge(opts.headers, headers)
   result.body = body
+  result.bodyStream = bodyStream

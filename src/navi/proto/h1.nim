@@ -5,12 +5,14 @@
 ## across the sync, asyncdispatch, and chronos backends and unit-testable in
 ## isolation.
 
-import std/strutils
+import std/[strutils, strformat]
 import ../core/[headers, url, request, response]
 
-proc serializeRequest*(req: Request): string =
-  ## Build an origin-form HTTP/1.1 request. Adds Host and Content-Length when
-  ## the caller did not supply them; keeps the connection close for phase 1.
+proc serializeHead*(req: Request, chunked = false): string =
+  ## Request line, headers, and the terminating blank line (no body). Adds Host
+  ## when missing, and either Transfer-Encoding: chunked (streaming upload) or
+  ## Content-Length. HTTP/1.1 keeps connections alive by default, which pooling
+  ## relies on.
   result = $req.verb & " " & req.url.requestTarget & " HTTP/1.1\r\n"
   if not req.headers.contains("host"):
     var hostLine = req.url.host
@@ -20,11 +22,22 @@ proc serializeRequest*(req: Request): string =
     result.add("Host: " & hostLine & "\r\n")
   for (k, v) in req.headers.pairs:
     result.add(k & ": " & v & "\r\n")
-  if req.body.len > 0 and not req.headers.contains("content-length"):
+  if chunked:
+    if not req.headers.contains("transfer-encoding"):
+      result.add("Transfer-Encoding: chunked\r\n")
+  elif req.body.len > 0 and not req.headers.contains("content-length"):
     result.add("Content-Length: " & $req.body.len & "\r\n")
-  # HTTP/1.1 keeps connections alive by default; we rely on that for pooling.
   result.add("\r\n")
-  result.add(req.body)
+
+proc serializeRequest*(req: Request): string =
+  ## Full request with a buffered body.
+  serializeHead(req) & req.body
+
+const chunkTerminator* = "0\r\n\r\n"
+
+proc encodeChunk*(data: string): string =
+  ## One HTTP/1.1 chunked-transfer frame. `data` must be non-empty.
+  fmt"{data.len:X}" & "\r\n" & data & "\r\n"
 
 type
   H1BodyMode = enum
@@ -43,10 +56,21 @@ type
     version: string
     headers: Headers
     body: string
+    sink: BodySink          ## when set, body bytes go here instead of `body`
 
-proc initH1Parser*(): H1Parser =
+proc initH1Parser*(sink: BodySink = nil): H1Parser =
   result.state = stStatusLine
   result.bodyMode = bmUntilClose
+  result.sink = sink
+
+proc emitBody(p: var H1Parser, chunk: string) =
+  if p.sink != nil:
+    # navi runs on a single thread (one event loop, or blocking sync), so the
+    # user's sink need not be marked gcsafe for chronos's gcsafe async procs.
+    {.cast(gcsafe).}:
+      p.sink(chunk.toOpenArrayByte(0, chunk.high))
+  else:
+    p.body.add(chunk)
 
 proc finished*(p: H1Parser): bool {.inline.} = p.state == stDone
 
@@ -109,14 +133,14 @@ proc step(p: var H1Parser): bool =
     of bmLength:
       let take = min(p.remaining, p.buf.len)
       if take == 0: return false
-      p.body.add(p.buf[0 ..< take])
+      p.emitBody(p.buf[0 ..< take])
       p.buf.delete(0 ..< take)
       dec p.remaining, take
       if p.remaining == 0: p.state = stDone
       true
     of bmUntilClose:
       if p.buf.len == 0: return false
-      p.body.add(p.buf)
+      p.emitBody(p.buf)
       p.buf.setLen(0)
       false # need EOF to terminate; drained for now
     else: false
@@ -130,7 +154,7 @@ proc step(p: var H1Parser): bool =
     true
   of stChunkData:
     if p.buf.len < p.remaining + 2: return false # need data + trailing CRLF
-    p.body.add(p.buf[0 ..< p.remaining])
+    p.emitBody(p.buf[0 ..< p.remaining])
     p.buf.delete(0 ..< p.remaining + 2)
     p.state = stChunkSize
     true
