@@ -1,14 +1,14 @@
 ## Asynchronous transport backend built on std/asyncnet.
 
-import std/[asyncdispatch, asyncnet, net, strutils]
-import ./api
+import std/[asyncdispatch, asyncnet, net, nativesockets, strutils]
+import ./api, ./openssl_alpn
 
 export api, asyncdispatch
 
 type
   Conn* = object
     socket: AsyncSocket
-    protocol*: string   ## ALPN protocol; always "" here (this backend is http/1.1)
+    protocol*: string   ## ALPN-negotiated protocol ("h2" or "", meaning http/1.1)
 
 proc proxyConnect(socket: AsyncSocket, host: string, port: int) {.async.} =
   let target = host & ":" & $port
@@ -17,25 +17,45 @@ proc proxyConnect(socket: AsyncSocket, host: string, port: int) {.async.} =
   if not resp.startsWith("HTTP/1.1 200") and not resp.startsWith("HTTP/1.0 200"):
     raise newException(ValueError, "navi: proxy CONNECT failed: " & resp.splitLines()[0])
 
+proc pickDomain(host: string, port: int): Domain =
+  ## Resolve the address family so an IPv6 target gets an AF_INET6 socket.
+  var ai = getAddrInfo(host, Port(port), AF_UNSPEC, SOCK_STREAM, IPPROTO_TCP)
+  result = if ai.ai_family == toInt(AF_INET6): AF_INET6 else: AF_INET
+  freeAddrInfo(ai)
+
 proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
               proxy: ProxyTarget, alpn: seq[string] = @[]): Future[Conn] {.async.} =
   ## Dial `host:port` (or the proxy), upgrading to TLS for https with a CONNECT
   ## tunnel when proxied. Unbuffered so recv returns the available chunk instead
   ## of blocking to fill the buffer. TLS requires `-d:ssl`.
+  when defined(ssl):
+    if tls and not proxy.isSet:
+      # Direct TLS: connect a wrapped socket so the handshake completes here and
+      # the ALPN result (h2 vs http/1.1) is available before any request.
+      let ctx = newContext(
+        verifyMode = if cfg.verify: CVerifyPeer else: CVerifyNone,
+        caFile = cfg.caFile)
+      setAlpn(ctx.context, alpn)
+      let socket = newAsyncSocket(pickDomain(host, port), SOCK_STREAM,
+                                  IPPROTO_TCP, buffered = false)
+      wrapSocket(ctx, socket)
+      await socket.connect(host, Port(port))
+      result.protocol = negotiatedProtocol(socket.sslHandle)
+      result.socket = socket
+      return
+
   let socket =
     if proxy.isSet: await asyncnet.dial(proxy.host, Port(proxy.port), buffered = false)
     else: await asyncnet.dial(host, Port(port), buffered = false)
   if proxy.isSet and tls:
     await proxyConnect(socket, host, port)
-  if tls:
     when defined(ssl):
+      # TLS over the proxy tunnel; the handshake (and any ALPN) completes lazily
+      # on first I/O, so this path stays http/1.1.
       let ctx = newContext(
         verifyMode = if cfg.verify: CVerifyPeer else: CVerifyNone,
         caFile = cfg.caFile)
       ctx.wrapConnectedSocket(socket, handshakeAsClient, host)
-    else:
-      raise newException(ValueError,
-        "navi: https requires compiling with -d:ssl")
   result.socket = socket
 
 proc sendAll*(c: Conn, data: string): Future[void] =
