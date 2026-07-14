@@ -102,3 +102,22 @@ jobs:
           NAVI_SANITIZE: "1"
           ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+
+  interop:
+    runs-on: ubuntu-latest
+    name: nghttpd interop (http/2)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # nghttpd (the nghttp2 reference server) validates navi's HPACK encoder,
+      # ALPN, real h2 framing, multiplexing, and receive-side flow control.
+      - name: Install nghttpd
+        run: sudo apt-get update && sudo apt-get install -y nghttp2-server
+
+      - name: Run the interop suite
+        run: nimble interop

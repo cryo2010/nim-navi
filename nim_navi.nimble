@@ -32,6 +32,10 @@ task test, "Run the test suite":
   for s in suites:
     exec "nim c -r " & opts & " tests/" & s & ".nim"
 
+task interop, "Run the nghttpd HTTP/2 interop suite (needs nghttpd + openssl)":
+  # Starts the nghttp2 reference server over TLS+h2 and runs navi against it.
+  exec "bash tests/interop/run.sh"
+
 task demoHello, "Run the hello demo (navi/js client + FastAPI server via Docker)":
   # Builds and runs both containers, stops when the client finishes, and cleans
   # up afterwards. Requires Docker.
