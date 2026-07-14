@@ -26,8 +26,11 @@ mkdir -p "$work/htdocs"
 printf 'hello from nghttpd\n' > "$work/htdocs/small.txt"
 head -c 262144 /dev/urandom > "$work/htdocs/large.bin"
 
-nghttpd -d "$work/htdocs" --echo-upload "$port" "$work/key.pem" "$work/cert.pem" &
+nghttpd -d "$work/htdocs" --echo-upload "$port" "$work/key.pem" "$work/cert.pem" \
+  >"$work/nghttpd.log" 2>&1 &
 srv=$!
+disown 2>/dev/null || true   # don't let the shell print a "Terminated" job notice
+                             # when the cleanup trap kills the server on exit
 
 # wait until nghttpd accepts TLS and negotiates h2 over ALPN
 ready=""
@@ -36,7 +39,8 @@ for _ in $(seq 1 50); do
        | grep -q "ALPN protocol: h2"; then ready=1; break; fi
   sleep 0.2
 done
-[ -n "$ready" ] || { echo "nghttpd did not become ready on :$port"; exit 1; }
+[ -n "$ready" ] || {
+  echo "nghttpd did not become ready on :$port"; cat "$work/nghttpd.log"; exit 1; }
 
 export NAVI_INTEROP_URL="https://localhost:$port"
 export NAVI_INTEROP_CERT="$work/cert.pem"
