@@ -62,7 +62,13 @@ proc drainToSink(res: JsObject, sink: BodySink) {.async.} =
 proc fetchExchange*(req: Request, sink: BodySink): Future[Response] {.async.} =
   ## One request/response through `fetch`. With a `sink`, the body streams to it
   ## and `Response.body` is left empty; otherwise the body is buffered.
-  let res = await fetch(cstring(req.url.absoluteTarget), buildInit(req))
+  var res: JsObject
+  try:
+    res = await fetch(cstring(req.url.absoluteTarget), buildInit(req))
+  except:  # noqa: bare — a fetch rejection is a native JS error (no Nim m_type),
+           # so a typed `except` would re-raise it. Surface it as a Nim exception
+           # the retry loop and user `try/except` can handle like any transport error.
+    raise newException(IOError, "navi: fetch failed: " & getCurrentExceptionMsg())
   if sink.isNil:
     result = toResponse(res, $(await jsText(res)))
   else:
