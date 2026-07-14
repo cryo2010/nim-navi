@@ -23,11 +23,10 @@ proc h2HeaderList*(req: Request): seq[HeaderPair] =
     result.add((lower, value))
 
 proc toResponse*(r: H2Response): Response =
-  result.status = r.status
-  result.httpVersion = "HTTP/2"
-  result.body = r.body
+  var headers: Headers
   for (name, value) in r.headers:
-    result.headers.add(name, value)
+    headers.add(name, value)
+  initResponse(r.status, "", "HTTP/2", headers, r.body)
 
 proc applySink*(r: var Response, sink: BodySink) =
   ## For streaming requests, hand the (buffered) body to the sink and clear it.

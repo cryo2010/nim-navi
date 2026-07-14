@@ -190,8 +190,4 @@ proc keepAliveAfter*(p: H1Parser): bool =
   "close" notin p.headers.get("connection").toLowerAscii
 
 proc toResponse*(p: H1Parser): Response =
-  result.status = p.status
-  result.reason = p.reason
-  result.httpVersion = p.version
-  result.headers = p.headers
-  result.body = p.body
+  initResponse(p.status, p.reason, p.version, p.headers, p.body)
