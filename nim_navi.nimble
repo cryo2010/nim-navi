@@ -23,3 +23,12 @@ task test, "Run the test suite":
                 "test_h2_conn", "test_entries", "test_async", "test_chronos"]
   for s in suites:
     exec "nim c -r " & opts & " tests/" & s & ".nim"
+
+task demoHello, "Run the hello demo (navi/js client + FastAPI server via Docker)":
+  # Builds and runs both containers, stops when the client finishes, and cleans
+  # up afterwards. Requires Docker.
+  let compose = "docker compose -f demos/hello/docker-compose.yml"
+  try:
+    exec compose & " up --build --abort-on-container-exit --exit-code-from client"
+  finally:
+    exec compose & " down"
