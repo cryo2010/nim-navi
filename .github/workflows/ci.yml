@@ -73,3 +73,32 @@ jobs:
       # with `nim js`; this is the only CI job that compiles it.
       - name: Compile the JavaScript backend
         run: nim js --path:src --hints:off -o:navi_js.js src/navi/js.nim
+
+  sanitize:
+    runs-on: ubuntu-latest
+    name: sanitizers (asan + ubsan)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Only needed for the navi/chronos entry and its test.
+      - name: Install chronos
+        run: nimble install -y "chronos@>= 4.0.0"
+
+      # Rebuilds and runs the whole suite under AddressSanitizer + UBSan
+      # (NAVI_SANITIZE=1, see the nimble `test` task). Catches heap overflows,
+      # use-after-free, and undefined behavior in the sans-io parsers and buffer
+      # handling that a passing test would otherwise hide. Leak detection is off:
+      # short-lived test processes leak by design (no teardown), and it is not
+      # what this job is looking for.
+      - name: Run tests under ASan/UBSan
+        run: nimble test
+        env:
+          NAVI_MM: orc
+          NAVI_SANITIZE: "1"
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
