@@ -24,7 +24,10 @@ proc initResponse*(status: int; reason, httpVersion: string; headers: Headers;
   ## layers so `data` caches instead of re-parsing.
   result = Response(status: status, reason: reason, httpVersion: httpVersion,
                     headers: headers, body: body)
-  new(result.dataCache)
+  when not defined(js):
+    # The JS backend can't allocate this ref-to-a-ref cell; leaving it nil makes
+    # `data` reparse each call instead of caching (see the nil branch there).
+    new(result.dataCache)
 
 proc ok*(r: Response): bool {.inline.} =
   ## True for 2xx status codes.

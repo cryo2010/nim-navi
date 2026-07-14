@@ -14,6 +14,6 @@ macro claimEntry*(name: static string): untyped =
   if claimed.len > 0 and claimed != name:
     error("navi: import only one entry module, but both '" & claimed &
           "' and '" & name & "' were imported. Choose one of " &
-          "navi (sync), navi/asyncdispatch, or navi/chronos.")
+          "navi (sync), navi/asyncdispatch, navi/chronos, or navi/js.")
   claimed = name
   newEmptyNode()

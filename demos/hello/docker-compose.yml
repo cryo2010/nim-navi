@@ -1,0 +1,21 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/hello')"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  client:
+    build:
+      # repo root, so the Dockerfile can COPY the navi sources under src/
+      context: ../..
+      dockerfile: demos/hello/Dockerfile.client
+    environment:
+      HELLO_URL: http://server:8080/hello
+    depends_on:
+      server:
+        condition: service_healthy
