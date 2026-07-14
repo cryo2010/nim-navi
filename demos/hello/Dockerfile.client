@@ -1,0 +1,14 @@
+# Compile the navi/js demo to JavaScript, then run it on Node (which supplies
+# the global fetch the js backend uses). Build context is the repo root so the
+# navi sources under src/ are available to the compiler.
+
+FROM nimlang/nim:2.2.10 AS build
+WORKDIR /build
+COPY src ./src
+COPY demos/hello/hello.nim ./hello.nim
+RUN nim js --path:src -d:release --hints:off -o:hello.js hello.nim
+
+FROM node:20-slim
+WORKDIR /app
+COPY --from=build /build/hello.js ./hello.js
+CMD ["node", "hello.js"]
