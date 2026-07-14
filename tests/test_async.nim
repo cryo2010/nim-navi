@@ -15,7 +15,7 @@ suite "asyncdispatch entry end to end":
     let res = waitFor api.get("http://127.0.0.1:" & $port & "/")
     check res.status == 200
     check res.ok
-    check res.json()["ok"].getBool()
+    check res.data["ok"].getBool()
     joinThread(th)
 
   test "retries with async backoff then succeeds":

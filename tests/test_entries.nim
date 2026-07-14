@@ -38,7 +38,7 @@ suite "sync entry end to end":
     check res.status == 200
     check res.ok
     check res.headers.get("content-type") == "application/json"
-    check res.json()["ok"].getBool()
+    check res.data["ok"].getBool()
     joinThread(th)
 
   test "reuses a pooled connection for the same origin":
@@ -100,7 +100,7 @@ suite "sync entry end to end":
     let api = newNavi()
     let res = api.get("http://[::1]:" & $port & "/")
     check res.status == 200
-    check res.json()["ok"].getBool()
+    check res.data["ok"].getBool()
     joinThread(th)
 
   test "transparently decompresses a gzip response body":
@@ -118,7 +118,7 @@ suite "sync entry end to end":
     let res = api.get("http://127.0.0.1:" & $port & "/")
     check res.status == 200
     check res.body == """{"ok":true}"""       # decoded
-    check res.json()["ok"].getBool()
+    check res.data["ok"].getBool()
     check not res.headers.contains("content-encoding")  # header dropped
     joinThread(th)
 

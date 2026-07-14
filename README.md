@@ -19,7 +19,7 @@ import navi/chronos   # or navi/asyncdispatch
 proc main() {.async.} =
   let api = newNavi()
   let res = await api.get("https://example.com")
-  echo res.status, " ", res.json()
+  echo res.status, " ", res.data
 
 waitFor main()
 ```
@@ -44,7 +44,7 @@ navi is under active development. What works today:
 - **Hooks**: `beforeRequest` / `afterResponse` / `beforeRetry`
 - **Cookie jar**, **basic/bearer auth**, **proxy** (http absolute-URI and https CONNECT)
 - **Body helpers**: `json=` and `form=`
-- **Response helpers**: `.status`, `.headers`, `.text()`, `.bytes()`, `.json()`, `.ok`
+- **Response helpers**: `.status`, `.headers`, `.text()`, `.body`, `.data`, `.ok`
 - **Reusable clients** with default options and `.extend()`
 
 HTTP/2 currently runs on the sync and asyncdispatch backends; chronos stays
@@ -88,7 +88,7 @@ let api = newNavi(NaviOptions(
 ))
 
 # Relative targets resolve against prefixUrl.
-let user = api.get("users/42").json()
+let user = api.get("users/42").data
 ```
 
 Derive a client that layers new defaults over an existing one:
@@ -120,11 +120,12 @@ res.status            # int, e.g. 200
 res.ok                # true for 2xx
 res.headers.get("content-type")
 res.text()            # body as string
-res.bytes()           # body as seq[byte]
-res.json()            # body parsed as JsonNode
+res.body              # raw body; a Nim string is a byte buffer, so this is your
+                      # bytes (use res.body.toOpenArrayByte(...) for a byte view)
+res.data              # body parsed as JsonNode (cached; raises on invalid)
 ```
 
-`std/json` is re-exported, so `res.json()["field"].getBool()` works without importing it yourself.
+`std/json` is re-exported, so `res.data["field"].getBool()` works without importing it yourself. `data` parses the body regardless of Content-Type, caches it, and raises `JsonParsingError` on invalid JSON.
 
 ### Headers
 
