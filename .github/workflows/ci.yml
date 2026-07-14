@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mm: [orc, arc]
+    name: nimble test (--mm:${{ matrix.mm }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Only needed for the navi/chronos entry and its test.
+      - name: Install chronos
+        run: nimble install -y "chronos@>= 4.0.0"
+
+      - name: Run tests
+        run: nimble test
+        env:
+          NAVI_MM: ${{ matrix.mm }}
