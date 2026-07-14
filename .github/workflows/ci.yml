@@ -28,3 +28,47 @@ jobs:
         run: nimble test
         env:
           NAVI_MM: ${{ matrix.mm }}
+
+  compile:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mm: [orc, arc]
+    name: compile entries (--mm:${{ matrix.mm }}, -d:ssl)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Only needed for the navi/chronos entry.
+      - name: Install chronos
+        run: nimble install -y "chronos@>= 4.0.0"
+
+      # Compiles each backend entry with -d:ssl, exercising the OpenSSL/ALPN path
+      # that the (plain-TCP) test suite never builds, under both memory managers.
+      - name: Compile entry modules
+        run: |
+          for entry in navi navi/asyncdispatch navi/chronos; do
+            echo "== $entry =="
+            nim check --mm:${{ matrix.mm }} -d:ssl --path:src --hints:off "src/$entry.nim"
+          done
+
+  compile-js:
+    runs-on: ubuntu-latest
+    name: compile navi/js (nim js)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The js entry is guarded to the JavaScript backend, so it must be built
+      # with `nim js`; this is the only CI job that compiles it.
+      - name: Compile the JavaScript backend
+        run: nim js --path:src --hints:off -o:navi_js.js src/navi/js.nim
