@@ -65,13 +65,24 @@ proc encodeInteger(value, prefixBits: int): string =
       v = v shr 7
     result.add char(v)
 
+proc need(data: string, i: int) {.inline.} =
+  ## Guard a read at `i`. A peer can send anything, so truncated or malformed
+  ## input must raise a catchable error, never an IndexDefect that crashes the
+  ## client (found by fuzzing; see tests/fuzz).
+  if i >= data.len:
+    raise newException(ValueError, "hpack: truncated header block")
+
 proc decodeInteger(data: string, i: var int, prefixBits: int): int =
+  need(data, i)
   let maxPrefix = (1 shl prefixBits) - 1
   result = int(uint8(data[i])) and maxPrefix
   inc i
   if result == maxPrefix:
     var shift = 0
     while true:
+      need(data, i)
+      if shift >= 28:                 # bound the continuation run (no overflow)
+        raise newException(ValueError, "hpack: integer too large")
       let b = int(uint8(data[i])); inc i
       result += (b and 0x7f) shl shift
       shift += 7
@@ -82,8 +93,11 @@ proc encodeString(s: string): string =
   result.add s
 
 proc decodeString(data: string, i: var int): string =
+  need(data, i)
   let huffman = (uint8(data[i]) and 0x80) != 0
   let length = decodeInteger(data, i, 7)
+  if length < 0 or i + length > data.len:
+    raise newException(ValueError, "hpack: truncated string")
   let raw = data[i ..< i + length]
   i += length
   if huffman: huffmanDecode(raw) else: raw

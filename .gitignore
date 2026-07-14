@@ -3,6 +3,8 @@ nimcache/
 *.exe
 # Compiled JavaScript output (demos/examples have .nim sources)
 demos/**/*.js
+# libFuzzer working corpus (committed starting seeds live in tests/fuzz/seeds)
+tests/fuzz/corpus/
 # Compiled test/example binaries (source has .nim/.nims extensions)
 tests/test_h1
 tests/test_entries
