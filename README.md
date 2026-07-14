@@ -187,13 +187,23 @@ Each client keeps a cookie jar: cookies from `Set-Cookie` are stored and replaye
 
 ### Hooks
 
+Hooks receive a mutable `HookCtx` (`ctx.request`, `ctx.response`, `ctx.attempt`):
+
 ```nim
 let api = newNavi(NaviOptions(hooks: Hooks(
-  beforeRequest: @[proc(req: var Request) {.closure.} =
-    req.headers["x-trace-id"] = newTraceId()],
-  afterResponse: @[proc(req: Request, resp: var Response) {.closure.} =
-    log(req.verb, resp.status)],
+  beforeRequest: @[proc(ctx: HookCtx) {.closure.} =
+    ctx.request.headers["x-trace-id"] = newTraceId()],
+  afterResponse: @[proc(ctx: HookCtx) {.closure.} =
+    log(ctx.request.verb, ctx.response.status)],
 )))
+```
+
+On the async entries (`navi/asyncdispatch`, `navi/chronos`) a hook may be async
+and `await` inside it; the type is `proc(ctx: HookCtx): Future[void]`:
+
+```nim
+let refreshToken: Hook = proc(ctx: HookCtx): Future[void] {.async.} =
+  ctx.request.headers["authorization"] = "Bearer " & await fetchToken()
 ```
 
 ### Decompression
@@ -304,4 +314,4 @@ requests and concurrent multiplexing.
 
 ## License
 
-MIT. Copyright Craig Younker.
+MIT
