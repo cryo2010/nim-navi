@@ -1,5 +1,8 @@
 # navi
 
+[![CI](https://github.com/cryo2010/nim-navi/actions/workflows/ci.yml/badge.svg)](https://github.com/cryo2010/nim-navi/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 An HTTP client for Nim, with a minimalist [ky](https://github.com/sindresorhus/ky)-inspired API. One request surface, three interchangeable engines: synchronous, `std/asyncdispatch`, or `chronos`. You pick the engine by which module you import.
 
 ```nim
