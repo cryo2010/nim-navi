@@ -155,7 +155,7 @@ template performRequest*(client, req0: typed): Response =
     var req = req0
     block:
       let ctx = HookCtx(request: req)
-      for hook in client.hooks.beforeRequest: await runHook(hook, ctx)
+      for hook in client.options.hooks.beforeRequest: await runHook(hook, ctx)
       req = ctx.request
     var resp: Response
     var attempt = 0
@@ -175,12 +175,12 @@ template performRequest*(client, req0: typed): Response =
       inc attempt
       block:
         let ctx = HookCtx(request: req, attempt: attempt)
-        for hook in client.hooks.beforeRetry: await runHook(hook, ctx)
+        for hook in client.options.hooks.beforeRetry: await runHook(hook, ctx)
         req = ctx.request
       await sleep(backoffMs(attempt, resp))
     block:
       let ctx = HookCtx(request: req, response: resp)
-      for hook in client.hooks.afterResponse: await runHook(hook, ctx)
+      for hook in client.options.hooks.afterResponse: await runHook(hook, ctx)
       resp = ctx.response
     if client.options.wantsThrow and not resp.ok:
       raiseHttpError(req, resp)

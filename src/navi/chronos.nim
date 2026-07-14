@@ -24,11 +24,17 @@ type
     afterResponse*: seq[Hook]
     beforeRetry*: seq[Hook]
 
+  NaviOptions* = object of NaviOptionsBase
+    hooks*: Hooks   ## lifecycle callbacks (may be async)
+
   Navi* = object
     options*: NaviOptions
-    hooks*: Hooks
     pool*: Pool[PooledConn[Conn]]
     jar*: CookieJar
+
+proc defaultOptions*(): NaviOptions =
+  result.http = {H1, H2}
+  result.tls = defaultTls()
 
 proc mergeHooks(base, add: Hooks): Hooks =
   Hooks(beforeRequest: base.beforeRequest & add.beforeRequest,
@@ -41,14 +47,13 @@ proc runHook(hook: Hook, ctx: HookCtx): Future[void] =
     {.cast(raises: []).}:
       result = hook(ctx)
 
-proc newNavi*(options = defaultOptions(), hooks = Hooks()): Navi =
-  Navi(options: options, hooks: hooks,
-       pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
+proc newNavi*(options = defaultOptions()): Navi =
+  Navi(options: options, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
-proc extend*(client: Navi, options: NaviOptions, hooks = Hooks()): Navi =
-  Navi(options: mergeOptions(client.options, options),
-       hooks: mergeHooks(client.hooks, hooks),
-       pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
+proc extend*(client: Navi, options: NaviOptions): Navi =
+  var merged = mergeBase(client.options, options)
+  merged.hooks = mergeHooks(client.options.hooks, options.hooks)
+  Navi(options: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
 proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
   ## Pool-based transport (http/1.1; chronos has no h2).

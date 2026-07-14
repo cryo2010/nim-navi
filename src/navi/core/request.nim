@@ -45,9 +45,10 @@ type
     H2 = "HTTP/2"
     H3 = "HTTP/3"
 
-  NaviOptions* = object
-    ## Client-level defaults, applied to every request and inheritable via
-    ## `.extend`.
+  NaviOptionsBase* = object of RootObj
+    ## Backend-agnostic client defaults, applied to every request and inheritable
+    ## via `.extend`. Each entry module derives its own `NaviOptions` from this,
+    ## adding a backend-specific `hooks` field.
     prefixUrl*: string
     headers*: Headers
     http*: set[HttpVersion]
@@ -81,21 +82,19 @@ type
     response*: Response
     attempt*: int
 
-proc defaultOptions*(): NaviOptions =
-  result.http = {H1, H2} # negotiate h2 over TLS via ALPN, fall back to h1
-  result.tls = defaultTls()
-
-proc wantsDecompress*(opts: NaviOptions): bool = opts.decompress.get(true)
-proc wantsThrow*(opts: NaviOptions): bool = opts.throwHttpErrors.get(true)
-proc redirectLimit*(opts: NaviOptions): int = opts.maxRedirects.get(20)
-proc retryLimit*(opts: NaviOptions): int = opts.maxRetries.get(2)
-proc wantsH2*(opts: NaviOptions): bool =
+# Readers take the base by value; a derived NaviOptions slices to it cleanly.
+proc wantsDecompress*(opts: NaviOptionsBase): bool = opts.decompress.get(true)
+proc wantsThrow*(opts: NaviOptionsBase): bool = opts.throwHttpErrors.get(true)
+proc redirectLimit*(opts: NaviOptionsBase): int = opts.maxRedirects.get(20)
+proc retryLimit*(opts: NaviOptionsBase): int = opts.maxRetries.get(2)
+proc wantsH2*(opts: NaviOptionsBase): bool =
   ## An unset `http` (empty set) means "negotiate h2 where possible".
   opts.http.card == 0 or H2 in opts.http
 
-proc mergeOptions*(base, overrides: NaviOptions): NaviOptions =
-  ## Layer `overrides` over `base` for `.extend`. Only fields the caller set
-  ## take effect; the rest are inherited.
+proc mergeBase*[T: NaviOptionsBase](base, overrides: T): T =
+  ## Layer `overrides`' base fields over `base` for `.extend`, preserving any
+  ## derived fields (e.g. hooks) from `base`. Generic so it returns the derived
+  ## type. Only fields the caller set take effect.
   result = base
   if overrides.prefixUrl.len > 0: result.prefixUrl = overrides.prefixUrl
   result.headers = merge(base.headers, overrides.headers)
@@ -108,7 +107,7 @@ proc mergeOptions*(base, overrides: NaviOptions): NaviOptions =
   if overrides.auth.kind != akNone: result.auth = overrides.auth
   if overrides.proxy.isSome: result.proxy = overrides.proxy
 
-proc buildRequest*(opts: NaviOptions, verb: HttpVerb, target: string,
+proc buildRequest*(opts: NaviOptionsBase, verb: HttpVerb, target: string,
                    headers: Headers = initHeaders(), body = "",
                    json: JsonNode = nil, form: seq[(string, string)] = @[],
                    bodyStream: BodyProducer = nil): Request =

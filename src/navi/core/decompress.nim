@@ -68,7 +68,7 @@ proc inflateBytes(src: string, windowBits: cint): string =
     if ret == zStreamEnd: break
     if strm.availIn == 0 and produced == 0: break  # truncated: stop, no progress
 
-proc decodeBody*(resp: var Response, opts: NaviOptions) =
+proc decodeBody*(resp: var Response, opts: NaviOptionsBase) =
   ## Decompress the body in place per Content-Encoding, then drop the headers
   ## that described the encoded form. No-op when decompression is disabled or
   ## the encoding is identity/unknown.

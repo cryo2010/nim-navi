@@ -248,11 +248,11 @@ suite "sync entry end to end":
     startBodyEcho(th, port)
 
     var observed = 0
-    let api = newNavi(hooks = Hooks(
+    let api = newNavi(NaviOptions(hooks: Hooks(
       beforeRequest: @[proc(ctx: HookCtx) {.closure.} =
         ctx.request.headers["authorization"] = "Hooked"],
       afterResponse: @[proc(ctx: HookCtx) {.closure.} =
-        observed = ctx.response.status]))
+        observed = ctx.response.status])))
     let res = api.post("http://127.0.0.1:" & $port & "/", body = "x")
     check res.headers.get("x-echo-authorization") == "Hooked"
     check observed == 200

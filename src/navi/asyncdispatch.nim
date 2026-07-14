@@ -22,13 +22,19 @@ type
     afterResponse*: seq[Hook]
     beforeRetry*: seq[Hook]
 
+  NaviOptions* = object of NaviOptionsBase
+    hooks*: Hooks   ## lifecycle callbacks (may be async)
+
   Navi* = object
     options*: NaviOptions
-    hooks*: Hooks
     pool*: Pool[PooledConn[Conn]]
     jar*: CookieJar
     muxes: TableRef[string, H2Mux]              ## live shared h2 connections
     pendingMux: TableRef[string, Future[H2Mux]] ## in-flight connects (coalescing)
+
+proc defaultOptions*(): NaviOptions =
+  result.http = {H1, H2}
+  result.tls = defaultTls()
 
 proc mergeHooks(base, add: Hooks): Hooks =
   Hooks(beforeRequest: base.beforeRequest & add.beforeRequest,
@@ -43,15 +49,16 @@ proc runHook(hook: Hook, ctx: HookCtx): Future[void] =
     {.cast(raises: []).}:
       result = hook(ctx)
 
-proc newNavi*(options = defaultOptions(), hooks = Hooks()): Navi =
-  Navi(options: options, hooks: hooks,
+proc newNavi*(options = defaultOptions()): Navi =
+  Navi(options: options,
        pool: newPool[PooledConn[Conn]](), jar: newCookieJar(),
        muxes: newTable[string, H2Mux](),
        pendingMux: newTable[string, Future[H2Mux]]())
 
-proc extend*(client: Navi, options: NaviOptions, hooks = Hooks()): Navi =
-  Navi(options: mergeOptions(client.options, options),
-       hooks: mergeHooks(client.hooks, hooks),
+proc extend*(client: Navi, options: NaviOptions): Navi =
+  var merged = mergeBase(client.options, options)
+  merged.hooks = mergeHooks(client.options.hooks, options.hooks)
+  Navi(options: merged,
        pool: newPool[PooledConn[Conn]](), jar: newCookieJar(),
        muxes: newTable[string, H2Mux](),
        pendingMux: newTable[string, Future[H2Mux]]())

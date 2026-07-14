@@ -28,11 +28,17 @@ type
     afterResponse*: seq[Hook]
     beforeRetry*: seq[Hook]
 
+  NaviOptions* = object of NaviOptionsBase
+    hooks*: Hooks   ## lifecycle callbacks (sync)
+
   Navi* = object
     options*: NaviOptions
-    hooks*: Hooks
     pool*: Pool[PooledConn[Conn]]
     jar*: CookieJar
+
+proc defaultOptions*(): NaviOptions =
+  result.http = {H1, H2} # negotiate h2 over TLS via ALPN, fall back to h1
+  result.tls = defaultTls()
 
 proc mergeHooks(base, add: Hooks): Hooks =
   Hooks(beforeRequest: base.beforeRequest & add.beforeRequest,
@@ -42,18 +48,17 @@ proc mergeHooks(base, add: Hooks): Hooks =
 proc runHook(hook: Hook, ctx: HookCtx) =
   {.cast(gcsafe).}: hook(ctx)
 
-proc newNavi*(options = defaultOptions(), hooks = Hooks()): Navi =
-  ## Create a client. `options` supplies defaults (prefixUrl, headers, TLS, …);
-  ## `hooks` supplies lifecycle callbacks.
-  Navi(options: options, hooks: hooks,
-       pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
+proc newNavi*(options = defaultOptions()): Navi =
+  ## Create a client. `options` supplies defaults (prefixUrl, headers, TLS,
+  ## hooks, …).
+  Navi(options: options, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
-proc extend*(client: Navi, options: NaviOptions, hooks = Hooks()): Navi =
-  ## Derive a new client, layering `options` and appending `hooks` over this
-  ## client's. The derived client gets its own connection pool and cookie jar.
-  Navi(options: mergeOptions(client.options, options),
-       hooks: mergeHooks(client.hooks, hooks),
-       pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
+proc extend*(client: Navi, options: NaviOptions): Navi =
+  ## Derive a new client, layering `options` over this client's (hooks are
+  ## appended). The derived client gets its own connection pool and cookie jar.
+  var merged = mergeBase(client.options, options)
+  merged.hooks = mergeHooks(client.options.hooks, options.hooks)
+  Navi(options: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
 proc transport(client: Navi, req: Request, sink: BodySink): Response =
   ## Pool-based transport (one request per connection at a time).
@@ -160,7 +165,7 @@ proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
   var pending: seq[BatchItem]
   for i, target in targets:
     let ctx = HookCtx(request: buildRequest(client.options, GET, target))
-    for hook in client.hooks.beforeRequest: runHook(hook, ctx)
+    for hook in client.options.hooks.beforeRequest: runHook(hook, ctx)
     pending.add BatchItem(idx: i, req: ctx.request)
 
   while pending.len > 0:
@@ -182,7 +187,7 @@ proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
         storeCookies(client.jar, item.req.url, resp)
         block:
           let ctx = HookCtx(request: item.req, response: resp)
-          for hook in client.hooks.afterResponse: runHook(hook, ctx)
+          for hook in client.options.hooks.afterResponse: runHook(hook, ctx)
           resp = ctx.response
         let location = resp.headers.get("location")
         if client.options.redirectLimit > 0 and item.hops < client.options.redirectLimit and
@@ -195,7 +200,7 @@ proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
           inc item.attempt
           block:
             let ctx = HookCtx(request: item.req, attempt: item.attempt)
-            for hook in client.hooks.beforeRetry: runHook(hook, ctx)
+            for hook in client.options.hooks.beforeRetry: runHook(hook, ctx)
           backoff = max(backoff, backoffMs(item.attempt, resp))
           nextRound.add item
         else:

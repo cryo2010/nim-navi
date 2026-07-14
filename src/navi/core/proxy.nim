@@ -25,7 +25,7 @@ proc excluded(host: string): bool =
     let h = host.toLowerAscii
     if h == entry or h.endsWith("." & entry): return true
 
-proc resolveProxy*(opts: NaviOptions, url: Url): ProxyTarget =
+proc resolveProxy*(opts: NaviOptionsBase, url: Url): ProxyTarget =
   ## The proxy to dial for `url`, or a direct target when none applies.
   let raw = if opts.proxy.isSome: opts.proxy.get else: envProxy(url)
   if raw.len == 0 or excluded(url.host):
