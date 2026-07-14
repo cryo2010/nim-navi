@@ -3,7 +3,7 @@
 ##   import navi
 ##   let api = newNavi()
 ##   let res = api.get("http://example.com")
-##   echo res.status, " ", res.text()
+##   echo res.status, " ", res.body
 ##
 ## For async, import `navi/asyncdispatch` or `navi/chronos` instead (exactly
 ## one entry module per program).

@@ -10,7 +10,7 @@ import navi
 
 let api = newNavi()
 let res = api.get("https://example.com")
-echo res.status, " ", res.text()
+echo res.status, " ", res.body
 ```
 
 ```nim
@@ -44,7 +44,7 @@ navi is under active development. What works today:
 - **Hooks**: `beforeRequest` / `afterResponse` / `beforeRetry`
 - **Cookie jar**, **basic/bearer auth**, **proxy** (http absolute-URI and https CONNECT)
 - **Body helpers**: `json=` and `form=`
-- **Response helpers**: `.status`, `.headers`, `.text()`, `.body`, `.data`, `.ok`
+- **Response helpers**: `.status`, `.headers`, `.body`, `.data`, `.ok`
 - **Reusable clients** with default options and `.extend()`
 
 HTTP/2 currently runs on the sync and asyncdispatch backends; chronos stays
@@ -119,9 +119,8 @@ let res = api.get("https://example.com")
 res.status            # int, e.g. 200
 res.ok                # true for 2xx
 res.headers.get("content-type")
-res.text()            # body as string
-res.body              # raw body; a Nim string is a byte buffer, so this is your
-                      # bytes (use res.body.toOpenArrayByte(...) for a byte view)
+res.body              # body as a string; a Nim string is a byte buffer, so this
+                      # is also your bytes (res.body.toOpenArrayByte(...) for a view)
 res.data              # body parsed as JsonNode (cached; raises on invalid)
 ```
 
@@ -158,7 +157,7 @@ try:
   discard api.get("https://example.com/missing")
 except HttpError as e:
   echo e.response.status      # e.g. 404
-  echo e.response.text()
+  echo e.response.body
 
 # Opt out to handle status codes yourself:
 let api = newNavi(NaviOptions(throwHttpErrors: some(false)))
