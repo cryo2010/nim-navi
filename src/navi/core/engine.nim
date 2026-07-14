@@ -10,7 +10,6 @@
 ## pool may have been closed by the server in the meantime, so a failed reused
 ## attempt is retried once on a fresh connection.
 
-import std/strutils
 import ./headers, ./url, ./request, ./response, ./pool, ./decompress, ./redirect,
        ./retry, ./cookies, ./proxy, ./session, ./h2glue
 import ../proto/h1
