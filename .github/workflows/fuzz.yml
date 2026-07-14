@@ -1,0 +1,55 @@
+name: fuzz
+
+on:
+  pull_request:
+  schedule:
+    - cron: "0 6 * * *"   # nightly
+  workflow_dispatch:
+
+jobs:
+  # Fast, portable, deterministic: replay the committed seed corpus under ASan on
+  # every PR. Catches regressions and keeps the harnesses building.
+  replay:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [hpack, h1, frame, huffman]
+    name: replay ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: bash tests/fuzz/run.sh ${{ matrix.target }} replay
+
+  # Coverage-guided libFuzzer, time-boxed. Nightly and on manual dispatch only.
+  fuzz:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [hpack, h1, frame, huffman]
+    name: fuzz ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install clang (libFuzzer runtime)
+        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: Fuzz ${{ matrix.target }} for 120s
+        run: bash tests/fuzz/run.sh ${{ matrix.target }} 120
+      - name: Upload any crash
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}-crash
+          path: |
+            crash-*
+            timeout-*
+            oom-*
+          if-no-files-found: ignore
