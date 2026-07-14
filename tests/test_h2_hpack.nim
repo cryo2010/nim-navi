@@ -52,3 +52,22 @@ suite "hpack encode":
     var dec = initHpackDecoder()
     let decoded = dec.decode(enc.encode(@[("Content-Type", "text/plain")]))
     check decoded == @[("content-type", "text/plain")]
+
+suite "hpack decode rejects malformed input without crashing":
+  # A peer controls the header block, so truncated/oversized fields must raise a
+  # catchable error, never an IndexDefect/OverflowDefect (found by tests/fuzz).
+  test "a string length past the end of the block raises":
+    var dec = initHpackDecoder()
+    # literal-with-indexing whose value length runs past the buffer (fuzz-found)
+    expect ValueError:
+      discard dec.decode(hex("a20f0b0d04c36ed80e71e0fd77"))
+
+  test "a truncated integer continuation raises":
+    var dec = initHpackDecoder()
+    expect ValueError:
+      discard dec.decode("\xff")  # indexed field, all-ones prefix, no continuation
+
+  test "an oversized integer raises instead of overflowing":
+    var dec = initHpackDecoder()
+    expect ValueError:
+      discard dec.decode("\x3f" & "\xff".repeat(8))  # table-size update, huge int
