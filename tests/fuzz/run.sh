@@ -23,7 +23,7 @@ if [ "$mode" = "replay" ]; then
   # Portable: any C compiler with ASan; no libFuzzer runtime required.
   bin="$(mktemp -d)/replay_${target}"
   nim c $common \
-    --passc:"-fsanitize=address,undefined -fno-sanitize=function -g -fno-omit-frame-pointer" \
+    --passc:"-fsanitize=address,undefined -g -fno-omit-frame-pointer" \
     --passl:"-fsanitize=address,undefined" \
     -o:"$bin" "$src"
   "$bin" "$seeds"
