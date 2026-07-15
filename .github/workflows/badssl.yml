@@ -1,8 +1,7 @@
 name: badssl
 
 on:
-  schedule:
-    - cron: "30 6 * * *"   # nightly (network-dependent, not a PR gate)
+  pull_request:            # PR check (badssl.com is external; move to nightly if flaky)
   workflow_dispatch:
 
 jobs:
