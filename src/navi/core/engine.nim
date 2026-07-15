@@ -103,7 +103,8 @@ template poolTransport*(client, req, sink: typed): Response =
 
     if not served:
       let transport = await connect(rq.url.host, rq.url.port, rq.url.isTls,
-                                    client.options.tls, proxy, alpn)
+                                    client.options.tls, proxy, alpn,
+                                    client.options.timeoutMs)
       var npc = PooledConn[typeof(transport)](transport: transport)
       if transport.protocol == "h2":
         npc.h2 = initH2Conn()

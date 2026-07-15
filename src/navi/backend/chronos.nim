@@ -31,7 +31,11 @@ proc proxyConnect(transport: StreamTransport, host: string, port: int) {.async.}
     raise newException(ValueError, "navi: proxy CONNECT failed: " & buf.splitLines()[0])
 
 proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
-              proxy: ProxyTarget, alpn: seq[string] = @[]): Future[Conn] {.async.} =
+              proxy: ProxyTarget, alpn: seq[string] = @[],
+              timeout = 0): Future[Conn] {.async.} =
+  ## `timeout` is enforced by the chronos entry via withTimeout, so it is unused
+  ## in this proc (kept for a uniform transport signature across backends).
+  discard timeout
   let dialAddr =
     if proxy.isSet: resolveTAddress(proxy.host, Port(proxy.port))[0]
     else: resolveTAddress(host, Port(port))[0]
