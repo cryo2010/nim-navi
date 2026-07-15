@@ -123,6 +123,32 @@ suite "sync entry end to end":
     check not res.headers.contains("content-encoding")  # header dropped
     joinThread(th)
 
+  test "transparently decompresses a brotli response body":
+    const port = 8968
+    let br = hexToBytes("0f05807b226f6b223a747275657d03")   # brotli of {"ok":true}
+    let payload = "HTTP/1.1 200 OK\r\nContent-Encoding: br\r\n" &
+                  "Content-Length: " & $br.len & "\r\nConnection: close\r\n\r\n" & br
+    var th: Thread[ServerCtx]
+    startRaw(th, port, payload)
+
+    let api = newNavi()
+    let res = api.get("http://127.0.0.1:" & $port & "/")
+    check res.body == """{"ok":true}"""
+    joinThread(th)
+
+  test "transparently decompresses a zstd response body":
+    const port = 8969
+    let zst = hexToBytes("28b52ffd04585900007b226f6b223a747275657d6abe13c7")  # zstd
+    let payload = "HTTP/1.1 200 OK\r\nContent-Encoding: zstd\r\n" &
+                  "Content-Length: " & $zst.len & "\r\nConnection: close\r\n\r\n" & zst
+    var th: Thread[ServerCtx]
+    startRaw(th, port, payload)
+
+    let api = newNavi()
+    let res = api.get("http://127.0.0.1:" & $port & "/")
+    check res.body == """{"ok":true}"""
+    joinThread(th)
+
   test "raises HttpError on a non-2xx response":
     const port = 8979
     let payload = "HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\nConnection: close\r\n\r\nno!"

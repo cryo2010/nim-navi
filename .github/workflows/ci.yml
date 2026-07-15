@@ -25,6 +25,10 @@ jobs:
       - name: Install chronos
         run: nimble install -y "chronos@>= 4.0.0"
 
+      # Runtime libs for the br/zstd decompression tests (loaded via dynlib).
+      - name: Install brotli/zstd
+        run: sudo apt-get update && sudo apt-get install -y libbrotli1 libzstd1
+
       - name: Run tests
         run: nimble test
         env:
@@ -95,6 +99,9 @@ jobs:
       # handling that a passing test would otherwise hide. Leak detection is off:
       # short-lived test processes leak by design (no teardown), and it is not
       # what this job is looking for.
+      - name: Install brotli/zstd
+        run: sudo apt-get update && sudo apt-get install -y libbrotli1 libzstd1
+
       - name: Run tests under ASan/UBSan
         run: nimble test
         env:
