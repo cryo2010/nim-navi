@@ -15,6 +15,7 @@ tests/test_h2_frame
 tests/test_h2_hpack
 tests/test_h2_hpack_corpus
 tests/test_h2_huffman
+tests/test_cookies
 tests/leak
 
 # nimble
