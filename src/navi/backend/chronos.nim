@@ -47,7 +47,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     # caFile is not yet honored here; chronos/BearSSL uses its bundled Mozilla
     # anchors. Custom CA support for this backend is a follow-up.
     let flags =
-      if cfg.verify: {} else: {TLSFlags.NoVerifyHost, TLSFlags.NoVerifyServerName}
+      if cfg.wantsVerify: {} else: {TLSFlags.NoVerifyHost, TLSFlags.NoVerifyServerName}
     # This chronos/BearSSL build negotiates up to TLS 1.2 only.
     let stream = newTLSClientAsyncStream(
       newAsyncStreamReader(transport), newAsyncStreamWriter(transport), host,

@@ -17,8 +17,5 @@ jobs:
       # Asserts navi rejects invalid server certificates (expired, self-signed,
       # wrong-host, untrusted-root) with verification on, and accepts a valid one.
       # Run directly (not via nimble) so a failing check fails the job.
-      # KNOWN FAILING: navi does not currently verify certificate chains (only
-      # the hostname), so the reject-invalid check fails. This job flags that gap
-      # until it is fixed.
       - name: Run badssl TLS checks
         run: nim c -r --hints:off tests/interop/badssl.nim

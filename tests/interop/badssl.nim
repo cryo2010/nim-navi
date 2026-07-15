@@ -31,5 +31,5 @@ suite "badssl TLS client conformance":
     check api.get("https://badssl.com/").status == 200
 
   test "verify = false accepts an invalid certificate":
-    let api = newNavi(NaviOptions(tls: TlsConfig(verify: false), maxRetries: some(0)))
+    let api = newNavi(NaviOptions(tls: TlsConfig(verify: some(false)), maxRetries: some(0)))
     check api.get("https://self-signed.badssl.com/").status == 200

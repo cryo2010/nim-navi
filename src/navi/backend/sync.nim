@@ -49,7 +49,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   if tls:
     when defined(ssl):
       let ctx = newContext(
-        verifyMode = if cfg.verify: CVerifyPeer else: CVerifyNone,
+        verifyMode = if cfg.wantsVerify: CVerifyPeer else: CVerifyNone,
         caFile = cfg.caFile)
       setAlpn(ctx.context, alpn)
       ctx.wrapConnectedSocket(result.socket, handshakeAsClient, host)
