@@ -22,8 +22,9 @@ proc jsLen(arr: JsObject): int {.importjs: "#.length".}
 proc bodyReader(res: JsObject): JsObject {.importjs: "#.body.getReader()".}
 proc readChunk(reader: JsObject): Future[JsObject] {.importjs: "#.read()".}
 proc setTimeout(cb: proc (), ms: int) {.importjs: "setTimeout(#, #)".}
+proc abortAfter(ms: int): JsObject {.importjs: "AbortSignal.timeout(#)".}
 
-proc buildInit(req: Request): JsObject =
+proc buildInit(req: Request, timeout: int): JsObject =
   result = newJsObject()
   result["method"] = cstring($req.verb)
   let h = newHeaders()
@@ -34,6 +35,8 @@ proc buildInit(req: Request): JsObject =
     result["body"] = cstring(req.body)
   result["redirect"] = cstring("follow")      # the browser follows redirects
   result["credentials"] = cstring("include")  # and owns the cookie jar
+  if timeout > 0:
+    result["signal"] = abortAfter(timeout)    # fetch aborts after `timeout` ms
 
 proc readHeaders(res: JsObject): Headers =
   result = initHeaders()
@@ -59,12 +62,13 @@ proc drainToSink(res: JsObject, sink: BodySink) {.async.} =
       bytes[i] = byte(arr[i].to(int))
     sink(bytes)
 
-proc fetchExchange*(req: Request, sink: BodySink): Future[Response] {.async.} =
+proc fetchExchange*(req: Request, sink: BodySink, timeout = 0): Future[Response] {.async.} =
   ## One request/response through `fetch`. With a `sink`, the body streams to it
-  ## and `Response.body` is left empty; otherwise the body is buffered.
+  ## and `Response.body` is left empty; otherwise the body is buffered. A nonzero
+  ## `timeout` aborts the fetch after that many ms (surfaces as a fetch failure).
   var res: JsObject
   try:
-    res = await fetch(cstring(req.url.absoluteTarget), buildInit(req))
+    res = await fetch(cstring(req.url.absoluteTarget), buildInit(req, timeout))
   except:  # noqa: bare — a fetch rejection is a native JS error (no Nim m_type),
            # so a typed `except` would re-raise it. Surface it as a Nim exception
            # the retry loop and user `try/except` can handle like any transport error.

@@ -5,6 +5,7 @@
 
 import std/[net, os, strutils]
 import ./api, ./openssl_alpn
+import ../core/response  # for navi's TimeoutError
 
 export api
 
@@ -12,6 +13,7 @@ type
   Conn* = object
     socket: Socket
     protocol*: string   ## ALPN-negotiated protocol ("h2" or "", meaning http/1.1)
+    timeout: int        ## per-recv timeout in ms; 0 means block indefinitely
 
 template await*(x: untyped): untyped = x
 
@@ -28,7 +30,7 @@ proc proxyConnect(socket: Socket, host: string, port: int) =
     raise newException(ValueError, "navi: proxy CONNECT failed: " & resp.splitLines()[0])
 
 proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
-              proxy: ProxyTarget, alpn: seq[string] = @[]): Conn =
+              proxy: ProxyTarget, alpn: seq[string] = @[], timeout = 0): Conn =
   ## Dial `host:port` (IPv4 or IPv6, resolved by std/net), upgrading to TLS for
   ## https. Through a proxy, https targets get a CONNECT tunnel and http targets
   ## are dialed directly to the proxy (the engine sends an absolute-URI).
@@ -37,6 +39,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   ## The socket is unbuffered: std/net's buffered `recv(pointer, size)` blocks
   ## until it fills the whole buffer, which deadlocks on a kept-alive connection
   ## where the response is smaller than the buffer.
+  result.timeout = timeout
   if proxy.isSet:
     result.socket = dial(proxy.host, Port(proxy.port), buffered = false)
     if tls:
@@ -59,9 +62,17 @@ proc sendAll*(c: Conn, data: string) =
   c.socket.send(data)
 
 proc recvSome*(c: Conn): string =
-  ## One chunk of up to 4096 bytes; "" means the peer closed.
+  ## One chunk of up to 4096 bytes; "" means the peer closed. With a timeout set,
+  ## a stalled read raises navi's TimeoutError (per-recv, not a total deadline).
   result = newString(4096)
-  let n = c.socket.recv(addr result[0], result.len)
+  var n: int
+  if c.timeout > 0:
+    try:
+      n = c.socket.recv(addr result[0], result.len, c.timeout)
+    except net.TimeoutError:
+      raise newException(response.TimeoutError, "navi: read timed out")
+  else:
+    n = c.socket.recv(addr result[0], result.len)
   if n <= 0:
     result.setLen(0)
   else:

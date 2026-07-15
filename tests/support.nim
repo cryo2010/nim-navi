@@ -1,7 +1,7 @@
 ## Shared test helper: a one-shot in-process HTTP/1.1 server on a thread.
 ## Filename has no leading 't' so `nimble test` does not treat it as a suite.
 
-import std/[net, strutils]
+import std/[net, strutils, os]
 
 type ServerCtx* = object
   port: int
@@ -37,6 +37,31 @@ proc startRaw*(th: var Thread[ServerCtx], port: int, payload: string) =
   ## Serve a single connection that replies with `payload`.
   var ready = false
   createThread(th, serveRaw, ServerCtx(port: port, ready: addr ready, payload: payload))
+  while not ready: discard
+
+proc serveHang(ctx: ServerCtx) {.thread.} =
+  ## Accept a connection, read the request, then never reply (for timeout tests).
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.listen()
+  ctx.ready[] = true
+  var client: Socket
+  server.accept(client)
+  var req = ""
+  while true:
+    let c = client.recv(1)
+    if c.len == 0: break
+    req.add c
+    if req.len >= 4 and req[^4 .. ^1] == "\r\n\r\n": break
+  sleep(600)  # hold the request open past the client's timeout, then clean up
+  client.close()
+  server.close()
+
+proc startHang*(th: var Thread[ServerCtx], port: int) =
+  ## Serve a single connection that accepts but never responds.
+  var ready = false
+  createThread(th, serveHang, ServerCtx(port: port, ready: addr ready))
   while not ready: discard
 
 proc headerValue(head, name: string): string =

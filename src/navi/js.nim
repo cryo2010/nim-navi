@@ -91,7 +91,7 @@ proc perform(client: Navi, req0: Request): Future[Response] {.async.} =
   while true:
     var failed = false
     try:
-      resp = await fetchExchange(req, nil)
+      resp = await fetchExchange(req, nil, client.options.timeoutMs)
     except CatchableError:
       if not (attempt < maxRetries and isRetryableVerb(req.verb)):
         raise   # not retryable: propagate the fetch error
@@ -121,7 +121,7 @@ proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
   ## Deliver the response body to `sink` as it arrives; `Response.body` stays
   ## empty. Not retried (the stream is consumed as it is read).
   var req = await client.runBefore(buildRequest(client.options, verb, target, headers))
-  var resp = await fetchExchange(req, sink)
+  var resp = await fetchExchange(req, sink, client.options.timeoutMs)
   resp = await client.runAfter(req, resp)
   client.maybeThrow(req, resp)
   result = resp

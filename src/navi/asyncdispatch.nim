@@ -136,18 +136,34 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
                            client.options.tls, proxyTarget, alpn)
   result = await client.h1OnConn(conn, origin, rq, sink)
 
+proc doRequest(client: Navi, req: Request): Future[Response] {.async.} =
+  result = performRequest(client, req)
+
+proc doStream(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
+  result = performStream(client, req, sink)
+
+proc withDeadline(client: Navi, fut: Future[Response]): Future[Response] {.async.} =
+  ## Bound the whole request (all attempts) by `timeout`. On expiry, raise
+  ## TimeoutError; the abandoned future runs to completion in the background.
+  let ms = client.options.timeoutMs
+  if ms <= 0:
+    return await fut
+  if await withTimeout(fut, ms):
+    return fut.read
+  raise newException(TimeoutError, "navi: request timed out after " & $ms & " ms")
+
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = "", json: JsonNode = nil,
               form: seq[(string, string)] = @[],
               bodyStream: BodyProducer = nil): Future[Response] {.async.} =
   let req = buildRequest(client.options, verb, target, headers, body, json,
                          form, bodyStream)
-  result = performRequest(client, req)
+  result = await client.withDeadline(doRequest(client, req))
 
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
              headers = initHeaders()): Future[Response] {.async.} =
   ## Deliver the response body to `sink` as it arrives; Response.body is empty.
   let req = buildRequest(client.options, verb, target, headers)
-  result = performStream(client, req, sink)
+  result = await client.withDeadline(doStream(client, req, sink))
 
 include navi/private/verbs
