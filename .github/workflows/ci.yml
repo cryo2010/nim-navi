@@ -121,3 +121,26 @@ jobs:
 
       - name: Run the interop suite
         run: nimble interop
+
+  leak:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mm: [orc, arc]
+    name: leak check (--mm:${{ matrix.mm }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Exercises every verb + request 1,000,000x (8M requests) against an
+      # in-process keep-alive server and asserts the Nim heap stays flat. Run
+      # under both managers: an orc/arc growth gap would mean a reference cycle.
+      - name: Run the leak check
+        run: nimble leak
+        env:
+          NAVI_MM: ${{ matrix.mm }}
