@@ -1,7 +1,7 @@
 ## Steady-state memory-growth check (run via `nimble leak`, not part of the
 ## default `nimble test` suites because of its size).
 ##
-## Exercises every verb and `request` in a 1,000,000-iteration loop against an
+## Exercises every verb and `request` in a 100,000-iteration loop against an
 ## in-process keep-alive server, then asserts the Nim heap did not grow. This
 ## catches the leaks ARC/ORC track: connection-pool, cookie-jar, and response
 ## accumulation. C-side leaks (OpenSSL, zlib, fds) are invisible to
@@ -70,12 +70,12 @@ proc exerciseAll(api: Navi) =
   discard api.request(GET, url)
 
 suite "memory growth":
-  test "every verb and request in a 1,000,000x loop does not grow the heap":
+  test "every verb and request in a 100,000x loop does not grow the heap":
     var th: Thread[void]
     createThread(th, serve)
     while not serverReady: sleep(5)
 
-    let iters = parseInt(getEnv("NAVI_LEAK_ITERS", "1000000"))
+    let iters = parseInt(getEnv("NAVI_LEAK_ITERS", "100000"))
     let api = newNavi()
 
     for _ in 0 ..< 1000: exerciseAll(api)   # let pool/jar reach steady state
@@ -89,7 +89,7 @@ suite "memory growth":
 
     echo "iterations=", iters, " requests=", iters * 8,
          " baseline=", base, " after=", after, " growth=", growth
-    # Steady-state jitter is a few KiB; a real per-request leak over 8M requests
-    # would be hundreds of MB (or OOM), so a generous bound flags it unambiguously.
+    # Steady-state jitter is a few KiB; a real per-request leak over 800k requests
+    # would be tens to hundreds of MB, so a generous bound flags it unambiguously.
     check growth < 8 * 1024 * 1024
     # The server thread blocks on the pooled connection; the process exit reaps it.

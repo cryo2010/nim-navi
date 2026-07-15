@@ -32,8 +32,8 @@ task test, "Run the test suite":
   for s in suites:
     exec "nim c -r " & opts & " tests/" & s & ".nim"
 
-task leak, "Memory-growth check: every verb + request in a 1,000,000x loop":
-  # Not in the default `test` suites (8M requests); its own PR job. NAVI_MM
+task leak, "Memory-growth check: every verb + request in a 100,000x loop":
+  # Not in the default `test` suites (800k requests); its own PR job. NAVI_MM
   # selects the memory manager, NAVI_LEAK_ITERS the loop count.
   let mm = getEnv("NAVI_MM", "orc")
   exec "nim c -r -d:release --hints:off --mm:" & mm & " tests/leak.nim"

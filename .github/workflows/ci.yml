@@ -137,7 +137,7 @@ jobs:
           nim-version: "2.2.10"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Exercises every verb + request 1,000,000x (8M requests) against an
+      # Exercises every verb + request 100,000x (800k requests) against an
       # in-process keep-alive server and asserts the Nim heap stays flat. Run
       # under both managers: an orc/arc growth gap would mean a reference cycle.
       - name: Run the leak check
