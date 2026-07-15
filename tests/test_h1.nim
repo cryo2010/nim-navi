@@ -70,3 +70,10 @@ suite "h1 parse":
     var p = initH1Parser()
     expect ValueError:
       p.feed("HTTP/1.1 200 OK\r\nContent-Length: -7\r\n\r\n")
+
+  test "rejects an overflowing chunk size without crashing":
+    # parseHexInt wraps on overflow; the result must be bounds-checked before it
+    # slices the buffer (found by tests/fuzz).
+    var p = initH1Parser()
+    expect ValueError:
+      p.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\n")
