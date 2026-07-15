@@ -129,6 +129,11 @@ proc encodeHeaders*(streamId: uint32, headerBlock: string,
   if endHeaders: flags = flags or flagEndHeaders
   encodeFrame(ftHeaders, flags, streamId, headerBlock)
 
+proc encodeContinuation*(streamId: uint32, headerBlock: string,
+                         endHeaders: bool): string =
+  encodeFrame(ftContinuation, if endHeaders: flagEndHeaders else: 0'u8,
+              streamId, headerBlock)
+
 proc parseSettings*(payload: string): seq[(uint16, uint32)] =
   ## Decode a SETTINGS payload into id/value pairs.
   var i = 0
