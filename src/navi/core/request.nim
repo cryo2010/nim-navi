@@ -134,4 +134,4 @@ proc buildRequest*(opts: NaviOptionsBase, verb: HttpVerb, target: string,
   if opts.auth.kind != akNone and not result.headers.contains("authorization"):
     result.headers.add("authorization", opts.auth.header)
   if opts.wantsDecompress and not result.headers.contains("accept-encoding"):
-    result.headers.add("accept-encoding", "gzip, deflate")
+    result.headers.add("accept-encoding", "gzip, deflate, br, zstd")
