@@ -28,6 +28,9 @@ type
     reset: bool
     hdrBuf: string
     hdrEndStream: bool
+    sendBuf: string       ## request body not yet on the wire (flow-control bound)
+    sendOff: int          ## bytes of sendBuf already sent
+    sendWindow: int       ## per-stream send window (peer's INITIAL_WINDOW_SIZE)
 
   H2Conn* = ref object
     enc: HpackEncoder
@@ -38,10 +41,15 @@ type
     streams: Table[uint32, Stream]
     goneAway*: bool
     goAwayLastId: uint32
+    connSendWindow: int          ## connection-level send window (shared by streams)
+    peerInitialWindow: int       ## peer's SETTINGS_INITIAL_WINDOW_SIZE
+
+const defaultWindow = 65535      ## HTTP/2 default flow-control window (RFC 9113)
 
 proc initH2Conn*(): H2Conn =
   H2Conn(dec: initHpackDecoder(), nextId: 1, maxFrameSize: defaultMaxFrameSize,
-         streams: initTable[uint32, Stream]())
+         streams: initTable[uint32, Stream](),
+         connSendWindow: defaultWindow, peerInitialWindow: defaultWindow)
 
 proc preamble*(c: H2Conn): string =
   ## Connection preface, our SETTINGS (server push disabled), and a large
@@ -53,22 +61,35 @@ proc preamble*(c: H2Conn): string =
 proc openStream*(c: H2Conn): uint32 =
   result = c.nextId
   c.nextId += 2
-  c.streams[result] = Stream()
+  c.streams[result] = Stream(sendWindow: c.peerInitialWindow)
+
+proc flushSend(c: H2Conn, streamId: uint32, s: Stream, outbuf: var string) =
+  ## Emit as many DATA frames as the stream and connection send windows allow,
+  ## setting END_STREAM on the frame that drains the body.
+  while s.sendOff < s.sendBuf.len:
+    let avail = min(s.sendWindow, c.connSendWindow)
+    if avail <= 0: break                       # windowed out; wait for a WINDOW_UPDATE
+    let n = min(min(avail, c.maxFrameSize), s.sendBuf.len - s.sendOff)
+    outbuf.add encodeData(streamId, s.sendBuf[s.sendOff ..< s.sendOff + n],
+                          endStream = s.sendOff + n >= s.sendBuf.len)
+    s.sendOff += n
+    s.sendWindow -= n
+    c.connSendWindow -= n
 
 proc encodeRequest*(c: H2Conn, streamId: uint32, headers: openArray[HeaderPair],
                     body: string): string =
   ## `headers` must start with the pseudo-headers (:method, :scheme, :path,
-  ## :authority) in order, followed by regular headers.
+  ## :authority) in order, followed by regular headers. Sends the header block
+  ## and as much of the body as the send window allows now; the rest is released
+  ## by `feed` as the peer sends WINDOW_UPDATE frames.
   let headerBlock = c.enc.encode(headers)
   let hasBody = body.len > 0
   result = encodeHeaders(streamId, headerBlock, endStream = not hasBody,
                          endHeaders = true)
   if hasBody:
-    var i = 0
-    while i < body.len:
-      let n = min(c.maxFrameSize, body.len - i)
-      result.add encodeData(streamId, body[i ..< i + n], endStream = i + n >= body.len)
-      i += n
+    let s = c.streams[streamId]
+    s.sendBuf = body
+    c.flushSend(streamId, s, result)
 
 proc applyHeaders(c: H2Conn, s: Stream) =
   for (name, value) in c.dec.decode(s.hdrBuf):
@@ -87,6 +108,14 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
       for (id, value) in parseSettings(f.payload):
         if id == settingsMaxFrameSize and value >= 16384'u32:
           c.maxFrameSize = int(value)
+        elif id == settingsInitialWindowSize:
+          # Adjust every open stream's send window by the delta (RFC 9113 6.9.2),
+          # then release any body the new room allows.
+          let delta = int(value) - c.peerInitialWindow
+          c.peerInitialWindow = int(value)
+          for sid, s in c.streams:
+            s.sendWindow += delta
+            c.flushSend(sid, s, outbuf)
       outbuf.add encodeSettingsAck()
   of uint8(ftPing):
     if (f.flags and flagAck) == 0:
@@ -114,8 +143,19 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
     if s != nil:
       s.reset = true
       s.ended = true
+  of uint8(ftWindowUpdate):
+    let inc = int(readU32(f.payload, 0) and 0x7fffffff'u32)
+    if f.streamId == 0:                        # connection-level: release all streams
+      c.connSendWindow += inc
+      for sid, s in c.streams:
+        c.flushSend(sid, s, outbuf)
+    else:
+      let s = c.streams.getOrDefault(f.streamId)
+      if s != nil:
+        s.sendWindow += inc
+        c.flushSend(f.streamId, s, outbuf)
   else:
-    discard # PRIORITY, WINDOW_UPDATE, PUSH_PROMISE (push disabled): ignore
+    discard # PRIORITY, PUSH_PROMISE (push disabled): ignore
 
 proc feed*(c: H2Conn, data: string): string =
   ## Consume received bytes; return control bytes (ACKs, window updates) to send.

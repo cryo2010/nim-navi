@@ -103,3 +103,29 @@ suite "h2 client connection":
     check f.typ == uint8(ftPing)
     check (f.flags and flagAck) != 0
     check f.payload == "01234567"
+
+proc dataBytes(s: string): int =
+  ## Total DATA-frame payload bytes in a serialized frame sequence.
+  var d: FrameDecoder
+  d.feed(s)
+  var f: Frame
+  while d.next(f):
+    if f.typ == uint8(ftData): result += f.payload.len
+
+suite "h2 send-side flow control":
+  test "caps the initial body to the window and releases on WINDOW_UPDATE":
+    let c = initH2Conn()
+    let sid = c.openStream()
+    let body = repeat("x", 200_000)          # > the 65535 default send window
+    let head = @[(":method", "POST"), (":scheme", "https"),
+                 (":path", "/"), (":authority", "x")]
+    let out1 = c.encodeRequest(sid, head, body)
+    check dataBytes(out1) == 65535           # only the initial window goes out now
+
+    # grant 100k on the stream and the connection
+    let out2 = c.feed(encodeWindowUpdate(sid, 100_000) & encodeWindowUpdate(0, 100_000))
+    check dataBytes(out2) == 100_000
+
+    # grant the rest; the whole body must be sent, and no more
+    let out3 = c.feed(encodeWindowUpdate(sid, 200_000) & encodeWindowUpdate(0, 200_000))
+    check dataBytes(out1) + dataBytes(out2) + dataBytes(out3) == 200_000
