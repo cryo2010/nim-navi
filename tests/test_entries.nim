@@ -4,6 +4,7 @@ import unittest
 import std/[net, os, strutils]
 import navi
 import navi/core/pool
+import navi/core/response  # for the `response.TimeoutError` qualifier
 import ./support
 
 var serverReady: bool
@@ -240,6 +241,20 @@ suite "sync entry end to end":
     let api = newNavi(NaviOptions(maxRetries: some(0), throwHttpErrors: some(false)))
     let res = api.get("http://127.0.0.1:" & $port & "/")
     check res.status == 503
+    joinThread(th)
+
+  test "times out a stalled response":
+    const port = 8996
+    var th: Thread[ServerCtx]
+    startHang(th, port)  # accepts, reads the request, never replies
+
+    let api = newNavi(NaviOptions(timeout: some(200), maxRetries: some(0)))
+    var raised = false
+    try:
+      discard api.get("http://127.0.0.1:" & $port & "/")
+    except response.TimeoutError:   # qualified: std/net also defines TimeoutError
+      raised = true
+    check raised
     joinThread(th)
 
   test "hooks mutate the request and observe the response":
