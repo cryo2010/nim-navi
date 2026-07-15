@@ -1,6 +1,7 @@
 name: badssl
 
 on:
+  pull_request:            # temporary: confirm the Linux/OpenSSL behavior
   schedule:
     - cron: "30 6 * * *"   # nightly (network-dependent, not a PR gate)
   workflow_dispatch:
