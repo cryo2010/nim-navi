@@ -63,3 +63,17 @@ suite "h1 parse":
   test "case-insensitive header lookup":
     let r = parseAll("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 0\r\n\r\n")
     check r.headers.get("CONTENT-TYPE") == "text/html"
+
+  test "rejects a negative Content-Length without crashing":
+    # A peer-controlled negative length must raise (caught upstream), not slice
+    # out of bounds into a RangeDefect crash (found by tests/fuzz).
+    var p = initH1Parser()
+    expect ValueError:
+      p.feed("HTTP/1.1 200 OK\r\nContent-Length: -7\r\n\r\n")
+
+  test "rejects an overflowing chunk size without crashing":
+    # parseHexInt wraps on overflow; the result must be bounds-checked before it
+    # slices the buffer (found by tests/fuzz).
+    var p = initH1Parser()
+    expect ValueError:
+      p.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\n")

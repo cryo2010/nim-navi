@@ -106,6 +106,11 @@ proc finishHeaders(p: var H1Parser) =
   elif p.headers.contains("content-length"):
     p.bodyMode = bmLength
     p.remaining = parseInt(p.headers.get("content-length").strip())
+    # A peer controls this; a negative length would slice out of bounds (a
+    # RangeDefect crash). Reject it as a catchable error instead (found by
+    # tests/fuzz). parseInt already rejects non-numeric and overflowing values.
+    if p.remaining < 0:
+      raise newException(ValueError, "h1: negative Content-Length")
     p.state = if p.remaining == 0: stDone else: stBody
   else:
     p.bodyMode = bmUntilClose
@@ -151,6 +156,11 @@ proc step(p: var H1Parser): bool =
     let semi = line.find(';')
     let hex = (if semi < 0: line else: line[0 ..< semi]).strip()
     p.remaining = parseHexInt(hex)
+    # parseHexInt wraps on overflow; a negative or absurd size would slice out
+    # of bounds (RangeDefect) or overflow `remaining + 2`. Reject it as a
+    # catchable error (fuzz-found). 1 shl 40 is far above any real chunk.
+    if p.remaining < 0 or p.remaining > (1 shl 40):
+      raise newException(ValueError, "h1: invalid chunk size")
     p.state = if p.remaining == 0: stTrailers else: stChunkData
     true
   of stChunkData:

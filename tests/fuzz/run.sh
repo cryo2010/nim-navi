@@ -33,7 +33,7 @@ else
   mkdir -p "$corpus"
   bin="$(mktemp -d)/fuzz_${target}"
   nim c --cc:clang $common --noMain:on -d:libfuzzer \
-    --passc:"-fsanitize=fuzzer,address,undefined -g -fno-omit-frame-pointer" \
+    --passc:"-fsanitize=fuzzer,address,undefined -fno-sanitize=function -g -fno-omit-frame-pointer" \
     --passl:"-fsanitize=fuzzer,address,undefined" \
     -o:"$bin" "$src"
   # Persist the growing corpus in the first dir; seed from the committed set.

@@ -24,9 +24,9 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - run: bash tests/fuzz/run.sh ${{ matrix.target }} replay
 
-  # Coverage-guided libFuzzer, time-boxed. Nightly and on manual dispatch only.
+  # Coverage-guided libFuzzer, time-boxed. Runs on every PR, nightly, and on
+  # manual dispatch.
   fuzz:
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
