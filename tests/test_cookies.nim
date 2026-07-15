@@ -45,3 +45,41 @@ suite "cookie expiry":
     let jar = newCookieJar()
     storeCookies(jar, parseUrl("http://x.test/"), setCookieResp("a=1"))
     check jar.replayed("http://x.test/") == "a=1"
+
+proc stored(setCookie, fromUrl: string): CookieJar =
+  result = newCookieJar()
+  storeCookies(result, parseUrl(fromUrl), setCookieResp(setCookie))
+
+suite "cookie domain and path matching (RFC 6265)":
+  test "a host-only cookie is not sent to a subdomain":
+    let jar = stored("a=1", "http://x.test/")
+    check jar.replayed("http://x.test/") == "a=1"
+    check jar.replayed("http://sub.x.test/") == ""
+
+  test "a Domain cookie is sent to subdomains":
+    let jar = stored("a=1; Domain=x.test", "http://x.test/")
+    check jar.replayed("http://x.test/") == "a=1"
+    check jar.replayed("http://sub.x.test/") == "a=1"
+
+  test "a Set-Cookie for an unrelated domain is rejected":
+    let jar = stored("a=1; Domain=evil.test", "http://x.test/")
+    check jar.replayed("http://x.test/") == ""
+    check jar.replayed("http://evil.test/") == ""
+
+  test "path-match respects '/' boundaries":
+    let jar = stored("a=1; Path=/foo", "http://x.test/foo")
+    check jar.replayed("http://x.test/foo") == "a=1"
+    check jar.replayed("http://x.test/foo/bar") == "a=1"
+    check jar.replayed("http://x.test/foobar") == ""   # not a boundary match
+    check jar.replayed("http://x.test/") == ""
+
+  test "default-path is derived from the request path":
+    let jar = stored("a=1", "http://x.test/dir/page")
+    check jar.replayed("http://x.test/dir/other") == "a=1"  # default-path is /dir
+    check jar.replayed("http://x.test/") == ""
+
+  test "an asctime Expires date is parsed":
+    # 1994 is in the past, so the cookie is dropped (proves the date parsed;
+    # an unparseable date would be kept as a session cookie).
+    let jar = stored("a=1; Expires=Sun Nov  6 08:49:37 1994", "http://x.test/")
+    check jar.replayed("http://x.test/") == ""
