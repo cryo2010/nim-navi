@@ -257,6 +257,20 @@ suite "sync entry end to end":
     check raised
     joinThread(th)
 
+  test "parallel times out a stalled response":
+    const port = 8997
+    var th: Thread[ServerCtx]
+    startHang(th, port)
+
+    let api = newNavi(NaviOptions(timeout: some(200)))
+    var raised = false
+    try:
+      discard api.parallel(@["http://127.0.0.1:" & $port & "/"])
+    except response.TimeoutError:
+      raised = true
+    check raised
+    joinThread(th)
+
   test "hooks mutate the request and observe the response":
     const port = 8989
     var th: Thread[ServerCtx]
