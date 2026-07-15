@@ -34,7 +34,7 @@ suite "nghttpd interop (sync, http/2)":
     check res.body.len == 262144      # 256 KiB > the 64 KiB initial window
 
   test "round-trips an uploaded body via echo-upload":
-    let payload = repeat("x", 60000)  # under the initial send window
+    let payload = repeat("x", 250_000)  # > the 64 KiB window: exercises send-side flow control
     let res = client().post(base & "/echo", body = payload)
     check res.status == 200
     check res.body == payload
