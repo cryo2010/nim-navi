@@ -59,6 +59,7 @@ type
     maxRetries*: Option[int]        ## retry attempts for transient failures (default 2)
     auth*: Auth                     ## Authorization applied to every request
     proxy*: Option[string]          ## proxy URL; none falls back to env vars
+    timeout*: Option[int]           ## request timeout in ms; none (default) disables
 
   BodyProducer* = proc(): string {.closure, raises: [CatchableError].}
     ## Pull-based upload source: returns the next chunk, or "" at end of body.
@@ -87,6 +88,8 @@ proc wantsDecompress*(opts: NaviOptionsBase): bool = opts.decompress.get(true)
 proc wantsThrow*(opts: NaviOptionsBase): bool = opts.throwHttpErrors.get(true)
 proc redirectLimit*(opts: NaviOptionsBase): int = opts.maxRedirects.get(20)
 proc retryLimit*(opts: NaviOptionsBase): int = opts.maxRetries.get(2)
+proc timeoutMs*(opts: NaviOptionsBase): int = opts.timeout.get(0)
+  ## Request timeout in milliseconds; 0 means no timeout.
 proc wantsH2*(opts: NaviOptionsBase): bool =
   ## An unset `http` (empty set) means "negotiate h2 where possible".
   opts.http.card == 0 or H2 in opts.http

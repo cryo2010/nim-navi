@@ -18,6 +18,9 @@ type
     ## The full response is attached for inspection.
     response*: Response
 
+  TimeoutError* = object of CatchableError
+    ## Raised when a request exceeds the configured `timeout`.
+
 proc initResponse*(status: int; reason, httpVersion: string; headers: Headers;
                    body: string): Response =
   ## Build a Response with an allocated JSON cache slot. Used by the protocol
