@@ -43,13 +43,18 @@ type
     goAwayLastId: uint32
     connSendWindow: int          ## connection-level send window (shared by streams)
     peerInitialWindow: int       ## peer's SETTINGS_INITIAL_WINDOW_SIZE
+    maxConcurrent: int           ## peer's SETTINGS_MAX_CONCURRENT_STREAMS
 
 const defaultWindow = 65535      ## HTTP/2 default flow-control window (RFC 9113)
 
 proc initH2Conn*(): H2Conn =
   H2Conn(dec: initHpackDecoder(), nextId: 1, maxFrameSize: defaultMaxFrameSize,
          streams: initTable[uint32, Stream](),
-         connSendWindow: defaultWindow, peerInitialWindow: defaultWindow)
+         connSendWindow: defaultWindow, peerInitialWindow: defaultWindow,
+         maxConcurrent: int.high)   # RFC 9113: unlimited until the peer says otherwise
+
+proc maxConcurrentStreams*(c: H2Conn): int = c.maxConcurrent
+  ## The peer's SETTINGS_MAX_CONCURRENT_STREAMS (int.high if not advertised).
 
 proc preamble*(c: H2Conn): string =
   ## Connection preface, our SETTINGS (server push disabled), and a large
@@ -108,6 +113,8 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
       for (id, value) in parseSettings(f.payload):
         if id == settingsMaxFrameSize and value >= 16384'u32:
           c.maxFrameSize = int(value)
+        elif id == settingsMaxConcurrentStreams:
+          c.maxConcurrent = int(value)
         elif id == settingsInitialWindowSize:
           # Adjust every open stream's send window by the delta (RFC 9113 6.9.2),
           # then release any body the new room allows.
