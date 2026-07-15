@@ -106,6 +106,11 @@ proc finishHeaders(p: var H1Parser) =
   elif p.headers.contains("content-length"):
     p.bodyMode = bmLength
     p.remaining = parseInt(p.headers.get("content-length").strip())
+    # A peer controls this; a negative length would slice out of bounds (a
+    # RangeDefect crash). Reject it as a catchable error instead (found by
+    # tests/fuzz). parseInt already rejects non-numeric and overflowing values.
+    if p.remaining < 0:
+      raise newException(ValueError, "h1: negative Content-Length")
     p.state = if p.remaining == 0: stDone else: stBody
   else:
     p.bodyMode = bmUntilClose
