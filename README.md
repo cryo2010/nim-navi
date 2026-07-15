@@ -190,7 +190,7 @@ for (name, value) in h.pairs: discard
 
 ```nim
 let api = newNavi(NaviOptions(
-  tls: TlsConfig(verify: true, caFile: "/path/to/ca-bundle.pem"),
+  tls: TlsConfig(verify: some(true), caFile: "/path/to/ca-bundle.pem"),
 ))
 ```
 

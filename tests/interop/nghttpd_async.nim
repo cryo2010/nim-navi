@@ -14,7 +14,7 @@ let cert = getEnv("NAVI_INTEROP_CERT")
 suite "nghttpd interop (asyncdispatch, http/2 mux)":
   test "concurrent GETs multiplex over a single connection":
     proc run(): Future[seq[Response]] {.async.} =
-      let api = newNavi(NaviOptions(tls: TlsConfig(verify: true, caFile: cert)))
+      let api = newNavi(NaviOptions(tls: TlsConfig(verify: some(true), caFile: cert)))
       result = await all(@[
         api.get(base & "/small.txt"),
         api.get(base & "/small.txt"),

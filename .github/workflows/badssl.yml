@@ -1,0 +1,21 @@
+name: badssl
+
+on:
+  pull_request:            # PR check (badssl.com is external; move to nightly if flaky)
+  workflow_dispatch:
+
+jobs:
+  badssl:
+    runs-on: ubuntu-latest
+    name: badssl TLS conformance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      # Asserts navi rejects invalid server certificates (expired, self-signed,
+      # wrong-host, untrusted-root) with verification on, and accepts a valid one.
+      # Run directly (not via nimble) so a failing check fails the job.
+      - name: Run badssl TLS checks
+        run: nim c -r --hints:off tests/interop/badssl.nim

@@ -13,10 +13,12 @@
 ## TLS is negotiated inside `connect` based on the `tls` flag, so the engine
 ## stays transport- and scheme-agnostic.
 
+import std/options
+
 type
   TlsConfig* = object
-    verify*: bool     ## verify the server certificate chain and hostname
-    caFile*: string   ## custom CA bundle path; "" uses the system trust store
+    verify*: Option[bool]  ## verify the cert chain and hostname; unset means on
+    caFile*: string        ## custom CA bundle path; "" uses the system trust store
 
   ProxyTarget* = object
     ## The HTTP proxy to dial through. An empty `host` means a direct
@@ -24,8 +26,13 @@ type
     host*: string
     port*: int
 
+proc wantsVerify*(tls: TlsConfig): bool = tls.verify.get(true)
+  ## Certificate verification is on unless explicitly disabled. This is secure
+  ## by default even when a TlsConfig (or the NaviOptions around it) is built
+  ## partially, leaving `verify` unset.
+
 proc defaultTls*(): TlsConfig =
-  TlsConfig(verify: true)
+  TlsConfig()  # verify defaults on via wantsVerify
 
 proc direct*(): ProxyTarget = ProxyTarget()
 proc isSet*(p: ProxyTarget): bool = p.host.len > 0
