@@ -38,6 +38,9 @@ task leak, "Memory-growth check: every verb + request in a 100,000x loop":
   let mm = getEnv("NAVI_MM", "orc")
   exec "nim c -r -d:release --hints:off --mm:" & mm & " tests/leak.nim"
 
+task badssl, "TLS client conformance against badssl.com (network; nightly)":
+  exec "nim c -r --hints:off tests/interop/badssl.nim"
+
 task interop, "Run the nghttpd HTTP/2 interop suite (needs nghttpd + openssl)":
   # Starts the nghttp2 reference server over TLS+h2 and runs navi against it.
   exec "bash tests/interop/run.sh"
