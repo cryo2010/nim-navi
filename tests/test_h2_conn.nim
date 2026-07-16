@@ -130,6 +130,13 @@ suite "h2 send-side flow control":
     let out3 = c.feed(encodeWindowUpdate(sid, 200_000) & encodeWindowUpdate(0, 200_000))
     check dataBytes(out1) + dataBytes(out2) + dataBytes(out3) == 200_000
 
+suite "h2 max concurrent streams":
+  test "reads the peer's MAX_CONCURRENT_STREAMS from SETTINGS":
+    let c = initH2Conn()
+    check c.maxConcurrentStreams == int.high        # unlimited until advertised
+    discard c.feed(encodeSettings({settingsMaxConcurrentStreams: 3'u32}))
+    check c.maxConcurrentStreams == 3
+
 suite "h2 CONTINUATION on send":
   test "splits a large header block across HEADERS and CONTINUATION frames":
     let c = initH2Conn()

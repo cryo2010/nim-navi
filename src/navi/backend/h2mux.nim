@@ -7,7 +7,7 @@
 ## concurrent `await api.get(...)` calls to the same origin multiplex over one
 ## connection.
 
-import std/[asyncdispatch, tables]
+import std/[asyncdispatch, tables, deques]
 import ../proto/h2/conn
 import ./asyncdispatch as be
 
@@ -16,8 +16,17 @@ type
     transport: be.Conn
     h2: H2Conn
     waiters: Table[uint32, Future[H2Response]]
+    pendingSlots: Deque[Future[void]]  ## requests waiting for a concurrency slot
     sendTail: Future[void]   ## tail of the serialized send chain
     alive: bool
+
+proc releaseSlot(mux: H2Mux) =
+  ## Wake one request waiting on MAX_CONCURRENT_STREAMS (a stream just freed up).
+  while mux.pendingSlots.len > 0:
+    let s = mux.pendingSlots.popFirst()
+    if not s.finished:
+      s.complete()
+      break
 
 proc dispatch(mux: H2Mux) =
   ## Resolve any streams that finished after the latest feed.
@@ -29,10 +38,12 @@ proc dispatch(mux: H2Mux) =
     if mux.h2.streamReset(sid):
       discard mux.h2.takeResponse(sid)
       mux.waiters.del(sid)
+      mux.releaseSlot()
       fut.fail(newException(IOError, "navi: http/2 stream reset"))
     elif mux.h2.streamEnded(sid):
       let resp = mux.h2.takeResponse(sid)
       mux.waiters.del(sid)
+      mux.releaseSlot()
       fut.complete(resp)
     elif mux.h2.goneAway:
       mux.waiters.del(sid)
@@ -44,6 +55,9 @@ proc failAll(mux: H2Mux, msg: string) =
     if not fut.finished:
       fut.fail(newException(IOError, msg))
   mux.waiters.clear()
+  while mux.pendingSlots.len > 0:                 # wake blocked requests; they see
+    let s = mux.pendingSlots.popFirst()           # `not alive` and raise
+    if not s.finished: s.complete()
 
 proc send(mux: H2Mux, data: string) {.async.} =
   ## Serialize writes (chained on the previous send) so concurrent streams don't
@@ -77,7 +91,8 @@ proc newH2Mux*(transport: be.Conn): Future[H2Mux] {.async.} =
   ## Take ownership of a freshly connected h2 transport, send the preface, and
   ## start the background reader.
   let mux = H2Mux(transport: transport, h2: initH2Conn(), alive: true,
-                  waiters: initTable[uint32, Future[H2Response]]())
+                  waiters: initTable[uint32, Future[H2Response]](),
+                  pendingSlots: initDeque[Future[void]]())
   await be.sendAll(transport, mux.h2.preamble())
   asyncCheck reader(mux)
   result = mux
@@ -86,7 +101,15 @@ proc canReuse*(mux: H2Mux): bool = mux.alive and mux.h2.canReuse
 
 proc request*(mux: H2Mux, headers: seq[(string, string)],
               body: string): Future[H2Response] {.async.} =
-  ## Open a stream, send the request, and await this stream's response.
+  ## Open a stream, send the request, and await this stream's response. Blocks
+  ## while the connection is at the peer's MAX_CONCURRENT_STREAMS, resuming when
+  ## a stream completes (so a burst of concurrent requests is queued, not RST).
+  if not mux.alive:
+    raise newException(IOError, "navi: http/2 connection not usable")
+  while mux.alive and mux.waiters.len >= mux.h2.maxConcurrentStreams:
+    let slot = newFuture[void]("h2mux.slot")
+    mux.pendingSlots.addLast(slot)
+    await slot
   if not mux.alive:
     raise newException(IOError, "navi: http/2 connection not usable")
   let sid = mux.h2.openStream()
