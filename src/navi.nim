@@ -108,7 +108,7 @@ proc transportGroup(client: Navi, items: seq[BatchItem],
     h2 = pc.h2
   else:
     transport = connect(url0.host, url0.port, url0.isTls, client.options.tls,
-                        resolveProxy(client.options, url0), alpn)
+                        resolveProxy(client.options, url0), alpn, client.options.timeoutMs)
     pc = PooledConn[Conn](transport: transport)
     if transport.protocol == "h2":
       h2 = initH2Conn()
@@ -152,7 +152,7 @@ proc transportGroup(client: Navi, items: seq[BatchItem],
       elif not keep:
         transport.close()
         transport = connect(url0.host, url0.port, url0.isTls, client.options.tls,
-                            resolveProxy(client.options, url0), alpn)
+                            resolveProxy(client.options, url0), alpn, client.options.timeoutMs)
         pc = PooledConn[Conn](transport: transport)
 
 proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =

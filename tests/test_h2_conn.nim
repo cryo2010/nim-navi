@@ -136,3 +136,31 @@ suite "h2 max concurrent streams":
     check c.maxConcurrentStreams == int.high        # unlimited until advertised
     discard c.feed(encodeSettings({settingsMaxConcurrentStreams: 3'u32}))
     check c.maxConcurrentStreams == 3
+
+suite "h2 CONTINUATION on send":
+  test "splits a large header block across HEADERS and CONTINUATION frames":
+    let c = initH2Conn()
+    let sid = c.openStream()
+    let big = repeat("v", 20_000)          # forces the block over the 16384 frame size
+    let want = @[(":method", "GET"), (":scheme", "https"), (":path", "/"),
+                 (":authority", "x"), ("x-big", big)]
+    let wire = c.encodeRequest(sid, want, body = "")
+
+    var d: FrameDecoder
+    d.feed(wire)
+    var frames: seq[Frame]
+    var f: Frame
+    while d.next(f): frames.add f
+
+    check frames.len >= 2
+    check frames[0].typ == uint8(ftHeaders)
+    check (frames[0].flags and flagEndHeaders) == 0        # more headers follow
+    check frames[^1].typ == uint8(ftContinuation)
+    check (frames[^1].flags and flagEndHeaders) != 0       # last one ends the block
+    for fr in frames:
+      check fr.payload.len <= defaultMaxFrameSize          # every frame within the limit
+
+    var hb = ""
+    for fr in frames: hb.add fr.payload
+    var dec = initHpackDecoder()
+    check dec.decode(hb) == want                           # reassembles losslessly

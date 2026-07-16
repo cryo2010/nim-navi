@@ -89,8 +89,22 @@ proc encodeRequest*(c: H2Conn, streamId: uint32, headers: openArray[HeaderPair],
   ## by `feed` as the peer sends WINDOW_UPDATE frames.
   let headerBlock = c.enc.encode(headers)
   let hasBody = body.len > 0
-  result = encodeHeaders(streamId, headerBlock, endStream = not hasBody,
-                         endHeaders = true)
+  # Split a header block larger than the peer's max frame size across a HEADERS
+  # frame and one or more CONTINUATION frames (RFC 9113 6.2/6.10); a single
+  # oversized HEADERS frame would be a FRAME_SIZE_ERROR.
+  let mfs = c.maxFrameSize
+  if headerBlock.len <= mfs:
+    result = encodeHeaders(streamId, headerBlock, endStream = not hasBody,
+                           endHeaders = true)
+  else:
+    result = encodeHeaders(streamId, headerBlock[0 ..< mfs],
+                           endStream = not hasBody, endHeaders = false)
+    var i = mfs
+    while i < headerBlock.len:
+      let n = min(mfs, headerBlock.len - i)
+      result.add encodeContinuation(streamId, headerBlock[i ..< i + n],
+                                    endHeaders = i + n >= headerBlock.len)
+      i += n
   if hasBody:
     let s = c.streams[streamId]
     s.sendBuf = body
