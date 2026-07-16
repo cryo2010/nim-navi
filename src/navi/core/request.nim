@@ -5,9 +5,9 @@
 
 import std/[options, json, base64]
 from std/uri import encodeQuery
-import ./headers, ./url, ./response
+import ./headers, ./url, ./response, ./multipart
 import ../backend/api
-export options
+export options, multipart
 
 type
   AuthKind* = enum akNone, akBasic, akBearer
@@ -113,10 +113,11 @@ proc mergeBase*[T: NaviOptionsBase](base, overrides: T): T =
 proc buildRequest*(opts: NaviOptionsBase, verb: HttpVerb, target: string,
                    headers: Headers = initHeaders(), body = "",
                    json: JsonNode = nil, form: seq[(string, string)] = @[],
+                   multipart: Multipart = @[],
                    bodyStream: BodyProducer = nil): Request =
   ## Resolve `target` against the client's prefixUrl, merge headers, and encode
-  ## the body. `json` and `form` take precedence over `body` and set a matching
-  ## Content-Type unless the caller supplied one.
+  ## the body. `json`, `form`, and `multipart` take precedence over `body` (in
+  ## that order) and set a matching Content-Type unless the caller supplied one.
   result.verb = verb
   result.url = join(opts.prefixUrl, target)
   result.headers = merge(opts.headers, headers)
@@ -125,6 +126,11 @@ proc buildRequest*(opts: NaviOptionsBase, verb: HttpVerb, target: string,
     result.body = $json
     if not result.headers.contains("content-type"):
       result.headers.add("content-type", "application/json")
+  elif multipart.len > 0:
+    let (body, contentType) = encodeMultipart(multipart)
+    result.body = body
+    if not result.headers.contains("content-type"):
+      result.headers.add("content-type", contentType)
   elif form.len > 0:
     result.body = encodeQuery(form)
     if not result.headers.contains("content-type"):
