@@ -129,6 +129,11 @@ jobs:
       - name: Run the interop suite
         run: nimble interop
 
+      # Mutual-TLS: an OpenSSL server that requires a client certificate,
+      # validating TlsConfig.certFile/keyFile on the sync (OpenSSL) backend.
+      - name: Run the mTLS interop test
+        run: nimble mtls
+
   leak:
     runs-on: ubuntu-latest
     strategy:
