@@ -69,7 +69,8 @@ navi is under active development. What works today:
 - **Retries** with capped exponential backoff, honoring `Retry-After`
 - **Redirect following** with method rewrites and cross-origin `Authorization` stripping
 - **Throw-on-non-2xx** by default (`HttpError`), opt-out available
-- **Automatic decompression** (gzip/deflate) via the system zlib
+- **Automatic decompression**: gzip/deflate (zlib), plus brotli and zstd when `libbrotlidec`/`libzstd` are present
+- **Request timeouts** via the `timeout` option (`TimeoutError`)
 - **Hooks**: `beforeRequest` / `afterResponse` / `beforeRetry`
 - **Cookie jar**, **basic/bearer auth**, **proxy** (http absolute-URI and https CONNECT)
 - **Body helpers**: `json=` and `form=`
@@ -88,7 +89,8 @@ See [Roadmap](#roadmap).
   ```
   nim c -r -d:ssl yourapp.nim
   ```
-- `chronos` >= 4.0, only if you `import navi/chronos`. The sync and asyncdispatch backends have no third-party dependencies.
+- `chronos` >= 4.0, only if you `import navi/chronos`. The sync and asyncdispatch backends have no third-party Nim dependencies.
+- `libbrotlidec` and `libzstd` (system libraries) are optional: needed only to decode `br`/`zstd` responses. They load lazily, so navi runs fine without them until a server actually sends those encodings.
 - For `import navi/js`: nothing beyond Nim. Compile with `nim js` and run in a browser or on Node 18+ (which provides a global `fetch`); no `-d:ssl`, since the runtime handles TLS.
 
 ## Choosing a backend
@@ -211,7 +213,7 @@ except HttpError as e:
 let api = newNavi(NaviOptions(throwHttpErrors: some(false)))
 ```
 
-### Retries and redirects
+### Retries, redirects, and timeouts
 
 Idempotent requests that hit a transient failure (network error or 408/413/429/500/502/503/504) are retried with capped exponential backoff, honoring `Retry-After`. Redirects are followed by default.
 
@@ -219,8 +221,11 @@ Idempotent requests that hit a transient failure (network error or 408/413/429/5
 let api = newNavi(NaviOptions(
   maxRetries: some(3),    # default 2
   maxRedirects: some(5),  # default 20; 0 disables
+  timeout: some(5000),    # 5s; unset (default) disables. Raises TimeoutError.
 ))
 ```
+
+`timeout` is per socket read on the sync backend and bounds the whole request (including retries) on the async backends.
 
 ### Auth, cookies, and proxy
 
@@ -256,7 +261,7 @@ let refreshToken: Hook = proc(ctx: HookCtx): Future[void] {.async.} =
 
 ### Decompression
 
-Responses are decoded transparently: clients send `Accept-Encoding: gzip, deflate` and decode the body per `Content-Encoding` (via the system zlib). Disable with `decompress: some(false)`.
+Responses are decoded transparently: clients send `Accept-Encoding: gzip, deflate, br, zstd` and decode the body per `Content-Encoding`. gzip/deflate use the system zlib (present everywhere); `br` and `zstd` use `libbrotlidec` and `libzstd`, loaded lazily, so they are only required if a server actually sends those encodings. Disable all of it with `decompress: some(false)`.
 
 ### HTTP/2
 
@@ -386,6 +391,9 @@ Every field is optional.
   Default on.
 - **maxRedirects** `Option[int]`: redirects to follow. Default 20; 0 disables.
 - **maxRetries** `Option[int]`: retry attempts for transient failures. Default 2.
+- **timeout** `Option[int]`: request timeout in milliseconds. Unset (default)
+  disables it. A stalled request raises `TimeoutError`. The sync backend applies
+  it per socket read; the async backends bound the whole request.
 - **auth** `Auth`: `basicAuth(user, pass)` or `bearerAuth(token)`; sets
   `Authorization` on every request.
 - **proxy** `Option[string]`: proxy URL. Unset falls back to `HTTP(S)_PROXY` /
@@ -428,11 +436,10 @@ cookies, auth, proxy, decompression, body helpers, throw-on-non-2xx) are done.
 
 - **HTTP/3**: reserved for when a usable QUIC stack lands on the chronos backend.
 
-Known follow-ups: HTTP/2 on the chronos backend (its bundled TLS exposes no
-client ALPN), send-side flow control for very large request bodies and the
-per-connection concurrent-stream cap, brotli/zstd decompression,
-streaming-response decompression, `caFile` on the chronos backend, and fuller
-cookie expiry.
+Known follow-ups: HTTP/2 on the chronos backend and `caFile` there (its bundled
+BearSSL TLS exposes no client ALPN and no custom-CA hook), streaming-response
+decompression (bodies are decoded once fully received), and `MAX_CONCURRENT_
+STREAMS` queuing on the sync `parallel` batch (the async mux already queues).
 
 ## Testing
 
