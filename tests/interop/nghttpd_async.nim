@@ -26,3 +26,18 @@ suite "nghttpd interop (asyncdispatch, http/2 mux)":
     for r in res:
       check r.status == 200
       check r.httpVersion == "HTTP/2"
+
+  test "the mux queues a burst larger than MAX_CONCURRENT_STREAMS":
+    # Server caps concurrency at 2 (run.sh -m 2). Firing 8 at once must be
+    # admitted in waves by the mux rather than opening streams that get reset.
+    proc run(): Future[seq[Response]] {.async.} =
+      let api = newNavi(NaviOptions(tls: TlsConfig(verify: some(true), caFile: cert)))
+      var futs: seq[Future[Response]]
+      for _ in 0 ..< 8: futs.add api.get(base & "/small.txt")
+      result = await all(futs)
+
+    let res = waitFor run()
+    check res.len == 8
+    for r in res:
+      check r.status == 200
+      check r.body == "hello from nghttpd\n"

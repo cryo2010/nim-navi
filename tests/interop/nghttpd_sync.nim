@@ -46,3 +46,14 @@ suite "nghttpd interop (sync, http/2)":
     for r in res:
       check r.status == 200
       check r.httpVersion == "HTTP/2"
+
+  test "parallel queues a batch larger than MAX_CONCURRENT_STREAMS":
+    # The server caps concurrency at 2 (see run.sh -m 2); a batch of 8 must be
+    # queued and drained in waves, not opened all at once (which would be reset).
+    var targets: seq[string]
+    for _ in 0 ..< 8: targets.add base & "/small.txt"
+    let res = client().parallel(targets)
+    check res.len == 8
+    for r in res:
+      check r.status == 200
+      check r.body == "hello from nghttpd\n"

@@ -26,7 +26,10 @@ mkdir -p "$work/htdocs"
 printf 'hello from nghttpd\n' > "$work/htdocs/small.txt"
 head -c 262144 /dev/urandom > "$work/htdocs/large.bin"
 
-nghttpd -d "$work/htdocs" --echo-upload "$port" "$work/key.pem" "$work/cert.pem" \
+# -m 2: a deliberately low MAX_CONCURRENT_STREAMS so a parallel batch larger
+# than 2 must be queued by the client (streams beyond the cap would otherwise be
+# refused/reset). Exercises the sync `parallel` and async mux stream queuing.
+nghttpd -m 2 -d "$work/htdocs" --echo-upload "$port" "$work/key.pem" "$work/cert.pem" \
   >"$work/nghttpd.log" 2>&1 &
 srv=$!
 disown 2>/dev/null || true   # don't let the shell print a "Terminated" job notice
