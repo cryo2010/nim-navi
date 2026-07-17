@@ -48,9 +48,11 @@ task leakSanitize, "LeakSanitizer check of the codec FFI (needs clang + libbrotl
 
 task valgrind, "Valgrind leak check of the TLS client path (Docker; Linux valgrind)":
   # Valgrind is Linux-only; the Docker image gives a reproducible run from any
-  # host (macOS included). Fails on any definite/indirect leak.
+  # host (macOS included). Fails on any definite/indirect leak. NAVI_MM selects
+  # the memory manager (default orc; arc also flags reference-cycle leaks).
+  let mm = getEnv("NAVI_MM", "orc")
   exec "docker build -f tests/valgrind/Dockerfile -t navi-valgrind ."
-  exec "docker run --rm navi-valgrind"
+  exec "docker run --rm -e NAVI_MM=" & mm & " navi-valgrind"
 
 task badssl, "TLS client conformance against badssl.com (network; nightly)":
   exec "nim c -r --hints:off tests/interop/badssl.nim"

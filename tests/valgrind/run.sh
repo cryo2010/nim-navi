@@ -28,8 +28,11 @@ for _ in $(seq 1 50); do
 done
 
 # -g/--debugger:native for symbolized stacks; -d:useMalloc so Nim allocations go
-# through malloc where Valgrind can see them; --mm:orc so scope-exit runs =destroy.
-nim c -d:ssl -d:useMalloc --mm:orc -g --debugger:native --hints:off \
+# through malloc where Valgrind can see them. NAVI_MM selects the memory manager
+# (default orc); run with NAVI_MM=arc to also catch reference-cycle leaks, which
+# arc does not collect.
+mm="${NAVI_MM:-orc}"
+nim c -d:ssl -d:useMalloc --mm:"$mm" -g --debugger:native --hints:off \
   -o:"$work/vg" "$root/tests/valgrind/leak_valgrind.nim"
 
 export NAVI_VG_URL="https://localhost:$port/small.txt"
