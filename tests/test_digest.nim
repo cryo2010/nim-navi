@@ -45,6 +45,26 @@ suite "digest computation":
     check ch.isSome
     check digestAuthHeader("u", "p", "GET", "/", ch.get) == ""
 
+  test "bestChallenge prefers SHA-256 when both MD5 and SHA-256 are offered":
+    let md5 = "Digest realm=\"r\", nonce=\"n-md5\", algorithm=MD5, qop=\"auth\""
+    let sha = "Digest realm=\"r\", nonce=\"n-sha\", algorithm=SHA-256, qop=\"auth\""
+    for order in [@[md5, sha], @[sha, md5]]:   # independent of header order
+      let ch = bestChallenge(order)
+      check ch.isSome
+      check ch.get.algorithm == "SHA-256"
+      check ch.get.nonce == "n-sha"
+
+  test "bestChallenge falls back to MD5 when it is the only supported offer":
+    let ch = bestChallenge(@[
+      "Digest realm=\"r\", nonce=\"n\", algorithm=SHA-512-256",  # unsupported
+      "Digest realm=\"r\", nonce=\"n\", algorithm=MD5"])
+    check ch.isSome
+    check ch.get.algorithm == "MD5"
+
+  test "bestChallenge returns none when no offer is answerable":
+    check bestChallenge(@["Digest realm=\"r\", nonce=\"n\", algorithm=SHA-512-256",
+                          "Basic realm=\"r\""]).isNone
+
   test "parseChallenge ignores a non-Digest scheme":
     check parseChallenge("Basic realm=\"x\"").isNone
 
@@ -97,12 +117,63 @@ proc serveDigest(port: int) {.thread.} =
       c.close()
     server.close()
 
+var multiReady: bool
+
+proc serveDigestMulti(port: int) {.thread.} =
+  ## Offer both an MD5 and a SHA-256 challenge; the client must answer the
+  ## stronger one, so the retry is accepted only when it declares SHA-256.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(port), "127.0.0.1")
+  server.listen()
+  multiReady = true
+
+  proc readReq(c: Socket): string =
+    while "\r\n\r\n" notin result: result.add c.recv(1)
+
+  block firstRequest:
+    var c: Socket
+    server.accept(c)
+    discard readReq(c)
+    let body = "unauthorized"
+    c.send("HTTP/1.1 401 Unauthorized\r\n" &
+           "WWW-Authenticate: Digest realm=\"navi\", qop=\"auth\", " &
+           "nonce=\"md5nonce\", algorithm=MD5\r\n" &
+           "WWW-Authenticate: Digest realm=\"navi\", qop=\"auth\", " &
+           "nonce=\"shanonce\", algorithm=SHA-256\r\n" &
+           "Content-Length: " & $body.len & "\r\nConnection: close\r\n\r\n" & body)
+    c.close()
+
+  block retry:
+    var c: Socket
+    server.accept(c)
+    let req = readReq(c)
+    let ok = "algorithm=SHA-256" in req and "nonce=\"shanonce\"" in req
+    let body = if ok: "welcome" else: "wrong algorithm"
+    let status = if ok: "200 OK" else: "401 Unauthorized"
+    c.send("HTTP/1.1 " & status & "\r\nContent-Length: " & $body.len &
+           "\r\nConnection: close\r\n\r\n" & body)
+    c.close()
+  server.close()
+
 suite "digest auth end to end":
   test "answers a 401 Digest challenge and retries with credentials":
     const port = 8992
     var th: Thread[int]
     createThread(th, serveDigest, port)
     while not chReady: sleep(5)
+
+    let api = newNavi(NaviOptions(auth: digestAuth("user", "pass")))
+    let res = api.get("http://127.0.0.1:" & $port & "/secret")
+    check res.status == 200
+    check res.body == "welcome"
+    joinThread(th)
+
+  test "answers the SHA-256 challenge when the server also offers MD5":
+    const port = 8993
+    var th: Thread[int]
+    createThread(th, serveDigestMulti, port)
+    while not multiReady: sleep(5)
 
     let api = newNavi(NaviOptions(auth: digestAuth("user", "pass")))
     let res = api.get("http://127.0.0.1:" & $port & "/secret")

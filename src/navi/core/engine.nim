@@ -148,7 +148,7 @@ template maybeDigest(client, rreq, resp: typed) =
   ## inline so the retry's `await`s run in the caller's async proc.
   if resp.status == 401 and client.options.auth.kind == akDigest and
      not rreq.headers.contains("authorization"):
-    let chal = parseChallenge(resp.headers.get("www-authenticate"))
+    let chal = bestChallenge(resp.headers.getAll("www-authenticate"))
     if chal.isSome:
       let auth = digestAuthHeader(
         client.options.auth.user, client.options.auth.pass,
