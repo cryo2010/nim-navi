@@ -159,10 +159,10 @@ proc withDeadline(client: Navi, fut: Future[Response]): Future[Response] {.async
 
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = "", json: JsonNode = nil,
-              form: seq[(string, string)] = @[],
+              form: seq[(string, string)] = @[], multipart: Multipart = @[],
               bodyStream: BodyProducer = nil): Future[Response] {.async.} =
   let req = buildRequest(client.options, verb, target, headers, body, json,
-                         form, bodyStream)
+                         form, multipart, bodyStream)
   result = await client.withDeadline(doRequest(client, req))
 
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,

@@ -18,13 +18,16 @@ proc options*(client: Navi, target: string, headers = initHeaders()): auto =
   client.request(OPTIONS, target, headers)
 
 proc post*(client: Navi, target: string, body = "", json: JsonNode = nil,
-           form: seq[(string, string)] = @[], headers = initHeaders()): auto =
-  client.request(POST, target, headers, body, json, form)
+           form: seq[(string, string)] = @[], multipart: Multipart = @[],
+           headers = initHeaders()): auto =
+  client.request(POST, target, headers, body, json, form, multipart)
 
 proc put*(client: Navi, target: string, body = "", json: JsonNode = nil,
-          form: seq[(string, string)] = @[], headers = initHeaders()): auto =
-  client.request(PUT, target, headers, body, json, form)
+          form: seq[(string, string)] = @[], multipart: Multipart = @[],
+          headers = initHeaders()): auto =
+  client.request(PUT, target, headers, body, json, form, multipart)
 
 proc patch*(client: Navi, target: string, body = "", json: JsonNode = nil,
-            form: seq[(string, string)] = @[], headers = initHeaders()): auto =
-  client.request(PATCH, target, headers, body, json, form)
+            form: seq[(string, string)] = @[], multipart: Multipart = @[],
+            headers = initHeaders()): auto =
+  client.request(PATCH, target, headers, body, json, form, multipart)

@@ -44,8 +44,10 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   if proxy.isSet and tls:
     await proxyConnect(transport, host, port)
   if tls:
-    # caFile is not yet honored here; chronos/BearSSL uses its bundled Mozilla
-    # anchors. Custom CA support for this backend is a follow-up.
+    # caFile and client certificates (cfg.certFile/keyFile, for mTLS) are not
+    # honored here; chronos/BearSSL uses its bundled Mozilla anchors and this
+    # client stream presents no certificate. Both are follow-ups for this
+    # backend. mTLS is available on the sync and asyncdispatch (OpenSSL) backends.
     let flags =
       if cfg.wantsVerify: {} else: {TLSFlags.NoVerifyHost, TLSFlags.NoVerifyServerName}
     # This chronos/BearSSL build negotiates up to TLS 1.2 only.

@@ -45,6 +45,11 @@ task interop, "Run the nghttpd HTTP/2 interop suite (needs nghttpd + openssl)":
   # Starts the nghttp2 reference server over TLS+h2 and runs navi against it.
   exec "bash tests/interop/run.sh"
 
+task mtls, "Run the mutual-TLS (client certificate) interop test (needs openssl)":
+  # Starts an OpenSSL server that requires a client certificate and runs navi's
+  # mTLS test against it.
+  exec "bash tests/interop/mtls.sh"
+
 task demoHello, "Run the hello demo (navi/js client + FastAPI server via Docker)":
   # Builds and runs both containers, stops when the client finishes, and cleans
   # up afterwards. Requires Docker.

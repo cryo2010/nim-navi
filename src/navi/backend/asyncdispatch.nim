@@ -37,6 +37,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
       # the ALPN result (h2 vs http/1.1) is available before any request.
       let ctx = newContext(
         verifyMode = if cfg.wantsVerify: CVerifyPeer else: CVerifyNone,
+        certFile = cfg.certFile, keyFile = cfg.clientKeyFile,
         caFile = cfg.caFile)
       setAlpn(ctx.context, alpn)
       let socket = newAsyncSocket(pickDomain(host, port), SOCK_STREAM,
@@ -57,6 +58,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
       # on first I/O, so this path stays http/1.1.
       let ctx = newContext(
         verifyMode = if cfg.wantsVerify: CVerifyPeer else: CVerifyNone,
+        certFile = cfg.certFile, keyFile = cfg.clientKeyFile,
         caFile = cfg.caFile)
       ctx.wrapConnectedSocket(socket, handshakeAsClient, host)
   result.socket = socket

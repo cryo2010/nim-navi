@@ -11,7 +11,7 @@
 ## attempt is retried once on a fresh connection.
 
 import ./headers, ./url, ./request, ./response, ./pool, ./decompress, ./redirect,
-       ./retry, ./cookies, ./proxy, ./session, ./h2glue
+       ./retry, ./cookies, ./proxy, ./session, ./h2glue, ./digest
 import ../proto/h1
 import ../proto/h2/conn
 
@@ -142,6 +142,19 @@ template run(client, req, sink: typed): Response =
     storeCookies(client.jar, rq.url, resp)
     resp
 
+template maybeDigest(client, rreq, resp: typed) =
+  ## On a 401 Digest challenge, when digest auth is configured and the request
+  ## carries no Authorization yet, compute the response and retry once. Expands
+  ## inline so the retry's `await`s run in the caller's async proc.
+  if resp.status == 401 and client.options.auth.kind == akDigest and
+     not rreq.headers.contains("authorization"):
+    let chal = parseChallenge(resp.headers.get("www-authenticate"))
+    if chal.isSome:
+      rreq.headers["authorization"] = digestAuthHeader(
+        client.options.auth.user, client.options.auth.pass,
+        $rreq.verb, rreq.url.requestTarget, chal.get)
+      resp = run(client, rreq, BodySink(nil))
+
 template followRedirects(client, startReq, resp: typed) =
   ## Issue `startReq`, following redirects into `resp`. Expands inline so its
   ## `await`s run in the caller's async proc.
@@ -150,6 +163,7 @@ template followRedirects(client, startReq, resp: typed) =
   let limit = client.options.redirectLimit
   while true:
     resp = run(client, rreq, BodySink(nil))
+    maybeDigest(client, rreq, resp)
     decodeBody(resp, client.options)
     let location = resp.headers.get("location")
     if limit > 0 and hops < limit and isRedirect(resp.status) and location.len > 0:

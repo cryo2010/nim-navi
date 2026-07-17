@@ -112,9 +112,11 @@ proc perform(client: Navi, req0: Request): Future[Response] {.async.} =
 
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = "", json: JsonNode = nil,
-              form: seq[(string, string)] = @[]): Future[Response] {.async.} =
+              form: seq[(string, string)] = @[],
+              multipart: Multipart = @[]): Future[Response] {.async.} =
   result = await client.perform(
-    buildRequest(client.options, verb, target, headers, body, json, form, nil))
+    buildRequest(client.options, verb, target, headers, body, json, form,
+                 multipart, nil))
 
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
              headers = initHeaders()): Future[Response] {.async.} =

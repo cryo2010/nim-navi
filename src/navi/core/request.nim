@@ -5,15 +5,15 @@
 
 import std/[options, json, base64]
 from std/uri import encodeQuery
-import ./headers, ./url, ./response
+import ./headers, ./url, ./response, ./multipart
 import ../backend/api
-export options
+export options, multipart
 
 type
-  AuthKind* = enum akNone, akBasic, akBearer
+  AuthKind* = enum akNone, akBasic, akBearer, akDigest
   Auth* = object
     case kind*: AuthKind
-    of akBasic:
+    of akBasic, akDigest:
       user*, pass*: string
     of akBearer:
       token*: string
@@ -23,12 +23,16 @@ proc basicAuth*(user, pass: string): Auth =
   Auth(kind: akBasic, user: user, pass: pass)
 proc bearerAuth*(token: string): Auth =
   Auth(kind: akBearer, token: token)
+proc digestAuth*(user, pass: string): Auth =
+  ## HTTP Digest auth. Unlike basic/bearer, the header can only be built after
+  ## the server's 401 challenge, so the engine adds it on a one-shot retry.
+  Auth(kind: akDigest, user: user, pass: pass)
 
 proc header(a: Auth): string =
   case a.kind
   of akBasic: "Basic " & encode(a.user & ":" & a.pass)
   of akBearer: "Bearer " & a.token
-  of akNone: ""
+  of akDigest, akNone: ""   # digest is added by the engine after the challenge
 
 type
   HttpVerb* = enum
@@ -113,10 +117,11 @@ proc mergeBase*[T: NaviOptionsBase](base, overrides: T): T =
 proc buildRequest*(opts: NaviOptionsBase, verb: HttpVerb, target: string,
                    headers: Headers = initHeaders(), body = "",
                    json: JsonNode = nil, form: seq[(string, string)] = @[],
+                   multipart: Multipart = @[],
                    bodyStream: BodyProducer = nil): Request =
   ## Resolve `target` against the client's prefixUrl, merge headers, and encode
-  ## the body. `json` and `form` take precedence over `body` and set a matching
-  ## Content-Type unless the caller supplied one.
+  ## the body. `json`, `form`, and `multipart` take precedence over `body` (in
+  ## that order) and set a matching Content-Type unless the caller supplied one.
   result.verb = verb
   result.url = join(opts.prefixUrl, target)
   result.headers = merge(opts.headers, headers)
@@ -125,13 +130,20 @@ proc buildRequest*(opts: NaviOptionsBase, verb: HttpVerb, target: string,
     result.body = $json
     if not result.headers.contains("content-type"):
       result.headers.add("content-type", "application/json")
+  elif multipart.len > 0:
+    let (body, contentType) = encodeMultipart(multipart)
+    result.body = body
+    if not result.headers.contains("content-type"):
+      result.headers.add("content-type", contentType)
   elif form.len > 0:
     result.body = encodeQuery(form)
     if not result.headers.contains("content-type"):
       result.headers.add("content-type", "application/x-www-form-urlencoded")
   else:
     result.body = body
-  if opts.auth.kind != akNone and not result.headers.contains("authorization"):
+  # Digest can't be precomputed (it needs the server's nonce), so its header is
+  # empty here and added by the engine after the 401 challenge.
+  if opts.auth.header.len > 0 and not result.headers.contains("authorization"):
     result.headers.add("authorization", opts.auth.header)
   if opts.wantsDecompress and not result.headers.contains("accept-encoding"):
     result.headers.add("accept-encoding", "gzip, deflate, br, zstd")
