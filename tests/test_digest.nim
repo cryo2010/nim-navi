@@ -21,6 +21,30 @@ suite "digest computation":
     check "cnonce=\"0a4f113b\"" in header
     check "opaque=\"5ccc069c403ebaf9f0171e9517f40e41\"" in header
 
+  test "matches the RFC 7616 section 3.9.1 SHA-256 example":
+    let ch = parseChallenge(
+      "Digest realm=\"http-auth@example.org\", qop=\"auth, auth-int\", " &
+      "algorithm=SHA-256, " &
+      "nonce=\"7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v\", " &
+      "opaque=\"FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS\"")
+    check ch.isSome
+    let header = digestAuthHeader("Mufasa", "Circle of Life", "GET",
+      "/dir/index.html", ch.get,
+      cnonce = "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ")
+    # The canonical SHA-256 response hash from the RFC example.
+    check ("response=\"753927fa0e85d155564e2e272a28d1802ca10da" &
+           "f4496794697cf8db5856cb6c1\"") in header
+    check "algorithm=SHA-256" in header
+    check "qop=auth" in header
+
+  test "an unsupported algorithm yields no header (rather than a mismatched one)":
+    # SHA-512-256 is not implemented; answering with an MD5 digest while echoing
+    # algorithm=SHA-512-256 would be a header the server rejects, so refuse it.
+    let ch = parseChallenge(
+      "Digest realm=\"r\", nonce=\"n\", algorithm=SHA-512-256, qop=\"auth\"")
+    check ch.isSome
+    check digestAuthHeader("u", "p", "GET", "/", ch.get) == ""
+
   test "parseChallenge ignores a non-Digest scheme":
     check parseChallenge("Basic realm=\"x\"").isNone
 

@@ -150,10 +150,12 @@ template maybeDigest(client, rreq, resp: typed) =
      not rreq.headers.contains("authorization"):
     let chal = parseChallenge(resp.headers.get("www-authenticate"))
     if chal.isSome:
-      rreq.headers["authorization"] = digestAuthHeader(
+      let auth = digestAuthHeader(
         client.options.auth.user, client.options.auth.pass,
         $rreq.verb, rreq.url.requestTarget, chal.get)
-      resp = run(client, rreq, BodySink(nil))
+      if auth.len > 0:                 # "" means the challenge algorithm is unsupported
+        rreq.headers["authorization"] = auth
+        resp = run(client, rreq, BodySink(nil))
 
 template followRedirects(client, startReq, resp: typed) =
   ## Issue `startReq`, following redirects into `resp`. Expands inline so its
