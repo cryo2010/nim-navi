@@ -41,3 +41,23 @@ suite "nghttpd interop (asyncdispatch, http/2 mux)":
     for r in res:
       check r.status == 200
       check r.body == "hello from nghttpd\n"
+
+  test "the mux stays flat over many concurrent requests":
+    # Batches of 10 (past the server's cap of 2) churn the mux's waiter table and
+    # slot queue; assert the Nim heap does not grow across 5000 requests.
+    proc run(): Future[int] {.async.} =
+      let api = newNavi(NaviOptions(tls: TlsConfig(verify: some(true), caFile: cert)))
+      proc batch(): Future[void] {.async.} =
+        var futs: seq[Future[Response]]
+        for _ in 0 ..< 10: futs.add api.get(base & "/small.txt")
+        discard await all(futs)
+      for _ in 0 ..< 20: await batch()          # reach steady state
+      GC_fullCollect()
+      let baseline = getOccupiedMem()
+      for _ in 0 ..< 500: await batch()          # 5000 requests
+      GC_fullCollect()
+      result = getOccupiedMem() - baseline
+
+    let growth = waitFor run()
+    echo "h2 mux growth over 5000 requests: ", growth, " bytes"
+    check growth < 8 * 1024 * 1024

@@ -19,6 +19,7 @@ tests/test_cookies
 tests/test_digest
 tests/test_stream_decompress
 tests/leak
+tests/leak_sanitize
 
 # nimble
 nimblecache/

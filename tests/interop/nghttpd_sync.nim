@@ -57,3 +57,16 @@ suite "nghttpd interop (sync, http/2)":
     for r in res:
       check r.status == 200
       check r.body == "hello from nghttpd\n"
+
+  test "many h2 requests over TLS do not grow the heap":
+    # Exercises the h2 connection, HPACK encoder/decoder tables, and pool reuse
+    # over TLS for growth the plain-http leak.nim loop can't reach.
+    let api = client()
+    for _ in 0 ..< 200: discard api.get(base & "/small.txt")   # reach steady state
+    GC_fullCollect()
+    let baseline = getOccupiedMem()
+    for _ in 0 ..< 5000: discard api.get(base & "/small.txt")
+    GC_fullCollect()
+    let growth = getOccupiedMem() - baseline
+    echo "h2 sync growth over 5000 requests: ", growth, " bytes"
+    check growth < 8 * 1024 * 1024

@@ -39,6 +39,13 @@ task leak, "Memory-growth check: every verb + request in a 100,000x loop":
   let mm = getEnv("NAVI_MM", "orc")
   exec "nim c -r -d:release --hints:off --mm:" & mm & " tests/leak.nim"
 
+task leakSanitize, "LeakSanitizer check of the codec FFI (needs clang + libbrotli/libzstd)":
+  # Catches C-side leaks getOccupiedMem can't see (zlib/brotli/zstd contexts).
+  # On Linux, ASan enables LeakSanitizer at exit by default (detect_leaks=1).
+  exec "nim c -r --mm:orc -d:useMalloc --hints:off " &
+       "--passC:\"-fsanitize=address\" --passL:\"-fsanitize=address\" " &
+       "tests/leak_sanitize.nim"
+
 task badssl, "TLS client conformance against badssl.com (network; nightly)":
   exec "nim c -r --hints:off tests/interop/badssl.nim"
 
