@@ -182,18 +182,24 @@ jobs:
 
   valgrind:
     runs-on: ubuntu-latest
-    name: valgrind leak check (TLS client)
+    strategy:
+      fail-fast: false
+      matrix:
+        mm: [orc, arc]
+    name: valgrind leak check (TLS client, --mm:${{ matrix.mm }})
     steps:
       - uses: actions/checkout@v4
 
       # Runs navi's HTTPS request loop under Valgrind memcheck (via the Docker
       # image, so the run matches local `nimble valgrind`) and fails on any
       # definite/indirect leak -- e.g. the per-connection SSL_CTX that
-      # getOccupiedMem and LeakSanitizer don't catch.
+      # getOccupiedMem and LeakSanitizer don't catch. Run under both managers:
+      # arc does not collect reference cycles, so a cycle leak the orc run hides
+      # surfaces here.
       - name: Build and run the Valgrind leak check
         run: |
           docker build -f tests/valgrind/Dockerfile -t navi-valgrind .
-          docker run --rm navi-valgrind
+          docker run --rm -e NAVI_MM=${{ matrix.mm }} navi-valgrind
 
   leak-sanitize:
     runs-on: ubuntu-latest
