@@ -61,6 +61,20 @@ suite "sync entry end to end":
     joinThread(th)
     check accepts == 1  # both requests used the one connection
 
+  test "close drains the connection pool":
+    const port = 8995
+    var accepts = 0
+    var th: Thread[KeepAliveCtx]
+    startKeepAlive(th, port, requests = 2, accepts = addr accepts)
+
+    let api = newNavi()
+    let key = "http://127.0.0.1:" & $port
+    discard api.get(key & "/")
+    check api.pool.idleCount(key) == 1     # pooled after the request
+    api.close()
+    check api.pool.idleCount(key) == 0     # drained (and the socket closed)
+    joinThread(th)
+
   test "stream delivers the response body to a sink and leaves body empty":
     const port = 8975
     var th: Thread[ServerCtx]

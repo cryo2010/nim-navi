@@ -60,6 +60,14 @@ proc extend*(client: Navi, options: NaviOptions): Navi =
   merged.hooks = mergeHooks(client.options.hooks, options.hooks)
   Navi(options: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
+proc close*(client: Navi) =
+  ## Close all idle pooled connections, freeing their TLS contexts. Optional but
+  ## recommended when done with a client: a later request just opens fresh
+  ## connections. Without it, pooled connections are reclaimed only at process
+  ## exit (and their OpenSSL contexts leak until then).
+  for pc in client.pool.drain():
+    pc.transport.close()
+
 proc transport(client: Navi, req: Request, sink: BodySink): Response =
   ## Pool-based transport (one request per connection at a time).
   poolTransport(client, req, sink)

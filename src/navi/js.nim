@@ -63,6 +63,11 @@ proc extend*(client: Navi, options: NaviOptions): Navi =
   merged.hooks = mergeHooks(client.options.hooks, options.hooks)
   Navi(options: merged)
 
+proc close*(client: Navi) =
+  ## No-op: the browser/runtime owns connections. Present for API symmetry with
+  ## the native backends.
+  discard
+
 # --- pipeline steps (shared by request and stream) ---
 proc runBefore(client: Navi, req: Request): Future[Request] {.async.} =
   let ctx = HookCtx(request: req)

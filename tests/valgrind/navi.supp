@@ -1,0 +1,17 @@
+# Valgrind suppressions for navi's leak check.
+#
+# Scope: we run with --show-leak-kinds=definite,indirect and treat only those as
+# errors, so OpenSSL's process-global "still reachable" caches and "possibly
+# lost" interior pointers are already ignored without suppressions. Entries here
+# are for the residual *definite/indirect* leaks that are genuinely not navi's
+# to free (one-time library/loader initialization). Keep this list short and
+# specific; a navi-owned leak must be fixed, not suppressed.
+
+# One-time dynamic-loader init when the first dlopen'd codec/TLS lib is resolved.
+{
+  dl-init-once
+  Memcheck:Leak
+  match-leak-kinds: definite,indirect
+  ...
+  fun:_dl_init
+}

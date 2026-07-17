@@ -1,0 +1,5 @@
+nimcache/
+.git/
+tests/test_*
+tests/leak
+tests/leak_sanitize

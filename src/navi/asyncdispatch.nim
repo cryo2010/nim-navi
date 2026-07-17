@@ -63,6 +63,16 @@ proc extend*(client: Navi, options: NaviOptions): Navi =
        muxes: newTable[string, H2Mux](),
        pendingMux: newTable[string, Future[H2Mux]]())
 
+proc close*(client: Navi): Future[void] {.async.} =
+  ## Close all pooled connections and shared h2 connections, freeing their TLS
+  ## contexts. Any in-flight request on a shared connection fails with IOError.
+  ## Optional but recommended when done with the client.
+  for pc in client.pool.drain():
+    await close(pc.transport)
+  for mux in client.muxes.values:
+    await mux.close()
+  client.muxes.clear()
+
 proc muxRequest(client: Navi, mux: H2Mux, req: Request,
                 sink: BodySink): Future[Response] {.async.} =
   var r = toResponse(await mux.request(h2HeaderList(req), req.body))
