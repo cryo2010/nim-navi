@@ -66,12 +66,12 @@ proc transport(client: Navi, req: Request, sink: BodySink): Response =
 
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = "", json: JsonNode = nil,
-              form: seq[(string, string)] = @[],
+              form: seq[(string, string)] = @[], multipart: Multipart = @[],
               bodyStream: BodyProducer = nil): Response =
-  ## Perform a request and return the response. `json`/`form` encode the body;
-  ## `bodyStream` uploads a chunked body from a pull-based producer.
+  ## Perform a request and return the response. `json`/`form`/`multipart` encode
+  ## the body; `bodyStream` uploads a chunked body from a pull-based producer.
   let req = buildRequest(client.options, verb, target, headers, body, json,
-                         form, bodyStream)
+                         form, multipart, bodyStream)
   performRequest(client, req)
 
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,

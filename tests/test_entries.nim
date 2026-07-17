@@ -226,6 +226,28 @@ suite "sync entry end to end":
     check res.headers.get("x-echo-content-type") == "application/x-www-form-urlencoded"
     joinThread(th)
 
+  test "post multipart= builds a multipart/form-data body":
+    const port = 8994
+    var th: Thread[ServerCtx]
+    startBodyEcho(th, port)
+
+    let api = newNavi()
+    let res = api.post("http://127.0.0.1:" & $port & "/", multipart = @[
+      field("title", "hello"),
+      filePart("file", "a.txt", "file body", "text/plain")])
+    let ct = res.headers.get("x-echo-content-type")
+    check ct.startsWith("multipart/form-data; boundary=----naviFormBoundary")
+    let boundary = ct.split("boundary=")[1]
+    check res.body == "--" & boundary & "\r\n" &
+      "Content-Disposition: form-data; name=\"title\"\r\n\r\n" &
+      "hello\r\n" &
+      "--" & boundary & "\r\n" &
+      "Content-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n" &
+      "Content-Type: text/plain\r\n\r\n" &
+      "file body\r\n" &
+      "--" & boundary & "--\r\n"
+    joinThread(th)
+
   test "bearer auth sets the Authorization header":
     const port = 8985
     var th: Thread[ServerCtx]
