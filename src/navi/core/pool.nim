@@ -36,3 +36,10 @@ proc pushIdle*[C](pool: Pool[C], key: string, conn: C): bool =
     return false
   pool.idle[key].add(conn)
   true
+
+iterator drain*[C](pool: Pool[C]): C =
+  ## Yield every idle connection and empty the pool, for client shutdown. The
+  ## caller closes each one; the backend (not this pure pool) owns closing.
+  for conns in pool.idle.values:
+    for c in conns: yield c
+  pool.idle.clear()

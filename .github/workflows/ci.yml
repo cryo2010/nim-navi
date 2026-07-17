@@ -180,6 +180,21 @@ jobs:
         env:
           NAVI_MM: ${{ matrix.mm }}
 
+  valgrind:
+    runs-on: ubuntu-latest
+    name: valgrind leak check (TLS client)
+    steps:
+      - uses: actions/checkout@v4
+
+      # Runs navi's HTTPS request loop under Valgrind memcheck (via the Docker
+      # image, so the run matches local `nimble valgrind`) and fails on any
+      # definite/indirect leak -- e.g. the per-connection SSL_CTX that
+      # getOccupiedMem and LeakSanitizer don't catch.
+      - name: Build and run the Valgrind leak check
+        run: |
+          docker build -f tests/valgrind/Dockerfile -t navi-valgrind .
+          docker run --rm navi-valgrind
+
   leak-sanitize:
     runs-on: ubuntu-latest
     name: leak check (codec FFI, LeakSanitizer)

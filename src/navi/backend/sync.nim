@@ -14,6 +14,8 @@ type
     socket: Socket
     protocol*: string   ## ALPN-negotiated protocol ("h2" or "", meaning http/1.1)
     timeout: int        ## per-recv timeout in ms; 0 means block indefinitely
+    when defined(ssl):
+      ctx: SslContext   ## kept so `close` can free the SSL_CTX (destroyContext)
 
 template await*(x: untyped): untyped = x
 
@@ -55,6 +57,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
       setAlpn(ctx.context, alpn)
       ctx.wrapConnectedSocket(result.socket, handshakeAsClient, host)
       result.protocol = negotiatedProtocol(result.socket.sslHandle)
+      result.ctx = ctx     # retain so close() can free the SSL_CTX
     else:
       raise newException(ValueError,
         "navi: https requires compiling with -d:ssl")
@@ -81,3 +84,7 @@ proc recvSome*(c: Conn): string =
 
 proc close*(c: Conn) =
   c.socket.close()
+  when defined(ssl):
+    # std/net closes the SSL on socket.close but never the SSL_CTX; free it so a
+    # long-lived client does not leak one context (~85 KB) per connection.
+    if not c.ctx.isNil: c.ctx.destroyContext()

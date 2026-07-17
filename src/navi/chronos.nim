@@ -55,6 +55,12 @@ proc extend*(client: Navi, options: NaviOptions): Navi =
   merged.hooks = mergeHooks(client.options.hooks, options.hooks)
   Navi(options: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
+proc close*(client: Navi): Future[void] {.async.} =
+  ## Close all idle pooled connections. Optional but recommended when done with
+  ## the client (a later request opens fresh connections).
+  for pc in client.pool.drain():
+    await close(pc.transport)
+
 proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
   ## Pool-based transport (http/1.1; chronos has no h2).
   result = poolTransport(client, req, sink)

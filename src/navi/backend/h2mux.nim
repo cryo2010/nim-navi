@@ -99,6 +99,15 @@ proc newH2Mux*(transport: be.Conn): Future[H2Mux] {.async.} =
 
 proc canReuse*(mux: H2Mux): bool = mux.alive and mux.h2.canReuse
 
+proc close*(mux: H2Mux) {.async.} =
+  ## Shut the shared connection down: fail any in-flight streams and close the
+  ## transport (which also frees its TLS context). The background reader unblocks
+  ## on the closed transport and exits.
+  if not mux.alive and mux.waiters.len == 0: return
+  mux.failAll("navi: client closed")
+  try: await be.close(mux.transport)
+  except CatchableError: discard
+
 proc request*(mux: H2Mux, headers: seq[(string, string)],
               body: string): Future[H2Response] {.async.} =
   ## Open a stream, send the request, and await this stream's response. Blocks

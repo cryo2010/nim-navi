@@ -9,6 +9,8 @@ type
   Conn* = object
     socket: AsyncSocket
     protocol*: string   ## ALPN-negotiated protocol ("h2" or "", meaning http/1.1)
+    when defined(ssl):
+      ctx: SslContext   ## kept so `close` can free the SSL_CTX (destroyContext)
 
 var openedConnections*: int  ## diagnostic: TCP connections opened by this backend
 
@@ -46,6 +48,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
       await socket.connect(host, Port(port))
       result.protocol = negotiatedProtocol(socket.sslHandle)
       result.socket = socket
+      result.ctx = ctx     # retain so close() can free the SSL_CTX
       return
 
   let socket =
@@ -61,6 +64,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
         certFile = cfg.certFile, keyFile = cfg.clientKeyFile,
         caFile = cfg.caFile)
       ctx.wrapConnectedSocket(socket, handshakeAsClient, host)
+      result.ctx = ctx     # retain so close() can free the SSL_CTX
   result.socket = socket
 
 proc sendAll*(c: Conn, data: string): Future[void] =
@@ -72,5 +76,9 @@ proc recvSome*(c: Conn): Future[string] =
 
 proc close*(c: Conn): Future[void] {.async.} =
   c.socket.close()
+  when defined(ssl):
+    # Free the SSL_CTX std/net leaves behind (see the sync backend); otherwise a
+    # long-lived client leaks one context per connection.
+    if not c.ctx.isNil: c.ctx.destroyContext()
 
 proc sleep*(ms: int): Future[void] = sleepAsync(ms)
