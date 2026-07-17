@@ -36,12 +36,18 @@ template sendRequest(conn, req: typed) =
   else:
     await sendAll(conn, serializeRequest(req))
 
-template h1Exchange*(transport, req, sink, keep: typed): Response =
+template h1Exchange*(transport, req, sink, keep, decompress: typed): Response =
   ## One HTTP/1.1 request/response over `transport`. Sets `keep` to whether the
-  ## connection may be reused; does not pool or close.
+  ## connection may be reused; does not pool or close. When `sink` is set and
+  ## `decompress` is on, body chunks are decompressed as they arrive.
   block:
     sendRequest(transport, req)
-    var parser = initH1Parser(sink)
+    var parser =
+      if not sink.isNil and decompress:
+        initH1Parser(sinkFactory = proc(h: Headers): BodySink =
+          decodingSink(h.get("content-encoding"), sink))
+      else:
+        initH1Parser(sink)
     while not parser.finished:
       let chunk = await recvSome(transport)
       if chunk.len == 0:
@@ -51,7 +57,7 @@ template h1Exchange*(transport, req, sink, keep: typed): Response =
     keep = parser.keepAliveAfter()
     parser.toResponse()
 
-template h2Stream(transport, h2, req, sink: typed): Response =
+template h2Stream(transport, h2, req, sink, decompress: typed): Response =
   ## One HTTP/2 request/response on a new stream of the shared connection `h2`.
   block:
     let sid = h2.openStream()
@@ -66,7 +72,13 @@ template h2Stream(transport, h2, req, sink: typed): Response =
     if wasReset or r.status == 0:  # reset, or gone away before a response
       raise newException(IOError, "navi: http/2 request did not complete")
     if not sink.isNil and r.body.len > 0:
-      {.cast(gcsafe).}: sink(r.body.toOpenArrayByte(0, r.body.high))
+      # The h2 body arrives buffered in the connection, so decode it in one pass
+      # here (consistent with the incremental h1 streaming path).
+      var payload = r.body
+      if decompress:
+        let dec = newStreamDecoder(r.headers.get("content-encoding"))
+        if dec != nil: payload = dec.update(payload.toOpenArrayByte(0, payload.high))
+      {.cast(gcsafe).}: sink(payload.toOpenArrayByte(0, payload.high))
       r.body = ""
     r
 
@@ -89,12 +101,12 @@ template poolTransport*(client, req, sink: typed): Response =
     if found:
       try:
         if pc.h2 != nil:
-          resp = h2Stream(pc.transport, pc.h2, rq, sink)
+          resp = h2Stream(pc.transport, pc.h2, rq, sink, client.options.wantsDecompress)
           if not (pc.h2.canReuse and pushIdle(client.pool, key, pc)):
             await close(pc.transport)
         else:
           var keep = false
-          resp = h1Exchange(pc.transport, rq, sink, keep)
+          resp = h1Exchange(pc.transport, rq, sink, keep, client.options.wantsDecompress)
           if not (keep and pushIdle(client.pool, key, pc)):
             await close(pc.transport)
         served = true
@@ -109,12 +121,12 @@ template poolTransport*(client, req, sink: typed): Response =
       if transport.protocol == "h2":
         npc.h2 = initH2Conn()
         await sendAll(transport, npc.h2.preamble())
-        resp = h2Stream(transport, npc.h2, rq, sink)
+        resp = h2Stream(transport, npc.h2, rq, sink, client.options.wantsDecompress)
         if not (npc.h2.canReuse and pushIdle(client.pool, key, npc)):
           await close(transport)
       else:
         var keep = false
-        resp = h1Exchange(transport, rq, sink, keep)
+        resp = h1Exchange(transport, rq, sink, keep, client.options.wantsDecompress)
         if not (keep and pushIdle(client.pool, key, npc)):
           await close(transport)
     resp

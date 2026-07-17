@@ -89,7 +89,8 @@ See [Roadmap](#roadmap).
   ```
   nim c -r -d:ssl yourapp.nim
   ```
-- `chronos` >= 4.0, only if you `import navi/chronos`. The sync and asyncdispatch backends have no third-party Nim dependencies.
+- `checksums` (MD5 for Digest auth; the former `std/md5`, now maintained by nim-lang as a separate package). This is navi's only required Nim dependency.
+- `chronos` >= 4.0, only if you `import navi/chronos`. Aside from `checksums`, the sync and asyncdispatch backends pull in no third-party Nim packages.
 - `libbrotlidec` and `libzstd` (system libraries) are optional: needed only to decode `br`/`zstd` responses. They load lazily, so navi runs fine without them until a server actually sends those encodings.
 - For `import navi/js`: nothing beyond Nim. Compile with `nim js` and run in a browser or on Node 18+ (which provides a global `fetch`); no `-d:ssl`, since the runtime handles TLS.
 
@@ -436,10 +437,10 @@ cookies, auth, proxy, decompression, body helpers, throw-on-non-2xx) are done.
 
 - **HTTP/3**: reserved for when a usable QUIC stack lands on the chronos backend.
 
-Known follow-ups: HTTP/2 on the chronos backend and `caFile` there (its bundled
-BearSSL TLS exposes no client ALPN and no custom-CA hook), streaming-response
-decompression (bodies are decoded once fully received), and `MAX_CONCURRENT_
-STREAMS` queuing on the sync `parallel` batch (the async mux already queues).
+Known follow-ups: HTTP/2 on the chronos backend and `caFile`/client certificates
+there (its bundled BearSSL TLS exposes no client ALPN, custom-CA hook, or client
+cert). Streamed HTTP/1.1 response bodies are now decompressed incrementally as
+they arrive.
 
 ## Testing
 

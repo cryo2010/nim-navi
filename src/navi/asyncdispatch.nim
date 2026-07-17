@@ -7,7 +7,7 @@
 import std/tables
 import navi/private/entryguard
 import navi/core/public
-import navi/core/[engine, pool, session, proxy, h2glue]
+import navi/core/[engine, pool, session, proxy, h2glue, decompress]
 import navi/backend/[asyncdispatch, h2mux]
 
 claimEntry("navi/asyncdispatch")
@@ -66,13 +66,18 @@ proc extend*(client: Navi, options: NaviOptions): Navi =
 proc muxRequest(client: Navi, mux: H2Mux, req: Request,
                 sink: BodySink): Future[Response] {.async.} =
   var r = toResponse(await mux.request(h2HeaderList(req), req.body))
+  # For a streaming request the h2 body is buffered by the mux; decode it once
+  # before handing it to the sink (the buffered path decodes via decodeBody).
+  if not sink.isNil and client.options.wantsDecompress and r.body.len > 0:
+    let dec = newStreamDecoder(r.headers.get("content-encoding"))
+    if dec != nil: r.body = dec.update(r.body.toOpenArrayByte(0, r.body.high))
   applySink(r, sink)
   result = r
 
 proc h1OnConn(client: Navi, conn: Conn, origin: string, req: Request,
               sink: BodySink): Future[Response] {.async.} =
   var keep = false
-  result = h1Exchange(conn, req, sink, keep)
+  result = h1Exchange(conn, req, sink, keep, client.options.wantsDecompress)
   let pc = PooledConn[Conn](transport: conn)
   if not (keep and pushIdle(client.pool, origin, pc)):
     await close(conn)
@@ -99,7 +104,7 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
   if found:
     try:
       var keep = false
-      result = h1Exchange(pc.transport, req, sink, keep)
+      result = h1Exchange(pc.transport, req, sink, keep, client.options.wantsDecompress)
       if not (keep and pushIdle(client.pool, origin, pc)): await close(pc.transport)
       return
     except CatchableError:

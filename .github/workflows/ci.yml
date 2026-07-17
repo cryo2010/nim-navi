@@ -25,6 +25,10 @@ jobs:
       - name: Install chronos
         run: nimble install -y "chronos@>= 4.0.0"
 
+      # navi's only required Nim dependency (MD5 for Digest auth).
+      - name: Install checksums
+        run: nimble install -y checksums
+
       # Runtime libs for the br/zstd decompression tests (loaded via dynlib).
       - name: Install brotli/zstd
         run: sudo apt-get update && sudo apt-get install -y libbrotli1 libzstd1
@@ -52,6 +56,12 @@ jobs:
       # Only needed for the navi/chronos entry.
       - name: Install chronos
         run: nimble install -y "chronos@>= 4.0.0"
+
+      # This job runs raw `nim check`, so navi's `requires` (checksums, for
+      # Digest auth's MD5) aren't auto-resolved the way a nimble task resolves
+      # them; install it explicitly.
+      - name: Install checksums
+        run: nimble install -y checksums
 
       # Compiles each backend entry with -d:ssl, exercising the OpenSSL/ALPN path
       # that the (plain-TCP) test suite never builds, under both memory managers.
@@ -93,6 +103,10 @@ jobs:
       - name: Install chronos
         run: nimble install -y "chronos@>= 4.0.0"
 
+      # navi's only required Nim dependency (MD5 for Digest auth).
+      - name: Install checksums
+        run: nimble install -y checksums
+
       # Rebuilds and runs the whole suite under AddressSanitizer + UBSan
       # (NAVI_SANITIZE=1, see the nimble `test` task). Catches heap overflows,
       # use-after-free, and undefined behavior in the sans-io parsers and buffer
@@ -121,6 +135,11 @@ jobs:
           nim-version: "2.2.10"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # navi's only required Nim dependency (MD5 for Digest auth); the interop
+      # tests build navi via raw `nim` inside run.sh.
+      - name: Install checksums
+        run: nimble install -y checksums
+
       # nghttpd (the nghttp2 reference server) validates navi's HPACK encoder,
       # ALPN, real h2 framing, multiplexing, and receive-side flow control.
       - name: Install nghttpd
@@ -148,6 +167,10 @@ jobs:
         with:
           nim-version: "2.2.10"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # navi's only required Nim dependency (MD5 for Digest auth).
+      - name: Install checksums
+        run: nimble install -y checksums
 
       # Exercises every verb + request 100,000x (800k requests) against an
       # in-process keep-alive server and asserts the Nim heap stays flat. Run

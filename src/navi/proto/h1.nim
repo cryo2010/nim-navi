@@ -47,6 +47,10 @@ type
   H1State = enum
     stStatusLine, stHeaders, stBody, stChunkSize, stChunkData, stTrailers, stDone
 
+  SinkFactory* = proc(headers: Headers): BodySink {.closure, raises: [CatchableError].}
+    ## Chooses the body sink once response headers are known (e.g. to wrap it in
+    ## a content-encoding decoder). Keeps the parser ignorant of decompression.
+
   H1Parser* = object
     state: H1State
     buf: string
@@ -58,11 +62,13 @@ type
     headers: Headers
     body: string
     sink: BodySink          ## when set, body bytes go here instead of `body`
+    sinkFactory: SinkFactory ## when set, builds `sink` from the parsed headers
 
-proc initH1Parser*(sink: BodySink = nil): H1Parser =
+proc initH1Parser*(sink: BodySink = nil, sinkFactory: SinkFactory = nil): H1Parser =
   result.state = stStatusLine
   result.bodyMode = bmUntilClose
   result.sink = sink
+  result.sinkFactory = sinkFactory
 
 proc emitBody(p: var H1Parser, chunk: string) =
   if p.sink != nil:
@@ -99,6 +105,10 @@ proc parseStatusLine(p: var H1Parser, line: string) =
   p.state = stHeaders
 
 proc finishHeaders(p: var H1Parser) =
+  if p.sinkFactory != nil:      # now that headers are known, choose the sink
+    # single-threaded client; the factory need not be gcsafe (see emitBody).
+    {.cast(gcsafe).}:
+      p.sink = p.sinkFactory(p.headers)
   let te = p.headers.get("transfer-encoding")
   if te.len > 0 and "chunked" in te.toLowerAscii:
     p.bodyMode = bmChunked
