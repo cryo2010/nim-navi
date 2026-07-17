@@ -1,16 +1,16 @@
-## HTTP Digest access authentication (RFC 7616 / RFC 2617), MD5 and MD5-sess.
+## HTTP Digest access authentication (RFC 7616 / RFC 2617).
 ##
 ## Pure: no I/O. The engine sends a request, and if the server answers 401 with a
 ## `WWW-Authenticate: Digest ...` challenge, it calls `digestAuthHeader` to build
 ## the `Authorization: Digest ...` response and retries once.
 ##
-## Only the MD5 and MD5-sess algorithms are implemented (Nim's stdlib ships MD5
-## but no SHA-256, which RFC 7616's SHA-256 variants would require). The `qop`
+## The MD5, MD5-sess, SHA-256, and SHA-256-sess algorithms are supported (the
+## hash follows the challenge's `algorithm`; an absent one means MD5). The `qop`
 ## values `auth` and the legacy no-qop form are supported; `auth-int` (which
 ## hashes the request body) is not.
 
 import std/[strutils, random, times, tables, options]
-import checksums/md5   # MD5 is all Digest auth needs (RFC 7616 / 2617)
+import checksums/md5, checksums/sha2
 export options
 
 type
@@ -56,6 +56,11 @@ proc parseChallenge*(header: string): Option[DigestChallenge]
 
 proc md5hex(s: string): string = $toMD5(s)
 
+proc sha256hex(s: string): string =
+  var h = initSha_256()
+  h.update(s)
+  $h.digest()
+
 proc pickQop(offered: string): string =
   ## Choose `auth` when the server offers it (possibly among a list); return ""
   ## for the legacy no-qop challenge. `auth-int` alone is unsupported.
@@ -74,19 +79,24 @@ proc digestAuthHeader*(user, pass, httpMethod, uri: string,
   ## Build the `Authorization: Digest ...` value answering `ch`. `uri` is the
   ## request-target (path plus query); `httpMethod` is the verb. `cnonce` is
   ## generated when empty; pass one only to make the output deterministic (tests).
-  let sessAlg = ch.algorithm.toLowerAscii == "md5-sess"
-  var ha1 = md5hex(user & ":" & ch.realm & ":" & pass)
+  let algo = ch.algorithm.toLowerAscii
+  let sessAlg = algo.endsWith("-sess")
+  let useSha256 = algo.startsWith("sha-256")   # else MD5 (incl. an absent algorithm)
+  template h(s: string): string =
+    (if useSha256: sha256hex(s) else: md5hex(s))
+
+  var ha1 = h(user & ":" & ch.realm & ":" & pass)
   let qop = pickQop(ch.qop)
   let cnonce = if cnonce.len > 0: cnonce else: newCnonce()
   const nc = "00000001"
   if sessAlg:
-    ha1 = md5hex(ha1 & ":" & ch.nonce & ":" & cnonce)
-  let ha2 = md5hex(httpMethod & ":" & uri)
+    ha1 = h(ha1 & ":" & ch.nonce & ":" & cnonce)
+  let ha2 = h(httpMethod & ":" & uri)
   let response =
     if qop.len > 0:
-      md5hex(ha1 & ":" & ch.nonce & ":" & nc & ":" & cnonce & ":" & qop & ":" & ha2)
+      h(ha1 & ":" & ch.nonce & ":" & nc & ":" & cnonce & ":" & qop & ":" & ha2)
     else:
-      md5hex(ha1 & ":" & ch.nonce & ":" & ha2)
+      h(ha1 & ":" & ch.nonce & ":" & ha2)
 
   result = "Digest username=\"" & user & "\", realm=\"" & ch.realm &
            "\", nonce=\"" & ch.nonce & "\", uri=\"" & uri &

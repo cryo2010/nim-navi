@@ -72,7 +72,7 @@ navi is under active development. What works today:
 - **Automatic decompression**: gzip/deflate (zlib), plus brotli and zstd when `libbrotlidec`/`libzstd` are present
 - **Request timeouts** via the `timeout` option (`TimeoutError`)
 - **Hooks**: `beforeRequest` / `afterResponse` / `beforeRetry`
-- **Cookie jar**, **basic/bearer auth**, **proxy** (http absolute-URI and https CONNECT)
+- **Cookie jar**, **basic/bearer/digest auth** (Digest: MD5 and SHA-256, RFC 7616), **proxy** (http absolute-URI and https CONNECT)
 - **Body helpers**: `json=` and `form=`
 - **Response helpers**: `.status`, `.headers`, `.body`, `.data`, `.ok`
 - **Reusable clients** with default options and `.extend()`
@@ -89,7 +89,7 @@ See [Roadmap](#roadmap).
   ```
   nim c -r -d:ssl yourapp.nim
   ```
-- `checksums` (MD5 for Digest auth; the former `std/md5`, now maintained by nim-lang as a separate package). This is navi's only required Nim dependency.
+- `checksums` (MD5 and SHA-256 for Digest auth; the former `std/md5`, now maintained by nim-lang as a separate package). This is navi's only required Nim dependency.
 - `chronos` >= 4.0, only if you `import navi/chronos`. Aside from `checksums`, the sync and asyncdispatch backends pull in no third-party Nim packages.
 - `libbrotlidec` and `libzstd` (system libraries) are optional: needed only to decode `br`/`zstd` responses. They load lazily, so navi runs fine without them until a server actually sends those encodings.
 - For `import navi/js`: nothing beyond Nim. Compile with `nim js` and run in a browser or on Node 18+ (which provides a global `fetch`); no `-d:ssl`, since the runtime handles TLS.
@@ -395,8 +395,9 @@ Every field is optional.
 - **timeout** `Option[int]`: request timeout in milliseconds. Unset (default)
   disables it. A stalled request raises `TimeoutError`. The sync backend applies
   it per socket read; the async backends bound the whole request.
-- **auth** `Auth`: `basicAuth(user, pass)` or `bearerAuth(token)`; sets
-  `Authorization` on every request.
+- **auth** `Auth`: `basicAuth(user, pass)`, `bearerAuth(token)`, or
+  `digestAuth(user, pass)`. Basic/bearer set `Authorization` on every request;
+  digest answers the server's 401 challenge (MD5 or SHA-256) on a one-shot retry.
 - **proxy** `Option[string]`: proxy URL. Unset falls back to `HTTP(S)_PROXY` /
   `NO_PROXY`.
 - **hooks** `Hooks`: lifecycle callbacks, each a `seq`:
@@ -428,7 +429,7 @@ response as `.response`.
 ### Helpers
 
 - **initHeaders(pairs)**: build a case-insensitive, order-preserving `Headers`.
-- **basicAuth(user, pass)** / **bearerAuth(token)**: construct an `Auth`.
+- **basicAuth(user, pass)** / **bearerAuth(token)** / **digestAuth(user, pass)**: construct an `Auth`.
 
 ## Roadmap
 
