@@ -19,6 +19,8 @@ type
   TlsConfig* = object
     verify*: Option[bool]  ## verify the cert chain and hostname; unset means on
     caFile*: string        ## custom CA bundle path; "" uses the system trust store
+    certFile*: string      ## client certificate (PEM) for mTLS; "" presents none
+    keyFile*: string       ## private key (PEM) for `certFile`; "" reuses certFile
 
   ProxyTarget* = object
     ## The HTTP proxy to dial through. An empty `host` means a direct
@@ -30,6 +32,11 @@ proc wantsVerify*(tls: TlsConfig): bool = tls.verify.get(true)
   ## Certificate verification is on unless explicitly disabled. This is secure
   ## by default even when a TlsConfig (or the NaviOptions around it) is built
   ## partially, leaving `verify` unset.
+
+proc clientKeyFile*(tls: TlsConfig): string =
+  ## Path to the client private key: `keyFile` when set, otherwise `certFile`
+  ## (a single PEM commonly holds both the certificate and its key).
+  if tls.keyFile.len > 0: tls.keyFile else: tls.certFile
 
 proc defaultTls*(): TlsConfig =
   TlsConfig()  # verify defaults on via wantsVerify
