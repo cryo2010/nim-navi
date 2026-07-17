@@ -37,6 +37,14 @@ suite "digest computation":
     check "algorithm=SHA-256" in header
     check "qop=auth" in header
 
+  test "an unsupported algorithm yields no header (rather than a mismatched one)":
+    # SHA-512-256 is not implemented; answering with an MD5 digest while echoing
+    # algorithm=SHA-512-256 would be a header the server rejects, so refuse it.
+    let ch = parseChallenge(
+      "Digest realm=\"r\", nonce=\"n\", algorithm=SHA-512-256, qop=\"auth\"")
+    check ch.isSome
+    check digestAuthHeader("u", "p", "GET", "/", ch.get) == ""
+
   test "parseChallenge ignores a non-Digest scheme":
     check parseChallenge("Basic realm=\"x\"").isNone
 

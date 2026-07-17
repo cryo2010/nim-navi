@@ -79,9 +79,18 @@ proc digestAuthHeader*(user, pass, httpMethod, uri: string,
   ## Build the `Authorization: Digest ...` value answering `ch`. `uri` is the
   ## request-target (path plus query); `httpMethod` is the verb. `cnonce` is
   ## generated when empty; pass one only to make the output deterministic (tests).
+  ##
+  ## Returns "" when the challenge's `algorithm` is not one we implement (only
+  ## MD5/MD5-sess and SHA-256/SHA-256-sess, or absent = MD5). Answering an
+  ## unsupported algorithm with an MD5 digest while echoing that algorithm would
+  ## be a self-contradictory header the server rejects, so the caller should skip
+  ## the retry instead.
   let algo = ch.algorithm.toLowerAscii
   let sessAlg = algo.endsWith("-sess")
-  let useSha256 = algo.startsWith("sha-256")   # else MD5 (incl. an absent algorithm)
+  let base = if sessAlg: algo[0 ..< algo.len - "-sess".len] else: algo
+  if base notin ["", "md5", "sha-256"]:
+    return ""
+  let useSha256 = base == "sha-256"
   template h(s: string): string =
     (if useSha256: sha256hex(s) else: md5hex(s))
 

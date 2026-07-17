@@ -11,7 +11,7 @@ installExt    = @["nim"]
 # Dependencies
 
 requires "nim >= 2.2.10"
-requires "checksums >= 0.2.0"   # MD5 + SHA-256 for Digest auth (the former std/md5, now split out)
+requires "checksums >= 0.2.2"   # MD5 + SHA-256 (sha2 API) for Digest auth; 0.2.2 is the tested floor
 
 # Optional: only needed when you `import navi/chronos`.
 # requires "chronos >= 4.0.0"
