@@ -179,3 +179,26 @@ jobs:
         run: nimble leak
         env:
           NAVI_MM: ${{ matrix.mm }}
+
+  leak-sanitize:
+    runs-on: ubuntu-latest
+    name: leak check (codec FFI, LeakSanitizer)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # clang provides the ASan/LeakSanitizer runtime; the codec libs are dlopened.
+      - name: Install clang + brotli/zstd
+        run: sudo apt-get update && sudo apt-get install -y clang libbrotli1 libzstd1
+
+      # LeakSanitizer sees what getOccupiedMem cannot: zlib/brotli/zstd contexts
+      # that a dropped defer/=destroy would leak. detect_leaks=1 is the Linux
+      # default under ASan, set explicitly for clarity.
+      - name: Run the codec leak check
+        run: nimble leakSanitize
+        env:
+          ASAN_OPTIONS: detect_leaks=1
