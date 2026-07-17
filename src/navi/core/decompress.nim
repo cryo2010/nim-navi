@@ -7,7 +7,7 @@
 ## are loaded lazily, so `br`/`zstd` decoding requires libbrotlidec/libzstd at
 ## runtime (advertised in Accept-Encoding regardless).
 
-import std/strutils
+import std/[strutils, dynlib]
 import ./headers, ./request, ./response
 
 when defined(windows):
@@ -81,14 +81,35 @@ else:
 
 type BrotliState = pointer
 
-proc brotliCreate(a, b, c: pointer): BrotliState
-  {.cdecl, importc: "BrotliDecoderCreateInstance", dynlib: brotliDll.}
-proc brotliDestroy(s: BrotliState)
-  {.cdecl, importc: "BrotliDecoderDestroyInstance", dynlib: brotliDll.}
-proc brotliStream(s: BrotliState, availIn: var csize_t, nextIn: var ptr uint8,
-                  availOut: var csize_t, nextOut: var ptr uint8,
-                  totalOut: pointer): cint
-  {.cdecl, importc: "BrotliDecoderDecompressStream", dynlib: brotliDll.}
+# Loaded on first use (see loadBrotli), not at process startup, so a program
+# that never receives a `br` body runs without libbrotlidec installed.
+type
+  BrotliCreateFn = proc(a, b, c: pointer): BrotliState {.cdecl, gcsafe, raises: [].}
+  BrotliDestroyFn = proc(s: BrotliState) {.cdecl, gcsafe, raises: [].}
+  BrotliStreamFn = proc(s: BrotliState, availIn: var csize_t, nextIn: var ptr uint8,
+                        availOut: var csize_t, nextOut: var ptr uint8,
+                        totalOut: pointer): cint {.cdecl, gcsafe, raises: [].}
+
+var
+  brotliCreate: BrotliCreateFn
+  brotliDestroy: BrotliDestroyFn
+  brotliStream: BrotliStreamFn
+
+proc loadBrotli() =
+  ## Resolve libbrotlidec's decode symbols on first use. Raises a clear error if
+  ## the library is not present (rather than crashing the whole process at start,
+  ## which an eager `dynlib` pragma would).
+  {.cast(gcsafe).}:      # module-global fn pointers; navi is single-threaded
+    if brotliCreate != nil: return
+    let lib = loadLib(brotliDll)
+    if lib == nil:
+      raise newException(ValueError, "navi: decoding a 'br' response needs " &
+        brotliDll & " (install brotli), which could not be loaded")
+    brotliCreate = cast[BrotliCreateFn](lib.symAddr("BrotliDecoderCreateInstance"))
+    brotliDestroy = cast[BrotliDestroyFn](lib.symAddr("BrotliDecoderDestroyInstance"))
+    brotliStream = cast[BrotliStreamFn](lib.symAddr("BrotliDecoderDecompressStream"))
+    if brotliCreate == nil or brotliDestroy == nil or brotliStream == nil:
+      raise newException(ValueError, "navi: " & brotliDll & " lacks expected symbols")
 
 const
   brSuccess = cint(1)
@@ -96,6 +117,7 @@ const
 
 proc decodeBrotli(src: string): string =
   if src.len == 0: return ""
+  loadBrotli()
   let s = brotliCreate(nil, nil, nil)
   if s == nil: raise newException(ValueError, "navi: brotli init failed")
   defer: brotliDestroy(s)
@@ -129,14 +151,38 @@ type
     size: csize_t
     pos: csize_t
 
-proc zstdCreate(): ZstdDStream {.cdecl, importc: "ZSTD_createDStream", dynlib: zstdDll.}
-proc zstdFree(s: ZstdDStream): csize_t {.cdecl, importc: "ZSTD_freeDStream", dynlib: zstdDll.}
-proc zstdStream(s: ZstdDStream, output: var ZstdBuffer, input: var ZstdBuffer): csize_t
-  {.cdecl, importc: "ZSTD_decompressStream", dynlib: zstdDll.}
-proc zstdIsError(code: csize_t): cuint {.cdecl, importc: "ZSTD_isError", dynlib: zstdDll.}
+# Loaded on first use (see loadZstd), not at process startup.
+type
+  ZstdCreateFn = proc(): ZstdDStream {.cdecl, gcsafe, raises: [].}
+  ZstdFreeFn = proc(s: ZstdDStream): csize_t {.cdecl, gcsafe, raises: [].}
+  ZstdStreamFn = proc(s: ZstdDStream, output: var ZstdBuffer,
+                      input: var ZstdBuffer): csize_t {.cdecl, gcsafe, raises: [].}
+  ZstdIsErrorFn = proc(code: csize_t): cuint {.cdecl, gcsafe, raises: [].}
+
+var
+  zstdCreate: ZstdCreateFn
+  zstdFree: ZstdFreeFn
+  zstdStream: ZstdStreamFn
+  zstdIsError: ZstdIsErrorFn
+
+proc loadZstd() =
+  ## Resolve libzstd's decode symbols on first use; a clear error if absent.
+  {.cast(gcsafe).}:      # module-global fn pointers; navi is single-threaded
+    if zstdCreate != nil: return
+    let lib = loadLib(zstdDll)
+    if lib == nil:
+      raise newException(ValueError, "navi: decoding a 'zstd' response needs " &
+        zstdDll & " (install zstd), which could not be loaded")
+    zstdCreate = cast[ZstdCreateFn](lib.symAddr("ZSTD_createDStream"))
+    zstdFree = cast[ZstdFreeFn](lib.symAddr("ZSTD_freeDStream"))
+    zstdStream = cast[ZstdStreamFn](lib.symAddr("ZSTD_decompressStream"))
+    zstdIsError = cast[ZstdIsErrorFn](lib.symAddr("ZSTD_isError"))
+    if zstdCreate == nil or zstdFree == nil or zstdStream == nil or zstdIsError == nil:
+      raise newException(ValueError, "navi: " & zstdDll & " lacks expected symbols")
 
 proc decodeZstd(src: string): string =
   if src.len == 0: return ""
+  loadZstd()
   let s = zstdCreate()
   if s == nil: raise newException(ValueError, "navi: zstd init failed")
   defer: discard zstdFree(s)
