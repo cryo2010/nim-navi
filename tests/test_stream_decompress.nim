@@ -2,7 +2,7 @@
 ## boundaries (deterministic), and the end-to-end `stream` path decoding a body.
 
 import unittest
-import std/[net, os, strutils]
+import std/net
 import navi
 import navi/core/decompress
 import ./support

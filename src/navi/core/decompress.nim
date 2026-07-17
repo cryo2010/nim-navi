@@ -95,13 +95,24 @@ var
   brotliDestroy: BrotliDestroyFn
   brotliStream: BrotliStreamFn
 
+proc loadCodec(dll: string): LibHandle =
+  ## Load `dll` by name, falling back to common absolute locations. On macOS the
+  ## Homebrew lib dir is not on the loader's default search path, and `nim c -r`
+  ## drops DYLD_* under SIP, so a bare-name load fails there; try those dirs
+  ## directly (which also lets the lib resolve its own @rpath dependencies).
+  ## Harmless on other platforms: the paths simply do not exist.
+  result = loadLib(dll)
+  when defined(macosx):
+    if result == nil: result = loadLib("/opt/homebrew/lib/" & dll)
+    if result == nil: result = loadLib("/usr/local/lib/" & dll)
+
 proc loadBrotli() =
   ## Resolve libbrotlidec's decode symbols on first use. Raises a clear error if
   ## the library is not present (rather than crashing the whole process at start,
   ## which an eager `dynlib` pragma would).
   {.cast(gcsafe).}:      # module-global fn pointers; navi is single-threaded
     if brotliCreate != nil: return
-    let lib = loadLib(brotliDll)
+    let lib = loadCodec(brotliDll)
     if lib == nil:
       raise newException(ValueError, "navi: decoding a 'br' response needs " &
         brotliDll & " (install brotli), which could not be loaded")
@@ -169,7 +180,7 @@ proc loadZstd() =
   ## Resolve libzstd's decode symbols on first use; a clear error if absent.
   {.cast(gcsafe).}:      # module-global fn pointers; navi is single-threaded
     if zstdCreate != nil: return
-    let lib = loadLib(zstdDll)
+    let lib = loadCodec(zstdDll)
     if lib == nil:
       raise newException(ValueError, "navi: decoding a 'zstd' response needs " &
         zstdDll & " (install zstd), which could not be loaded")
@@ -291,10 +302,12 @@ proc newStreamDecoder*(encoding: string): StreamDecoder =
     # not auto-detectable mid-stream; that rare form is left to the buffered path.
     newZlibDecoder(wbAuto)
   of "br":
+    loadBrotli()                       # resolve the lazily-bound symbols first
     let s = brotliCreate(nil, nil, nil)
     if s == nil: raise newException(ValueError, "navi: brotli init failed")
     StreamDecoder(kind: dkBrotli, brs: s)
   of "zstd":
+    loadZstd()
     let s = zstdCreate()
     if s == nil: raise newException(ValueError, "navi: zstd init failed")
     StreamDecoder(kind: dkZstd, zds: s)
