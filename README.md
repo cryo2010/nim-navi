@@ -436,10 +436,10 @@ cookies, auth, proxy, decompression, body helpers, throw-on-non-2xx) are done.
 
 - **HTTP/3**: reserved for when a usable QUIC stack lands on the chronos backend.
 
-Known follow-ups: HTTP/2 on the chronos backend and `caFile` there (its bundled
-BearSSL TLS exposes no client ALPN and no custom-CA hook), streaming-response
-decompression (bodies are decoded once fully received), and `MAX_CONCURRENT_
-STREAMS` queuing on the sync `parallel` batch (the async mux already queues).
+Known follow-ups: HTTP/2 on the chronos backend and `caFile`/client certificates
+there (its bundled BearSSL TLS exposes no client ALPN, custom-CA hook, or client
+cert). Streamed HTTP/1.1 response bodies are now decompressed incrementally as
+they arrive.
 
 ## Testing
 
