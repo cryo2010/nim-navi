@@ -53,6 +53,12 @@ jobs:
       - name: Install chronos
         run: nimble install -y "chronos@>= 4.0.0"
 
+      # This job runs raw `nim check`, so navi's `requires` (checksums, for
+      # Digest auth's MD5) aren't auto-resolved the way a nimble task resolves
+      # them; install it explicitly.
+      - name: Install checksums
+        run: nimble install -y checksums
+
       # Compiles each backend entry with -d:ssl, exercising the OpenSSL/ALPN path
       # that the (plain-TCP) test suite never builds, under both memory managers.
       - name: Compile entry modules

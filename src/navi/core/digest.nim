@@ -9,7 +9,8 @@
 ## values `auth` and the legacy no-qop form are supported; `auth-int` (which
 ## hashes the request body) is not.
 
-import std/[strutils, md5, random, times, tables, options]
+import std/[strutils, random, times, tables, options]
+import checksums/md5   # MD5 is all Digest auth needs (RFC 7616 / 2617)
 export options
 
 type
