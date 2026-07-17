@@ -116,23 +116,43 @@ proc transportGroup(client: Navi, items: seq[BatchItem],
       transport.sendAll(h2.preamble())
 
   if h2 != nil:
-    var streams: seq[uint32]
-    for pi in members:
-      let sid = h2.openStream()
-      streams.add sid
-      transport.sendAll(h2.encodeRequest(sid, h2HeaderList(items[pi].req),
-                                         items[pi].req.body))
-    while true:
-      var remaining = 0
-      for sid in streams:
-        if not h2.streamDone(sid): inc remaining
-      if remaining == 0: break
+    # On a fresh connection the server's SETTINGS (carrying MAX_CONCURRENT_
+    # STREAMS) arrive first; read them before opening streams so a large batch
+    # honors the cap from the start instead of over-committing and having the
+    # excess streams reset. A pooled connection already processed its settings.
+    if not found:
       let chunk = transport.recvSome()
-      if chunk.len == 0: break
+      if chunk.len > 0:
+        let toSend = h2.feed(chunk)
+        if toSend.len > 0: transport.sendAll(toSend)
+
+    var sidK: Table[uint32, int]   ## in-flight stream id -> index into `members`
+    var opened = 0                 ## members whose stream has been opened
+    var completed = 0
+
+    proc openMore() =
+      ## Open as many queued requests as the peer's stream limit allows now.
+      while sidK.len < h2.maxConcurrentStreams and opened < members.len:
+        let sid = h2.openStream()
+        sidK[sid] = opened
+        transport.sendAll(h2.encodeRequest(sid, h2HeaderList(items[members[opened]].req),
+                                           items[members[opened]].req.body))
+        inc opened
+
+    openMore()
+    while completed < members.len:
+      let chunk = transport.recvSome()
+      if chunk.len == 0: break                 # peer closed mid-batch
       let toSend = h2.feed(chunk)
       if toSend.len > 0: transport.sendAll(toSend)
-    for k in 0 ..< streams.len:
-      result[k] = toResponse(h2.takeResponse(streams[k]))
+      var finished: seq[uint32]
+      for sid in sidK.keys:
+        if h2.streamDone(sid): finished.add sid
+      for sid in finished:
+        result[sidK[sid]] = toResponse(h2.takeResponse(sid))
+        sidK.del(sid)
+        inc completed
+      openMore()                               # a freed slot admits the next request
     if not (h2.canReuse and pushIdle(client.pool, origin, pc)):
       transport.close()
   else:
