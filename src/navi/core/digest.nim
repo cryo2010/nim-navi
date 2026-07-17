@@ -54,6 +54,34 @@ proc parseChallenge*(header: string): Option[DigestChallenge]
     algorithm: params.getOrDefault("algorithm"),
     qop: params.getOrDefault("qop")))
 
+proc algorithmBase(algorithm: string): string =
+  ## The hash family of a Digest `algorithm`, lowercased and without the `-sess`
+  ## session suffix. "" (the default) means MD5.
+  let a = algorithm.toLowerAscii
+  if a.endsWith("-sess"): a[0 ..< a.len - "-sess".len] else: a
+
+proc algorithmRank(ch: DigestChallenge): int =
+  ## Preference among the algorithms we implement: SHA-256 over MD5. 0 means the
+  ## challenge uses an algorithm we cannot answer.
+  case algorithmBase(ch.algorithm)
+  of "sha-256": 2
+  of "", "md5": 1
+  else: 0
+
+proc bestChallenge*(wwwAuthenticate: openArray[string]): Option[DigestChallenge] =
+  ## From all `WWW-Authenticate` header values, pick the strongest Digest
+  ## challenge we can answer -- SHA-256 in preference to MD5 -- so a server that
+  ## offers both is answered with the stronger hash. Returns none when none is a
+  ## Digest challenge with an implemented algorithm.
+  var best: DigestChallenge
+  var bestRank = 0
+  for value in wwwAuthenticate:
+    let ch = parseChallenge(value)
+    if ch.isSome and algorithmRank(ch.get) > bestRank:
+      bestRank = algorithmRank(ch.get)
+      best = ch.get
+  if bestRank > 0: some(best) else: none(DigestChallenge)
+
 proc md5hex(s: string): string = $toMD5(s)
 
 proc sha256hex(s: string): string =
@@ -85,9 +113,8 @@ proc digestAuthHeader*(user, pass, httpMethod, uri: string,
   ## unsupported algorithm with an MD5 digest while echoing that algorithm would
   ## be a self-contradictory header the server rejects, so the caller should skip
   ## the retry instead.
-  let algo = ch.algorithm.toLowerAscii
-  let sessAlg = algo.endsWith("-sess")
-  let base = if sessAlg: algo[0 ..< algo.len - "-sess".len] else: algo
+  let sessAlg = ch.algorithm.toLowerAscii.endsWith("-sess")
+  let base = algorithmBase(ch.algorithm)
   if base notin ["", "md5", "sha-256"]:
     return ""
   let useSha256 = base == "sha-256"

@@ -57,6 +57,13 @@ proc get*(h: Headers, name: string, default = ""): string =
       return v
   default
 
+proc getAll*(h: Headers, name: string): seq[string] =
+  ## Every value for `name`, in order (a field may appear more than once, e.g.
+  ## multiple `WWW-Authenticate` challenges).
+  for (k, v) in h.fields:
+    if cmpIgnoreCase(k, name) == 0:
+      result.add v
+
 proc `[]`*(h: Headers, name: string): string =
   ## First value for `name`; raises KeyError if absent.
   for (k, v) in h.fields:
