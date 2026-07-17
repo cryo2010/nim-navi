@@ -14,6 +14,11 @@ jobs:
         with:
           nim-version: "2.2.10"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+      # navi's only required Nim dep (MD5 for Digest auth); this job builds with
+      # raw `nim`, so it isn't resolved automatically.
+      - name: Install checksums
+        run: nimble install -y checksums
+
       # Asserts navi rejects invalid server certificates (expired, self-signed,
       # wrong-host, untrusted-root) with verification on, and accepts a valid one.
       # Run directly (not via nimble) so a failing check fails the job.
