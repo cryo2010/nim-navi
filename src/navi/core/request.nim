@@ -10,10 +10,10 @@ import ../backend/api
 export options, multipart
 
 type
-  AuthKind* = enum akNone, akBasic, akBearer
+  AuthKind* = enum akNone, akBasic, akBearer, akDigest
   Auth* = object
     case kind*: AuthKind
-    of akBasic:
+    of akBasic, akDigest:
       user*, pass*: string
     of akBearer:
       token*: string
@@ -23,12 +23,16 @@ proc basicAuth*(user, pass: string): Auth =
   Auth(kind: akBasic, user: user, pass: pass)
 proc bearerAuth*(token: string): Auth =
   Auth(kind: akBearer, token: token)
+proc digestAuth*(user, pass: string): Auth =
+  ## HTTP Digest auth. Unlike basic/bearer, the header can only be built after
+  ## the server's 401 challenge, so the engine adds it on a one-shot retry.
+  Auth(kind: akDigest, user: user, pass: pass)
 
 proc header(a: Auth): string =
   case a.kind
   of akBasic: "Basic " & encode(a.user & ":" & a.pass)
   of akBearer: "Bearer " & a.token
-  of akNone: ""
+  of akDigest, akNone: ""   # digest is added by the engine after the challenge
 
 type
   HttpVerb* = enum
@@ -137,7 +141,9 @@ proc buildRequest*(opts: NaviOptionsBase, verb: HttpVerb, target: string,
       result.headers.add("content-type", "application/x-www-form-urlencoded")
   else:
     result.body = body
-  if opts.auth.kind != akNone and not result.headers.contains("authorization"):
+  # Digest can't be precomputed (it needs the server's nonce), so its header is
+  # empty here and added by the engine after the 401 challenge.
+  if opts.auth.header.len > 0 and not result.headers.contains("authorization"):
     result.headers.add("authorization", opts.auth.header)
   if opts.wantsDecompress and not result.headers.contains("accept-encoding"):
     result.headers.add("accept-encoding", "gzip, deflate, br, zstd")
