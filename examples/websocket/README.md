@@ -106,7 +106,7 @@ actually trusts — [`mkcert`](https://github.com/FiloSottile/mkcert) makes one.
 
 ```sh
 nimble demoWssBrowser
-# then open  http://localhost:8000/wss_index.html
+# then open  http://localhost:8000/
 ```
 
 It runs `mkcert -install` (trusts a local CA in your browser — a one-time step

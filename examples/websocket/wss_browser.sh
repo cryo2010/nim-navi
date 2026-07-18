@@ -21,7 +21,12 @@ mkcert -install
 ( cd "$certdir" && [ -f localhost+1.pem ] || mkcert localhost 127.0.0.1 )
 
 echo "building the page (nim js) and the wss echo server ..."
-nim js --path:"$root/src" -d:release --hints:off -o:"$here/navi_ws.js" "$here/js.nim"
+# Stage a served directory so the wss page is index.html (served at `/`), rather
+# than the plain-ws index.html that also lives in examples/websocket.
+web="$certdir/web"
+mkdir -p "$web"
+nim js --path:"$root/src" -d:release --hints:off -o:"$web/navi_ws.js" "$here/js.nim"
+cp "$here/wss_index.html" "$web/index.html"
 nim c -d:ssl -d:release --hints:off -o:"$certdir/wss_echo_server" "$here/wss_echo_server.nim"
 
 srv=""
@@ -34,9 +39,9 @@ srv=$!
 sleep 1
 
 echo
-echo "  Open  http://localhost:8000/wss_index.html  in your browser."
+echo "  Open  http://localhost:8000/  in your browser."
 echo "  Type a message; it echoes back over wss with no cert warnings."
 echo "  (Ctrl-C to stop.)"
 echo
-cd "$here"
+cd "$web"
 python3 -m http.server 8000
