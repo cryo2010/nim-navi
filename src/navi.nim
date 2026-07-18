@@ -14,7 +14,9 @@ import navi/core/public
 import navi/core/[engine, pool, session, decompress, redirect, retry, proxy, h2glue]
 import navi/proto/h1
 import navi/proto/h2/conn
+import navi/proto/ws
 import navi/backend/sync
+from std/strutils import startsWith, find, splitLines, strip, cmpIgnoreCase, contains
 
 claimEntry("navi")
 export public
@@ -235,3 +237,126 @@ proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
           result[item.idx] = resp
     if backoff > 0: sleep(backoff)
     pending = nextRound
+
+# --- WebSocket (RFC 6455) ---
+
+type
+  WsMessageKind* = enum wmText, wmBinary, wmClose
+  WsMessage* = object
+    ## A received WebSocket message. `data` is the payload for text/binary and
+    ## the (optional) reason for a close; `closeCode` is set for `wmClose`.
+    kind*: WsMessageKind
+    data*: string
+    closeCode*: uint16
+
+  WebSocket* = ref object
+    conn: Conn
+    dec: WsDecoder
+    open: bool
+
+proc hostHeader(u: Url): string =
+  result = u.host
+  let p = u.port
+  if not ((u.isTls and p == 443) or (not u.isTls and p == 80)):
+    result.add(":" & $p)
+
+proc websocket*(client: Navi, url: string, headers = initHeaders()): WebSocket =
+  ## Open a WebSocket connection (RFC 6455). Accepts `ws://` / `wss://` (or
+  ## http/https) URLs; `wss` uses TLS. Performs the HTTP/1.1 Upgrade handshake and
+  ## validates `Sec-WebSocket-Accept`. Use `send`, `receive`, and `close`.
+  var httpUrl = url
+  if httpUrl.startsWith("ws://"): httpUrl = "http://" & httpUrl["ws://".len .. ^1]
+  elif httpUrl.startsWith("wss://"): httpUrl = "https://" & httpUrl["wss://".len .. ^1]
+  let u = parseUrl(httpUrl)
+
+  let conn = connect(u.host, u.port, u.isTls, client.options.tls,
+                     resolveProxy(client.options, u), @[], client.options.timeoutMs)
+  let key = genKey()
+  var req = "GET " & u.requestTarget & " HTTP/1.1\r\n" &
+            "Host: " & hostHeader(u) & "\r\n" &
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
+            "Sec-WebSocket-Key: " & key & "\r\n" &
+            "Sec-WebSocket-Version: " & wsVersion & "\r\n"
+  for (k, v) in headers.pairs: req.add(k & ": " & v & "\r\n")
+  req.add("\r\n")
+  conn.sendAll(req)
+
+  var buf = ""
+  while "\r\n\r\n" notin buf:
+    let chunk = conn.recvSome()
+    if chunk.len == 0:
+      conn.close()
+      raise newException(IOError, "navi: websocket handshake closed by peer")
+    buf.add chunk
+  let headEnd = buf.find("\r\n\r\n") + 4
+  let lines = buf[0 ..< headEnd].splitLines
+  if not lines[0].startsWith("HTTP/1.1 101"):
+    conn.close()
+    raise newException(IOError, "navi: websocket upgrade failed: " & lines[0])
+  var accept = ""
+  for line in lines[1 .. ^1]:
+    let c = line.find(':')
+    if c > 0 and cmpIgnoreCase(line[0 ..< c].strip, "sec-websocket-accept") == 0:
+      accept = line[c + 1 .. ^1].strip
+  if accept != acceptFor(key):
+    conn.close()
+    raise newException(IOError, "navi: websocket bad Sec-WebSocket-Accept")
+
+  result = WebSocket(conn: conn, open: true)
+  if buf.len > headEnd:                 # server frames already in the buffer
+    result.dec.feed(buf[headEnd .. ^1])
+
+proc send*(ws: WebSocket, data: string, binary = false) =
+  ## Send a text (default) or binary message. Client frames are masked.
+  ws.conn.sendAll(encodeFrame(if binary: opBinary else: opText, data))
+
+proc ping*(ws: WebSocket, data = "") =
+  ws.conn.sendAll(encodeFrame(opPing, data))
+
+proc receive*(ws: WebSocket): WsMessage =
+  ## Block until a full message arrives, transparently answering pings and
+  ## reassembling fragmented messages. A close frame returns `wmClose` (and the
+  ## connection is then closed).
+  var assembled = ""
+  var msgKind = wmText
+  while true:
+    var f: Frame
+    while not ws.dec.next(f):
+      let chunk = ws.conn.recvSome()
+      if chunk.len == 0:
+        ws.open = false
+        return WsMessage(kind: wmClose, closeCode: closeGoingAway)
+      ws.dec.feed(chunk)
+    case f.opcode
+    of opPing:
+      ws.conn.sendAll(encodeFrame(opPong, f.payload))
+    of opPong:
+      discard
+    of opClose:
+      var code = closeNormal
+      if f.payload.len >= 2:
+        code = uint16((ord(f.payload[0]) shl 8) or ord(f.payload[1]))
+      if ws.open:                                # echo the close, then close
+        try: ws.conn.sendAll(encodeFrame(opClose, f.payload))
+        except CatchableError: discard
+        ws.open = false
+        ws.conn.close()
+      return WsMessage(kind: wmClose, closeCode: code,
+                       data: if f.payload.len > 2: f.payload[2 .. ^1] else: "")
+    of opText, opBinary:
+      msgKind = if f.opcode == opText: wmText else: wmBinary
+      assembled = f.payload
+      if f.fin: return WsMessage(kind: msgKind, data: assembled)
+    of opContinuation:
+      assembled.add f.payload
+      if f.fin: return WsMessage(kind: msgKind, data: assembled)
+
+proc close*(ws: WebSocket, code = closeNormal, reason = "") =
+  ## Send a close frame and close the transport (freeing its TLS context).
+  ## Idempotent: a no-op once the socket is already closed (e.g. by `receive`
+  ## after the peer initiated the close).
+  if not ws.open: return
+  try: ws.conn.sendAll(encodeFrame(opClose, closePayload(code, reason)))
+  except CatchableError: discard
+  ws.open = false
+  ws.conn.close()
