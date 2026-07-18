@@ -26,3 +26,4 @@ tests/leak_sanitize
 nimblecache/
 tests/interop/badssl
 tests/test_ws_async
+tests/test_ws_chronos
