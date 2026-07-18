@@ -8,6 +8,25 @@ import navi/chronos
 import navi/proto/ws        # server-side codec helpers
 
 var wsReady: bool
+var stallReady: bool
+
+proc wsStall(port: int) {.thread.} =
+  ## Accept the connection and read the upgrade request, but never send the 101
+  ## response, so the client's open blocks until its timeout fires.
+  var server = newSocket(buffered = false)
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(port), "127.0.0.1")
+  server.listen()
+  stallReady = true
+  var c: Socket
+  server.accept(c)
+  var head = ""
+  try:
+    while "\r\n\r\n" notin head: head.add c.recv(1)
+  except CatchableError: discard
+  os.sleep(2000)   # hold past the client's timeout, then tear down
+  c.close()
+  server.close()
 
 proc wsEcho(port: int) {.thread.} =
   # Unbuffered so recv returns available bytes instead of blocking for a full
@@ -89,3 +108,23 @@ suite "chronos websocket client end to end":
     check m[1].kind == wmBinary and m[1].data == "\x00\x01\x02 bytes"
     check m[2].kind == wmText and m[2].data == "frag-ment"
     check m[3].kind == wmClose and m[3].closeCode == closeNormal
+
+  test "open times out when the server never completes the handshake":
+    const port = 8997
+    var th: Thread[int]
+    createThread(th, wsStall, port)
+    while not stallReady: os.sleep(5)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi(NaviOptions(timeout: some(600)))
+      try:
+        discard await api.websocket("ws://127.0.0.1:" & $port & "/")
+        return "opened"
+      except CatchableError as e:
+        # navi raises its own TimeoutError; match by name to avoid the
+        # std/net vs navi ambiguity on the bare type.
+        return (if $e.name == "TimeoutError": "timeout" else: "other:" & $e.name)
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == "timeout"
