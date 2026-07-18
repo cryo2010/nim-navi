@@ -40,3 +40,4 @@ examples/websocket/wss_echo_server
 examples/websocket/wss_sync
 examples/websocket/wss_asyncdispatch
 examples/websocket/wss_chronos
+examples/websocket/.certs/

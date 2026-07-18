@@ -66,6 +66,11 @@ task wsjs, "navi/js WebSocket runtime test (Node client vs a native server)":
   # Runs the navi/js WebSocket client under Node against a native echo server.
   exec "bash tests/interop/jsws.sh"
 
+task demoWssBrowser, "Browser wss demo: mkcert cert + wss server + page (needs mkcert, python3)":
+  # Generates a browser-trusted cert (mkcert), serves the navi/js page over a
+  # wss echo server, and prints the URL to open.
+  exec "bash examples/websocket/wss_browser.sh"
+
 task demoWs, "Run the WebSocket demos for every backend + browser page (Docker)":
   # Builds and runs one container: the native clients print their round trip,
   # then a page for the navi/js client is served at http://localhost:8000/.

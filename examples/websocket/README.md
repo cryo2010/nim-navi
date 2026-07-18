@@ -100,16 +100,26 @@ The js client speaks wss unchanged — the page just points at a `wss://` URL. B
 the browser owns TLS trust and **rejects a self-signed cert from a script**
 (there's no `verify: false`, and clicking through the address-bar warning does
 *not* carry over to a script WebSocket). So browser wss needs a cert the browser
-actually trusts — use [`mkcert`](https://github.com/FiloSottile/mkcert):
+actually trusts — [`mkcert`](https://github.com/FiloSottile/mkcert) makes one.
+
+**One command** (needs `mkcert` and `python3`):
+
+```sh
+nimble demoWssBrowser
+# then open  http://localhost:8000/wss_index.html
+```
+
+It runs `mkcert -install` (trusts a local CA in your browser — a one-time step
+that may prompt for your password), generates a cert, builds the page and the
+wss echo server, and serves everything. `mkcert -install` has to run on the host
+because your browser reads the host's trust store — it can't be done inside a
+container.
+
+The equivalent by hand:
 
 ```sh
 mkcert -install                     # trust a local CA in your browser (one time)
 mkcert localhost 127.0.0.1          # -> localhost+1.pem  localhost+1-key.pem
-```
-
-Then run the wss server with that cert, compile the page, and serve it:
-
-```sh
 NAVI_WSS_CERT=localhost+1.pem NAVI_WSS_KEY=localhost+1-key.pem \
   nim c -r -d:ssl examples/websocket/wss_echo_server.nim
 nim js -o:examples/websocket/navi_ws.js examples/websocket/js.nim
