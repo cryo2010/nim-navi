@@ -126,6 +126,39 @@ were imported. Choose one of navi (sync), navi/asyncdispatch, navi/chronos,
 or navi/js.
 ```
 
+### Capability matrix
+
+Every backend shares the same request surface: HTTP/1.1, WebSocket (`ws`/`wss`),
+TLS certificate verification, retries, redirects, hooks, throw-on-non-2xx,
+streaming download, and response decompression all work everywhere. Where the
+backends differ:
+
+| Capability | `navi` (sync) | `navi/asyncdispatch` | `navi/chronos` | `navi/js` |
+| --- | :---: | :---: | :---: | :---: |
+| HTTP/2 | ✓ | ✓ | ✗ | runtime |
+| Concurrent multiplexing | `parallel()` | transparent | ✗ | runtime |
+| TLS engine | OpenSSL | OpenSSL | BearSSL | runtime |
+| Custom CA (`caFile`) | ✓ | ✓ | ✓ | runtime |
+| Client cert / mTLS | ✓ | ✓ | ✗ | ✗ |
+| Max TLS version | system | system | 1.2 | runtime |
+| Keep-alive / connection pool | ✓ | ✓ | ✓ | ✗ |
+| Streaming upload | ✓ | ✓ | ✓ | ✗ |
+| Cookie jar | ✓ | ✓ | ✓ | ✗ |
+| Proxy configuration | ✓ | ✓ | ✓ | ✗ |
+
+Legend: ✓ supported · ✗ not supported · **runtime** = provided by the
+browser/Node platform rather than navi.
+
+Two backends carry caveats:
+
+- **chronos is HTTP/1.1 only.** Its bundled BearSSL exposes no client ALPN (so
+  no h2 negotiation) and no client-certificate hook (so no mTLS), and negotiates
+  up to TLS 1.2. Custom-CA verification via `caFile` does work.
+- **`navi/js` runs on `fetch`/`WebSocket`,** so the platform owns connections,
+  cookies, redirects, decompression, and TLS; navi keeps request building,
+  retries, throw-on-non-2xx, and hooks. Its WebSocket wraps the native one, so
+  custom handshake headers are ignored and the runtime handles ping/pong.
+
 ### The browser backend (`navi/js`)
 
 `import navi/js` compiles with `nim js` and runs over the runtime's `fetch`, so the platform handles TLS, HTTP-version negotiation, redirects, cookies, and decompression. navi keeps the request building, retries, throw-on-non-2xx, and (async) hooks. It has no connection pool or cookie jar (the browser owns both), streaming uploads are unavailable, and `res.httpVersion` is empty because `fetch` does not expose it. Hooks are async, as on the other async backends.
@@ -451,10 +484,9 @@ cookies, auth, proxy, decompression, body helpers, throw-on-non-2xx) are done.
 
 - **HTTP/3**: reserved for when a usable QUIC stack lands on the chronos backend.
 
-Known follow-ups: HTTP/2 on the chronos backend and `caFile`/client certificates
-there (its bundled BearSSL TLS exposes no client ALPN, custom-CA hook, or client
-cert). Streamed HTTP/1.1 response bodies are now decompressed incrementally as
-they arrive.
+Known follow-ups on the chronos backend: HTTP/2 and client certificates (mTLS).
+Its bundled BearSSL exposes no client ALPN (so no h2 negotiation) and no
+client-certificate hook. Custom-CA verification via `caFile` works there today.
 
 ## Testing
 
