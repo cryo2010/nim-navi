@@ -1,13 +1,14 @@
 ## A tiny WebSocket echo server for the backend examples, built from navi's
 ## sans-io core (`navi/proto/ws`). Every message it receives, it sends straight
-## back. Serves one connection at a time in a loop, so you can run each example
-## client against it in turn (and point a browser at it for the navi/js one).
+## back. Each connection is handled on its own thread, so overlapping clients
+## work -- in particular the interactive browser page holds its socket open, and
+## a refresh briefly runs two connections at once.
 ##
 ##   nim c -r examples/websocket/echo_server.nim
 ##
 ## Listens on ws://127.0.0.1:9700/. Ctrl-C to stop.
 
-import std/[net, strutils, os]
+import std/[net, strutils, os, sequtils]
 import navi/proto/ws
 
 const port = 9700
@@ -44,15 +45,22 @@ proc serveConn(c: Socket) =
       return
     else: discard
 
+proc handle(c: Socket) {.thread.} =
+  try: serveConn(c)
+  except CatchableError as e: echo "connection error: ", e.msg
+  c.close()
+
 var server = newSocket(buffered = false)   # unbuffered: recv returns available bytes
 server.setSockOpt(OptReuseAddr, true)
 server.bindAddr(Port(port), bindHost)
 server.listen()
 echo "WebSocket echo server on ws://", bindHost, ":", port, "/  (Ctrl-C to stop)"
 
+var threads: seq[ref Thread[Socket]]
 while true:
   var c: Socket
   server.accept(c)
-  try: serveConn(c)
-  except CatchableError as e: echo "connection error: ", e.msg
-  c.close()
+  threads.keepItIf(it[].running)   # drop handlers whose connection has closed
+  let t = new(Thread[Socket])
+  threads.add t
+  createThread(t[], handle, c)
