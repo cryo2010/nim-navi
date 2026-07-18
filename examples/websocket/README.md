@@ -70,6 +70,37 @@ ok - the server echoed the message back
 The compiled `navi_ws.js` is a build artifact (git-ignored); regenerate it with
 the `nim js` command above.
 
+## 4. Over TLS (wss)
+
+The same round trip, encrypted. The `wss_*` files mirror the plain ones but use
+a `wss://` URL and a `TlsConfig`; the server wraps each connection in TLS and
+generates a self-signed cert for localhost on first run. Compile with `-d:ssl`:
+
+```sh
+nim c -r -d:ssl examples/websocket/wss_echo_server.nim   # one terminal (needs openssl)
+nim c -r -d:ssl examples/websocket/wss_sync.nim           # another
+nim c -r -d:ssl examples/websocket/wss_asyncdispatch.nim
+nim c -r -d:ssl examples/websocket/wss_chronos.nim
+```
+
+The only difference from the plain clients is the URL and:
+
+```nim
+let api = newNavi(NaviOptions(tls: TlsConfig(verify: some(false))))
+```
+
+`verify` is off because the demo cert is self-signed — a real deployment would
+verify against a trusted CA (`TlsConfig(caFile: "ca.pem")`). Note that chronos
+(BearSSL) can *only* use `verify: false` for a self-signed cert, since it can't
+add a custom CA.
+
+**Browser (navi/js) over wss:** the js client speaks wss unchanged — just give
+`websocket` a `wss://` URL. But the browser owns TLS trust and rejects
+self-signed certs from script (there's no `verify: false`), so browser wss needs
+a cert the browser already trusts: a real certificate, or a locally-trusted one
+from [`mkcert`](https://github.com/FiloSottile/mkcert). With such a cert the page
+behaves exactly like the `ws` version.
+
 ## Notes
 
 - The API is the same across backends: `api.websocket(url)` then
