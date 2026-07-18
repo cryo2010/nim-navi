@@ -65,6 +65,13 @@ suite "websocket frame codec":
     check d.next(f) and f.opcode == opPing
     check d.next(f) and f.opcode == opText and f.payload == "hi"
 
+  test "rejects a reserved opcode (RFC 6455 5.2)":
+    var d: WsDecoder
+    d.feed("\x83\x00")            # FIN + opcode 0x3 (reserved), unmasked, len 0
+    var f: Frame
+    expect ValueError:
+      discard d.next(f)
+
 suite "websocket close":
   test "closePayload carries the big-endian code then the reason":
     let p = closePayload(closeNormal, "bye")
