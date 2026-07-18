@@ -29,8 +29,25 @@ proc exercise(): int =
     inc result
   api.close()            # drain pooled connections for a leak-clean shutdown
 
+proc exerciseFailedHandshake(): int =
+  ## Verification on but no CA, so the server's self-signed cert is rejected and
+  ## connect() raises during the TLS handshake. The SSL_CTX it allocated must be
+  ## freed on that path too -- a regression guard for the connect-cleanup defer.
+  let api = newNavi(NaviOptions(
+    tls: TlsConfig(verify: some(true)),   # no caFile -> the cert is untrusted
+    maxRetries: some(0)))                 # one connect attempt per request
+  for _ in 0 ..< iters:
+    var raised = false
+    try: discard api.get(url)
+    except CatchableError: raised = true
+    doAssert raised, "expected the untrusted-cert handshake to fail"
+    inc result
+  api.close()
+
 let completed = exercise()
 doAssert completed == iters,
   "only " & $completed & " of " & $iters & " requests completed"
+let refused = exerciseFailedHandshake()
+doAssert refused == iters, "only " & $refused & " of " & $iters & " handshakes failed"
 GC_fullCollect()
-echo "completed ", completed, " https requests"
+echo "completed ", completed, " https requests + ", refused, " rejected handshakes"

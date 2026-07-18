@@ -33,6 +33,16 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   ## tunnel when proxied. Unbuffered so recv returns the available chunk instead
   ## of blocking to fill the buffer. TLS requires `-d:ssl`.
   inc openedConnections
+  # Release the socket and TLS context if we don't finish connecting -- both
+  # close ops are synchronous, so this works in an async proc. The SSL_CTX has no
+  # destructor, so a failed handshake would otherwise leak it permanently.
+  var established = false
+  defer:
+    if not established:
+      if not result.socket.isNil: result.socket.close()
+      when defined(ssl):
+        if not result.ctx.isNil: result.ctx.destroyContext()
+
   when defined(ssl):
     if tls and not proxy.isSet:
       # Direct TLS: connect a wrapped socket so the handshake completes here and
@@ -41,19 +51,21 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
         verifyMode = if cfg.wantsVerify: CVerifyPeer else: CVerifyNone,
         certFile = cfg.certFile, keyFile = cfg.clientKeyFile,
         caFile = cfg.caFile)
+      result.ctx = ctx           # store before the handshake so cleanup frees it
       setAlpn(ctx.context, alpn)
       let socket = newAsyncSocket(pickDomain(host, port), SOCK_STREAM,
                                   IPPROTO_TCP, buffered = false)
+      result.socket = socket
       wrapSocket(ctx, socket)
       await socket.connect(host, Port(port))
       result.protocol = negotiatedProtocol(socket.sslHandle)
-      result.socket = socket
-      result.ctx = ctx     # retain so close() can free the SSL_CTX
+      established = true
       return
 
   let socket =
     if proxy.isSet: await asyncnet.dial(proxy.host, Port(proxy.port), buffered = false)
     else: await asyncnet.dial(host, Port(port), buffered = false)
+  result.socket = socket
   if proxy.isSet and tls:
     await proxyConnect(socket, host, port)
     when defined(ssl):
@@ -63,9 +75,9 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
         verifyMode = if cfg.wantsVerify: CVerifyPeer else: CVerifyNone,
         certFile = cfg.certFile, keyFile = cfg.clientKeyFile,
         caFile = cfg.caFile)
+      result.ctx = ctx           # store before the handshake so cleanup frees it
       ctx.wrapConnectedSocket(socket, handshakeAsClient, host)
-      result.ctx = ctx     # retain so close() can free the SSL_CTX
-  result.socket = socket
+  established = true
 
 proc sendAll*(c: Conn, data: string): Future[void] =
   c.socket.send(data)

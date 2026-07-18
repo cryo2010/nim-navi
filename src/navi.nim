@@ -262,23 +262,29 @@ proc websocket*(client: Navi, url: string, headers = initHeaders()): WebSocket =
   let u = toWsUrl(url)
   let conn = connect(u.host, u.port, u.isTls, client.options.tls,
                      resolveProxy(client.options, u), @[], client.options.timeoutMs)
+  # Close the connection unless the handshake completes -- a send/recv error mid
+  # handshake would otherwise leak the socket (and its SSL_CTX for wss).
+  var handshakeOk = false
+  defer:
+    if not handshakeOk:
+      try: conn.close()
+      except CatchableError: discard
   let key = genKey()
   conn.sendAll(upgradeRequest(u, key, headers))
   var buf = ""
   while "\r\n\r\n" notin buf:
     let chunk = conn.recvSome()
     if chunk.len == 0:
-      conn.close()
       raise newException(IOError, "navi: websocket handshake closed by peer")
     buf.add chunk
   let headEnd = buf.find("\r\n\r\n") + 4
   if not validate101(buf[0 ..< headEnd], key):
-    conn.close()
     raise newException(IOError, "navi: websocket upgrade rejected: " &
       buf[0 ..< headEnd].splitLines[0])
   result = WebSocket(conn: conn, open: true)
   if buf.len > headEnd:                 # server frames already buffered
     result.dec.feed(buf[headEnd .. ^1])
+  handshakeOk = true
 
 proc send*(ws: WebSocket, data: string, binary = false) =
   ## Send a text (default) or binary message. Client frames are masked.
