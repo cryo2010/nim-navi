@@ -7,10 +7,13 @@
 ##
 ## Listens on ws://127.0.0.1:9700/. Ctrl-C to stop.
 
-import std/[net, strutils]
+import std/[net, strutils, os]
 import navi/proto/ws
 
 const port = 9700
+# Loopback by default; set NAVI_WS_HOST=0.0.0.0 to accept connections forwarded
+# from outside (e.g. Docker port publishing, so a browser on the host can reach it).
+let bindHost = getEnv("NAVI_WS_HOST", "127.0.0.1")
 
 proc serveConn(c: Socket) =
   ## Complete the handshake, then echo frames until the peer closes.
@@ -43,9 +46,9 @@ proc serveConn(c: Socket) =
 
 var server = newSocket(buffered = false)   # unbuffered: recv returns available bytes
 server.setSockOpt(OptReuseAddr, true)
-server.bindAddr(Port(port), "127.0.0.1")
+server.bindAddr(Port(port), bindHost)
 server.listen()
-echo "WebSocket echo server on ws://127.0.0.1:", port, "/  (Ctrl-C to stop)"
+echo "WebSocket echo server on ws://", bindHost, ":", port, "/  (Ctrl-C to stop)"
 
 while true:
   var c: Socket
