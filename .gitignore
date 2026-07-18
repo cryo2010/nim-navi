@@ -25,3 +25,4 @@ tests/leak_sanitize
 # nimble
 nimblecache/
 tests/interop/badssl
+tests/test_ws_async
