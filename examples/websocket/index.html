@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>navi/js WebSocket echo</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 40rem; }
+    h1 { font-size: 1.3rem; }
+    #out { background: #111; color: #0f0; padding: 1rem; border-radius: 6px;
+           white-space: pre-wrap; min-height: 6rem; }
+    code { background: #eee; padding: 0 .3rem; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <h1>navi/js WebSocket echo</h1>
+  <p>
+    This page runs navi compiled to JavaScript (<code>import navi/js</code>). It
+    opens a WebSocket to the local echo server, sends a message, and prints the
+    reply. Start the server first:
+    <code>nim c -r examples/websocket/echo_server.nim</code>.
+  </p>
+  <pre id="out"></pre>
+  <!-- Compiled from js.nim:  nim js -o:navi_ws.js js.nim -->
+  <script src="navi_ws.js"></script>
+</body>
+</html>
