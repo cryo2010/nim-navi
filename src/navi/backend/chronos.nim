@@ -3,12 +3,12 @@
 ## Both plaintext and TLS connections read/write through AsyncStream
 ## reader/writer pairs, so the send/recv paths are identical. TLS uses
 ## chronos's BearSSL streams, which verify against the bundled Mozilla trust
-## anchors by default (no system CA sourcing needed).
+## anchors by default, or a custom CA when TlsConfig.caFile is set.
 
-import std/strutils
+import std/[strutils, os]
 import pkg/chronos, pkg/chronos/transports/stream
 import pkg/chronos/streams/[asyncstream, tlsstream]
-import ./api
+import ./api, ./chronos_castore
 
 export api, chronos
 
@@ -18,6 +18,7 @@ type
     reader: AsyncStreamReader
     writer: AsyncStreamWriter
     tls: TLSAsyncStream  ## kept alive for the connection's lifetime; nil if plaintext
+    caStore: CaTrustStore  ## keeps custom-CA anchors alive; BearSSL holds raw pointers into it
     protocol*: string    ## ALPN protocol; always "" here (this backend is http/1.1)
 
 proc proxyConnect(transport: StreamTransport, host: string, port: int) {.async.} =
@@ -47,16 +48,26 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     if proxy.isSet and tls:
       await proxyConnect(transport, host, port)
     if tls:
-      # caFile and client certificates (cfg.certFile/keyFile, for mTLS) are not
-      # honored here; chronos/BearSSL uses its bundled Mozilla anchors and this
-      # client stream presents no certificate. Both are follow-ups for this
-      # backend. mTLS is available on the sync and asyncdispatch (OpenSSL) backends.
+      # Client certificates (cfg.certFile/keyFile, for mTLS) are not honored
+      # here; this client stream presents no certificate. mTLS is available on
+      # the sync and asyncdispatch (OpenSSL) backends.
       let flags =
         if cfg.wantsVerify: {} else: {TLSFlags.NoVerifyHost, TLSFlags.NoVerifyServerName}
+      # A custom CA (cfg.caFile) replaces BearSSL's bundled Mozilla anchors, but
+      # only matters when verifying: NoVerifyHost skips anchor checks entirely.
+      if cfg.wantsVerify and cfg.caFile.len > 0:
+        if not fileExists(cfg.caFile):
+          raise newException(IOError, "navi: CA file not found: " & cfg.caFile)
+        result.caStore = loadCaTrustStore(readFile(cfg.caFile))
+      let rdr = newAsyncStreamReader(transport)
+      let wtr = newAsyncStreamWriter(transport)
       # This chronos/BearSSL build negotiates up to TLS 1.2 only.
-      let stream = newTLSClientAsyncStream(
-        newAsyncStreamReader(transport), newAsyncStreamWriter(transport), host,
-        flags = flags)
+      let stream =
+        if result.caStore != nil:
+          newTLSClientAsyncStream(rdr, wtr, host, flags = flags,
+                                  trustAnchors = result.caStore.store)
+        else:
+          newTLSClientAsyncStream(rdr, wtr, host, flags = flags)
       result.tls = stream
       result.reader = stream.reader
       result.writer = stream.writer

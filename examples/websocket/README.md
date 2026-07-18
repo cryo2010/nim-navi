@@ -99,9 +99,9 @@ let api = newNavi(NaviOptions(tls: TlsConfig(verify: some(false))))
 ```
 
 `verify` is off because the demo cert is self-signed — a real deployment would
-verify against a trusted CA (`TlsConfig(caFile: "ca.pem")`). Note that chronos
-(BearSSL) can *only* use `verify: false` for a self-signed cert, since it can't
-add a custom CA.
+verify against a trusted CA (`TlsConfig(caFile: "ca.pem")`), which every backend
+supports, chronos included. Client certificates (mTLS) remain sync/asyncdispatch
+only.
 
 ### Browser (navi/js) over wss
 

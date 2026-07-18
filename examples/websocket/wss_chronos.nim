@@ -3,8 +3,9 @@
 ##   nim c -r -d:ssl examples/websocket/wss_echo_server.nim   # in one terminal
 ##   nim c -r -d:ssl examples/websocket/wss_chronos.nim        # in another
 ##
-## chronos uses BearSSL, which can't add a custom CA, so a self-signed cert
-## always needs verify off (TlsConfig(caFile: ...) is not honored here).
+## chronos (BearSSL) can verify against a custom CA via TlsConfig(caFile: ...),
+## but the demo server's cert is self-signed with no separate CA, so this uses
+## verify off. Client certificates (mTLS) are still not supported on this backend.
 
 import pkg/chronos
 import navi/chronos

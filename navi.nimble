@@ -95,6 +95,11 @@ task mtls, "Run the mutual-TLS (client certificate) interop test (needs openssl)
   # mTLS test against it.
   exec "bash tests/interop/mtls.sh"
 
+task chronosCafile, "chronos custom-CA (caFile) interop test (needs openssl + chronos)":
+  # Starts an OpenSSL HTTPS server with a cert signed by a throwaway CA and
+  # checks that navi/chronos verifies it against TlsConfig.caFile.
+  exec "bash tests/interop/chronos_cafile.sh"
+
 task demoHello, "Run the hello demo (navi/js client + FastAPI server via Docker)":
   # Builds and runs both containers, stops when the client finishes, and cleans
   # up afterwards. Requires Docker.

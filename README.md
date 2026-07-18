@@ -210,7 +210,7 @@ let api = newNavi(NaviOptions(
 ))
 ```
 
-`verify` defaults to on. `caFile` is honored by the sync and asyncdispatch backends; the chronos backend verifies against its bundled Mozilla trust anchors and negotiates up to TLS 1.2.
+`verify` defaults to on. `caFile` is honored by all three backends: sync and asyncdispatch through OpenSSL, and chronos through BearSSL (which otherwise verifies against its bundled Mozilla trust anchors). The chronos backend negotiates up to TLS 1.2 and does not support client certificates (mTLS).
 
 ### Errors
 
