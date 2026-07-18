@@ -1,0 +1,9 @@
+services:
+  demo:
+    build:
+      # repo root, so the Dockerfile can COPY src/ and examples/websocket
+      context: ../..
+      dockerfile: demos/websocket/Dockerfile
+    ports:
+      - "9700:9700"   # WebSocket echo server (the browser page connects here)
+      - "8000:8000"   # static server for the navi/js page

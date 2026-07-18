@@ -66,6 +66,15 @@ task wsjs, "navi/js WebSocket runtime test (Node client vs a native server)":
   # Runs the navi/js WebSocket client under Node against a native echo server.
   exec "bash tests/interop/jsws.sh"
 
+task demoWs, "Run the WebSocket demos for every backend + browser page (Docker)":
+  # Builds and runs one container: the native clients print their round trip,
+  # then a page for the navi/js client is served at http://localhost:8000/.
+  let compose = "docker compose -f demos/websocket/docker-compose.yml"
+  try:
+    exec compose & " up --build"
+  finally:
+    exec compose & " down"
+
 task mtls, "Run the mutual-TLS (client certificate) interop test (needs openssl)":
   # Starts an OpenSSL server that requires a client certificate and runs navi's
   # mTLS test against it.

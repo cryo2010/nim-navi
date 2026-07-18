@@ -4,6 +4,17 @@ The same round trip — connect, send a message, receive it echoed back — on e
 of navi's four backends. They all talk to one small echo server built from
 navi's sans-io WebSocket core.
 
+## Run everything with one command (Docker)
+
+```sh
+nimble demoWs
+```
+
+Builds and runs one container: the sync/asyncdispatch/chronos clients print
+their round trip in the logs, and the navi/js page is served at
+<http://localhost:8000/> for your browser. See `demos/websocket/`. To run the
+pieces by hand instead (no Docker), read on.
+
 ## 1. Start the echo server
 
 ```sh
