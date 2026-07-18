@@ -71,6 +71,10 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
       result.tls = stream
       result.reader = stream.reader
       result.writer = stream.writer
+      # Drive the handshake now so a verification failure raises here, at connect
+      # time, rather than deadlocking a later read (BearSSL's fatal alert can't be
+      # flushed while we are only awaiting a response) or surfacing mid-request.
+      await stream.handshake()
     else:
       result.reader = newAsyncStreamReader(transport)
       result.writer = newAsyncStreamWriter(transport)
@@ -88,6 +92,8 @@ proc recvSome*(c: Conn): Future[string] {.async.} =
   var n = 0
   try:
     n = await c.reader.readOnce(addr buf[0], buf.len)
+  except TLSStreamError:
+    raise  # a real TLS/handshake failure is not an EOF -- surface it, don't spin
   except AsyncStreamError:
     n = 0  # remote closed mid-stream; treat as EOF for the parser
   buf.setLen(n)

@@ -45,7 +45,6 @@ done
 [ -n "$ready" ] || { echo "s_server did not become ready on :$port"; cat "$work/s_server.log"; exit 1; }
 
 export NAVI_CAFILE_URL="https://127.0.0.1:$port"
-export NAVI_CAFILE_WSS="wss://127.0.0.1:$port/"
 export NAVI_CAFILE_CA="$work/ca.pem"
 
 nim c -r --hints:off -d:ssl -o:"$work/chronos_cafile" "$root/tests/interop/chronos_cafile.nim"

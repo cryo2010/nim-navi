@@ -73,9 +73,9 @@ proc doRequest(client: Navi, req: Request): Future[Response] {.async.} =
 proc doStream(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
   result = performStream(client, req, sink)
 
-proc withDeadline(client: Navi, fut: Future[Response]): Future[Response] {.async.} =
-  ## Bound the whole request (all attempts) by `timeout`. On expiry, raise
-  ## TimeoutError; chronos cancels the abandoned future.
+proc withDeadline[T](client: Navi, fut: Future[T]): Future[T] {.async.} =
+  ## Bound the whole operation by `timeout`. On expiry, raise TimeoutError;
+  ## chronos cancels the abandoned future (whose own cleanup closes the socket).
   let ms = client.options.timeoutMs
   if ms <= 0:
     return await fut
@@ -116,18 +116,16 @@ proc toWsUrl(url: string): Url =
   elif s.startsWith("wss://"): s = "https://" & s["wss://".len .. ^1]
   parseUrl(s)
 
-proc websocket*(client: Navi, url: string,
-                headers = initHeaders()): Future[WebSocket] {.async.} =
-  ## Open a WebSocket connection (RFC 6455). Accepts `ws://` / `wss://` (or
-  ## http/https); `wss` uses TLS. Does the HTTP/1.1 Upgrade over the transport and
-  ## validates `Sec-WebSocket-Accept`. Use `send`, `receive`, and `close`.
+proc doWebsocket(client: Navi, url: string,
+                 headers = initHeaders()): Future[WebSocket] {.async.} =
   let u = toWsUrl(url)
   let conn = await connect(u.host, u.port, u.isTls, client.options.tls,
                            resolveProxy(client.options, u), @[],
                            client.options.timeoutMs)
   let key = genKey()
   # Close the connection on any handshake failure (its close is async, so this
-  # uses try/except rather than defer).
+  # uses try/except rather than defer). A timeout cancels this future, raising
+  # CancelledError here (a CatchableError), so the connection is closed too.
   try:
     await conn.sendAll(upgradeRequest(u, key, headers))
     var buf = ""
@@ -146,6 +144,14 @@ proc websocket*(client: Navi, url: string,
   except CatchableError:
     await conn.close()
     raise
+
+proc websocket*(client: Navi, url: string,
+                headers = initHeaders()): Future[WebSocket] {.async.} =
+  ## Open a WebSocket connection (RFC 6455). Accepts `ws://` / `wss://` (or
+  ## http/https); `wss` uses TLS. Does the HTTP/1.1 Upgrade over the transport and
+  ## validates `Sec-WebSocket-Accept`. The whole open (connect, TLS handshake, and
+  ## Upgrade) is bounded by `timeout`. Use `send`, `receive`, and `close`.
+  result = await client.withDeadline(doWebsocket(client, url, headers))
 
 proc send*(ws: WebSocket, data: string, binary = false): Future[void] {.async.} =
   ## Send a text (default) or binary message. Client frames are masked.
