@@ -18,6 +18,7 @@ tests/test_h2_huffman
 tests/test_cookies
 tests/test_digest
 tests/test_stream_decompress
+tests/test_ws
 tests/leak
 tests/leak_sanitize
 

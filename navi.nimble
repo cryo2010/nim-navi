@@ -29,7 +29,8 @@ task test, "Run the test suite":
              "\" --passL:\"-fsanitize=address,undefined\""
   let suites = ["test_h1", "test_h2_frame", "test_h2_hpack", "test_h2_hpack_corpus",
                 "test_h2_huffman", "test_h2_conn", "test_cookies", "test_digest",
-                "test_entries", "test_stream_decompress", "test_async", "test_chronos"]
+                "test_entries", "test_stream_decompress", "test_ws",
+                "test_async", "test_chronos"]
   for s in suites:
     exec "nim c -r " & opts & " tests/" & s & ".nim"
 
