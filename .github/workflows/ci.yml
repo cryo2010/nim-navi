@@ -88,6 +88,16 @@ jobs:
       - name: Compile the JavaScript backend
         run: nim js --path:src --hints:off -o:navi_js.js src/navi/js.nim
 
+      # Node 22+ has a global WebSocket; run the navi/js WebSocket client under it
+      # against a native echo server (the only runtime test of the js backend).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install checksums
+        run: nimble install -y checksums   # the native echo server pulls in proto/ws
+      - name: navi/js WebSocket runtime test
+        run: nimble wsjs
+
   sanitize:
     runs-on: ubuntu-latest
     name: sanitizers (asan + ubsan)

@@ -74,15 +74,16 @@ navi is under active development. What works today:
 - **Hooks**: `beforeRequest` / `afterResponse` / `beforeRetry`
 - **Cookie jar**, **basic/bearer/digest auth** (Digest: MD5 and SHA-256, RFC 7616), **proxy** (http absolute-URI and https CONNECT)
 - **Body helpers**: `json=`, `form=`, and `multipart=`
-- **WebSocket** (RFC 6455) on the sync, asyncdispatch, and chronos backends: `websocket()` with `send`/`receive`/`close`, text and binary messages, fragmentation reassembly, and automatic ping/pong
+- **WebSocket** (RFC 6455) on all four backends (sync, asyncdispatch, chronos, and js): `websocket()` with `send`/`receive`/`close`, text and binary messages, fragmentation reassembly, and automatic ping/pong
 - **Response helpers**: `.status`, `.headers`, `.body`, `.data`, `.ok`
 - **Reusable clients** with default options and `.extend()`
 
 HTTP/2 currently runs on the sync and asyncdispatch backends; chronos stays
 http/1.1 (its bundled TLS exposes no client ALPN). The `navi/js` backend defers
-the protocol to the browser/runtime. WebSocket runs on the sync, asyncdispatch,
-and chronos backends (a `navi/js` wrapper is a follow-up). Not built yet:
-**HTTP/3**. See [Roadmap](#roadmap).
+the protocol to the browser/runtime. WebSocket runs on all four backends; the
+`navi/js` one wraps the runtime's native `WebSocket` (so it ignores custom
+handshake headers and the runtime handles ping/pong). Not built yet: **HTTP/3**.
+See [Roadmap](#roadmap).
 
 WebSocket in brief (sync; on `navi/asyncdispatch` the same calls are `await`ed):
 
