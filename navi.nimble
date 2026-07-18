@@ -71,6 +71,16 @@ task demoWssBrowser, "Browser wss demo: mkcert cert + wss server + page (needs m
   # wss echo server, and prints the URL to open.
   exec "bash examples/websocket/wss_browser.sh"
 
+task demoWssSync, "wss echo round trip on the sync backend (navi)":
+  # Builds and starts the wss echo server, runs the sync client, cleans up.
+  exec "bash examples/websocket/wss_demo.sh sync"
+
+task demoWssAsync, "wss echo round trip on the asyncdispatch backend (navi/asyncdispatch)":
+  exec "bash examples/websocket/wss_demo.sh asyncdispatch"
+
+task demoWssChronos, "wss echo round trip on the chronos backend (needs the chronos package)":
+  exec "bash examples/websocket/wss_demo.sh chronos"
+
 task demoWs, "Run the WebSocket demos for every backend + browser page (Docker)":
   # Builds and runs one container: the native clients print their round trip,
   # then a page for the navi/js client is served at http://localhost:8000/.

@@ -83,6 +83,15 @@ nim c -r -d:ssl examples/websocket/wss_asyncdispatch.nim
 nim c -r -d:ssl examples/websocket/wss_chronos.nim
 ```
 
+Or run one backend's round trip with a single command (starts the server, runs
+the client, cleans up):
+
+```sh
+nimble demoWssSync       # navi
+nimble demoWssAsync      # navi/asyncdispatch
+nimble demoWssChronos    # navi/chronos (needs the chronos package)
+```
+
 The only difference from the plain clients is the URL and:
 
 ```nim
