@@ -112,7 +112,18 @@ proc next*(d: var WsDecoder, f: var Frame): bool =
     pos += 4
   if d.buf.len < pos + length: return false     # payload not fully arrived
   f.fin = (b0 and 0x80) != 0
-  f.opcode = Opcode(b0 and 0x0F)
+  # Map the 4-bit opcode explicitly: Opcode has holes (0x3-0x7 and 0xB-0xF are
+  # reserved), so a blind int-to-enum conversion is unsafe. A reserved opcode
+  # must fail the connection (RFC 6455 5.2).
+  f.opcode = case b0 and 0x0F
+    of 0x0: opContinuation
+    of 0x1: opText
+    of 0x2: opBinary
+    of 0x8: opClose
+    of 0x9: opPing
+    of 0xA: opPong
+    else: raise newException(ValueError,
+      "navi: reserved WebSocket opcode 0x" & toHex(b0 and 0x0F, 1))
   f.payload = newString(length)
   for i in 0 ..< length:
     let b = ord(d.buf[pos + i])
