@@ -41,25 +41,32 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     else: resolveTAddress(host, Port(port))[0]
   let transport = await connect(dialAddr)
   result.transport = transport
-  if proxy.isSet and tls:
-    await proxyConnect(transport, host, port)
-  if tls:
-    # caFile and client certificates (cfg.certFile/keyFile, for mTLS) are not
-    # honored here; chronos/BearSSL uses its bundled Mozilla anchors and this
-    # client stream presents no certificate. Both are follow-ups for this
-    # backend. mTLS is available on the sync and asyncdispatch (OpenSSL) backends.
-    let flags =
-      if cfg.wantsVerify: {} else: {TLSFlags.NoVerifyHost, TLSFlags.NoVerifyServerName}
-    # This chronos/BearSSL build negotiates up to TLS 1.2 only.
-    let stream = newTLSClientAsyncStream(
-      newAsyncStreamReader(transport), newAsyncStreamWriter(transport), host,
-      flags = flags)
-    result.tls = stream
-    result.reader = stream.reader
-    result.writer = stream.writer
-  else:
-    result.reader = newAsyncStreamReader(transport)
-    result.writer = newAsyncStreamWriter(transport)
+  # Close the transport if the CONNECT tunnel or TLS setup fails; the transport's
+  # close is async, so this uses try/except rather than defer.
+  try:
+    if proxy.isSet and tls:
+      await proxyConnect(transport, host, port)
+    if tls:
+      # caFile and client certificates (cfg.certFile/keyFile, for mTLS) are not
+      # honored here; chronos/BearSSL uses its bundled Mozilla anchors and this
+      # client stream presents no certificate. Both are follow-ups for this
+      # backend. mTLS is available on the sync and asyncdispatch (OpenSSL) backends.
+      let flags =
+        if cfg.wantsVerify: {} else: {TLSFlags.NoVerifyHost, TLSFlags.NoVerifyServerName}
+      # This chronos/BearSSL build negotiates up to TLS 1.2 only.
+      let stream = newTLSClientAsyncStream(
+        newAsyncStreamReader(transport), newAsyncStreamWriter(transport), host,
+        flags = flags)
+      result.tls = stream
+      result.reader = stream.reader
+      result.writer = stream.writer
+    else:
+      result.reader = newAsyncStreamReader(transport)
+      result.writer = newAsyncStreamWriter(transport)
+  except CatchableError:
+    try: await transport.closeWait()
+    except CatchableError: discard
+    raise
 
 proc sendAll*(c: Conn, data: string): Future[void] {.async.} =
   await c.writer.write(data)

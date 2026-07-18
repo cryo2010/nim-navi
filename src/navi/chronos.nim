@@ -126,22 +126,26 @@ proc websocket*(client: Navi, url: string,
                            resolveProxy(client.options, u), @[],
                            client.options.timeoutMs)
   let key = genKey()
-  await conn.sendAll(upgradeRequest(u, key, headers))
-  var buf = ""
-  while "\r\n\r\n" notin buf:
-    let chunk = await conn.recvSome()
-    if chunk.len == 0:
-      await conn.close()
-      raise newException(IOError, "navi: websocket handshake closed by peer")
-    buf.add chunk
-  let headEnd = buf.find("\r\n\r\n") + 4
-  if not validate101(buf[0 ..< headEnd], key):
+  # Close the connection on any handshake failure (its close is async, so this
+  # uses try/except rather than defer).
+  try:
+    await conn.sendAll(upgradeRequest(u, key, headers))
+    var buf = ""
+    while "\r\n\r\n" notin buf:
+      let chunk = await conn.recvSome()
+      if chunk.len == 0:
+        raise newException(IOError, "navi: websocket handshake closed by peer")
+      buf.add chunk
+    let headEnd = buf.find("\r\n\r\n") + 4
+    if not validate101(buf[0 ..< headEnd], key):
+      raise newException(IOError, "navi: websocket upgrade rejected: " &
+        buf[0 ..< headEnd].splitLines[0])
+    result = WebSocket(conn: conn, open: true)
+    if buf.len > headEnd:
+      result.dec.feed(buf[headEnd .. ^1])
+  except CatchableError:
     await conn.close()
-    raise newException(IOError, "navi: websocket upgrade rejected: " &
-      buf[0 ..< headEnd].splitLines[0])
-  result = WebSocket(conn: conn, open: true)
-  if buf.len > headEnd:
-    result.dec.feed(buf[headEnd .. ^1])
+    raise
 
 proc send*(ws: WebSocket, data: string, binary = false): Future[void] {.async.} =
   ## Send a text (default) or binary message. Client frames are masked.

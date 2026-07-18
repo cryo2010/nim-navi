@@ -42,6 +42,17 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   ## until it fills the whole buffer, which deadlocks on a kept-alive connection
   ## where the response is smaller than the buffer.
   result.timeout = timeout
+  # Release the socket and TLS context if we don't finish connecting -- a failed
+  # proxy CONNECT or TLS handshake (e.g. cert rejection) would otherwise leak
+  # both, the SSL_CTX permanently (it has no destructor).
+  var established = false
+  defer:
+    if not established:
+      if not result.socket.isNil:
+        try: result.socket.close()
+        except CatchableError: discard
+      when defined(ssl):
+        if not result.ctx.isNil: result.ctx.destroyContext()
   if proxy.isSet:
     result.socket = dial(proxy.host, Port(proxy.port), buffered = false)
     if tls:
@@ -54,13 +65,14 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
         verifyMode = if cfg.wantsVerify: CVerifyPeer else: CVerifyNone,
         certFile = cfg.certFile, keyFile = cfg.clientKeyFile,
         caFile = cfg.caFile)
+      result.ctx = ctx     # store before the handshake so cleanup can free it
       setAlpn(ctx.context, alpn)
       ctx.wrapConnectedSocket(result.socket, handshakeAsClient, host)
       result.protocol = negotiatedProtocol(result.socket.sslHandle)
-      result.ctx = ctx     # retain so close() can free the SSL_CTX
     else:
       raise newException(ValueError,
         "navi: https requires compiling with -d:ssl")
+  established = true
 
 proc sendAll*(c: Conn, data: string) =
   c.socket.send(data)
