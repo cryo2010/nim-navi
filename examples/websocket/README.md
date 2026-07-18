@@ -94,12 +94,37 @@ verify against a trusted CA (`TlsConfig(caFile: "ca.pem")`). Note that chronos
 (BearSSL) can *only* use `verify: false` for a self-signed cert, since it can't
 add a custom CA.
 
-**Browser (navi/js) over wss:** the js client speaks wss unchanged — just give
-`websocket` a `wss://` URL. But the browser owns TLS trust and rejects
-self-signed certs from script (there's no `verify: false`), so browser wss needs
-a cert the browser already trusts: a real certificate, or a locally-trusted one
-from [`mkcert`](https://github.com/FiloSottile/mkcert). With such a cert the page
-behaves exactly like the `ws` version.
+### Browser (navi/js) over wss
+
+The js client speaks wss unchanged — the page just points at a `wss://` URL. But
+the browser owns TLS trust and **rejects a self-signed cert from a script**
+(there's no `verify: false`, and clicking through the address-bar warning does
+*not* carry over to a script WebSocket). So browser wss needs a cert the browser
+actually trusts — use [`mkcert`](https://github.com/FiloSottile/mkcert):
+
+```sh
+mkcert -install                     # trust a local CA in your browser (one time)
+mkcert localhost 127.0.0.1          # -> localhost+1.pem  localhost+1-key.pem
+```
+
+Then run the wss server with that cert, compile the page, and serve it:
+
+```sh
+NAVI_WSS_CERT=localhost+1.pem NAVI_WSS_KEY=localhost+1-key.pem \
+  nim c -r -d:ssl examples/websocket/wss_echo_server.nim
+nim js -o:examples/websocket/navi_ws.js examples/websocket/js.nim
+cd examples/websocket && python3 -m http.server 8000
+# open http://127.0.0.1:8000/wss_index.html
+```
+
+`wss_index.html` loads the same compiled bundle as the plain page (`js.nim` reads
+the target from `window.NAVI_WS_URL`) but points it at `wss://127.0.0.1:9701/`.
+It then behaves exactly like the `ws` page — status, send box, reconnect, and
+live disconnect — just over TLS, with no cert warnings.
+
+The same `mkcert` cert works for the native clients too (they use `verify:
+false`, so they accept any cert). A self-signed cert works for the native
+clients but **not** for the browser.
 
 ## Notes
 

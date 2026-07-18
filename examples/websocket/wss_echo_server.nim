@@ -16,11 +16,17 @@ import navi/proto/ws
 const port = 9701
 let
   certDir = getTempDir() / "navi-wss-demo"
-  certFile = certDir / "cert.pem"
-  keyFile = certDir / "key.pem"
+  # Defaults to a self-signed cert (auto-generated, fine for the native clients).
+  # For the browser demo, point these at a browser-trusted cert -- e.g. mkcert:
+  #   mkcert -install && mkcert localhost 127.0.0.1
+  #   NAVI_WSS_CERT=localhost+1.pem NAVI_WSS_KEY=localhost+1-key.pem nim c -r -d:ssl ...
+  certFile = getEnv("NAVI_WSS_CERT", certDir / "cert.pem")
+  keyFile = getEnv("NAVI_WSS_KEY", certDir / "key.pem")
 
 proc ensureCert() =
   if fileExists(certFile) and fileExists(keyFile): return
+  if existsEnv("NAVI_WSS_CERT") or existsEnv("NAVI_WSS_KEY"):
+    quit("NAVI_WSS_CERT / NAVI_WSS_KEY set but the files were not found")
   createDir(certDir)
   discard execProcess("openssl", args = [
     "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "365",
@@ -63,6 +69,9 @@ proc serveConn(c: Socket) =
 
 ensureCert()
 let ctx = newContext(certFile = certFile, keyFile = keyFile)
+# Server-side OpenSSL needs a session-id context once a client (e.g. a browser)
+# attempts TLS session resumption; without it the handshake fails.
+ctx.sessionIdContext = "navi-wss-demo"
 var server = newSocket(buffered = false)
 server.setSockOpt(OptReuseAddr, true)
 # NAVI_WS_HOST=0.0.0.0 lets Docker's published port reach the server.

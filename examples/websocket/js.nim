@@ -11,7 +11,10 @@
 import navi/js
 import std/dom
 
-const url = "ws://127.0.0.1:9700/"
+# The page may set `window.NAVI_WS_URL` (see wss_index.html for the wss variant);
+# defaults to the plain-ws echo server.
+proc configuredUrl(): cstring {.importjs: "(window.NAVI_WS_URL || 'ws://127.0.0.1:9700/')".}
+let url = $configuredUrl()
 
 var
   sock: WebSocket
