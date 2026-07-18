@@ -62,6 +62,10 @@ task interop, "Run the nghttpd HTTP/2 interop suite (needs nghttpd + openssl)":
   # Starts the nghttp2 reference server over TLS+h2 and runs navi against it.
   exec "bash tests/interop/run.sh"
 
+task wsjs, "navi/js WebSocket runtime test (Node client vs a native server)":
+  # Runs the navi/js WebSocket client under Node against a native echo server.
+  exec "bash tests/interop/jsws.sh"
+
 task mtls, "Run the mutual-TLS (client certificate) interop test (needs openssl)":
   # Starts an OpenSSL server that requires a client certificate and runs navi's
   # mTLS test against it.

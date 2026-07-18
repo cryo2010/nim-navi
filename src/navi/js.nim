@@ -19,13 +19,17 @@ when not defined(js):
            "(import `navi` for the native sync client).".}
 
 import std/asyncjs
+from std/strutils import startsWith
 import navi/private/entryguard
 import navi/core/public
 import navi/core/retry
 import navi/backend/js
+import navi/backend/jsws
 
 claimEntry("navi/js")
 export public, asyncjs
+export jsws.WebSocket, jsws.WsMessage, jsws.WsMessageKind,
+       jsws.send, jsws.receive, jsws.close, jsws.closeNormal, jsws.closeGoingAway
 
 type
   Hook* = proc(ctx: HookCtx): Future[void] {.closure.}
@@ -132,5 +136,16 @@ proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
   resp = await client.runAfter(req, resp)
   client.maybeThrow(req, resp)
   result = resp
+
+proc websocket*(client: Navi, url: string,
+                headers = initHeaders()): Future[WebSocket] =
+  ## Open a WebSocket over the runtime's native `WebSocket`. Accepts `ws://` /
+  ## `wss://` (or http/https, which are mapped to ws/wss). Use `send`, `receive`,
+  ## and `close`. `headers` is ignored: a browser WebSocket cannot set custom
+  ## handshake headers, and the runtime handles ping/pong.
+  var u = url
+  if u.startsWith("http://"): u = "ws://" & u["http://".len .. ^1]
+  elif u.startsWith("https://"): u = "wss://" & u["https://".len .. ^1]
+  openWebSocket(u)
 
 include navi/private/verbs

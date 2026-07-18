@@ -27,3 +27,6 @@ nimblecache/
 tests/interop/badssl
 tests/test_ws_async
 tests/test_ws_chronos
+tests/interop/jsws_server
+tests/interop/jsws_client.js
+navi_js.js
