@@ -1,7 +1,9 @@
 ## A WebSocket-over-TLS (wss) echo server for the wss backend examples. Same as
 ## echo_server.nim but each accepted connection is wrapped in server-side TLS
 ## before the WebSocket handshake. A self-signed cert for localhost is generated
-## on first run (via openssl), so this just works out of the box.
+## on first run (via openssl), so this just works out of the box. Each connection
+## runs on its own thread, so overlapping clients work -- in particular a browser
+## refresh, which briefly runs two connections at once.
 ##
 ##   nim c -r -d:ssl examples/websocket/wss_echo_server.nim
 ##
@@ -10,8 +12,16 @@
 when not defined(ssl):
   {.error: "compile the wss echo server with -d:ssl (OpenSSL)".}
 
-import std/[net, strutils, os, osproc]
+import std/[net, strutils, os, osproc, sequtils, openssl]
 import navi/proto/ws
+
+# std/net's `sessionIdContext=` binds SSL_CTX_set_session_id_context with a Nim
+# `string` where C wants `const unsigned char*`, so it hands OpenSSL the string
+# object instead of its bytes and the context is never actually set. A client
+# that resumes a TLS session (e.g. a browser tab on reload) then fails the
+# handshake with "session id context uninitialized". Bind it correctly.
+proc setSessionIdContext(ctx: SslCtx, sid: cstring, len: cuint): cint
+  {.cdecl, dynlib: DLLSSLName, importc: "SSL_CTX_set_session_id_context".}
 
 const port = 9701
 let
@@ -67,11 +77,24 @@ proc serveConn(c: Socket) =
       return
     else: discard
 
+proc handle(a: tuple[c: Socket, ctx: SslContext]) {.thread.} =
+  ## Own the connection end to end so the accept loop is never blocked: the TLS
+  ## handshake runs here too. ctx is passed in (not read as a global) to keep the
+  ## thread GC-safe; OpenSSL's SSL_CTX is safe to share across threads.
+  try:
+    a.ctx.wrapConnectedSocket(a.c, handshakeAsServer)   # server-side TLS handshake
+    serveConn(a.c)
+  except CatchableError as e:
+    echo "connection error: ", e.msg
+  a.c.close()
+
 ensureCert()
 let ctx = newContext(certFile = certFile, keyFile = keyFile)
 # Server-side OpenSSL needs a session-id context once a client (e.g. a browser)
 # attempts TLS session resumption; without it the handshake fails.
-ctx.sessionIdContext = "navi-wss-demo"
+const sidCtx = "navi-wss-demo"
+if setSessionIdContext(ctx.context, sidCtx.cstring, sidCtx.len.cuint) != 1:
+  quit("could not set the TLS session-id context")
 var server = newSocket(buffered = false)
 server.setSockOpt(OptReuseAddr, true)
 # NAVI_WS_HOST=0.0.0.0 lets Docker's published port reach the server.
@@ -79,12 +102,11 @@ server.bindAddr(Port(port), getEnv("NAVI_WS_HOST", "127.0.0.1"))
 server.listen()
 echo "WSS echo server on wss://127.0.0.1:", port, "/  (Ctrl-C to stop)"
 
+var threads: seq[ref Thread[tuple[c: Socket, ctx: SslContext]]]
 while true:
   var c: Socket
   server.accept(c)
-  try:
-    ctx.wrapConnectedSocket(c, handshakeAsServer)   # server-side TLS handshake
-    serveConn(c)
-  except CatchableError as e:
-    echo "connection error: ", e.msg
-  c.close()
+  threads.keepItIf(it[].running)   # drop handlers whose connection has closed
+  let t = new(Thread[tuple[c: Socket, ctx: SslContext]])
+  threads.add t
+  createThread(t[], handle, (c, ctx))
