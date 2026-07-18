@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>navi/js WebSocket echo</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 42rem; }
+    h1 { font-size: 1.3rem; margin-bottom: .3rem; }
+    .row { display: flex; gap: .5rem; margin: .8rem 0; align-items: center; }
+    input[type=text] { flex: 1; padding: .5rem; font-size: 1rem; }
+    button { padding: .5rem .9rem; font-size: 1rem; cursor: pointer; }
+    #status { font-weight: 600; padding: .15rem .6rem; border-radius: 999px; }
+    #status.on   { background: #d4f7d4; color: #0a0; }
+    #status.off  { background: #f7d4d4; color: #a00; }
+    #status.wait { background: #f7efd4; color: #a80; }
+    #log { background: #111; color: #0f0; padding: 1rem; border-radius: 6px;
+           white-space: pre-wrap; min-height: 10rem; max-height: 22rem;
+           overflow-y: auto; font-family: ui-monospace, monospace; }
+    code { background: #eee; padding: 0 .3rem; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <h1>navi/js WebSocket echo</h1>
+  <p>
+    navi compiled to JavaScript (<code>import navi/js</code>), talking to the
+    local echo server. Type a message and send it; the server echoes it back.
+    Stop <code>echo_server.nim</code> to watch it go <em>disconnected</em>, then
+    restart it and press <strong>Reconnect</strong>.
+  </p>
+
+  <div class="row">
+    Status: <span id="status" class="wait">starting...</span>
+  </div>
+  <div class="row">
+    <input id="msg" type="text" placeholder="type a message and press Enter" autofocus>
+    <button id="send">Send</button>
+    <button id="reconnect">Reconnect</button>
+  </div>
+
+  <pre id="log"></pre>
+
+  <!-- Compiled from js.nim:  nim js -o:navi_ws.js js.nim -->
+  <script src="navi_ws.js"></script>
+</body>
+</html>

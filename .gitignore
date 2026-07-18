@@ -3,6 +3,7 @@ nimcache/
 *.exe
 # Compiled JavaScript output (demos/examples have .nim sources)
 demos/**/*.js
+examples/**/*.js
 # libFuzzer working corpus (committed starting seeds live in tests/fuzz/seeds)
 tests/fuzz/corpus/
 # Compiled test/example binaries (source has .nim/.nims extensions)
@@ -30,3 +31,8 @@ tests/test_ws_chronos
 tests/interop/jsws_server
 tests/interop/jsws_client.js
 navi_js.js
+# Compiled WebSocket example binaries (sources are .nim)
+examples/websocket/echo_server
+examples/websocket/sync
+examples/websocket/asyncdispatch
+examples/websocket/chronos
