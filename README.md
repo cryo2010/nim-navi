@@ -74,17 +74,17 @@ navi is under active development. What works today:
 - **Hooks**: `beforeRequest` / `afterResponse` / `beforeRetry`
 - **Cookie jar**, **basic/bearer/digest auth** (Digest: MD5 and SHA-256, RFC 7616), **proxy** (http absolute-URI and https CONNECT)
 - **Body helpers**: `json=`, `form=`, and `multipart=`
-- **WebSocket** (RFC 6455) on the sync backend: `websocket()` with `send`/`receive`/`close`, text and binary messages, fragmentation reassembly, and automatic ping/pong
+- **WebSocket** (RFC 6455) on the sync and asyncdispatch backends: `websocket()` with `send`/`receive`/`close`, text and binary messages, fragmentation reassembly, and automatic ping/pong
 - **Response helpers**: `.status`, `.headers`, `.body`, `.data`, `.ok`
 - **Reusable clients** with default options and `.extend()`
 
 HTTP/2 currently runs on the sync and asyncdispatch backends; chronos stays
 http/1.1 (its bundled TLS exposes no client ALPN). The `navi/js` backend defers
-the protocol to the browser/runtime. WebSocket is sync-only so far
-(asyncdispatch/chronos/js are follow-ups). Not built yet: **HTTP/3**.
-See [Roadmap](#roadmap).
+the protocol to the browser/runtime. WebSocket runs on the sync and
+asyncdispatch backends (chronos and a `navi/js` wrapper are follow-ups). Not
+built yet: **HTTP/3**. See [Roadmap](#roadmap).
 
-WebSocket in brief:
+WebSocket in brief (sync; on `navi/asyncdispatch` the same calls are `await`ed):
 
 ```nim
 let ws = api.websocket("wss://example.com/socket")

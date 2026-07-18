@@ -71,6 +71,32 @@ suite "websocket close":
     check ord(p[0]) == 0x03 and ord(p[1]) == 0xe8   # 1000
     check p[2 .. ^1] == "bye"
 
+suite "websocket message assembly":
+  test "reassembles a fragmented text message":
+    var a: WsAssembler
+    check not a.offer(Frame(fin: false, opcode: opText, payload: "he")).ready
+    let o = a.offer(Frame(fin: true, opcode: opContinuation, payload: "llo"))
+    check o.ready
+    check o.message.kind == wmText
+    check o.message.data == "hello"
+
+  test "a ping asks for a pong with the same payload":
+    var a: WsAssembler
+    let o = a.offer(Frame(fin: true, opcode: opPing, payload: "hi"))
+    check o.reply == wrPong
+    check o.replyPayload == "hi"
+    check not o.ready
+
+  test "a close yields wmClose and asks for a close echo":
+    var a: WsAssembler
+    let o = a.offer(Frame(fin: true, opcode: opClose,
+                          payload: closePayload(closeNormal, "bye")))
+    check o.ready
+    check o.message.kind == wmClose
+    check o.message.closeCode == closeNormal
+    check o.message.data == "bye"
+    check o.reply == wrCloseEcho
+
 # End-to-end: navi's sync WebSocket client against an in-process echo server
 # built from the same sans-io core (server frames unmasked).
 import std/[net, os]

@@ -8,6 +8,7 @@
 
 import std/[strutils, base64, random, times]
 import checksums/sha1
+import ../core/[url, headers]
 
 type
   Opcode* = enum
@@ -126,3 +127,84 @@ proc closePayload*(code: uint16, reason = ""): string =
   result[0] = char((code shr 8) and 0xFF)
   result[1] = char(code and 0xFF)
   result.add reason
+
+# --- message assembly + handshake helpers (pure; shared by every backend) ---
+
+type
+  WsMessageKind* = enum wmText, wmBinary, wmClose
+  WsMessage* = object
+    ## A received WebSocket message. `data` is the payload for text/binary and
+    ## the (optional) reason for a close; `closeCode` is set for `wmClose`.
+    kind*: WsMessageKind
+    data*: string
+    closeCode*: uint16
+
+  WsReply* = enum wrNone, wrPong, wrCloseEcho   ## control frame the caller must send
+  WsOutcome* = object
+    ready*: bool             ## `message` is a complete message (or close)
+    message*: WsMessage
+    reply*: WsReply          ## a control frame to send back, with `replyPayload`
+    replyPayload*: string
+
+  WsAssembler* = object      ## reassembles fragmented messages across frames
+    kind: WsMessageKind
+    buf: string
+
+proc offer*(a: var WsAssembler, f: Frame): WsOutcome =
+  ## Feed one decoded frame. Handles fragmentation (text/binary + continuation)
+  ## and the control frames: a ping asks for a pong, a close both yields a
+  ## `wmClose` message and asks for a close echo. No I/O -- the caller sends any
+  ## `reply` and surfaces `message` when `ready`.
+  case f.opcode
+  of opPing:
+    result.reply = wrPong
+    result.replyPayload = f.payload
+  of opPong:
+    discard
+  of opClose:
+    var code = closeNormal
+    if f.payload.len >= 2:
+      code = uint16((ord(f.payload[0]) shl 8) or ord(f.payload[1]))
+    result.reply = wrCloseEcho
+    result.replyPayload = f.payload
+    result.ready = true
+    result.message = WsMessage(kind: wmClose, closeCode: code,
+      data: if f.payload.len > 2: f.payload[2 .. ^1] else: "")
+  of opText, opBinary:
+    a.kind = if f.opcode == opText: wmText else: wmBinary
+    a.buf = f.payload
+    if f.fin:
+      result.ready = true
+      result.message = WsMessage(kind: a.kind, data: a.buf)
+  of opContinuation:
+    a.buf.add f.payload
+    if f.fin:
+      result.ready = true
+      result.message = WsMessage(kind: a.kind, data: a.buf)
+
+proc hostHeader(u: Url): string =
+  result = u.host
+  let p = u.port
+  if not ((u.isTls and p == 443) or (not u.isTls and p == 80)):
+    result.add(":" & $p)
+
+proc upgradeRequest*(u: Url, key: string, extra: Headers): string =
+  ## The client's HTTP/1.1 Upgrade request for `u` with Sec-WebSocket-Key `key`.
+  result = "GET " & u.requestTarget & " HTTP/1.1\r\n" &
+           "Host: " & hostHeader(u) & "\r\n" &
+           "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
+           "Sec-WebSocket-Key: " & key & "\r\n" &
+           "Sec-WebSocket-Version: " & wsVersion & "\r\n"
+  for (k, v) in extra.pairs: result.add(k & ": " & v & "\r\n")
+  result.add("\r\n")
+
+proc validate101*(responseHead, key: string): bool =
+  ## True when `responseHead` (the status line + headers) is a 101 whose
+  ## Sec-WebSocket-Accept matches `key`.
+  let lines = responseHead.splitLines
+  if lines.len == 0 or not lines[0].startsWith("HTTP/1.1 101"): return false
+  for line in lines[1 .. ^1]:
+    let c = line.find(':')
+    if c > 0 and cmpIgnoreCase(line[0 ..< c].strip, "sec-websocket-accept") == 0:
+      return line[c + 1 .. ^1].strip == acceptFor(key)
+  false

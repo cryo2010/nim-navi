@@ -8,7 +8,9 @@ import std/tables
 import navi/private/entryguard
 import navi/core/public
 import navi/core/[engine, pool, session, proxy, h2glue, decompress]
+import navi/proto/ws
 import navi/backend/[asyncdispatch, h2mux]
+from std/strutils import startsWith, find, splitLines, contains
 
 claimEntry("navi/asyncdispatch")
 export public, asyncdispatch
@@ -182,3 +184,86 @@ proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
   result = await client.withDeadline(doStream(client, req, sink))
 
 include navi/private/verbs
+
+# --- WebSocket (RFC 6455) ---
+
+export ws.WsMessage, ws.WsMessageKind, ws.closeNormal, ws.closeGoingAway
+
+type
+  WebSocket* = ref object
+    conn: Conn
+    dec: WsDecoder
+    asmb: WsAssembler
+    open: bool
+
+proc toWsUrl(url: string): Url =
+  var s = url
+  if s.startsWith("ws://"): s = "http://" & s["ws://".len .. ^1]
+  elif s.startsWith("wss://"): s = "https://" & s["wss://".len .. ^1]
+  parseUrl(s)
+
+proc websocket*(client: Navi, url: string,
+                headers = initHeaders()): Future[WebSocket] {.async.} =
+  ## Open a WebSocket connection (RFC 6455). Accepts `ws://` / `wss://` (or
+  ## http/https); `wss` uses TLS. Does the HTTP/1.1 Upgrade over the transport and
+  ## validates `Sec-WebSocket-Accept`. Use `send`, `receive`, and `close`.
+  let u = toWsUrl(url)
+  let conn = await connect(u.host, u.port, u.isTls, client.options.tls,
+                           resolveProxy(client.options, u), @[])
+  let key = genKey()
+  await conn.sendAll(upgradeRequest(u, key, headers))
+  var buf = ""
+  while "\r\n\r\n" notin buf:
+    let chunk = await conn.recvSome()
+    if chunk.len == 0:
+      await conn.close()
+      raise newException(IOError, "navi: websocket handshake closed by peer")
+    buf.add chunk
+  let headEnd = buf.find("\r\n\r\n") + 4
+  if not validate101(buf[0 ..< headEnd], key):
+    await conn.close()
+    raise newException(IOError, "navi: websocket upgrade rejected: " &
+      buf[0 ..< headEnd].splitLines[0])
+  result = WebSocket(conn: conn, open: true)
+  if buf.len > headEnd:
+    result.dec.feed(buf[headEnd .. ^1])
+
+proc send*(ws: WebSocket, data: string, binary = false): Future[void] {.async.} =
+  ## Send a text (default) or binary message. Client frames are masked.
+  await ws.conn.sendAll(encodeFrame(if binary: opBinary else: opText, data))
+
+proc ping*(ws: WebSocket, data = ""): Future[void] {.async.} =
+  await ws.conn.sendAll(encodeFrame(opPing, data))
+
+proc receive*(ws: WebSocket): Future[WsMessage] {.async.} =
+  ## Await a full message, answering pings and reassembling fragments. A close
+  ## returns `wmClose` (and the connection is then closed).
+  while true:
+    var f: Frame
+    while not ws.dec.next(f):
+      let chunk = await ws.conn.recvSome()
+      if chunk.len == 0:
+        ws.open = false
+        return WsMessage(kind: wmClose, closeCode: closeGoingAway)
+      ws.dec.feed(chunk)
+    let o = ws.asmb.offer(f)
+    case o.reply
+    of wrPong:
+      await ws.conn.sendAll(encodeFrame(opPong, o.replyPayload))
+    of wrCloseEcho:
+      if ws.open:
+        try: await ws.conn.sendAll(encodeFrame(opClose, o.replyPayload))
+        except CatchableError: discard
+        ws.open = false
+        await ws.conn.close()
+    of wrNone: discard
+    if o.ready: return o.message
+
+proc close*(ws: WebSocket, code = closeNormal, reason = ""): Future[void] {.async.} =
+  ## Send a close frame and close the transport (freeing its TLS context).
+  ## Idempotent: a no-op once the socket is already closed.
+  if not ws.open: return
+  try: await ws.conn.sendAll(encodeFrame(opClose, closePayload(code, reason)))
+  except CatchableError: discard
+  ws.open = false
+  await ws.conn.close()
