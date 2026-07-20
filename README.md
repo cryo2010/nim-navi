@@ -336,6 +336,14 @@ Middleware wraps the whole request including the built-in retries and redirects,
 so it runs once per call; to act on each retry, implement the retry loop in a
 middleware. It does not apply to `websocket()`.
 
+Because middleware cannot capture, cross-request state lives at module scope or
+on the `NaviContext`. One backend caveat: on `navi/chronos` the middleware type
+is `gcsafe`, so a middleware there may read and write value-type globals (an
+`int` counter, say) but not globals that hold GC'd memory (`string`, `seq`,
+`ref`, `Table`), not even a `let` one. Keep such state on the `NaviContext`, or
+guard the access with `{.cast(gcsafe).}` if the program is single-threaded (navi
+clients are). The other three backends have no such restriction.
+
 ### Decompression
 
 Responses are decoded transparently: clients send `Accept-Encoding: gzip, deflate, br, zstd` and decode the body per `Content-Encoding`. gzip/deflate use the system zlib (present everywhere); `br` and `zstd` use `libbrotlidec` and `libzstd`, loaded lazily, so they are only required if a server actually sends those encodings. Disable all of it with `decompress: some(false)`.
