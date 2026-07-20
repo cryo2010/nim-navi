@@ -11,9 +11,9 @@
 ## Runs only on the JavaScript backend (`nim js`). `fetch` handles TLS, HTTP
 ## version negotiation, redirects, and body decoding; navi layers on request
 ## building, hooks, retries, and throw-on-non-2xx. There is no connection pool
-## (the runtime owns connections). A cookie jar is kept automatically wherever
-## there is no browser cookie store (Node, Deno, Bun, Workers) and left to the
-## browser otherwise; `NaviOptions(cookieJar: ...)` forces it either way.
+## (the runtime owns connections). Cookies persist automatically: navi keeps a
+## jar wherever there is no browser cookie store (Node, Deno, Bun, Workers), and
+## leaves it to the browser otherwise. Nothing to configure.
 
 when not defined(js):
   {.error: "navi/js requires the JavaScript backend; compile with `nim js` " &
@@ -44,17 +44,10 @@ type
 
   NaviOptions* = object of NaviOptionsBase
     hooks*: Hooks   ## lifecycle callbacks (may be async)
-    cookieJar*: Option[bool]
-      ## navi-managed cookie jar. Unset (the default) means "auto": on wherever
-      ## there is no browser cookie store (Node, Deno, Bun, Workers), off in a
-      ## browser (its store owns cookies, and a navi jar would be inert there
-      ## anyway -- Set-Cookie is hidden and the Cookie header is forbidden). This
-      ## matches the native backends, which always keep a jar. Set some(true) /
-      ## some(false) to force it.
 
   Navi* = object
-    options*: NaviOptions   ## the runtime owns connections; cookies too unless cookieJar is on
-    jar: CookieJar          ## nil unless cookieJar was opted into
+    options*: NaviOptions   ## the runtime owns connections
+    jar: CookieJar          ## kept off-browser; nil in a browser (its store owns cookies)
 
 proc defaultOptions*(): NaviOptions =
   # The browser decodes bodies and forbids the Accept-Encoding request header, so
@@ -73,19 +66,15 @@ proc runHook(hook: Hook, ctx: HookCtx): Future[void] = hook(ctx)
 # a browser document context.
 proc inBrowser(): bool {.importjs: "(typeof document !== 'undefined')".}
 
-proc wantsJar(o: NaviOptions): bool = o.cookieJar.get(not inBrowser())
-
 proc newNavi*(options = defaultOptions()): Navi =
   result = Navi(options: options)
-  if options.wantsJar: result.jar = newCookieJar()
+  if not inBrowser(): result.jar = newCookieJar()
 
 proc extend*(client: Navi, options: NaviOptions): Navi =
   var merged = mergeBase(client.options, options)
   merged.hooks = mergeHooks(client.options.hooks, options.hooks)
-  # An explicit setting on either side wins; otherwise inherit the auto default.
-  merged.cookieJar = some(options.cookieJar.get(client.options.wantsJar))
   result = Navi(options: merged)
-  if merged.wantsJar: result.jar = newCookieJar()
+  if not inBrowser(): result.jar = newCookieJar()
 
 proc close*(client: Navi) =
   ## No-op: the browser/runtime owns connections. Present for API symmetry with

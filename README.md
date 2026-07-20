@@ -143,12 +143,12 @@ backends differ:
 | Max TLS version | system | system | 1.2 | runtime |
 | Keep-alive / connection pool | ✓ | ✓ | ✓ | ✗ |
 | Streaming upload | ✓ | ✓ | ✓ | ✗ |
-| Cookie jar | ✓ | ✓ | ✓ | auto |
+| Cookie jar | ✓ | ✓ | ✓ | ✓ |
 | Proxy configuration | ✓ | ✓ | ✓ | ✗ |
 
-Legend: ✓ supported · ✗ not supported · **auto** = on by default except in a
-browser, where the store handles it · **runtime** = provided by the browser/Node
-platform rather than navi.
+Legend: ✓ supported · ✗ not supported · **runtime** = provided by the
+browser/Node platform rather than navi. (`navi/js` keeps its own cookie jar off
+a browser, and defers to the browser store on one; see below.)
 
 Two backends carry caveats:
 
@@ -161,11 +161,11 @@ Two backends carry caveats:
   custom handshake headers are ignored and the runtime handles ping/pong. On a
   runtime with no cookie store (Node, Deno, Bun, Workers), navi keeps its own
   cookie jar automatically so cookies persist across requests; in a browser the
-  store handles that. `NaviOptions(cookieJar: some(false)/some(true))` forces it.
+  store handles that. Either way it needs no configuration.
 
 ### The browser backend (`navi/js`)
 
-`import navi/js` compiles with `nim js` and runs over the runtime's `fetch`, so the platform handles TLS, HTTP-version negotiation, redirects, cookies, and decompression. navi keeps the request building, retries, throw-on-non-2xx, and (async) hooks. It has no connection pool, streaming uploads are unavailable, and `res.httpVersion` is empty because `fetch` does not expose it. Cookies persist automatically: in a browser the store handles them, and on a runtime without one (Node, Deno, Bun, Workers) navi keeps its own jar. Either way no configuration is needed; `NaviOptions(cookieJar: some(false))` opts out and `some(true)` forces it on. Hooks are async, as on the other async backends.
+`import navi/js` compiles with `nim js` and runs over the runtime's `fetch`, so the platform handles TLS, HTTP-version negotiation, redirects, cookies, and decompression. navi keeps the request building, retries, throw-on-non-2xx, and (async) hooks. It has no connection pool, streaming uploads are unavailable, and `res.httpVersion` is empty because `fetch` does not expose it. Cookies persist automatically with no configuration: in a browser the store handles them, and on a runtime without one (Node, Deno, Bun, Workers) navi keeps its own jar. Hooks are async, as on the other async backends.
 
 ```nim
 import navi/js
