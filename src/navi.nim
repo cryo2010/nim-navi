@@ -22,15 +22,22 @@ claimEntry("navi")
 export public
 
 type
-  Next* = proc(req: Request): Response {.closure.}
-    ## Runs the rest of the chain (inner middleware, then the request itself) and
-    ## returns its response.
-  Middleware* = proc(req: Request, next: Next): Response {.closure.}
-    ## Wraps a request: modify `req`, call `next(req)` to proceed (or skip it to
-    ## short-circuit without sending), then inspect or replace the response.
+  Context* = ref object
+    ## Carried through the middleware chain. A middleware reads and mutates it,
+    ## then calls `next` to run the rest of the chain (which fills `response`).
+    request*: Request       ## the outgoing request; modify it before `next`
+    response*: Response      ## the response; set by `next`, adjust it after
+    clientp: ptr Navi        ## the owning client (see `client`); valid for the call
+    sink: BodySink           ## non-nil for a streaming request
+    idx: int                 ## index of the next middleware to run
+  Middleware* = proc(ctx: Context) {.nimcall.}
+    ## A middleware step. Deliberately `nimcall` (not a closure, so it cannot
+    ## capture): read/modify `ctx.request`, call `ctx.next()` to proceed -- or
+    ## skip it to short-circuit -- then read/modify `ctx.response`. Run in order;
+    ## index 0 is the outermost.
 
   NaviOptions* = object of NaviOptionsBase
-    middleware*: seq[Middleware]   ## run in order; index 0 is the outermost wrap
+    middleware*: seq[Middleware]
 
   Navi* = object
     options*: NaviOptions
@@ -40,19 +47,6 @@ type
 proc defaultOptions*(): NaviOptions =
   result.http = {H1, H2} # negotiate h2 over TLS via ALPN, fall back to h1
   result.tls = defaultTls()
-
-proc wrap(m: Middleware, nxt: Next): Next =
-  ## `m` and `nxt` are parameters (not loop locals) so each layer captures its
-  ## own `nxt` -- capturing a loop variable would make every layer share one.
-  proc(req: Request): Response =
-    {.cast(gcsafe).}: m(req, nxt)
-
-proc compose(mws: seq[Middleware], base: Next): Next =
-  ## Nest the middleware around `base` so mws[0] is outermost and each `next`
-  ## calls the layer beneath it.
-  result = base
-  for i in countdown(mws.high, 0):
-    result = wrap(mws[i], result)
 
 proc newNavi*(options = defaultOptions()): Navi =
   ## Create a client. `options` supplies defaults (prefixUrl, headers, TLS,
@@ -85,6 +79,22 @@ proc runCore(client: Navi, req: Request): Response =
 proc runCoreStream(client: Navi, req: Request, sink: BodySink): Response =
   performStream(client, req, sink)
 
+proc client*(ctx: Context): Navi = ctx.clientp[]
+  ## The client handling this request (e.g. to read `ctx.client.options`).
+
+proc next*(ctx: Context) =
+  ## Run the rest of the chain: the next middleware, or -- once they are
+  ## exhausted -- the request itself. The outcome lands in `ctx.response`.
+  let mws = ctx.clientp[].options.middleware
+  if ctx.idx >= mws.len:
+    ctx.response =
+      if ctx.sink.isNil: runCore(ctx.clientp[], ctx.request)
+      else: runCoreStream(ctx.clientp[], ctx.request, ctx.sink)
+  else:
+    let m = mws[ctx.idx]
+    inc ctx.idx
+    m(ctx)
+
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = "", json: JsonNode = nil,
               form: seq[(string, string)] = @[], multipart: Multipart = @[],
@@ -95,8 +105,9 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
   let req = buildRequest(client.options, verb, target, headers, body, json,
                          form, multipart, bodyStream)
   if client.options.middleware.len == 0: return runCore(client, req)
-  let base: Next = proc(r: Request): Response = runCore(client, r)
-  compose(client.options.middleware, base)(req)
+  let ctx = Context(request: req, clientp: unsafeAddr client)
+  ctx.next()
+  ctx.response
 
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
              headers = initHeaders()): Response =
@@ -104,8 +115,9 @@ proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
   ## The returned Response carries status and headers but an empty body.
   let req = buildRequest(client.options, verb, target, headers)
   if client.options.middleware.len == 0: return runCoreStream(client, req, sink)
-  let base: Next = proc(r: Request): Response = runCoreStream(client, r, sink)
-  compose(client.options.middleware, base)(req)
+  let ctx = Context(request: req, clientp: unsafeAddr client, sink: sink)
+  ctx.next()
+  ctx.response
 
 include navi/private/verbs
 
@@ -213,10 +225,11 @@ proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
   result.setLen(targets.len)
   if client.options.middleware.len > 0:
     for i, target in targets:
-      let req = buildRequest(client.options, GET, target)
-      let base: Next = proc(r: Request): Response = runCore(client, r)
+      let ctx = Context(request: buildRequest(client.options, GET, target),
+                        clientp: unsafeAddr client)
       try:
-        result[i] = compose(client.options.middleware, base)(req)
+        ctx.next()
+        result[i] = ctx.response
       except HttpError as e:
         result[i] = e.response          # keep parallel's non-throwing contract
     return

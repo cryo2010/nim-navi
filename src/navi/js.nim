@@ -33,15 +33,21 @@ export jsws.WebSocket, jsws.WsMessage, jsws.WsMessageKind,
        jsws.send, jsws.receive, jsws.close, jsws.closeNormal, jsws.closeGoingAway
 
 type
-  Next* = proc(req: Request): Future[Response] {.closure.}
-    ## Runs the rest of the chain (inner middleware, then the request itself) and
-    ## returns its response. `await` it.
-  Middleware* = proc(req: Request, next: Next): Future[Response] {.closure.}
-    ## Wraps a request; may be async. Modify `req`, `await next(req)` to proceed
-    ## (or skip it to short-circuit), then inspect or replace the response.
+  Context* = ref object
+    ## Carried through the middleware chain. A middleware reads and mutates it,
+    ## then `await ctx.next()` runs the rest of the chain (which fills `response`).
+    request*: Request       ## the outgoing request; modify it before `next`
+    response*: Response      ## the response; set by `next`, adjust it after
+    clientp: ptr Navi        ## the owning client (see `client`); valid for the call
+    sink: BodySink           ## non-nil for a streaming request
+    idx: int                 ## index of the next middleware to run
+  Middleware* = proc(ctx: Context): Future[void] {.nimcall.}
+    ## A middleware step; may be async. Deliberately `nimcall` (not a closure, so
+    ## it cannot capture): read/modify `ctx.request`, `await ctx.next()` to
+    ## proceed -- or skip it to short-circuit -- then read/modify `ctx.response`.
 
   NaviOptions* = object of NaviOptionsBase
-    middleware*: seq[Middleware]   ## run in order; index 0 is the outermost wrap
+    middleware*: seq[Middleware]
 
   Navi* = object
     options*: NaviOptions   ## the runtime owns connections
@@ -51,19 +57,6 @@ proc defaultOptions*(): NaviOptions =
   # The browser decodes bodies and forbids the Accept-Encoding request header, so
   # keep navi from adding it; TLS and HTTP-version negotiation are the runtime's.
   result.decompress = some(false)
-
-proc wrap(m: Middleware, nxt: Next): Next =
-  ## `m` and `nxt` are parameters (not loop locals) so each layer captures its
-  ## own `nxt` -- capturing a loop variable would make every layer share one.
-  proc(req: Request): Future[Response] =
-    {.cast(gcsafe).}: m(req, nxt)
-
-proc compose(mws: seq[Middleware], base: Next): Next =
-  ## Nest the middleware around `base` so mws[0] is outermost and each `next`
-  ## calls the layer beneath it.
-  result = base
-  for i in countdown(mws.high, 0):
-    result = wrap(mws[i], result)
 
 # A browser owns the cookie store (and hides Set-Cookie from fetch); Node, Deno,
 # Bun, and Workers do not, so navi keeps the jar there. `document` exists only in
@@ -128,6 +121,27 @@ proc runCoreStream(client: Navi, req: Request, sink: BodySink): Future[Response]
   client.maybeThrow(rq, resp)
   result = resp
 
+proc client*(ctx: Context): Navi = ctx.clientp[]
+  ## The client handling this request (e.g. to read `ctx.client.options`).
+
+proc next*(ctx: Context): Future[void] {.async.} =
+  ## Run the rest of the chain: the next middleware, or -- once they are
+  ## exhausted -- the request itself. The outcome lands in `ctx.response`.
+  let mws = ctx.clientp[].options.middleware
+  if ctx.idx >= mws.len:
+    if ctx.sink.isNil:
+      ctx.response = await runCore(ctx.clientp[], ctx.request)
+    else:
+      ctx.response = await runCoreStream(ctx.clientp[], ctx.request, ctx.sink)
+  else:
+    let m = mws[ctx.idx]
+    inc ctx.idx
+    await m(ctx)
+
+proc runChain(ctx: Context): Future[Response] {.async.} =
+  await ctx.next()
+  return ctx.response
+
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = "", json: JsonNode = nil,
               form: seq[(string, string)] = @[],
@@ -136,8 +150,8 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
   let req = buildRequest(client.options, verb, target, headers, body, json, form,
                          multipart, nil)
   if client.options.middleware.len == 0: return await runCore(client, req)
-  let base: Next = proc(r: Request): Future[Response] = runCore(client, r)
-  result = await compose(client.options.middleware, base)(req)
+  let ctx = Context(request: req, clientp: unsafeAddr client)
+  return await runChain(ctx)
 
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
              headers = initHeaders()): Future[Response] {.async.} =
@@ -145,8 +159,8 @@ proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
   ## empty. Not retried (the stream is consumed as it is read).
   let req = buildRequest(client.options, verb, target, headers)
   if client.options.middleware.len == 0: return await runCoreStream(client, req, sink)
-  let base: Next = proc(r: Request): Future[Response] = runCoreStream(client, r, sink)
-  result = await compose(client.options.middleware, base)(req)
+  let ctx = Context(request: req, clientp: unsafeAddr client, sink: sink)
+  return await runChain(ctx)
 
 proc websocket*(client: Navi, url: string,
                 headers = initHeaders()): Future[WebSocket] =

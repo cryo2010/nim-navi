@@ -9,6 +9,15 @@ import ./support
 
 var serverReady: bool
 
+# Middleware are nimcall procs (no capture), so shared state is module-level.
+var mwObservedStatus: int
+proc addAuthMw(ctx: Context) {.nimcall.} =
+  ctx.request.headers["authorization"] = "Wrapped"   # before
+  ctx.next()
+  mwObservedStatus = ctx.response.status              # after
+proc cannedMw(ctx: Context) {.nimcall.} =
+  ctx.response = initResponse(299, "Short", "", initHeaders(), "from middleware")
+
 proc serve(port: int) {.thread.} =
   var server = newSocket()
   server.setSockOpt(OptReuseAddr, true)
@@ -333,29 +342,22 @@ suite "sync entry end to end":
     check raised
     joinThread(th)
 
-  test "middleware wraps the request: modify before, observe after":
+  test "middleware modifies the request and observes the response":
     const port = 8989
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)
 
-    var observed = 0
-    let addAuth: Middleware = proc(req: Request, next: Next): Response =
-      var r = req
-      r.headers["authorization"] = "Wrapped"      # before
-      result = next(r)
-      observed = result.status                     # after, same scope
-    let api = newNavi(NaviOptions(middleware: @[addAuth]))
+    mwObservedStatus = 0
+    let api = newNavi(NaviOptions(middleware: @[Middleware(addAuthMw)]))
     let res = api.post("http://127.0.0.1:" & $port & "/", body = "x")
     check res.headers.get("x-echo-authorization") == "Wrapped"
-    check observed == 200
+    check mwObservedStatus == 200
     joinThread(th)
 
   test "middleware can short-circuit without sending a request":
     # No server here: if the request were dialed it would fail to connect, so a
-    # 299 proves `next` was never called.
-    let canned: Middleware = proc(req: Request, next: Next): Response =
-      initResponse(299, "Short", "", initHeaders(), "from middleware")
-    let api = newNavi(NaviOptions(middleware: @[canned]))
+    # 299 proves `ctx.next()` was never called.
+    let api = newNavi(NaviOptions(middleware: @[Middleware(cannedMw)]))
     let res = api.get("http://127.0.0.1:1/")
     check res.status == 299
     check res.body == "from middleware"

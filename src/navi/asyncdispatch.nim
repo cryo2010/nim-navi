@@ -16,15 +16,21 @@ claimEntry("navi/asyncdispatch")
 export public, asyncdispatch
 
 type
-  Next* = proc(req: Request): Future[Response] {.closure.}
-    ## Runs the rest of the chain (inner middleware, then the request itself) and
-    ## returns its response. `await` it.
-  Middleware* = proc(req: Request, next: Next): Future[Response] {.closure.}
-    ## Wraps a request; may be async. Modify `req`, `await next(req)` to proceed
-    ## (or skip it to short-circuit), then inspect or replace the response.
+  Context* = ref object
+    ## Carried through the middleware chain. A middleware reads and mutates it,
+    ## then `await ctx.next()` runs the rest of the chain (which fills `response`).
+    request*: Request       ## the outgoing request; modify it before `next`
+    response*: Response      ## the response; set by `next`, adjust it after
+    clientp: ptr Navi        ## the owning client (see `client`); valid for the call
+    sink: BodySink           ## non-nil for a streaming request
+    idx: int                 ## index of the next middleware to run
+  Middleware* = proc(ctx: Context): Future[void] {.nimcall.}
+    ## A middleware step; may be async. Deliberately `nimcall` (not a closure, so
+    ## it cannot capture): read/modify `ctx.request`, `await ctx.next()` to
+    ## proceed -- or skip it to short-circuit -- then read/modify `ctx.response`.
 
   NaviOptions* = object of NaviOptionsBase
-    middleware*: seq[Middleware]   ## run in order; index 0 is the outermost wrap
+    middleware*: seq[Middleware]
 
   Navi* = object
     options*: NaviOptions
@@ -36,19 +42,6 @@ type
 proc defaultOptions*(): NaviOptions =
   result.http = {H1, H2}
   result.tls = defaultTls()
-
-proc wrap(m: Middleware, nxt: Next): Next =
-  ## `m` and `nxt` are parameters (not loop locals) so each layer captures its
-  ## own `nxt` -- capturing a loop variable would make every layer share one.
-  proc(req: Request): Future[Response] =
-    {.cast(gcsafe).}: m(req, nxt)
-
-proc compose(mws: seq[Middleware], base: Next): Next =
-  ## Nest the middleware around `base` so mws[0] is outermost and each `next`
-  ## calls the layer beneath it. The wrapper forwards the inner Future directly.
-  result = base
-  for i in countdown(mws.high, 0):
-    result = wrap(mws[i], result)
 
 proc newNavi*(options = defaultOptions()): Navi =
   Navi(options: options,
@@ -168,6 +161,27 @@ proc withDeadline(client: Navi, fut: Future[Response]): Future[Response] {.async
     return fut.read
   raise newException(TimeoutError, "navi: request timed out after " & $ms & " ms")
 
+proc client*(ctx: Context): Navi = ctx.clientp[]
+  ## The client handling this request (e.g. to read `ctx.client.options`).
+
+proc next*(ctx: Context): Future[void] {.async.} =
+  ## Run the rest of the chain: the next middleware, or -- once they are
+  ## exhausted -- the request itself. The outcome lands in `ctx.response`.
+  let mws = ctx.clientp[].options.middleware
+  if ctx.idx >= mws.len:
+    if ctx.sink.isNil:
+      ctx.response = await doRequest(ctx.clientp[], ctx.request)
+    else:
+      ctx.response = await doStream(ctx.clientp[], ctx.request, ctx.sink)
+  else:
+    let m = mws[ctx.idx]
+    inc ctx.idx
+    await m(ctx)
+
+proc runChain(ctx: Context): Future[Response] {.async.} =
+  await ctx.next()
+  return ctx.response
+
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = "", json: JsonNode = nil,
               form: seq[(string, string)] = @[], multipart: Multipart = @[],
@@ -177,8 +191,8 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
                          form, multipart, bodyStream)
   if client.options.middleware.len == 0:
     return await client.withDeadline(doRequest(client, req))
-  let base: Next = proc(r: Request): Future[Response] = doRequest(client, r)
-  result = await client.withDeadline(compose(client.options.middleware, base)(req))
+  let ctx = Context(request: req, clientp: unsafeAddr client)
+  return await client.withDeadline(runChain(ctx))
 
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
              headers = initHeaders()): Future[Response] {.async.} =
@@ -186,8 +200,8 @@ proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
   let req = buildRequest(client.options, verb, target, headers)
   if client.options.middleware.len == 0:
     return await client.withDeadline(doStream(client, req, sink))
-  let base: Next = proc(r: Request): Future[Response] = doStream(client, r, sink)
-  result = await client.withDeadline(compose(client.options.middleware, base)(req))
+  let ctx = Context(request: req, clientp: unsafeAddr client, sink: sink)
+  return await client.withDeadline(runChain(ctx))
 
 include navi/private/verbs
 

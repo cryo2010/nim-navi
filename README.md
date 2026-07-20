@@ -71,7 +71,7 @@ navi is under active development. What works today:
 - **Throw-on-non-2xx** by default (`HttpError`), opt-out available
 - **Automatic decompression**: gzip/deflate (zlib), plus brotli and zstd when `libbrotlidec`/`libzstd` are present
 - **Request timeouts** via the `timeout` option (`TimeoutError`)
-- **Middleware**: onion-style `proc(req, next)` wrappers that modify, observe, or short-circuit a request
+- **Middleware**: onion-style `proc(ctx)` steps that modify, observe, or short-circuit a request
 - **Cookie jar**, **basic/bearer/digest auth** (Digest: MD5 and SHA-256, RFC 7616), **proxy** (http absolute-URI and https CONNECT)
 - **Body helpers**: `json=`, `form=`, and `multipart=`
 - **WebSocket** (RFC 6455) on all four backends (sync, asyncdispatch, chronos, and js): `websocket()` with `send`/`receive`/`close`, text and binary messages, fragmentation reassembly, and automatic ping/pong
@@ -291,43 +291,45 @@ Each client keeps a cookie jar: cookies from `Set-Cookie` are stored and replaye
 
 ### Middleware
 
-Middleware wraps a request onion-style: a `proc(req, next)` that may modify the
-request, call `next(req)` to run the rest of the chain (and get its response),
-inspect or replace that response, or skip `next` entirely to short-circuit
-without sending anything. `middleware[0]` is the outermost layer. Everything
-before the `next(...)` call is "before", everything after is "after", and both
-share the same scope:
+Middleware wraps a request onion-style. Each is a **`proc(ctx: Context)`** that
+reads and mutates a shared `Context` (`ctx.request`, `ctx.response`, `ctx.client`),
+calls `ctx.next()` to run the rest of the chain, and then inspects or replaces
+`ctx.response`, or skips `next` to short-circuit without sending. `middleware[0]`
+is the outermost layer; everything before the `ctx.next()` call is "before" and
+everything after is "after".
+
+Middleware are **`nimcall` procs, not closures**, so they cannot capture local
+variables; shared state lives at module scope or on the `Context`. Write them as
+top-level procs:
 
 ```nim
-let api = newNavi(NaviOptions(middleware: @[
-  (proc(req: Request, next: Next): Response =    # trace + log
-    var r = req
-    r.headers["x-trace-id"] = newTraceId()
-    let t0 = epochTime()
-    result = next(r)
-    log(r.verb, result.status, epochTime() - t0)),
-]))
+proc trace(ctx: Context) =                 # sync (import navi)
+  ctx.request.headers["x-trace-id"] = newTraceId()   # before
+  let t0 = epochTime()
+  ctx.next()
+  log(ctx.request.verb, ctx.response.status, epochTime() - t0)   # after
+
+let api = newNavi(NaviOptions(middleware: @[Middleware(trace)]))
 ```
 
-Short-circuit by returning a response without calling `next` (e.g. a cache hit
-or a mock) — nothing goes over the wire:
+Short-circuit by setting `ctx.response` and *not* calling `next` (a cache hit or
+a mock), and nothing goes over the wire:
 
 ```nim
-let cache = proc(req: Request, next: Next): Response =
-  if req.url in store: return store[req.url]
-  result = next(req)
-  store[req.url] = result
+proc cache(ctx: Context) =
+  if ctx.request.url in store: ctx.response = store[ctx.request.url]  # no next()
+  else:
+    ctx.next()
+    store[ctx.request.url] = ctx.response
 ```
 
-On the async entries (`navi/asyncdispatch`, `navi/chronos`, `navi/js`) middleware
-is async and may `await`; the type is
-`proc(req: Request, next: Next): Future[Response]` and you `await next(req)`:
+On the async entries (`navi/asyncdispatch`, `navi/chronos`, `navi/js`) a
+middleware is `proc(ctx: Context): Future[void]` and you `await ctx.next()`:
 
 ```nim
-let refreshToken: Middleware = proc(req: Request, next: Next): Future[Response] {.async.} =
-  var r = req
-  r.headers["authorization"] = "Bearer " & await fetchToken()
-  result = await next(r)
+proc refreshToken(ctx: Context): Future[void] {.async.} =
+  ctx.request.headers["authorization"] = "Bearer " & await fetchToken()
+  await ctx.next()
 ```
 
 Middleware wraps the whole request including the built-in retries and redirects,
@@ -474,11 +476,11 @@ Every field is optional.
   digest answers the server's 401 challenge (MD5 or SHA-256) on a one-shot retry.
 - **proxy** `Option[string]`: proxy URL. Unset falls back to `HTTP(S)_PROXY` /
   `NO_PROXY`.
-- **middleware** `seq[Middleware]`: onion-style wrappers run in order, with
-  `middleware[0]` outermost. Each is `proc(req: Request, next: Next): Response`
-  (sync) or `proc(req, next): Future[Response]` (async): modify `req`, call
-  `next(req)` to proceed, then inspect or replace the response — or skip `next`
-  to short-circuit without sending. See [Middleware](#middleware).
+- **middleware** `seq[Middleware]`: onion-style steps run in order, with
+  `middleware[0]` outermost. Each is a `nimcall` `proc(ctx: Context)` (sync) or
+  `proc(ctx: Context): Future[void]` (async): modify `ctx.request`, call
+  `ctx.next()` to proceed, then inspect or replace `ctx.response`, or skip
+  `next` to short-circuit without sending. See [Middleware](#middleware).
 
 ### Response
 
