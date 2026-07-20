@@ -22,16 +22,22 @@ claimEntry("navi")
 export public
 
 type
-  Hook* = proc(ctx: HookCtx) {.closure.}
-    ## Lifecycle callback: mutate `ctx.request` (beforeRequest), read/mutate
-    ## `ctx.response` (afterResponse), or read `ctx.attempt` (beforeRetry).
-  Hooks* = object
-    beforeRequest*: seq[Hook]
-    afterResponse*: seq[Hook]
-    beforeRetry*: seq[Hook]
+  NaviContext* = ref object
+    ## Carried through the middleware chain. A middleware reads and mutates it,
+    ## then calls `next` to run the rest of the chain (which fills `res`).
+    req*: Request            ## the outgoing request; modify it before `next`
+    res*: Response           ## the response; set by `next`, adjust it after
+    clientp: ptr Navi        ## the owning client (see `client`); valid for the call
+    sink: BodySink           ## non-nil for a streaming request
+    idx: int                 ## index of the next middleware to run
+  Middleware* = proc(ctx: NaviContext) {.nimcall.}
+    ## A middleware step. Deliberately `nimcall` (not a closure, so it cannot
+    ## capture): read/modify `ctx.req`, call `ctx.next()` to proceed -- or
+    ## skip it to short-circuit -- then read/modify `ctx.res`. Run in order;
+    ## index 0 is the outermost.
 
   NaviOptions* = object of NaviOptionsBase
-    hooks*: Hooks   ## lifecycle callbacks (sync)
+    middleware*: seq[Middleware]
 
   Navi* = object
     options*: NaviOptions
@@ -42,24 +48,16 @@ proc defaultOptions*(): NaviOptions =
   result.http = {H1, H2} # negotiate h2 over TLS via ALPN, fall back to h1
   result.tls = defaultTls()
 
-proc mergeHooks(base, add: Hooks): Hooks =
-  Hooks(beforeRequest: base.beforeRequest & add.beforeRequest,
-        afterResponse: base.afterResponse & add.afterResponse,
-        beforeRetry: base.beforeRetry & add.beforeRetry)
-
-proc runHook(hook: Hook, ctx: HookCtx) =
-  {.cast(gcsafe).}: hook(ctx)
-
 proc newNavi*(options = defaultOptions()): Navi =
   ## Create a client. `options` supplies defaults (prefixUrl, headers, TLS,
-  ## hooks, …).
+  ## middleware, …).
   Navi(options: options, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
 proc extend*(client: Navi, options: NaviOptions): Navi =
-  ## Derive a new client, layering `options` over this client's (hooks are
+  ## Derive a new client, layering `options` over this client's (middleware is
   ## appended). The derived client gets its own connection pool and cookie jar.
   var merged = mergeBase(client.options, options)
-  merged.hooks = mergeHooks(client.options.hooks, options.hooks)
+  merged.middleware = client.options.middleware & options.middleware
   Navi(options: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
 proc close*(client: Navi) =
@@ -74,22 +72,52 @@ proc transport(client: Navi, req: Request, sink: BodySink): Response =
   ## Pool-based transport (one request per connection at a time).
   poolTransport(client, req, sink)
 
+proc runCore(client: Navi, req: Request): Response =
+  ## The innermost `next`: the full policy layer for one buffered request.
+  performRequest(client, req)
+
+proc runCoreStream(client: Navi, req: Request, sink: BodySink): Response =
+  performStream(client, req, sink)
+
+proc client*(ctx: NaviContext): Navi = ctx.clientp[]
+  ## The client handling this request (e.g. to read `ctx.client.options`).
+
+proc next*(ctx: NaviContext) =
+  ## Run the rest of the chain: the next middleware, or -- once they are
+  ## exhausted -- the request itself. The outcome lands in `ctx.res`.
+  let mws = ctx.clientp[].options.middleware
+  if ctx.idx >= mws.len:
+    ctx.res =
+      if ctx.sink.isNil: runCore(ctx.clientp[], ctx.req)
+      else: runCoreStream(ctx.clientp[], ctx.req, ctx.sink)
+  else:
+    let m = mws[ctx.idx]
+    inc ctx.idx
+    m(ctx)
+
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = "", json: JsonNode = nil,
               form: seq[(string, string)] = @[], multipart: Multipart = @[],
               bodyStream: BodyProducer = nil): Response =
   ## Perform a request and return the response. `json`/`form`/`multipart` encode
   ## the body; `bodyStream` uploads a chunked body from a pull-based producer.
+  ## Configured middleware wraps the whole call.
   let req = buildRequest(client.options, verb, target, headers, body, json,
                          form, multipart, bodyStream)
-  performRequest(client, req)
+  if client.options.middleware.len == 0: return runCore(client, req)
+  let ctx = NaviContext(req: req, clientp: unsafeAddr client)
+  ctx.next()
+  ctx.res
 
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
              headers = initHeaders()): Response =
   ## Perform a request and deliver the response body to `sink` as it arrives.
   ## The returned Response carries status and headers but an empty body.
   let req = buildRequest(client.options, verb, target, headers)
-  performStream(client, req, sink)
+  if client.options.middleware.len == 0: return runCoreStream(client, req, sink)
+  let ctx = NaviContext(req: req, clientp: unsafeAddr client, sink: sink)
+  ctx.next()
+  ctx.res
 
 include navi/private/verbs
 
@@ -188,15 +216,27 @@ proc transportGroup(client: Navi, items: seq[BatchItem],
 proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
   ## Fetch many URLs (GET) concurrently. Same-origin requests are multiplexed
   ## over one HTTP/2 connection when the server supports h2, otherwise run
-  ## sequentially. Each response is still put through the policy layer: cookies,
-  ## decompression, redirects, retries, and hooks. Non-2xx responses are
-  ## returned (not raised) so every result is available; inspect `.ok`.
+  ## sequentially, each through the policy layer (cookies, decompression,
+  ## redirects, retries). Non-2xx responses are returned (not raised) so every
+  ## result is available; inspect `.ok`.
+  ##
+  ## When middleware is configured it wraps each request individually, which
+  ## forgoes the shared-connection multiplexing (every request stands alone).
   result.setLen(targets.len)
+  if client.options.middleware.len > 0:
+    for i, target in targets:
+      let ctx = NaviContext(req: buildRequest(client.options, GET, target),
+                        clientp: unsafeAddr client)
+      try:
+        ctx.next()
+        result[i] = ctx.res
+      except HttpError as e:
+        result[i] = e.response          # keep parallel's non-throwing contract
+    return
+
   var pending: seq[BatchItem]
   for i, target in targets:
-    let ctx = HookCtx(request: buildRequest(client.options, GET, target))
-    for hook in client.options.hooks.beforeRequest: runHook(hook, ctx)
-    pending.add BatchItem(idx: i, req: ctx.request)
+    pending.add BatchItem(idx: i, req: buildRequest(client.options, GET, target))
 
   while pending.len > 0:
     for pi in 0 ..< pending.len:
@@ -215,10 +255,6 @@ proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
         var resp = raw[k]
         decodeBody(resp, client.options)
         storeCookies(client.jar, item.req.url, resp)
-        block:
-          let ctx = HookCtx(request: item.req, response: resp)
-          for hook in client.options.hooks.afterResponse: runHook(hook, ctx)
-          resp = ctx.response
         let location = resp.headers.get("location")
         if client.options.redirectLimit > 0 and item.hops < client.options.redirectLimit and
            isRedirect(resp.status) and location.len > 0:
@@ -228,9 +264,6 @@ proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
         elif item.attempt < client.options.retryLimit and
              isRetryableVerb(item.req.verb) and isRetryableStatus(resp.status):
           inc item.attempt
-          block:
-            let ctx = HookCtx(request: item.req, attempt: item.attempt)
-            for hook in client.options.hooks.beforeRetry: runHook(hook, ctx)
           backoff = max(backoff, backoffMs(item.attempt, resp))
           nextRound.add item
         else:

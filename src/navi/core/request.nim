@@ -78,15 +78,6 @@ type
     bodyStream*: BodyProducer  ## when set, the body is streamed chunked
     absoluteForm*: bool         ## use absolute-URI on the request line (http proxy)
 
-  HookCtx* = ref object
-    ## Mutable context passed to lifecycle hooks. A ref so async hooks can hold
-    ## it across an `await` and still mutate it (a `var` param cannot be
-    ## captured). beforeRequest edits `request`; afterResponse edits `response`;
-    ## beforeRetry sees `attempt`.
-    request*: Request
-    response*: Response
-    attempt*: int
-
 # Readers take the base by value; a derived NaviOptions slices to it cleanly.
 proc wantsDecompress*(opts: NaviOptionsBase): bool = opts.decompress.get(true)
 proc wantsThrow*(opts: NaviOptionsBase): bool = opts.throwHttpErrors.get(true)

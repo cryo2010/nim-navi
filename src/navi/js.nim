@@ -33,17 +33,21 @@ export jsws.WebSocket, jsws.WsMessage, jsws.WsMessageKind,
        jsws.send, jsws.receive, jsws.close, jsws.closeNormal, jsws.closeGoingAway
 
 type
-  Hook* = proc(ctx: HookCtx): Future[void] {.closure.}
-    ## Lifecycle callback; may be async and `await` inside. Mutate `ctx.request`
-    ## (beforeRequest), read/mutate `ctx.response` (afterResponse), read
-    ## `ctx.attempt` (beforeRetry).
-  Hooks* = object
-    beforeRequest*: seq[Hook]
-    afterResponse*: seq[Hook]
-    beforeRetry*: seq[Hook]
+  NaviContext* = ref object
+    ## Carried through the middleware chain. A middleware reads and mutates it,
+    ## then `await ctx.next()` runs the rest of the chain (which fills `res`).
+    req*: Request            ## the outgoing request; modify it before `next`
+    res*: Response           ## the response; set by `next`, adjust it after
+    clientp: ptr Navi        ## the owning client (see `client`); valid for the call
+    sink: BodySink           ## non-nil for a streaming request
+    idx: int                 ## index of the next middleware to run
+  Middleware* = proc(ctx: NaviContext): Future[void] {.nimcall.}
+    ## A middleware step; may be async. Deliberately `nimcall` (not a closure, so
+    ## it cannot capture): read/modify `ctx.req`, `await ctx.next()` to
+    ## proceed -- or skip it to short-circuit -- then read/modify `ctx.res`.
 
   NaviOptions* = object of NaviOptionsBase
-    hooks*: Hooks   ## lifecycle callbacks (may be async)
+    middleware*: seq[Middleware]
 
   Navi* = object
     options*: NaviOptions   ## the runtime owns connections
@@ -53,13 +57,6 @@ proc defaultOptions*(): NaviOptions =
   # The browser decodes bodies and forbids the Accept-Encoding request header, so
   # keep navi from adding it; TLS and HTTP-version negotiation are the runtime's.
   result.decompress = some(false)
-
-proc mergeHooks(base, add: Hooks): Hooks =
-  Hooks(beforeRequest: base.beforeRequest & add.beforeRequest,
-        afterResponse: base.afterResponse & add.afterResponse,
-        beforeRetry: base.beforeRetry & add.beforeRetry)
-
-proc runHook(hook: Hook, ctx: HookCtx): Future[void] = hook(ctx)
 
 # A browser owns the cookie store (and hides Set-Cookie from fetch); Node, Deno,
 # Bun, and Workers do not, so navi keeps the jar there. `document` exists only in
@@ -72,7 +69,7 @@ proc newNavi*(options = defaultOptions()): Navi =
 
 proc extend*(client: Navi, options: NaviOptions): Navi =
   var merged = mergeBase(client.options, options)
-  merged.hooks = mergeHooks(client.options.hooks, options.hooks)
+  merged.middleware = client.options.middleware & options.middleware
   result = Navi(options: merged)
   if not inBrowser(): result.jar = newCookieJar()
 
@@ -81,28 +78,18 @@ proc close*(client: Navi) =
   ## the native backends.
   discard
 
-# --- pipeline steps (shared by request and stream) ---
-proc runBefore(client: Navi, req: Request): Future[Request] {.async.} =
-  let ctx = HookCtx(request: req)
-  for hook in client.options.hooks.beforeRequest: await runHook(hook, ctx)
-  result = ctx.request
-
-proc runAfter(client: Navi, req: Request, resp: Response): Future[Response] {.async.} =
-  let ctx = HookCtx(request: req, response: resp)
-  for hook in client.options.hooks.afterResponse: await runHook(hook, ctx)
-  result = ctx.response
-
+# --- request core (wrapped by middleware in request/stream) ---
 proc maybeThrow(client: Navi, req: Request, resp: Response) =
   if client.options.wantsThrow and not resp.ok:
     raise (ref HttpError)(
       msg: $req.verb & " " & $req.url & " -> " & $resp.status & " " & resp.reason,
       response: resp)
 
-proc perform(client: Navi, req0: Request): Future[Response] {.async.} =
-  ## Buffered request with the policy layer navi still owns: beforeRequest hooks,
-  ## retries with backoff on transient failures, afterResponse hooks, and
-  ## throw-on-non-2xx. Redirects, cookies, and decoding are the browser's.
-  var req = await client.runBefore(req0)
+proc runCore(client: Navi, req0: Request): Future[Response] {.async.} =
+  ## The innermost `next`: buffered request with the policy navi owns here (cookie
+  ## jar, retries with backoff, throw-on-non-2xx). Redirects and decoding are the
+  ## runtime's.
+  var req = req0
   var resp: Response
   var attempt = 0
   let maxRetries = client.options.retryLimit
@@ -122,34 +109,58 @@ proc perform(client: Navi, req0: Request): Future[Response] {.async.} =
             isRetryableStatus(resp.status)):
       break
     inc attempt
-    block:
-      let ctx = HookCtx(request: req, attempt: attempt)
-      for hook in client.options.hooks.beforeRetry: await runHook(hook, ctx)
-      req = ctx.request
     await sleep(backoffMs(attempt, resp))
-  resp = await client.runAfter(req, resp)
   client.maybeThrow(req, resp)
   result = resp
+
+proc runCoreStream(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
+  var rq = req
+  if not client.jar.isNil: applyCookies(client.jar, rq)
+  var resp = await fetchExchange(rq, sink, client.options.timeoutMs)
+  if not client.jar.isNil: storeCookies(client.jar, rq.url, resp)
+  client.maybeThrow(rq, resp)
+  result = resp
+
+proc client*(ctx: NaviContext): Navi = ctx.clientp[]
+  ## The client handling this request (e.g. to read `ctx.client.options`).
+
+proc next*(ctx: NaviContext): Future[void] {.async.} =
+  ## Run the rest of the chain: the next middleware, or -- once they are
+  ## exhausted -- the request itself. The outcome lands in `ctx.res`.
+  let mws = ctx.clientp[].options.middleware
+  if ctx.idx >= mws.len:
+    if ctx.sink.isNil:
+      ctx.res = await runCore(ctx.clientp[], ctx.req)
+    else:
+      ctx.res = await runCoreStream(ctx.clientp[], ctx.req, ctx.sink)
+  else:
+    let m = mws[ctx.idx]
+    inc ctx.idx
+    await m(ctx)
+
+proc runChain(ctx: NaviContext): Future[Response] {.async.} =
+  await ctx.next()
+  return ctx.res
 
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = "", json: JsonNode = nil,
               form: seq[(string, string)] = @[],
               multipart: Multipart = @[]): Future[Response] {.async.} =
-  result = await client.perform(
-    buildRequest(client.options, verb, target, headers, body, json, form,
-                 multipart, nil))
+  ## Perform a request; configured middleware wraps the whole call.
+  let req = buildRequest(client.options, verb, target, headers, body, json, form,
+                         multipart, nil)
+  if client.options.middleware.len == 0: return await runCore(client, req)
+  let ctx = NaviContext(req: req, clientp: unsafeAddr client)
+  return await runChain(ctx)
 
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
              headers = initHeaders()): Future[Response] {.async.} =
   ## Deliver the response body to `sink` as it arrives; `Response.body` stays
   ## empty. Not retried (the stream is consumed as it is read).
-  var req = await client.runBefore(buildRequest(client.options, verb, target, headers))
-  if not client.jar.isNil: applyCookies(client.jar, req)
-  var resp = await fetchExchange(req, sink, client.options.timeoutMs)
-  if not client.jar.isNil: storeCookies(client.jar, req.url, resp)
-  resp = await client.runAfter(req, resp)
-  client.maybeThrow(req, resp)
-  result = resp
+  let req = buildRequest(client.options, verb, target, headers)
+  if client.options.middleware.len == 0: return await runCoreStream(client, req, sink)
+  let ctx = NaviContext(req: req, clientp: unsafeAddr client, sink: sink)
+  return await runChain(ctx)
 
 proc websocket*(client: Navi, url: string,
                 headers = initHeaders()): Future[WebSocket] =

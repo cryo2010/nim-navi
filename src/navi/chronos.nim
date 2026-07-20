@@ -18,16 +18,22 @@ claimEntry("navi/chronos")
 export public, chronos
 
 type
-  Hook* = proc(ctx: HookCtx): Future[void] {.closure.}
-    ## Lifecycle callback; may be async. Mutate `ctx.request` (beforeRequest),
-    ## read/mutate `ctx.response` (afterResponse), or read `ctx.attempt`.
-  Hooks* = object
-    beforeRequest*: seq[Hook]
-    afterResponse*: seq[Hook]
-    beforeRetry*: seq[Hook]
+  NaviContext* = ref object
+    ## Carried through the middleware chain. A middleware reads and mutates it,
+    ## then `await ctx.next()` runs the rest of the chain (which fills `res`).
+    req*: Request            ## the outgoing request; modify it before `next`
+    res*: Response           ## the response; set by `next`, adjust it after
+    clientp: ptr Navi        ## the owning client (see `client`); valid for the call
+    sink: BodySink           ## non-nil for a streaming request
+    idx: int                 ## index of the next middleware to run
+  Middleware* = proc(ctx: NaviContext): Future[void] {.nimcall, gcsafe, raises: [].}
+    ## A middleware step; may be async. Deliberately `nimcall` (not a closure, so
+    ## it cannot capture): read/modify `ctx.req`, `await ctx.next()` to
+    ## proceed -- or skip it to short-circuit -- then read/modify `ctx.res`.
+    ## `gcsafe, raises: []` keep it within chronos's strict effect tracking.
 
   NaviOptions* = object of NaviOptionsBase
-    hooks*: Hooks   ## lifecycle callbacks (may be async)
+    middleware*: seq[Middleware]
 
   Navi* = object
     options*: NaviOptions
@@ -38,23 +44,12 @@ proc defaultOptions*(): NaviOptions =
   result.http = {H1, H2}
   result.tls = defaultTls()
 
-proc mergeHooks(base, add: Hooks): Hooks =
-  Hooks(beforeRequest: base.beforeRequest & add.beforeRequest,
-        afterResponse: base.afterResponse & add.afterResponse,
-        beforeRetry: base.beforeRetry & add.beforeRetry)
-
-proc runHook(hook: Hook, ctx: HookCtx): Future[void] =
-  # See the asyncdispatch entry: the call returns a Future without raising.
-  {.cast(gcsafe).}:
-    {.cast(raises: []).}:
-      result = hook(ctx)
-
 proc newNavi*(options = defaultOptions()): Navi =
   Navi(options: options, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
 proc extend*(client: Navi, options: NaviOptions): Navi =
   var merged = mergeBase(client.options, options)
-  merged.hooks = mergeHooks(client.options.hooks, options.hooks)
+  merged.middleware = client.options.middleware & options.middleware
   Navi(options: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
 proc close*(client: Navi): Future[void] {.async.} =
@@ -83,19 +78,46 @@ proc withDeadline[T](client: Navi, fut: Future[T]): Future[T] {.async.} =
     return await fut
   raise newException(TimeoutError, "navi: request timed out after " & $ms & " ms")
 
+proc client*(ctx: NaviContext): Navi = ctx.clientp[]
+  ## The client handling this request (e.g. to read `ctx.client.options`).
+
+proc next*(ctx: NaviContext): Future[void] {.async.} =
+  ## Run the rest of the chain: the next middleware, or -- once they are
+  ## exhausted -- the request itself. The outcome lands in `ctx.res`.
+  let mws = ctx.clientp[].options.middleware
+  if ctx.idx >= mws.len:
+    if ctx.sink.isNil:
+      ctx.res = await doRequest(ctx.clientp[], ctx.req)
+    else:
+      ctx.res = await doStream(ctx.clientp[], ctx.req, ctx.sink)
+  else:
+    let m = mws[ctx.idx]
+    inc ctx.idx
+    await m(ctx)
+
+proc runChain(ctx: NaviContext): Future[Response] {.async.} =
+  await ctx.next()
+  return ctx.res
+
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = "", json: JsonNode = nil,
               form: seq[(string, string)] = @[], multipart: Multipart = @[],
               bodyStream: BodyProducer = nil): Future[Response] {.async.} =
   let req = buildRequest(client.options, verb, target, headers, body, json,
                          form, multipart, bodyStream)
-  result = await client.withDeadline(doRequest(client, req))
+  if client.options.middleware.len == 0:
+    return await client.withDeadline(doRequest(client, req))
+  let ctx = NaviContext(req: req, clientp: unsafeAddr client)
+  return await client.withDeadline(runChain(ctx))
 
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
              headers = initHeaders()): Future[Response] {.async.} =
   ## Deliver the response body to `sink` as it arrives; Response.body is empty.
   let req = buildRequest(client.options, verb, target, headers)
-  result = await client.withDeadline(doStream(client, req, sink))
+  if client.options.middleware.len == 0:
+    return await client.withDeadline(doStream(client, req, sink))
+  let ctx = NaviContext(req: req, clientp: unsafeAddr client, sink: sink)
+  return await client.withDeadline(runChain(ctx))
 
 include navi/private/verbs
 

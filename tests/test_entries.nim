@@ -9,6 +9,15 @@ import ./support
 
 var serverReady: bool
 
+# Middleware are nimcall procs (no capture), so shared state is module-level.
+var mwObservedStatus: int
+proc addAuthMw(ctx: NaviContext) {.nimcall.} =
+  ctx.req.headers["authorization"] = "Wrapped"   # before
+  ctx.next()
+  mwObservedStatus = ctx.res.status              # after
+proc cannedMw(ctx: NaviContext) {.nimcall.} =
+  ctx.res = initResponse(299, "Short", "", initHeaders(), "from middleware")
+
 proc serve(port: int) {.thread.} =
   var server = newSocket()
   server.setSockOpt(OptReuseAddr, true)
@@ -333,21 +342,25 @@ suite "sync entry end to end":
     check raised
     joinThread(th)
 
-  test "hooks mutate the request and observe the response":
+  test "middleware modifies the request and observes the response":
     const port = 8989
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)
 
-    var observed = 0
-    let api = newNavi(NaviOptions(hooks: Hooks(
-      beforeRequest: @[proc(ctx: HookCtx) {.closure.} =
-        ctx.request.headers["authorization"] = "Hooked"],
-      afterResponse: @[proc(ctx: HookCtx) {.closure.} =
-        observed = ctx.response.status])))
+    mwObservedStatus = 0
+    let api = newNavi(NaviOptions(middleware: @[Middleware(addAuthMw)]))
     let res = api.post("http://127.0.0.1:" & $port & "/", body = "x")
-    check res.headers.get("x-echo-authorization") == "Hooked"
-    check observed == 200
+    check res.headers.get("x-echo-authorization") == "Wrapped"
+    check mwObservedStatus == 200
     joinThread(th)
+
+  test "middleware can short-circuit without sending a request":
+    # No server here: if the request were dialed it would fail to connect, so a
+    # 299 proves `ctx.next()` was never called.
+    let api = newNavi(NaviOptions(middleware: @[Middleware(cannedMw)]))
+    let res = api.get("http://127.0.0.1:1/")
+    check res.status == 299
+    check res.body == "from middleware"
 
   test "stores a Set-Cookie and replays it on the next request":
     const port = 8990

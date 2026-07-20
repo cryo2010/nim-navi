@@ -15,15 +15,15 @@ import navi/js
 
 proc getEnv(key, fallback: cstring): cstring {.importjs: "(process.env[#] ?? #)".}
 
+# A middleware that echoes the outgoing URL, then proceeds. Middleware are
+# nimcall procs that take a NaviContext (no capture), so this is a top-level proc.
+proc echoUrl(ctx: NaviContext): Future[void] {.async, nimcall.} =
+  echo "-> ", ctx.req.url
+  await ctx.next()
+
 proc main() {.async.} =
   let url = $getEnv("HELLO_URL", "http://localhost:8080/hello")
-
-  # A beforeRequest hook that echoes the outgoing URL. On the js entry hooks are
-  # async, so bind to a Hook-typed let for the async literal to coerce to the
-  # closure type.
-  let echoUrl: Hook = proc(ctx: HookCtx): Future[void] {.async.} =
-    echo "-> ", ctx.request.url
-  let api = newNavi(NaviOptions(hooks: Hooks(beforeRequest: @[echoUrl])))
+  let api = newNavi(NaviOptions(middleware: @[Middleware(echoUrl)]))
 
   try:
     let res = await api.get(url)
