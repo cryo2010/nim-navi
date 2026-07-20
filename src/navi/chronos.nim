@@ -18,16 +18,17 @@ claimEntry("navi/chronos")
 export public, chronos
 
 type
-  Hook* = proc(ctx: HookCtx): Future[void] {.closure.}
-    ## Lifecycle callback; may be async. Mutate `ctx.request` (beforeRequest),
-    ## read/mutate `ctx.response` (afterResponse), or read `ctx.attempt`.
-  Hooks* = object
-    beforeRequest*: seq[Hook]
-    afterResponse*: seq[Hook]
-    beforeRetry*: seq[Hook]
+  Next* = proc(req: Request): Future[Response] {.closure, gcsafe, raises: [].}
+    ## Runs the rest of the chain (inner middleware, then the request itself) and
+    ## returns its response. `await` it. `gcsafe, raises: []` let a middleware
+    ## `await next(req)` under chronos's strict effect tracking (errors ride the
+    ## Future rather than being raised by the synchronous call).
+  Middleware* = proc(req: Request, next: Next): Future[Response] {.closure, gcsafe, raises: [].}
+    ## Wraps a request; may be async. Modify `req`, `await next(req)` to proceed
+    ## (or skip it to short-circuit), then inspect or replace the response.
 
   NaviOptions* = object of NaviOptionsBase
-    hooks*: Hooks   ## lifecycle callbacks (may be async)
+    middleware*: seq[Middleware]   ## run in order; index 0 is the outermost wrap
 
   Navi* = object
     options*: NaviOptions
@@ -38,23 +39,36 @@ proc defaultOptions*(): NaviOptions =
   result.http = {H1, H2}
   result.tls = defaultTls()
 
-proc mergeHooks(base, add: Hooks): Hooks =
-  Hooks(beforeRequest: base.beforeRequest & add.beforeRequest,
-        afterResponse: base.afterResponse & add.afterResponse,
-        beforeRetry: base.beforeRetry & add.beforeRetry)
+proc wrap(m: Middleware, nxt: Next): Next =
+  ## `m` and `nxt` are parameters (not loop locals) so each layer captures its
+  ## own `nxt` -- capturing a loop variable would make every layer share one. The
+  ## casts keep the forwarded call within chronos's strict effect tracking
+  ## (the call returns a Future rather than raising).
+  proc(req: Request): Future[Response] =
+    {.cast(gcsafe).}:
+      {.cast(raises: []).}:
+        m(req, nxt)
 
-proc runHook(hook: Hook, ctx: HookCtx): Future[void] =
-  # See the asyncdispatch entry: the call returns a Future without raising.
+proc compose(mws: seq[Middleware], base: Next): Next =
+  ## Nest the middleware around `base` so mws[0] is outermost and each `next`
+  ## calls the layer beneath it.
+  result = base
+  for i in countdown(mws.high, 0):
+    result = wrap(mws[i], result)
+
+proc invoke(chain: Next, req: Request): Future[Response] =
+  ## Call the composed chain, casting so the synchronous invocation stays within
+  ## chronos's strict effect tracking (errors ride the returned Future).
   {.cast(gcsafe).}:
     {.cast(raises: []).}:
-      result = hook(ctx)
+      chain(req)
 
 proc newNavi*(options = defaultOptions()): Navi =
   Navi(options: options, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
 proc extend*(client: Navi, options: NaviOptions): Navi =
   var merged = mergeBase(client.options, options)
-  merged.hooks = mergeHooks(client.options.hooks, options.hooks)
+  merged.middleware = client.options.middleware & options.middleware
   Navi(options: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
 proc close*(client: Navi): Future[void] {.async.} =
@@ -89,13 +103,17 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
               bodyStream: BodyProducer = nil): Future[Response] {.async.} =
   let req = buildRequest(client.options, verb, target, headers, body, json,
                          form, multipart, bodyStream)
-  result = await client.withDeadline(doRequest(client, req))
+  let base: Next = proc(r: Request): Future[Response] = doRequest(client, r)
+  result = await client.withDeadline(
+    invoke(compose(client.options.middleware, base), req))
 
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
              headers = initHeaders()): Future[Response] {.async.} =
   ## Deliver the response body to `sink` as it arrives; Response.body is empty.
   let req = buildRequest(client.options, verb, target, headers)
-  result = await client.withDeadline(doStream(client, req, sink))
+  let base: Next = proc(r: Request): Future[Response] = doStream(client, r, sink)
+  result = await client.withDeadline(
+    invoke(compose(client.options.middleware, base), req))
 
 include navi/private/verbs
 

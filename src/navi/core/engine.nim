@@ -175,16 +175,12 @@ template followRedirects(client, startReq, resp: typed) =
       break
 
 template performRequest*(client, req0: typed): Response =
-  ## Buffered request with the full policy layer: beforeRequest hooks, retries
-  ## with backoff, redirect following, decompression, afterResponse hooks, and
-  ## throw-on-non-2xx.
-  mixin sleep, runHook
+  ## Buffered request with the full policy layer: retries with backoff, redirect
+  ## following, decompression, and throw-on-non-2xx. Middleware (which can wrap,
+  ## short-circuit, or observe) is composed around this by the entry module.
+  mixin sleep
   block:
     var req = req0
-    block:
-      let ctx = HookCtx(request: req)
-      for hook in client.options.hooks.beforeRequest: await runHook(hook, ctx)
-      req = ctx.request
     var resp: Response
     var attempt = 0
     let maxRetries = client.options.retryLimit
@@ -201,15 +197,7 @@ template performRequest*(client, req0: typed): Response =
               isRetryableStatus(resp.status)):
         break
       inc attempt
-      block:
-        let ctx = HookCtx(request: req, attempt: attempt)
-        for hook in client.options.hooks.beforeRetry: await runHook(hook, ctx)
-        req = ctx.request
       await sleep(backoffMs(attempt, resp))
-    block:
-      let ctx = HookCtx(request: req, response: resp)
-      for hook in client.options.hooks.afterResponse: await runHook(hook, ctx)
-      resp = ctx.response
     if client.options.wantsThrow and not resp.ok:
       raiseHttpError(req, resp)
     resp

@@ -22,16 +22,15 @@ claimEntry("navi")
 export public
 
 type
-  Hook* = proc(ctx: HookCtx) {.closure.}
-    ## Lifecycle callback: mutate `ctx.request` (beforeRequest), read/mutate
-    ## `ctx.response` (afterResponse), or read `ctx.attempt` (beforeRetry).
-  Hooks* = object
-    beforeRequest*: seq[Hook]
-    afterResponse*: seq[Hook]
-    beforeRetry*: seq[Hook]
+  Next* = proc(req: Request): Response {.closure.}
+    ## Runs the rest of the chain (inner middleware, then the request itself) and
+    ## returns its response.
+  Middleware* = proc(req: Request, next: Next): Response {.closure.}
+    ## Wraps a request: modify `req`, call `next(req)` to proceed (or skip it to
+    ## short-circuit without sending), then inspect or replace the response.
 
   NaviOptions* = object of NaviOptionsBase
-    hooks*: Hooks   ## lifecycle callbacks (sync)
+    middleware*: seq[Middleware]   ## run in order; index 0 is the outermost wrap
 
   Navi* = object
     options*: NaviOptions
@@ -42,24 +41,29 @@ proc defaultOptions*(): NaviOptions =
   result.http = {H1, H2} # negotiate h2 over TLS via ALPN, fall back to h1
   result.tls = defaultTls()
 
-proc mergeHooks(base, add: Hooks): Hooks =
-  Hooks(beforeRequest: base.beforeRequest & add.beforeRequest,
-        afterResponse: base.afterResponse & add.afterResponse,
-        beforeRetry: base.beforeRetry & add.beforeRetry)
+proc wrap(m: Middleware, nxt: Next): Next =
+  ## `m` and `nxt` are parameters (not loop locals) so each layer captures its
+  ## own `nxt` -- capturing a loop variable would make every layer share one.
+  proc(req: Request): Response =
+    {.cast(gcsafe).}: m(req, nxt)
 
-proc runHook(hook: Hook, ctx: HookCtx) =
-  {.cast(gcsafe).}: hook(ctx)
+proc compose(mws: seq[Middleware], base: Next): Next =
+  ## Nest the middleware around `base` so mws[0] is outermost and each `next`
+  ## calls the layer beneath it.
+  result = base
+  for i in countdown(mws.high, 0):
+    result = wrap(mws[i], result)
 
 proc newNavi*(options = defaultOptions()): Navi =
   ## Create a client. `options` supplies defaults (prefixUrl, headers, TLS,
-  ## hooks, …).
+  ## middleware, …).
   Navi(options: options, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
 proc extend*(client: Navi, options: NaviOptions): Navi =
-  ## Derive a new client, layering `options` over this client's (hooks are
+  ## Derive a new client, layering `options` over this client's (middleware is
   ## appended). The derived client gets its own connection pool and cookie jar.
   var merged = mergeBase(client.options, options)
-  merged.hooks = mergeHooks(client.options.hooks, options.hooks)
+  merged.middleware = client.options.middleware & options.middleware
   Navi(options: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
 proc close*(client: Navi) =
@@ -74,22 +78,32 @@ proc transport(client: Navi, req: Request, sink: BodySink): Response =
   ## Pool-based transport (one request per connection at a time).
   poolTransport(client, req, sink)
 
+proc runCore(client: Navi, req: Request): Response =
+  ## The innermost `next`: the full policy layer for one buffered request.
+  performRequest(client, req)
+
+proc runCoreStream(client: Navi, req: Request, sink: BodySink): Response =
+  performStream(client, req, sink)
+
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = "", json: JsonNode = nil,
               form: seq[(string, string)] = @[], multipart: Multipart = @[],
               bodyStream: BodyProducer = nil): Response =
   ## Perform a request and return the response. `json`/`form`/`multipart` encode
   ## the body; `bodyStream` uploads a chunked body from a pull-based producer.
+  ## Configured middleware wraps the whole call.
   let req = buildRequest(client.options, verb, target, headers, body, json,
                          form, multipart, bodyStream)
-  performRequest(client, req)
+  let base: Next = proc(r: Request): Response = runCore(client, r)
+  compose(client.options.middleware, base)(req)
 
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
              headers = initHeaders()): Response =
   ## Perform a request and deliver the response body to `sink` as it arrives.
   ## The returned Response carries status and headers but an empty body.
   let req = buildRequest(client.options, verb, target, headers)
-  performStream(client, req, sink)
+  let base: Next = proc(r: Request): Response = runCoreStream(client, r, sink)
+  compose(client.options.middleware, base)(req)
 
 include navi/private/verbs
 
@@ -188,15 +202,26 @@ proc transportGroup(client: Navi, items: seq[BatchItem],
 proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
   ## Fetch many URLs (GET) concurrently. Same-origin requests are multiplexed
   ## over one HTTP/2 connection when the server supports h2, otherwise run
-  ## sequentially. Each response is still put through the policy layer: cookies,
-  ## decompression, redirects, retries, and hooks. Non-2xx responses are
-  ## returned (not raised) so every result is available; inspect `.ok`.
+  ## sequentially, each through the policy layer (cookies, decompression,
+  ## redirects, retries). Non-2xx responses are returned (not raised) so every
+  ## result is available; inspect `.ok`.
+  ##
+  ## When middleware is configured it wraps each request individually, which
+  ## forgoes the shared-connection multiplexing (every request stands alone).
   result.setLen(targets.len)
+  if client.options.middleware.len > 0:
+    for i, target in targets:
+      let req = buildRequest(client.options, GET, target)
+      let base: Next = proc(r: Request): Response = runCore(client, r)
+      try:
+        result[i] = compose(client.options.middleware, base)(req)
+      except HttpError as e:
+        result[i] = e.response          # keep parallel's non-throwing contract
+    return
+
   var pending: seq[BatchItem]
   for i, target in targets:
-    let ctx = HookCtx(request: buildRequest(client.options, GET, target))
-    for hook in client.options.hooks.beforeRequest: runHook(hook, ctx)
-    pending.add BatchItem(idx: i, req: ctx.request)
+    pending.add BatchItem(idx: i, req: buildRequest(client.options, GET, target))
 
   while pending.len > 0:
     for pi in 0 ..< pending.len:
@@ -215,10 +240,6 @@ proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
         var resp = raw[k]
         decodeBody(resp, client.options)
         storeCookies(client.jar, item.req.url, resp)
-        block:
-          let ctx = HookCtx(request: item.req, response: resp)
-          for hook in client.options.hooks.afterResponse: runHook(hook, ctx)
-          resp = ctx.response
         let location = resp.headers.get("location")
         if client.options.redirectLimit > 0 and item.hops < client.options.redirectLimit and
            isRedirect(resp.status) and location.len > 0:
@@ -228,9 +249,6 @@ proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
         elif item.attempt < client.options.retryLimit and
              isRetryableVerb(item.req.verb) and isRetryableStatus(resp.status):
           inc item.attempt
-          block:
-            let ctx = HookCtx(request: item.req, attempt: item.attempt)
-            for hook in client.options.hooks.beforeRetry: runHook(hook, ctx)
           backoff = max(backoff, backoffMs(item.attempt, resp))
           nextRound.add item
         else:

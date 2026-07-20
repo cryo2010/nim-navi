@@ -18,12 +18,13 @@ proc getEnv(key, fallback: cstring): cstring {.importjs: "(process.env[#] ?? #)"
 proc main() {.async.} =
   let url = $getEnv("HELLO_URL", "http://localhost:8080/hello")
 
-  # A beforeRequest hook that echoes the outgoing URL. On the js entry hooks are
-  # async, so bind to a Hook-typed let for the async literal to coerce to the
-  # closure type.
-  let echoUrl: Hook = proc(ctx: HookCtx): Future[void] {.async.} =
-    echo "-> ", ctx.request.url
-  let api = newNavi(NaviOptions(hooks: Hooks(beforeRequest: @[echoUrl])))
+  # A middleware that echoes the outgoing URL, then proceeds. On the js entry
+  # middleware is async, so bind to a Middleware-typed let for the async literal
+  # to coerce to the closure type.
+  let echoUrl: Middleware = proc(req: Request, next: Next): Future[Response] {.async.} =
+    echo "-> ", req.url
+    result = await next(req)
+  let api = newNavi(NaviOptions(middleware: @[echoUrl]))
 
   try:
     let res = await api.get(url)

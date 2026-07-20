@@ -333,21 +333,32 @@ suite "sync entry end to end":
     check raised
     joinThread(th)
 
-  test "hooks mutate the request and observe the response":
+  test "middleware wraps the request: modify before, observe after":
     const port = 8989
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)
 
     var observed = 0
-    let api = newNavi(NaviOptions(hooks: Hooks(
-      beforeRequest: @[proc(ctx: HookCtx) {.closure.} =
-        ctx.request.headers["authorization"] = "Hooked"],
-      afterResponse: @[proc(ctx: HookCtx) {.closure.} =
-        observed = ctx.response.status])))
+    let addAuth: Middleware = proc(req: Request, next: Next): Response =
+      var r = req
+      r.headers["authorization"] = "Wrapped"      # before
+      result = next(r)
+      observed = result.status                     # after, same scope
+    let api = newNavi(NaviOptions(middleware: @[addAuth]))
     let res = api.post("http://127.0.0.1:" & $port & "/", body = "x")
-    check res.headers.get("x-echo-authorization") == "Hooked"
+    check res.headers.get("x-echo-authorization") == "Wrapped"
     check observed == 200
     joinThread(th)
+
+  test "middleware can short-circuit without sending a request":
+    # No server here: if the request were dialed it would fail to connect, so a
+    # 299 proves `next` was never called.
+    let canned: Middleware = proc(req: Request, next: Next): Response =
+      initResponse(299, "Short", "", initHeaders(), "from middleware")
+    let api = newNavi(NaviOptions(middleware: @[canned]))
+    let res = api.get("http://127.0.0.1:1/")
+    check res.status == 299
+    check res.body == "from middleware"
 
   test "stores a Set-Cookie and replays it on the next request":
     const port = 8990

@@ -2,7 +2,7 @@
 
 A [navi/js](../../src/navi/js.nim) client that does `GET /hello` against a
 Python FastAPI server. The client compiles to JavaScript and runs on Node, and
-uses a `beforeRequest` hook to echo the outgoing URL.
+uses a middleware to echo the outgoing URL.
 
 ## Run with Docker (client + server)
 

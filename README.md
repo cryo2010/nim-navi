@@ -71,7 +71,7 @@ navi is under active development. What works today:
 - **Throw-on-non-2xx** by default (`HttpError`), opt-out available
 - **Automatic decompression**: gzip/deflate (zlib), plus brotli and zstd when `libbrotlidec`/`libzstd` are present
 - **Request timeouts** via the `timeout` option (`TimeoutError`)
-- **Hooks**: `beforeRequest` / `afterResponse` / `beforeRetry`
+- **Middleware**: onion-style `proc(req, next)` wrappers that modify, observe, or short-circuit a request
 - **Cookie jar**, **basic/bearer/digest auth** (Digest: MD5 and SHA-256, RFC 7616), **proxy** (http absolute-URI and https CONNECT)
 - **Body helpers**: `json=`, `form=`, and `multipart=`
 - **WebSocket** (RFC 6455) on all four backends (sync, asyncdispatch, chronos, and js): `websocket()` with `send`/`receive`/`close`, text and binary messages, fragmentation reassembly, and automatic ping/pong
@@ -129,7 +129,7 @@ or navi/js.
 ### Capability matrix
 
 Every backend shares the same request surface: HTTP/1.1, WebSocket (`ws`/`wss`),
-TLS certificate verification, retries, redirects, hooks, throw-on-non-2xx,
+TLS certificate verification, retries, redirects, middleware, throw-on-non-2xx,
 streaming download, and response decompression all work everywhere. Where the
 backends differ:
 
@@ -157,7 +157,7 @@ Two backends carry caveats:
   up to TLS 1.2. Custom-CA verification via `caFile` does work.
 - **`navi/js` runs on `fetch`/`WebSocket`,** so the platform owns connections,
   cookies, redirects, decompression, and TLS; navi keeps request building,
-  retries, throw-on-non-2xx, and hooks. Its WebSocket wraps the native one, so
+  retries, throw-on-non-2xx, and middleware. Its WebSocket wraps the native one, so
   custom handshake headers are ignored and the runtime handles ping/pong. On a
   runtime with no cookie store (Node, Deno, Bun, Workers), navi keeps its own
   cookie jar automatically so cookies persist across requests; in a browser the
@@ -165,7 +165,7 @@ Two backends carry caveats:
 
 ### The browser backend (`navi/js`)
 
-`import navi/js` compiles with `nim js` and runs over the runtime's `fetch`, so the platform handles TLS, HTTP-version negotiation, redirects, cookies, and decompression. navi keeps the request building, retries, throw-on-non-2xx, and (async) hooks. It has no connection pool, streaming uploads are unavailable, and `res.httpVersion` is empty because `fetch` does not expose it. Cookies persist automatically with no configuration: in a browser the store handles them, and on a runtime without one (Node, Deno, Bun, Workers) navi keeps its own jar. Hooks are async, as on the other async backends.
+`import navi/js` compiles with `nim js` and runs over the runtime's `fetch`, so the platform handles TLS, HTTP-version negotiation, redirects, cookies, and decompression. navi keeps the request building, retries, throw-on-non-2xx, and (async) middleware. It has no connection pool, streaming uploads are unavailable, and `res.httpVersion` is empty because `fetch` does not expose it. Cookies persist automatically with no configuration: in a browser the store handles them, and on a runtime without one (Node, Deno, Bun, Workers) navi keeps its own jar. Middleware is async, as on the other async backends.
 
 ```nim
 import navi/js
@@ -289,26 +289,50 @@ let api = newNavi(NaviOptions(
 
 Each client keeps a cookie jar: cookies from `Set-Cookie` are stored and replayed on later requests to the same client (matched by domain, path, and Secure).
 
-### Hooks
+### Middleware
 
-Hooks receive a mutable `HookCtx` (`ctx.request`, `ctx.response`, `ctx.attempt`):
-
-```nim
-let api = newNavi(NaviOptions(hooks: Hooks(
-  beforeRequest: @[proc(ctx: HookCtx) {.closure.} =
-    ctx.request.headers["x-trace-id"] = newTraceId()],
-  afterResponse: @[proc(ctx: HookCtx) {.closure.} =
-    log(ctx.request.verb, ctx.response.status)],
-)))
-```
-
-On the async entries (`navi/asyncdispatch`, `navi/chronos`) a hook may be async
-and `await` inside it; the type is `proc(ctx: HookCtx): Future[void]`:
+Middleware wraps a request onion-style: a `proc(req, next)` that may modify the
+request, call `next(req)` to run the rest of the chain (and get its response),
+inspect or replace that response, or skip `next` entirely to short-circuit
+without sending anything. `middleware[0]` is the outermost layer. Everything
+before the `next(...)` call is "before", everything after is "after", and both
+share the same scope:
 
 ```nim
-let refreshToken: Hook = proc(ctx: HookCtx): Future[void] {.async.} =
-  ctx.request.headers["authorization"] = "Bearer " & await fetchToken()
+let api = newNavi(NaviOptions(middleware: @[
+  (proc(req: Request, next: Next): Response =    # trace + log
+    var r = req
+    r.headers["x-trace-id"] = newTraceId()
+    let t0 = epochTime()
+    result = next(r)
+    log(r.verb, result.status, epochTime() - t0)),
+]))
 ```
+
+Short-circuit by returning a response without calling `next` (e.g. a cache hit
+or a mock) — nothing goes over the wire:
+
+```nim
+let cache = proc(req: Request, next: Next): Response =
+  if req.url in store: return store[req.url]
+  result = next(req)
+  store[req.url] = result
+```
+
+On the async entries (`navi/asyncdispatch`, `navi/chronos`, `navi/js`) middleware
+is async and may `await`; the type is
+`proc(req: Request, next: Next): Future[Response]` and you `await next(req)`:
+
+```nim
+let refreshToken: Middleware = proc(req: Request, next: Next): Future[Response] {.async.} =
+  var r = req
+  r.headers["authorization"] = "Bearer " & await fetchToken()
+  result = await next(r)
+```
+
+Middleware wraps the whole request including the built-in retries and redirects,
+so it runs once per call; to act on each retry, implement the retry loop in a
+middleware. It does not apply to `websocket()`.
 
 ### Decompression
 
@@ -354,7 +378,7 @@ let results = api.parallel(@[
   "https://nghttp2.org/httpbin/get",
   "https://nghttp2.org/httpbin/ip",
 ])   # multiplexed over one h2 connection; each result still goes through the
-     # policy layer (redirects, retries, decompression, cookies, hooks)
+     # policy layer (redirects, retries, decompression, cookies)
 ```
 
 `parallel` collects every response (it does not raise on non-2xx); inspect
@@ -423,8 +447,8 @@ requests together with `all(@[...])` multiplexes them the same way.
 
 ### client.extend(options)
 
-Derive a new client, layering `options` over this one: headers are merged, hooks
-are appended, and other set fields override. The derived client gets its own
+Derive a new client, layering `options` over this one: headers are merged, middleware
+is appended, and other set fields override. The derived client gets its own
 connection pool and cookie jar.
 
 ### NaviOptions
@@ -450,14 +474,11 @@ Every field is optional.
   digest answers the server's 401 challenge (MD5 or SHA-256) on a one-shot retry.
 - **proxy** `Option[string]`: proxy URL. Unset falls back to `HTTP(S)_PROXY` /
   `NO_PROXY`.
-- **hooks** `Hooks`: lifecycle callbacks, each a `seq`:
-  - **beforeRequest**: mutate `ctx.request` before it is sent.
-  - **afterResponse**: read or replace `ctx.response`.
-  - **beforeRetry**: runs before a retry; see `ctx.attempt`.
-
-  A hook receives a mutable `HookCtx` (`ctx.request`, `ctx.response`,
-  `ctx.attempt`). On the sync backend the type is `proc(ctx: HookCtx)`; on the
-  async backends it is `proc(ctx: HookCtx): Future[void]` and may `await`.
+- **middleware** `seq[Middleware]`: onion-style wrappers run in order, with
+  `middleware[0]` outermost. Each is `proc(req: Request, next: Next): Response`
+  (sync) or `proc(req, next): Future[Response]` (async): modify `req`, call
+  `next(req)` to proceed, then inspect or replace the response — or skip `next`
+  to short-circuit without sending. See [Middleware](#middleware).
 
 ### Response
 
@@ -483,7 +504,7 @@ response as `.response`.
 
 ## Roadmap
 
-HTTP/1.1 and HTTP/2 with the full policy layer (retries, redirects, hooks,
+HTTP/1.1 and HTTP/2 with the full policy layer (retries, redirects, middleware,
 cookies, auth, proxy, decompression, body helpers, throw-on-non-2xx) are done.
 
 - **HTTP/3**: reserved for when a usable QUIC stack lands on the chronos backend.
