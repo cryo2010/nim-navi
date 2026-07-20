@@ -1,15 +1,16 @@
 ## JavaScript transport: HTTP via the runtime's `fetch`.
 ##
 ## `fetch` already performs TLS, HTTP-version negotiation, redirect following,
-## cookie storage (the browser jar), and content-decoding, so navi does none of
-## that here. This module only marshals a navi `Request` into a `fetch` call and
-## the `Response` back. JavaScript-only: compiled solely through `import navi/js`
-## under `nim js`.
+## and content-decoding, so navi does none of that here. This module marshals a
+## navi `Request` into a `fetch` call and the `Response` back, surfacing
+## Set-Cookie via getSetCookie() so the entry's opt-in cookie jar can read it.
+## JavaScript-only: compiled solely through `import navi/js` under `nim js`.
 
 when not defined(js):
   {.error: "navi/backend/js is JavaScript-only; compile with `nim js` via `import navi/js`.".}
 
 import std/[asyncjs, jsffi]
+from std/strutils import cmpIgnoreCase
 import ../core/[headers, url, request, response]
 
 # --- fetch / DOM bindings ---
@@ -18,6 +19,7 @@ proc newHeaders(): JsObject {.importjs: "new Headers()".}
 proc append(h: JsObject, name, value: cstring) {.importjs: "#.append(#, #)".}
 proc jsText(res: JsObject): Future[cstring] {.importjs: "#.text()".}
 proc headerEntries(res: JsObject): JsObject {.importjs: "Array.from(#.headers.entries())".}
+proc setCookieList(res: JsObject): JsObject {.importjs: "(#.headers.getSetCookie?.() ?? [])".}
 proc jsLen(arr: JsObject): int {.importjs: "#.length".}
 proc bodyReader(res: JsObject): JsObject {.importjs: "#.body.getReader()".}
 proc readChunk(reader: JsObject): Future[JsObject] {.importjs: "#.read()".}
@@ -43,7 +45,16 @@ proc readHeaders(res: JsObject): Headers =
   let entries = headerEntries(res)
   for i in 0 ..< jsLen(entries):
     let pair = entries[i]
-    result.add($pair[0].to(cstring), $pair[1].to(cstring))
+    let name = $pair[0].to(cstring)
+    # `entries()` folds duplicate headers into one comma-joined value, which is
+    # lossy for Set-Cookie (an Expires date contains a comma). Skip it here and
+    # re-add each cookie individually from getSetCookie() below. In a browser
+    # getSetCookie() returns [] (Set-Cookie is hidden), so this is a no-op there.
+    if cmpIgnoreCase(name, "set-cookie") == 0: continue
+    result.add(name, $pair[1].to(cstring))
+  let cookies = setCookieList(res)
+  for i in 0 ..< jsLen(cookies):
+    result.add("set-cookie", $cookies[i].to(cstring))
 
 proc toResponse(res: JsObject, body: string): Response =
   initResponse(res["status"].to(int), $res["statusText"].to(cstring),

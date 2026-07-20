@@ -66,6 +66,10 @@ task wsjs, "navi/js WebSocket runtime test (Node client vs a native server)":
   # Runs the navi/js WebSocket client under Node against a native echo server.
   exec "bash tests/interop/jsws.sh"
 
+task jsCookieJar, "navi/js opt-in cookie jar runtime test (Node)":
+  # Verifies the opt-in jar replays cookies across requests on Node/undici.
+  exec "bash tests/interop/js_cookiejar.sh"
+
 task demoWssBrowser, "Browser wss demo: mkcert cert + wss server + page (needs mkcert, python3)":
   # Generates a browser-trusted cert (mkcert), serves the navi/js page over a
   # wss echo server, and prints the URL to open.
