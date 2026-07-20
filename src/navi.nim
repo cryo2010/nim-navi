@@ -24,16 +24,16 @@ export public
 type
   NaviContext* = ref object
     ## Carried through the middleware chain. A middleware reads and mutates it,
-    ## then calls `next` to run the rest of the chain (which fills `response`).
-    request*: Request       ## the outgoing request; modify it before `next`
-    response*: Response      ## the response; set by `next`, adjust it after
+    ## then calls `next` to run the rest of the chain (which fills `res`).
+    req*: Request            ## the outgoing request; modify it before `next`
+    res*: Response           ## the response; set by `next`, adjust it after
     clientp: ptr Navi        ## the owning client (see `client`); valid for the call
     sink: BodySink           ## non-nil for a streaming request
     idx: int                 ## index of the next middleware to run
   Middleware* = proc(ctx: NaviContext) {.nimcall.}
     ## A middleware step. Deliberately `nimcall` (not a closure, so it cannot
-    ## capture): read/modify `ctx.request`, call `ctx.next()` to proceed -- or
-    ## skip it to short-circuit -- then read/modify `ctx.response`. Run in order;
+    ## capture): read/modify `ctx.req`, call `ctx.next()` to proceed -- or
+    ## skip it to short-circuit -- then read/modify `ctx.res`. Run in order;
     ## index 0 is the outermost.
 
   NaviOptions* = object of NaviOptionsBase
@@ -84,12 +84,12 @@ proc client*(ctx: NaviContext): Navi = ctx.clientp[]
 
 proc next*(ctx: NaviContext) =
   ## Run the rest of the chain: the next middleware, or -- once they are
-  ## exhausted -- the request itself. The outcome lands in `ctx.response`.
+  ## exhausted -- the request itself. The outcome lands in `ctx.res`.
   let mws = ctx.clientp[].options.middleware
   if ctx.idx >= mws.len:
-    ctx.response =
-      if ctx.sink.isNil: runCore(ctx.clientp[], ctx.request)
-      else: runCoreStream(ctx.clientp[], ctx.request, ctx.sink)
+    ctx.res =
+      if ctx.sink.isNil: runCore(ctx.clientp[], ctx.req)
+      else: runCoreStream(ctx.clientp[], ctx.req, ctx.sink)
   else:
     let m = mws[ctx.idx]
     inc ctx.idx
@@ -105,9 +105,9 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
   let req = buildRequest(client.options, verb, target, headers, body, json,
                          form, multipart, bodyStream)
   if client.options.middleware.len == 0: return runCore(client, req)
-  let ctx = NaviContext(request: req, clientp: unsafeAddr client)
+  let ctx = NaviContext(req: req, clientp: unsafeAddr client)
   ctx.next()
-  ctx.response
+  ctx.res
 
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
              headers = initHeaders()): Response =
@@ -115,9 +115,9 @@ proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
   ## The returned Response carries status and headers but an empty body.
   let req = buildRequest(client.options, verb, target, headers)
   if client.options.middleware.len == 0: return runCoreStream(client, req, sink)
-  let ctx = NaviContext(request: req, clientp: unsafeAddr client, sink: sink)
+  let ctx = NaviContext(req: req, clientp: unsafeAddr client, sink: sink)
   ctx.next()
-  ctx.response
+  ctx.res
 
 include navi/private/verbs
 
@@ -225,11 +225,11 @@ proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
   result.setLen(targets.len)
   if client.options.middleware.len > 0:
     for i, target in targets:
-      let ctx = NaviContext(request: buildRequest(client.options, GET, target),
+      let ctx = NaviContext(req: buildRequest(client.options, GET, target),
                         clientp: unsafeAddr client)
       try:
         ctx.next()
-        result[i] = ctx.response
+        result[i] = ctx.res
       except HttpError as e:
         result[i] = e.response          # keep parallel's non-throwing contract
     return

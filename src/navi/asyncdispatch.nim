@@ -18,16 +18,16 @@ export public, asyncdispatch
 type
   NaviContext* = ref object
     ## Carried through the middleware chain. A middleware reads and mutates it,
-    ## then `await ctx.next()` runs the rest of the chain (which fills `response`).
-    request*: Request       ## the outgoing request; modify it before `next`
-    response*: Response      ## the response; set by `next`, adjust it after
+    ## then `await ctx.next()` runs the rest of the chain (which fills `res`).
+    req*: Request            ## the outgoing request; modify it before `next`
+    res*: Response           ## the response; set by `next`, adjust it after
     clientp: ptr Navi        ## the owning client (see `client`); valid for the call
     sink: BodySink           ## non-nil for a streaming request
     idx: int                 ## index of the next middleware to run
   Middleware* = proc(ctx: NaviContext): Future[void] {.nimcall.}
     ## A middleware step; may be async. Deliberately `nimcall` (not a closure, so
-    ## it cannot capture): read/modify `ctx.request`, `await ctx.next()` to
-    ## proceed -- or skip it to short-circuit -- then read/modify `ctx.response`.
+    ## it cannot capture): read/modify `ctx.req`, `await ctx.next()` to
+    ## proceed -- or skip it to short-circuit -- then read/modify `ctx.res`.
 
   NaviOptions* = object of NaviOptionsBase
     middleware*: seq[Middleware]
@@ -166,13 +166,13 @@ proc client*(ctx: NaviContext): Navi = ctx.clientp[]
 
 proc next*(ctx: NaviContext): Future[void] {.async.} =
   ## Run the rest of the chain: the next middleware, or -- once they are
-  ## exhausted -- the request itself. The outcome lands in `ctx.response`.
+  ## exhausted -- the request itself. The outcome lands in `ctx.res`.
   let mws = ctx.clientp[].options.middleware
   if ctx.idx >= mws.len:
     if ctx.sink.isNil:
-      ctx.response = await doRequest(ctx.clientp[], ctx.request)
+      ctx.res = await doRequest(ctx.clientp[], ctx.req)
     else:
-      ctx.response = await doStream(ctx.clientp[], ctx.request, ctx.sink)
+      ctx.res = await doStream(ctx.clientp[], ctx.req, ctx.sink)
   else:
     let m = mws[ctx.idx]
     inc ctx.idx
@@ -180,7 +180,7 @@ proc next*(ctx: NaviContext): Future[void] {.async.} =
 
 proc runChain(ctx: NaviContext): Future[Response] {.async.} =
   await ctx.next()
-  return ctx.response
+  return ctx.res
 
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = "", json: JsonNode = nil,
@@ -191,7 +191,7 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
                          form, multipart, bodyStream)
   if client.options.middleware.len == 0:
     return await client.withDeadline(doRequest(client, req))
-  let ctx = NaviContext(request: req, clientp: unsafeAddr client)
+  let ctx = NaviContext(req: req, clientp: unsafeAddr client)
   return await client.withDeadline(runChain(ctx))
 
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
@@ -200,7 +200,7 @@ proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
   let req = buildRequest(client.options, verb, target, headers)
   if client.options.middleware.len == 0:
     return await client.withDeadline(doStream(client, req, sink))
-  let ctx = NaviContext(request: req, clientp: unsafeAddr client, sink: sink)
+  let ctx = NaviContext(req: req, clientp: unsafeAddr client, sink: sink)
   return await client.withDeadline(runChain(ctx))
 
 include navi/private/verbs

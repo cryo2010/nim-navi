@@ -292,9 +292,9 @@ Each client keeps a cookie jar: cookies from `Set-Cookie` are stored and replaye
 ### Middleware
 
 Middleware wraps a request onion-style. Each is a **`proc(ctx: NaviContext)`** that
-reads and mutates a shared `NaviContext` (`ctx.request`, `ctx.response`, `ctx.client`),
+reads and mutates a shared `NaviContext` (`ctx.req`, `ctx.res`, `ctx.client`),
 calls `ctx.next()` to run the rest of the chain, and then inspects or replaces
-`ctx.response`, or skips `next` to short-circuit without sending. `middleware[0]`
+`ctx.res`, or skips `next` to short-circuit without sending. `middleware[0]`
 is the outermost layer; everything before the `ctx.next()` call is "before" and
 everything after is "after".
 
@@ -304,23 +304,23 @@ top-level procs:
 
 ```nim
 proc trace(ctx: NaviContext) =                 # sync (import navi)
-  ctx.request.headers["x-trace-id"] = newTraceId()   # before
+  ctx.req.headers["x-trace-id"] = newTraceId()   # before
   let t0 = epochTime()
   ctx.next()
-  log(ctx.request.verb, ctx.response.status, epochTime() - t0)   # after
+  log(ctx.req.verb, ctx.res.status, epochTime() - t0)   # after
 
 let api = newNavi(NaviOptions(middleware: @[Middleware(trace)]))
 ```
 
-Short-circuit by setting `ctx.response` and *not* calling `next` (a cache hit or
+Short-circuit by setting `ctx.res` and *not* calling `next` (a cache hit or
 a mock), and nothing goes over the wire:
 
 ```nim
 proc cache(ctx: NaviContext) =
-  if ctx.request.url in store: ctx.response = store[ctx.request.url]  # no next()
+  if ctx.req.url in store: ctx.res = store[ctx.req.url]  # no next()
   else:
     ctx.next()
-    store[ctx.request.url] = ctx.response
+    store[ctx.req.url] = ctx.res
 ```
 
 On the async entries (`navi/asyncdispatch`, `navi/chronos`, `navi/js`) a
@@ -328,7 +328,7 @@ middleware is `proc(ctx: NaviContext): Future[void]` and you `await ctx.next()`:
 
 ```nim
 proc refreshToken(ctx: NaviContext): Future[void] {.async.} =
-  ctx.request.headers["authorization"] = "Bearer " & await fetchToken()
+  ctx.req.headers["authorization"] = "Bearer " & await fetchToken()
   await ctx.next()
 ```
 
@@ -486,8 +486,8 @@ Every field is optional.
   `NO_PROXY`.
 - **middleware** `seq[Middleware]`: onion-style steps run in order, with
   `middleware[0]` outermost. Each is a `nimcall` `proc(ctx: NaviContext)` (sync) or
-  `proc(ctx: NaviContext): Future[void]` (async): modify `ctx.request`, call
-  `ctx.next()` to proceed, then inspect or replace `ctx.response`, or skip
+  `proc(ctx: NaviContext): Future[void]` (async): modify `ctx.req`, call
+  `ctx.next()` to proceed, then inspect or replace `ctx.res`, or skip
   `next` to short-circuit without sending. See [Middleware](#middleware).
 
 ### Response
