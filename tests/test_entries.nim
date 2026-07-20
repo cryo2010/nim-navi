@@ -11,11 +11,11 @@ var serverReady: bool
 
 # Middleware are nimcall procs (no capture), so shared state is module-level.
 var mwObservedStatus: int
-proc addAuthMw(ctx: Context) {.nimcall.} =
+proc addAuthMw(ctx: NaviContext) {.nimcall.} =
   ctx.request.headers["authorization"] = "Wrapped"   # before
   ctx.next()
   mwObservedStatus = ctx.response.status              # after
-proc cannedMw(ctx: Context) {.nimcall.} =
+proc cannedMw(ctx: NaviContext) {.nimcall.} =
   ctx.response = initResponse(299, "Short", "", initHeaders(), "from middleware")
 
 proc serve(port: int) {.thread.} =

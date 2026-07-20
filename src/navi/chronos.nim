@@ -18,7 +18,7 @@ claimEntry("navi/chronos")
 export public, chronos
 
 type
-  Context* = ref object
+  NaviContext* = ref object
     ## Carried through the middleware chain. A middleware reads and mutates it,
     ## then `await ctx.next()` runs the rest of the chain (which fills `response`).
     request*: Request       ## the outgoing request; modify it before `next`
@@ -26,7 +26,7 @@ type
     clientp: ptr Navi        ## the owning client (see `client`); valid for the call
     sink: BodySink           ## non-nil for a streaming request
     idx: int                 ## index of the next middleware to run
-  Middleware* = proc(ctx: Context): Future[void] {.nimcall, gcsafe, raises: [].}
+  Middleware* = proc(ctx: NaviContext): Future[void] {.nimcall, gcsafe, raises: [].}
     ## A middleware step; may be async. Deliberately `nimcall` (not a closure, so
     ## it cannot capture): read/modify `ctx.request`, `await ctx.next()` to
     ## proceed -- or skip it to short-circuit -- then read/modify `ctx.response`.
@@ -78,10 +78,10 @@ proc withDeadline[T](client: Navi, fut: Future[T]): Future[T] {.async.} =
     return await fut
   raise newException(TimeoutError, "navi: request timed out after " & $ms & " ms")
 
-proc client*(ctx: Context): Navi = ctx.clientp[]
+proc client*(ctx: NaviContext): Navi = ctx.clientp[]
   ## The client handling this request (e.g. to read `ctx.client.options`).
 
-proc next*(ctx: Context): Future[void] {.async.} =
+proc next*(ctx: NaviContext): Future[void] {.async.} =
   ## Run the rest of the chain: the next middleware, or -- once they are
   ## exhausted -- the request itself. The outcome lands in `ctx.response`.
   let mws = ctx.clientp[].options.middleware
@@ -95,7 +95,7 @@ proc next*(ctx: Context): Future[void] {.async.} =
     inc ctx.idx
     await m(ctx)
 
-proc runChain(ctx: Context): Future[Response] {.async.} =
+proc runChain(ctx: NaviContext): Future[Response] {.async.} =
   await ctx.next()
   return ctx.response
 
@@ -107,7 +107,7 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
                          form, multipart, bodyStream)
   if client.options.middleware.len == 0:
     return await client.withDeadline(doRequest(client, req))
-  let ctx = Context(request: req, clientp: unsafeAddr client)
+  let ctx = NaviContext(request: req, clientp: unsafeAddr client)
   return await client.withDeadline(runChain(ctx))
 
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
@@ -116,7 +116,7 @@ proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
   let req = buildRequest(client.options, verb, target, headers)
   if client.options.middleware.len == 0:
     return await client.withDeadline(doStream(client, req, sink))
-  let ctx = Context(request: req, clientp: unsafeAddr client, sink: sink)
+  let ctx = NaviContext(request: req, clientp: unsafeAddr client, sink: sink)
   return await client.withDeadline(runChain(ctx))
 
 include navi/private/verbs

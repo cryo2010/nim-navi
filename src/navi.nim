@@ -22,7 +22,7 @@ claimEntry("navi")
 export public
 
 type
-  Context* = ref object
+  NaviContext* = ref object
     ## Carried through the middleware chain. A middleware reads and mutates it,
     ## then calls `next` to run the rest of the chain (which fills `response`).
     request*: Request       ## the outgoing request; modify it before `next`
@@ -30,7 +30,7 @@ type
     clientp: ptr Navi        ## the owning client (see `client`); valid for the call
     sink: BodySink           ## non-nil for a streaming request
     idx: int                 ## index of the next middleware to run
-  Middleware* = proc(ctx: Context) {.nimcall.}
+  Middleware* = proc(ctx: NaviContext) {.nimcall.}
     ## A middleware step. Deliberately `nimcall` (not a closure, so it cannot
     ## capture): read/modify `ctx.request`, call `ctx.next()` to proceed -- or
     ## skip it to short-circuit -- then read/modify `ctx.response`. Run in order;
@@ -79,10 +79,10 @@ proc runCore(client: Navi, req: Request): Response =
 proc runCoreStream(client: Navi, req: Request, sink: BodySink): Response =
   performStream(client, req, sink)
 
-proc client*(ctx: Context): Navi = ctx.clientp[]
+proc client*(ctx: NaviContext): Navi = ctx.clientp[]
   ## The client handling this request (e.g. to read `ctx.client.options`).
 
-proc next*(ctx: Context) =
+proc next*(ctx: NaviContext) =
   ## Run the rest of the chain: the next middleware, or -- once they are
   ## exhausted -- the request itself. The outcome lands in `ctx.response`.
   let mws = ctx.clientp[].options.middleware
@@ -105,7 +105,7 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
   let req = buildRequest(client.options, verb, target, headers, body, json,
                          form, multipart, bodyStream)
   if client.options.middleware.len == 0: return runCore(client, req)
-  let ctx = Context(request: req, clientp: unsafeAddr client)
+  let ctx = NaviContext(request: req, clientp: unsafeAddr client)
   ctx.next()
   ctx.response
 
@@ -115,7 +115,7 @@ proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
   ## The returned Response carries status and headers but an empty body.
   let req = buildRequest(client.options, verb, target, headers)
   if client.options.middleware.len == 0: return runCoreStream(client, req, sink)
-  let ctx = Context(request: req, clientp: unsafeAddr client, sink: sink)
+  let ctx = NaviContext(request: req, clientp: unsafeAddr client, sink: sink)
   ctx.next()
   ctx.response
 
@@ -225,7 +225,7 @@ proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
   result.setLen(targets.len)
   if client.options.middleware.len > 0:
     for i, target in targets:
-      let ctx = Context(request: buildRequest(client.options, GET, target),
+      let ctx = NaviContext(request: buildRequest(client.options, GET, target),
                         clientp: unsafeAddr client)
       try:
         ctx.next()

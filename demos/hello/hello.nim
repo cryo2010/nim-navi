@@ -16,8 +16,8 @@ import navi/js
 proc getEnv(key, fallback: cstring): cstring {.importjs: "(process.env[#] ?? #)".}
 
 # A middleware that echoes the outgoing URL, then proceeds. Middleware are
-# nimcall procs that take a Context (no capture), so this is a top-level proc.
-proc echoUrl(ctx: Context): Future[void] {.async, nimcall.} =
+# nimcall procs that take a NaviContext (no capture), so this is a top-level proc.
+proc echoUrl(ctx: NaviContext): Future[void] {.async, nimcall.} =
   echo "-> ", ctx.request.url
   await ctx.next()
 

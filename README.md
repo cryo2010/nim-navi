@@ -291,19 +291,19 @@ Each client keeps a cookie jar: cookies from `Set-Cookie` are stored and replaye
 
 ### Middleware
 
-Middleware wraps a request onion-style. Each is a **`proc(ctx: Context)`** that
-reads and mutates a shared `Context` (`ctx.request`, `ctx.response`, `ctx.client`),
+Middleware wraps a request onion-style. Each is a **`proc(ctx: NaviContext)`** that
+reads and mutates a shared `NaviContext` (`ctx.request`, `ctx.response`, `ctx.client`),
 calls `ctx.next()` to run the rest of the chain, and then inspects or replaces
 `ctx.response`, or skips `next` to short-circuit without sending. `middleware[0]`
 is the outermost layer; everything before the `ctx.next()` call is "before" and
 everything after is "after".
 
 Middleware are **`nimcall` procs, not closures**, so they cannot capture local
-variables; shared state lives at module scope or on the `Context`. Write them as
+variables; shared state lives at module scope or on the `NaviContext`. Write them as
 top-level procs:
 
 ```nim
-proc trace(ctx: Context) =                 # sync (import navi)
+proc trace(ctx: NaviContext) =                 # sync (import navi)
   ctx.request.headers["x-trace-id"] = newTraceId()   # before
   let t0 = epochTime()
   ctx.next()
@@ -316,7 +316,7 @@ Short-circuit by setting `ctx.response` and *not* calling `next` (a cache hit or
 a mock), and nothing goes over the wire:
 
 ```nim
-proc cache(ctx: Context) =
+proc cache(ctx: NaviContext) =
   if ctx.request.url in store: ctx.response = store[ctx.request.url]  # no next()
   else:
     ctx.next()
@@ -324,10 +324,10 @@ proc cache(ctx: Context) =
 ```
 
 On the async entries (`navi/asyncdispatch`, `navi/chronos`, `navi/js`) a
-middleware is `proc(ctx: Context): Future[void]` and you `await ctx.next()`:
+middleware is `proc(ctx: NaviContext): Future[void]` and you `await ctx.next()`:
 
 ```nim
-proc refreshToken(ctx: Context): Future[void] {.async.} =
+proc refreshToken(ctx: NaviContext): Future[void] {.async.} =
   ctx.request.headers["authorization"] = "Bearer " & await fetchToken()
   await ctx.next()
 ```
@@ -477,8 +477,8 @@ Every field is optional.
 - **proxy** `Option[string]`: proxy URL. Unset falls back to `HTTP(S)_PROXY` /
   `NO_PROXY`.
 - **middleware** `seq[Middleware]`: onion-style steps run in order, with
-  `middleware[0]` outermost. Each is a `nimcall` `proc(ctx: Context)` (sync) or
-  `proc(ctx: Context): Future[void]` (async): modify `ctx.request`, call
+  `middleware[0]` outermost. Each is a `nimcall` `proc(ctx: NaviContext)` (sync) or
+  `proc(ctx: NaviContext): Future[void]` (async): modify `ctx.request`, call
   `ctx.next()` to proceed, then inspect or replace `ctx.response`, or skip
   `next` to short-circuit without sending. See [Middleware](#middleware).
 

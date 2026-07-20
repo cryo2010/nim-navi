@@ -33,7 +33,7 @@ export jsws.WebSocket, jsws.WsMessage, jsws.WsMessageKind,
        jsws.send, jsws.receive, jsws.close, jsws.closeNormal, jsws.closeGoingAway
 
 type
-  Context* = ref object
+  NaviContext* = ref object
     ## Carried through the middleware chain. A middleware reads and mutates it,
     ## then `await ctx.next()` runs the rest of the chain (which fills `response`).
     request*: Request       ## the outgoing request; modify it before `next`
@@ -41,7 +41,7 @@ type
     clientp: ptr Navi        ## the owning client (see `client`); valid for the call
     sink: BodySink           ## non-nil for a streaming request
     idx: int                 ## index of the next middleware to run
-  Middleware* = proc(ctx: Context): Future[void] {.nimcall.}
+  Middleware* = proc(ctx: NaviContext): Future[void] {.nimcall.}
     ## A middleware step; may be async. Deliberately `nimcall` (not a closure, so
     ## it cannot capture): read/modify `ctx.request`, `await ctx.next()` to
     ## proceed -- or skip it to short-circuit -- then read/modify `ctx.response`.
@@ -121,10 +121,10 @@ proc runCoreStream(client: Navi, req: Request, sink: BodySink): Future[Response]
   client.maybeThrow(rq, resp)
   result = resp
 
-proc client*(ctx: Context): Navi = ctx.clientp[]
+proc client*(ctx: NaviContext): Navi = ctx.clientp[]
   ## The client handling this request (e.g. to read `ctx.client.options`).
 
-proc next*(ctx: Context): Future[void] {.async.} =
+proc next*(ctx: NaviContext): Future[void] {.async.} =
   ## Run the rest of the chain: the next middleware, or -- once they are
   ## exhausted -- the request itself. The outcome lands in `ctx.response`.
   let mws = ctx.clientp[].options.middleware
@@ -138,7 +138,7 @@ proc next*(ctx: Context): Future[void] {.async.} =
     inc ctx.idx
     await m(ctx)
 
-proc runChain(ctx: Context): Future[Response] {.async.} =
+proc runChain(ctx: NaviContext): Future[Response] {.async.} =
   await ctx.next()
   return ctx.response
 
@@ -150,7 +150,7 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
   let req = buildRequest(client.options, verb, target, headers, body, json, form,
                          multipart, nil)
   if client.options.middleware.len == 0: return await runCore(client, req)
-  let ctx = Context(request: req, clientp: unsafeAddr client)
+  let ctx = NaviContext(request: req, clientp: unsafeAddr client)
   return await runChain(ctx)
 
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
@@ -159,7 +159,7 @@ proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
   ## empty. Not retried (the stream is consumed as it is read).
   let req = buildRequest(client.options, verb, target, headers)
   if client.options.middleware.len == 0: return await runCoreStream(client, req, sink)
-  let ctx = Context(request: req, clientp: unsafeAddr client, sink: sink)
+  let ctx = NaviContext(request: req, clientp: unsafeAddr client, sink: sink)
   return await runChain(ctx)
 
 proc websocket*(client: Navi, url: string,
