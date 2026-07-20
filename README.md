@@ -143,11 +143,11 @@ backends differ:
 | Max TLS version | system | system | 1.2 | runtime |
 | Keep-alive / connection pool | ✓ | ✓ | ✓ | ✗ |
 | Streaming upload | ✓ | ✓ | ✓ | ✗ |
-| Cookie jar | ✓ | ✓ | ✓ | ✗ |
+| Cookie jar | ✓ | ✓ | ✓ | opt-in |
 | Proxy configuration | ✓ | ✓ | ✓ | ✗ |
 
-Legend: ✓ supported · ✗ not supported · **runtime** = provided by the
-browser/Node platform rather than navi.
+Legend: ✓ supported · ✗ not supported · **opt-in** = off by default, enabled by
+an option · **runtime** = provided by the browser/Node platform rather than navi.
 
 Two backends carry caveats:
 
@@ -157,11 +157,14 @@ Two backends carry caveats:
 - **`navi/js` runs on `fetch`/`WebSocket`,** so the platform owns connections,
   cookies, redirects, decompression, and TLS; navi keeps request building,
   retries, throw-on-non-2xx, and hooks. Its WebSocket wraps the native one, so
-  custom handshake headers are ignored and the runtime handles ping/pong.
+  custom handshake headers are ignored and the runtime handles ping/pong. On a
+  runtime with no cookie store (Node/undici), `NaviOptions(cookieJar: some(true))`
+  turns on a navi-managed jar so cookies persist across requests; in a browser
+  the store already handles this, so the option is inert there.
 
 ### The browser backend (`navi/js`)
 
-`import navi/js` compiles with `nim js` and runs over the runtime's `fetch`, so the platform handles TLS, HTTP-version negotiation, redirects, cookies, and decompression. navi keeps the request building, retries, throw-on-non-2xx, and (async) hooks. It has no connection pool or cookie jar (the browser owns both), streaming uploads are unavailable, and `res.httpVersion` is empty because `fetch` does not expose it. Hooks are async, as on the other async backends.
+`import navi/js` compiles with `nim js` and runs over the runtime's `fetch`, so the platform handles TLS, HTTP-version negotiation, redirects, cookies, and decompression. navi keeps the request building, retries, throw-on-non-2xx, and (async) hooks. It has no connection pool, streaming uploads are unavailable, and `res.httpVersion` is empty because `fetch` does not expose it. Cookies are the browser store's by default; on a runtime without one (Node/undici), set `NaviOptions(cookieJar: some(true))` to have navi keep its own jar so cookies persist across requests. Hooks are async, as on the other async backends.
 
 ```nim
 import navi/js

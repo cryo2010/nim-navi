@@ -9,10 +9,11 @@
 ##   discard main()
 ##
 ## Runs only on the JavaScript backend (`nim js`). `fetch` handles TLS, HTTP
-## version negotiation, redirects, cookies (the browser store), and body
-## decoding; navi layers on request building, hooks, retries, and
-## throw-on-non-2xx. There is no connection pool or cookie jar here: the browser
-## owns both.
+## version negotiation, redirects, and body decoding; navi layers on request
+## building, hooks, retries, and throw-on-non-2xx. There is no connection pool
+## (the runtime owns connections). Cookies are the browser store's by default,
+## but `NaviOptions(cookieJar: some(true))` opts into a navi-managed jar for
+## runtimes without one (Node/undici); see `newNavi`.
 
 when not defined(js):
   {.error: "navi/js requires the JavaScript backend; compile with `nim js` " &
@@ -43,9 +44,15 @@ type
 
   NaviOptions* = object of NaviOptionsBase
     hooks*: Hooks   ## lifecycle callbacks (may be async)
+    cookieJar*: Option[bool]
+      ## opt into a navi-managed cookie jar. Off by default: in a browser the
+      ## store owns cookies (and this is inert -- Set-Cookie is hidden and the
+      ## Cookie header is forbidden). Turn it on for runtimes with no cookie
+      ## store, e.g. Node/undici, so cookies persist across requests.
 
   Navi* = object
-    options*: NaviOptions   ## no pool/jar: the browser owns connections and cookies
+    options*: NaviOptions   ## the runtime owns connections; cookies too unless cookieJar is on
+    jar: CookieJar          ## nil unless cookieJar was opted into
 
 proc defaultOptions*(): NaviOptions =
   # The browser decodes bodies and forbids the Accept-Encoding request header, so
@@ -60,12 +67,16 @@ proc mergeHooks(base, add: Hooks): Hooks =
 proc runHook(hook: Hook, ctx: HookCtx): Future[void] = hook(ctx)
 
 proc newNavi*(options = defaultOptions()): Navi =
-  Navi(options: options)
+  result = Navi(options: options)
+  if options.cookieJar.get(false): result.jar = newCookieJar()
 
 proc extend*(client: Navi, options: NaviOptions): Navi =
   var merged = mergeBase(client.options, options)
   merged.hooks = mergeHooks(client.options.hooks, options.hooks)
-  Navi(options: merged)
+  merged.cookieJar = some(client.options.cookieJar.get(false) or
+                          options.cookieJar.get(false))
+  result = Navi(options: merged)
+  if merged.cookieJar.get(false): result.jar = newCookieJar()
 
 proc close*(client: Navi) =
   ## No-op: the browser/runtime owns connections. Present for API symmetry with
@@ -99,12 +110,15 @@ proc perform(client: Navi, req0: Request): Future[Response] {.async.} =
   let maxRetries = client.options.retryLimit
   while true:
     var failed = false
+    if not client.jar.isNil: applyCookies(client.jar, req)
     try:
       resp = await fetchExchange(req, nil, client.options.timeoutMs)
     except CatchableError:
       if not (attempt < maxRetries and isRetryableVerb(req.verb)):
         raise   # not retryable: propagate the fetch error
       failed = true
+    if not failed and not client.jar.isNil:
+      storeCookies(client.jar, req.url, resp)
     if not failed and
        not (attempt < maxRetries and isRetryableVerb(req.verb) and
             isRetryableStatus(resp.status)):
@@ -132,7 +146,9 @@ proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
   ## Deliver the response body to `sink` as it arrives; `Response.body` stays
   ## empty. Not retried (the stream is consumed as it is read).
   var req = await client.runBefore(buildRequest(client.options, verb, target, headers))
+  if not client.jar.isNil: applyCookies(client.jar, req)
   var resp = await fetchExchange(req, sink, client.options.timeoutMs)
+  if not client.jar.isNil: storeCookies(client.jar, req.url, resp)
   resp = await client.runAfter(req, resp)
   client.maybeThrow(req, resp)
   result = resp
