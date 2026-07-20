@@ -94,6 +94,7 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
   ## Configured middleware wraps the whole call.
   let req = buildRequest(client.options, verb, target, headers, body, json,
                          form, multipart, bodyStream)
+  if client.options.middleware.len == 0: return runCore(client, req)
   let base: Next = proc(r: Request): Response = runCore(client, r)
   compose(client.options.middleware, base)(req)
 
@@ -102,6 +103,7 @@ proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
   ## Perform a request and deliver the response body to `sink` as it arrives.
   ## The returned Response carries status and headers but an empty body.
   let req = buildRequest(client.options, verb, target, headers)
+  if client.options.middleware.len == 0: return runCoreStream(client, req, sink)
   let base: Next = proc(r: Request): Response = runCoreStream(client, r, sink)
   compose(client.options.middleware, base)(req)
 

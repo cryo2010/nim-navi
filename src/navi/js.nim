@@ -135,6 +135,7 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
   ## Perform a request; configured middleware wraps the whole call.
   let req = buildRequest(client.options, verb, target, headers, body, json, form,
                          multipart, nil)
+  if client.options.middleware.len == 0: return await runCore(client, req)
   let base: Next = proc(r: Request): Future[Response] = runCore(client, r)
   result = await compose(client.options.middleware, base)(req)
 
@@ -143,6 +144,7 @@ proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
   ## Deliver the response body to `sink` as it arrives; `Response.body` stays
   ## empty. Not retried (the stream is consumed as it is read).
   let req = buildRequest(client.options, verb, target, headers)
+  if client.options.middleware.len == 0: return await runCoreStream(client, req, sink)
   let base: Next = proc(r: Request): Future[Response] = runCoreStream(client, r, sink)
   result = await compose(client.options.middleware, base)(req)
 

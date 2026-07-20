@@ -175,6 +175,8 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
   ## Perform a request; configured middleware wraps the whole call.
   let req = buildRequest(client.options, verb, target, headers, body, json,
                          form, multipart, bodyStream)
+  if client.options.middleware.len == 0:
+    return await client.withDeadline(doRequest(client, req))
   let base: Next = proc(r: Request): Future[Response] = doRequest(client, r)
   result = await client.withDeadline(compose(client.options.middleware, base)(req))
 
@@ -182,6 +184,8 @@ proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
              headers = initHeaders()): Future[Response] {.async.} =
   ## Deliver the response body to `sink` as it arrives; Response.body is empty.
   let req = buildRequest(client.options, verb, target, headers)
+  if client.options.middleware.len == 0:
+    return await client.withDeadline(doStream(client, req, sink))
   let base: Next = proc(r: Request): Future[Response] = doStream(client, r, sink)
   result = await client.withDeadline(compose(client.options.middleware, base)(req))
 
