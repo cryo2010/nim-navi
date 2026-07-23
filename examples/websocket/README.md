@@ -95,7 +95,9 @@ nimble demoWssChronos    # navi/chronos (needs the chronos package)
 The only difference from the plain clients is the URL and:
 
 ```nim
-let api = newNavi(NaviOptions(tls: TlsConfig(verify: some(false))))
+var cfg = newNaviConfig()
+cfg.tls.verify = false
+let api = newNavi(cfg)
 ```
 
 `verify` is off because the demo cert is self-signed — a real deployment would

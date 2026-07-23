@@ -46,28 +46,30 @@ type
     ## it cannot capture): read/modify `ctx.req`, `await ctx.next()` to
     ## proceed -- or skip it to short-circuit -- then read/modify `ctx.res`.
 
-  NaviOptions* = object of NaviOptionsBase
+  NaviConfig* = object of NaviConfigBase
     middleware*: seq[Middleware]
 
   Navi* = object
-    options*: NaviOptions   ## the runtime owns connections
+    options*: NaviConfig   ## the runtime owns connections
     jar: CookieJar          ## kept off-browser; nil in a browser (its store owns cookies)
 
-proc defaultOptions*(): NaviOptions =
-  # The browser decodes bodies and forbids the Accept-Encoding request header, so
-  # keep navi from adding it; TLS and HTTP-version negotiation are the runtime's.
-  result.decompress = some(false)
+proc newNaviConfig*(): NaviConfig =
+  ## Safe defaults, minus decompression: the browser decodes bodies and forbids
+  ## the Accept-Encoding request header, so navi does not add it. TLS and HTTP
+  ## version negotiation are the runtime's.
+  result.withDefaults()
+  result.decompress = false
 
 # A browser owns the cookie store (and hides Set-Cookie from fetch); Node, Deno,
 # Bun, and Workers do not, so navi keeps the jar there. `document` exists only in
 # a browser document context.
 proc inBrowser(): bool {.importjs: "(typeof document !== 'undefined')".}
 
-proc newNavi*(options = defaultOptions()): Navi =
+proc newNavi*(options = newNaviConfig()): Navi =
   result = Navi(options: options)
   if not inBrowser(): result.jar = newCookieJar()
 
-proc extend*(client: Navi, options: NaviOptions): Navi =
+proc extend*(client: Navi, options: NaviConfig): Navi =
   var merged = mergeBase(client.options, options)
   merged.middleware = client.options.middleware & options.middleware
   result = Navi(options: merged)

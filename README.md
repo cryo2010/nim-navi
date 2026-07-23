@@ -171,7 +171,9 @@ Two backends carry caveats:
 import navi/js
 
 proc main() {.async.} =
-  let api = newNavi(NaviOptions(prefixUrl: "https://api.example.com"))
+  var cfg = newNaviConfig()
+  cfg.prefixUrl = "https://api.example.com"
+  let api = newNavi(cfg)
   let user = await api.get("users/42")
   echo user.data["name"].getStr
 
@@ -182,20 +184,27 @@ discard main()   # a browser or Node runs the returned Promise
 
 ### Clients and options
 
+Build a config with `newNaviConfig()`, which sets the safe defaults (verification
+on, decompression on, 2 retries, 20 redirects); then set the fields you want and
+pass it to `newNavi`. Prefer this over a bare `NaviConfig(...)` literal, which
+leaves every unmentioned field zeroed (including `verify`, i.e. off).
+
 ```nim
-let api = newNavi(NaviOptions(
-  prefixUrl: "https://api.example.com",
-  headers: initHeaders({"authorization": "Bearer ..."}),
-))
+var cfg = newNaviConfig()
+cfg.prefixUrl = "https://api.example.com"
+cfg.headers = initHeaders({"authorization": "Bearer ..."})
+let api = newNavi(cfg)
 
 # Relative targets resolve against prefixUrl.
 let user = api.get("users/42").data
 ```
 
-Derive a client that layers new defaults over an existing one:
+Derive a client that layers new defaults over an existing one. `extend` takes a
+sparse override: only the fields you set (prefixUrl, headers, http, auth, proxy)
+layer over the parent, and everything else is inherited:
 
 ```nim
-let authed = api.extend(NaviOptions(headers: initHeaders({"x-api-key": "..."})))
+let authed = api.extend(NaviConfig(headers: initHeaders({"x-api-key": "..."})))
 ```
 
 ### Requests
@@ -242,9 +251,9 @@ for (name, value) in h.pairs: discard
 ### TLS
 
 ```nim
-let api = newNavi(NaviOptions(
-  tls: TlsConfig(verify: some(true), caFile: "/path/to/ca-bundle.pem"),
-))
+var cfg = newNaviConfig()
+cfg.tls.caFile = "/path/to/ca-bundle.pem"   # verify is already on
+let api = newNavi(cfg)
 ```
 
 `verify` defaults to on. `caFile` is honored by all three backends: sync and asyncdispatch through OpenSSL, and chronos through BearSSL (which otherwise verifies against its bundled Mozilla trust anchors). The chronos backend negotiates up to TLS 1.2 and does not support client certificates (mTLS).
@@ -261,7 +270,9 @@ except HttpError as e:
   echo e.response.body
 
 # Opt out to handle status codes yourself:
-let api = newNavi(NaviOptions(throwHttpErrors: some(false)))
+var cfg = newNaviConfig()
+cfg.throwHttpErrors = false
+let api = newNavi(cfg)
 ```
 
 ### Retries, redirects, and timeouts
@@ -269,11 +280,11 @@ let api = newNavi(NaviOptions(throwHttpErrors: some(false)))
 Idempotent requests that hit a transient failure (network error or 408/413/429/500/502/503/504) are retried with capped exponential backoff, honoring `Retry-After`. Redirects are followed by default.
 
 ```nim
-let api = newNavi(NaviOptions(
-  maxRetries: some(3),    # default 2
-  maxRedirects: some(5),  # default 20; 0 disables
-  timeout: some(5000),    # 5s; unset (default) disables. Raises TimeoutError.
-))
+var cfg = newNaviConfig()
+cfg.maxRetries = 3     # default 2
+cfg.maxRedirects = 5   # default 20; 0 disables
+cfg.timeout = 5000     # 5s; 0 (default) disables. Raises TimeoutError.
+let api = newNavi(cfg)
 ```
 
 `timeout` is per socket read on the sync backend and bounds the whole request (including retries) on the async backends.
@@ -281,10 +292,10 @@ let api = newNavi(NaviOptions(
 ### Auth, cookies, and proxy
 
 ```nim
-let api = newNavi(NaviOptions(
-  auth: bearerAuth("token"),          # or basicAuth("user", "pass")
-  proxy: some("http://proxy:8080"),   # else HTTP(S)_PROXY / NO_PROXY env
-))
+var cfg = newNaviConfig()
+cfg.auth = bearerAuth("token")      # or basicAuth("user", "pass")
+cfg.proxy = "http://proxy:8080"     # else HTTP(S)_PROXY / NO_PROXY env
+let api = newNavi(cfg)
 ```
 
 Each client keeps a cookie jar: cookies from `Set-Cookie` are stored and replayed on later requests to the same client (matched by domain, path, and Secure).
@@ -309,7 +320,9 @@ proc trace(ctx: NaviContext) =                 # sync (import navi)
   ctx.next()
   log(ctx.req.verb, ctx.res.status, epochTime() - t0)   # after
 
-let api = newNavi(NaviOptions(middleware: @[Middleware(trace)]))
+var cfg = newNaviConfig()
+cfg.middleware = @[Middleware(trace)]
+let api = newNavi(cfg)
 ```
 
 Short-circuit by setting `ctx.res` and *not* calling `next` (a cache hit or
@@ -346,7 +359,7 @@ clients are). The other three backends have no such restriction.
 
 ### Decompression
 
-Responses are decoded transparently: clients send `Accept-Encoding: gzip, deflate, br, zstd` and decode the body per `Content-Encoding`. gzip/deflate use the system zlib (present everywhere); `br` and `zstd` use `libbrotlidec` and `libzstd`, loaded lazily, so they are only required if a server actually sends those encodings. Disable all of it with `decompress: some(false)`.
+Responses are decoded transparently: clients send `Accept-Encoding: gzip, deflate, br, zstd` and decode the body per `Content-Encoding`. gzip/deflate use the system zlib (present everywhere); `br` and `zstd` use `libbrotlidec` and `libzstd`, loaded lazily, so they are only required if a server actually sends those encodings. Disable all of it with `decompress: false`.
 
 ### HTTP/2
 
@@ -395,7 +408,7 @@ let results = api.parallel(@[
 `.ok` per result.
 
 HTTP/2 runs on the sync and asyncdispatch backends. To disable it and force
-HTTP/1.1, set `http: {H1}` in `NaviOptions`.
+HTTP/1.1, set `http: {H1}` in `NaviConfig`.
 
 ### Keep-alive
 
@@ -425,7 +438,7 @@ discard api.request(POST, "https://example.com/upload", bodyStream = proc(): str
 
 ## API
 
-### newNavi(options = NaviOptions())
+### newNavi(options = newNaviConfig())
 
 Create a client. `options` are the defaults applied to every request and
 inherited via `extend`. Returns a `Navi`.
@@ -461,28 +474,29 @@ Derive a new client, layering `options` over this one: headers are merged, middl
 is appended, and other set fields override. The derived client gets its own
 connection pool and cookie jar.
 
-### NaviOptions
+### NaviConfig
 
-Every field is optional.
+Build one with `newNaviConfig()`, which sets the defaults below, then assign the
+fields you want. A bare `NaviConfig()` leaves every field at its zero value
+(e.g. `verify = false`), so prefer `newNaviConfig()`.
 
 - **prefixUrl** `string`: prepended to relative request targets.
 - **headers** `Headers`: sent on every request (merged with per-call headers).
 - **http** `set[HttpVersion]`: protocol preference. Default `{H1, H2}` negotiates
   h2 via ALPN with h1 fallback; set `{H1}` to force HTTP/1.1. Ignored by `navi/js`.
-- **tls** `TlsConfig`: `verify` (default `true`) and `caFile` (custom CA bundle,
-  honored by the sync and asyncdispatch backends).
-- **decompress** `Option[bool]`: decode gzip/deflate response bodies. Default on.
-- **throwHttpErrors** `Option[bool]`: raise `HttpError` on a non-2xx response.
-  Default on.
-- **maxRedirects** `Option[int]`: redirects to follow. Default 20; 0 disables.
-- **maxRetries** `Option[int]`: retry attempts for transient failures. Default 2.
-- **timeout** `Option[int]`: request timeout in milliseconds. Unset (default)
-  disables it. A stalled request raises `TimeoutError`. The sync backend applies
-  it per socket read; the async backends bound the whole request.
+- **tls** `TlsConfig`: `verify` (`bool`, default `true`) and `caFile` (custom CA
+  bundle, honored on all backends), plus `certFile`/`keyFile` for mTLS.
+- **decompress** `bool`: decode gzip/deflate response bodies. Default on.
+- **throwHttpErrors** `bool`: raise `HttpError` on a non-2xx response. Default on.
+- **maxRedirects** `int`: redirects to follow. Default 20; 0 disables.
+- **maxRetries** `int`: retry attempts for transient failures. Default 2.
+- **timeout** `int`: request timeout in milliseconds. 0 (default) disables it. A
+  stalled request raises `TimeoutError`. The sync backend applies it per socket
+  read; the async backends bound the whole request.
 - **auth** `Auth`: `basicAuth(user, pass)`, `bearerAuth(token)`, or
   `digestAuth(user, pass)`. Basic/bearer set `Authorization` on every request;
   digest answers the server's 401 challenge (MD5 or SHA-256) on a one-shot retry.
-- **proxy** `Option[string]`: proxy URL. Unset falls back to `HTTP(S)_PROXY` /
+- **proxy** `string`: proxy URL. `""` (default) falls back to `HTTP(S)_PROXY` /
   `NO_PROXY`.
 - **middleware** `seq[Middleware]`: onion-style steps run in order, with
   `middleware[0]` outermost. Each is a `nimcall` `proc(ctx: NaviContext)` (sync) or

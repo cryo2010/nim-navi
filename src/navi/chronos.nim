@@ -32,22 +32,23 @@ type
     ## proceed -- or skip it to short-circuit -- then read/modify `ctx.res`.
     ## `gcsafe, raises: []` keep it within chronos's strict effect tracking.
 
-  NaviOptions* = object of NaviOptionsBase
+  NaviConfig* = object of NaviConfigBase
     middleware*: seq[Middleware]
 
   Navi* = object
-    options*: NaviOptions
+    options*: NaviConfig
     pool*: Pool[PooledConn[Conn]]
     jar*: CookieJar
 
-proc defaultOptions*(): NaviOptions =
+proc newNaviConfig*(): NaviConfig =
+  ## A config with the safe defaults set. Prefer this over a bare `NaviConfig()`.
+  result.withDefaults()
   result.http = {H1, H2}
-  result.tls = defaultTls()
 
-proc newNavi*(options = defaultOptions()): Navi =
+proc newNavi*(options = newNaviConfig()): Navi =
   Navi(options: options, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
-proc extend*(client: Navi, options: NaviOptions): Navi =
+proc extend*(client: Navi, options: NaviConfig): Navi =
   var merged = mergeBase(client.options, options)
   merged.middleware = client.options.middleware & options.middleware
   Navi(options: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())

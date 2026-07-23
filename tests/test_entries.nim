@@ -195,7 +195,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startRaw(th, port, payload)
 
-    let api = newNavi(NaviOptions(throwHttpErrors: some(false)))
+    let api = newNavi(NaviConfig(throwHttpErrors: false))
     let res = api.get("http://127.0.0.1:" & $port & "/")
     check res.status == 404
     check res.body == "no!"
@@ -219,8 +219,8 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startRaw(th, port, payload)
 
-    let api = newNavi(NaviOptions(
-      maxRedirects: some(0), throwHttpErrors: some(false)))
+    let api = newNavi(NaviConfig(
+      maxRedirects: 0, throwHttpErrors: false))
     let res = api.get("http://127.0.0.1:" & $port & "/start")
     check res.status == 302
     check res.headers.get("location") == "/final"
@@ -276,7 +276,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)
 
-    let api = newNavi(NaviOptions(auth: bearerAuth("secret-token")))
+    let api = newNavi(NaviConfig(auth: bearerAuth("secret-token")))
     let res = api.post("http://127.0.0.1:" & $port & "/", body = "x")
     check res.headers.get("x-echo-authorization") == "Bearer secret-token"
     joinThread(th)
@@ -286,7 +286,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)
 
-    let api = newNavi(NaviOptions(auth: basicAuth("user", "pass")))
+    let api = newNavi(NaviConfig(auth: basicAuth("user", "pass")))
     let res = api.post("http://127.0.0.1:" & $port & "/", body = "x")
     check res.headers.get("x-echo-authorization") == "Basic dXNlcjpwYXNz"
     joinThread(th)
@@ -309,7 +309,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startRaw(th, port, payload)
 
-    let api = newNavi(NaviOptions(maxRetries: some(0), throwHttpErrors: some(false)))
+    let api = newNavi(NaviConfig(maxRetries: 0, throwHttpErrors: false))
     let res = api.get("http://127.0.0.1:" & $port & "/")
     check res.status == 503
     joinThread(th)
@@ -319,7 +319,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startHang(th, port)  # accepts, reads the request, never replies
 
-    let api = newNavi(NaviOptions(timeout: some(200), maxRetries: some(0)))
+    let api = newNavi(NaviConfig(timeout: 200, maxRetries: 0))
     var raised = false
     try:
       discard api.get("http://127.0.0.1:" & $port & "/")
@@ -333,7 +333,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startHang(th, port)
 
-    let api = newNavi(NaviOptions(timeout: some(200)))
+    let api = newNavi(NaviConfig(timeout: 200))
     var raised = false
     try:
       discard api.parallel(@["http://127.0.0.1:" & $port & "/"])
@@ -348,7 +348,7 @@ suite "sync entry end to end":
     startBodyEcho(th, port)
 
     mwObservedStatus = 0
-    let api = newNavi(NaviOptions(middleware: @[Middleware(addAuthMw)]))
+    let api = newNavi(NaviConfig(middleware: @[Middleware(addAuthMw)]))
     let res = api.post("http://127.0.0.1:" & $port & "/", body = "x")
     check res.headers.get("x-echo-authorization") == "Wrapped"
     check mwObservedStatus == 200
@@ -357,7 +357,7 @@ suite "sync entry end to end":
   test "middleware can short-circuit without sending a request":
     # No server here: if the request were dialed it would fail to connect, so a
     # 299 proves `ctx.next()` was never called.
-    let api = newNavi(NaviOptions(middleware: @[Middleware(cannedMw)]))
+    let api = newNavi(NaviConfig(middleware: @[Middleware(cannedMw)]))
     let res = api.get("http://127.0.0.1:1/")
     check res.status == 299
     check res.body == "from middleware"
@@ -378,7 +378,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startProxy(th, port)
 
-    let api = newNavi(NaviOptions(proxy: some("http://127.0.0.1:" & $port)))
+    let api = newNavi(NaviConfig(proxy: "http://127.0.0.1:" & $port))
     let res = api.get("http://example.test/path?q=1")
     check res.status == 200
     check res.body == "http://example.test/path?q=1"  # proxy saw the absolute URI
@@ -413,7 +413,7 @@ suite "sync entry end to end":
     joinThread(th)
 
   test "extend layers headers and prefixUrl":
-    let base = newNavi(NaviOptions(headers: initHeaders({"x-base": "1"})))
-    let child = base.extend(NaviOptions(prefixUrl: "http://api.test"))
+    let base = newNavi(NaviConfig(headers: initHeaders({"x-base": "1"})))
+    let child = base.extend(NaviConfig(prefixUrl: "http://api.test"))
     check child.options.prefixUrl == "http://api.test"
     check child.options.headers.get("x-base") == "1"

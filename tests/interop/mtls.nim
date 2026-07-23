@@ -18,14 +18,14 @@ let
 
 suite "mTLS interop (sync, client certificate)":
   test "presents a client certificate and completes the handshake":
-    let api = newNavi(NaviOptions(tls: TlsConfig(
-      verify: some(true), caFile: ca, certFile: cert, keyFile: key),
-      throwHttpErrors: some(false)))
+    let api = newNavi(NaviConfig(tls: TlsConfig(
+      verify: true, caFile: ca, certFile: cert, keyFile: key),
+      throwHttpErrors: false))
     let res = api.get(base & "/")
     check res.status == 200        # openssl s_server -www answers 200
 
   test "a client without a certificate is rejected at the handshake":
-    let api = newNavi(NaviOptions(tls: TlsConfig(verify: some(true), caFile: ca)))
+    let api = newNavi(NaviConfig(tls: TlsConfig(verify: true, caFile: ca)))
     var rejected = false
     try:
       discard api.get(base & "/")

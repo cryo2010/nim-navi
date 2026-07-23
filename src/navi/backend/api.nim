@@ -13,11 +13,9 @@
 ## TLS is negotiated inside `connect` based on the `tls` flag, so the engine
 ## stays transport- and scheme-agnostic.
 
-import std/options
-
 type
   TlsConfig* = object
-    verify*: Option[bool]  ## verify the cert chain and hostname; unset means on
+    verify*: bool          ## verify the cert chain and hostname (default on)
     caFile*: string        ## custom CA bundle path; "" uses the system trust store
     certFile*: string      ## client certificate (PEM) for mTLS; "" presents none
     keyFile*: string       ## private key (PEM) for `certFile`; "" reuses certFile
@@ -28,10 +26,10 @@ type
     host*: string
     port*: int
 
-proc wantsVerify*(tls: TlsConfig): bool = tls.verify.get(true)
-  ## Certificate verification is on unless explicitly disabled. This is secure
-  ## by default even when a TlsConfig (or the NaviOptions around it) is built
-  ## partially, leaving `verify` unset.
+proc wantsVerify*(tls: TlsConfig): bool = tls.verify
+  ## Whether to verify the cert chain and hostname. `defaultTls()` /
+  ## `newNaviConfig()` turn it on; a bare `TlsConfig()` leaves it off, so build
+  ## configs through those to stay secure by default.
 
 proc clientKeyFile*(tls: TlsConfig): string =
   ## Path to the client private key: `keyFile` when set, otherwise `certFile`
@@ -39,7 +37,7 @@ proc clientKeyFile*(tls: TlsConfig): string =
   if tls.keyFile.len > 0: tls.keyFile else: tls.certFile
 
 proc defaultTls*(): TlsConfig =
-  TlsConfig()  # verify defaults on via wantsVerify
+  TlsConfig(verify: true)  # secure by default
 
 proc direct*(): ProxyTarget = ProxyTarget()
 proc isSet*(p: ProxyTarget): bool = p.host.len > 0

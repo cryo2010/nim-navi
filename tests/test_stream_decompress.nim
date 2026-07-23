@@ -62,7 +62,7 @@ suite "stream() decompresses the response body":
     var th: Thread[ServerCtx]
     startRaw(th, port, payload)
 
-    let api = newNavi(NaviOptions(decompress: some(false)))
+    let api = newNavi(NaviConfig(decompress: false))
     var collected = ""
     let res = api.stream(GET, "http://127.0.0.1:" & $port & "/",
       sink = proc(data: openArray[byte]) =

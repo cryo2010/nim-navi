@@ -25,7 +25,7 @@ const
     "zstd": "28b52ffd04585900007b226f6b223a747275657d6abe13c7",
   }
 
-let opts = NaviOptionsBase()   # decompression on by default
+let opts = NaviConfigBase(decompress: true)   # exercise the decoders
 
 proc decodeBuffered(encoding, body: string) =
   var r = initResponse(200, "", "HTTP/1.1",
