@@ -441,10 +441,12 @@ discard api.request(POST, "https://example.com/upload", bodyStream = proc(): str
 
 ## API
 
-### newNavi(options = newNaviConfig())
+### newNavi(config = newNaviConfig())
 
-Create a client. `options` are the defaults applied to every request and
-inherited via `extend`. Returns a `Navi`.
+Create a client. `config` supplies the defaults applied to every request and
+inherited via `extend`. Returns a `Navi`. Read it back (read-only) via
+`client.config`; the config is fixed at construction, so build a fresh client or
+`extend` to change it rather than mutating a live one.
 
 ### client.get / head / delete / options (target, headers = initHeaders())
 ### client.post / put / patch (target, body = "", json = nil, form = @[], headers = initHeaders())

@@ -37,7 +37,7 @@ type
     middleware*: seq[Middleware]
 
   Navi* = object
-    options*: NaviConfig
+    config: NaviConfig
     pool*: Pool[PooledConn[Conn]]
     jar*: CookieJar
 
@@ -49,13 +49,18 @@ proc newNaviConfig*(): NaviConfig =
     decompress: true, throwHttpErrors: true, maxRedirects: 20, maxRetries: 2,
     auth: Auth(), proxy: "", timeout: 0, middleware: @[])
 
-proc newNavi*(options = newNaviConfig()): Navi =
-  Navi(options: options, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
+proc newNavi*(config = newNaviConfig()): Navi =
+  Navi(config: config, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
-proc extend*(client: Navi, options: NaviConfig): Navi =
-  var merged = mergeBase(client.options, options)
-  merged.middleware = client.options.middleware & options.middleware
-  Navi(options: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
+proc config*(client: Navi): lent NaviConfig = client.config
+  ## Read-only view of the client's config. Config is fixed at construction;
+  ## build a fresh client (or `extend`) to change it rather than mutating a live
+  ## one, so its pooled connections stay consistent with its settings.
+
+proc extend*(client: Navi, config: NaviConfig): Navi =
+  var merged = mergeBase(client.config, config)
+  merged.middleware = client.config.middleware & config.middleware
+  Navi(config: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
 proc close*(client: Navi): Future[void] {.async.} =
   ## Close all idle pooled connections. Optional but recommended when done with
@@ -76,7 +81,7 @@ proc doStream(client: Navi, req: Request, sink: BodySink): Future[Response] {.as
 proc withDeadline[T](client: Navi, fut: Future[T]): Future[T] {.async.} =
   ## Bound the whole operation by `timeout`. On expiry, raise TimeoutError;
   ## chronos cancels the abandoned future (whose own cleanup closes the socket).
-  let ms = client.options.timeoutMs
+  let ms = client.config.timeoutMs
   if ms <= 0:
     return await fut
   if await withTimeout(fut, ms.milliseconds):
@@ -84,12 +89,12 @@ proc withDeadline[T](client: Navi, fut: Future[T]): Future[T] {.async.} =
   raise newException(TimeoutError, "navi: request timed out after " & $ms & " ms")
 
 proc client*(ctx: NaviContext): Navi = ctx.clientp[]
-  ## The client handling this request (e.g. to read `ctx.client.options`).
+  ## The client handling this request (e.g. to read `ctx.client.config`).
 
 proc next*(ctx: NaviContext): Future[void] {.async.} =
   ## Run the rest of the chain: the next middleware, or -- once they are
   ## exhausted -- the request itself. The outcome lands in `ctx.res`.
-  let mws = ctx.clientp[].options.middleware
+  let mws = ctx.clientp[].config.middleware
   if ctx.idx >= mws.len:
     if ctx.sink.isNil:
       ctx.res = await doRequest(ctx.clientp[], ctx.req)
@@ -108,9 +113,9 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = "", json: JsonNode = nil,
               form: seq[(string, string)] = @[], multipart: Multipart = @[],
               bodyStream: BodyProducer = nil): Future[Response] {.async.} =
-  let req = buildRequest(client.options, verb, target, headers, body, json,
+  let req = buildRequest(client.config, verb, target, headers, body, json,
                          form, multipart, bodyStream)
-  if client.options.middleware.len == 0:
+  if client.config.middleware.len == 0:
     return await client.withDeadline(doRequest(client, req))
   let ctx = NaviContext(req: req, clientp: unsafeAddr client)
   return await client.withDeadline(runChain(ctx))
@@ -118,8 +123,8 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
              headers = initHeaders()): Future[Response] {.async.} =
   ## Deliver the response body to `sink` as it arrives; Response.body is empty.
-  let req = buildRequest(client.options, verb, target, headers)
-  if client.options.middleware.len == 0:
+  let req = buildRequest(client.config, verb, target, headers)
+  if client.config.middleware.len == 0:
     return await client.withDeadline(doStream(client, req, sink))
   let ctx = NaviContext(req: req, clientp: unsafeAddr client, sink: sink)
   return await client.withDeadline(runChain(ctx))
@@ -146,9 +151,9 @@ proc toWsUrl(url: string): Url =
 proc doWebsocket(client: Navi, url: string,
                  headers = initHeaders()): Future[WebSocket] {.async.} =
   let u = toWsUrl(url)
-  let conn = await connect(u.host, u.port, u.isTls, client.options.tls,
-                           resolveProxy(client.options, u), @[],
-                           client.options.timeoutMs)
+  let conn = await connect(u.host, u.port, u.isTls, client.config.tls,
+                           resolveProxy(client.config, u), @[],
+                           client.config.timeoutMs)
   let key = genKey()
   # Close the connection on any handshake failure (its close is async, so this
   # uses try/except rather than defer). A timeout cancels this future, raising

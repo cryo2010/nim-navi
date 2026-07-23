@@ -43,7 +43,7 @@ type
     middleware*: seq[Middleware]
 
   Navi* = object
-    options*: NaviConfig
+    config: NaviConfig
     pool*: Pool[PooledConn[Conn]]
     jar*: CookieJar
 
@@ -56,17 +56,22 @@ proc newNaviConfig*(): NaviConfig =
     decompress: true, throwHttpErrors: true, maxRedirects: 20, maxRetries: 2,
     auth: Auth(), proxy: "", timeout: 0, middleware: @[])
 
-proc newNavi*(options = newNaviConfig()): Navi =
-  ## Create a client. `options` supplies defaults (prefixUrl, headers, TLS,
+proc newNavi*(config = newNaviConfig()): Navi =
+  ## Create a client. `config` supplies defaults (prefixUrl, headers, TLS,
   ## middleware, …).
-  Navi(options: options, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
+  Navi(config: config, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
-proc extend*(client: Navi, options: NaviConfig): Navi =
-  ## Derive a new client, layering `options` over this client's (middleware is
+proc config*(client: Navi): lent NaviConfig = client.config
+  ## Read-only view of the client's config. Config is fixed at construction;
+  ## build a fresh client (or `extend`) to change it rather than mutating a live
+  ## one, so its pooled connections stay consistent with its settings.
+
+proc extend*(client: Navi, config: NaviConfig): Navi =
+  ## Derive a new client, layering `config` over this client's (middleware is
   ## appended). The derived client gets its own connection pool and cookie jar.
-  var merged = mergeBase(client.options, options)
-  merged.middleware = client.options.middleware & options.middleware
-  Navi(options: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
+  var merged = mergeBase(client.config, config)
+  merged.middleware = client.config.middleware & config.middleware
+  Navi(config: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
 proc close*(client: Navi) =
   ## Close all idle pooled connections, freeing their TLS contexts. Optional but
@@ -88,12 +93,12 @@ proc runCoreStream(client: Navi, req: Request, sink: BodySink): Response =
   performStream(client, req, sink)
 
 proc client*(ctx: NaviContext): Navi = ctx.clientp[]
-  ## The client handling this request (e.g. to read `ctx.client.options`).
+  ## The client handling this request (e.g. to read `ctx.client.config`).
 
 proc next*(ctx: NaviContext) =
   ## Run the rest of the chain: the next middleware, or -- once they are
   ## exhausted -- the request itself. The outcome lands in `ctx.res`.
-  let mws = ctx.clientp[].options.middleware
+  let mws = ctx.clientp[].config.middleware
   if ctx.idx >= mws.len:
     ctx.res =
       if ctx.sink.isNil: runCore(ctx.clientp[], ctx.req)
@@ -110,9 +115,9 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
   ## Perform a request and return the response. `json`/`form`/`multipart` encode
   ## the body; `bodyStream` uploads a chunked body from a pull-based producer.
   ## Configured middleware wraps the whole call.
-  let req = buildRequest(client.options, verb, target, headers, body, json,
+  let req = buildRequest(client.config, verb, target, headers, body, json,
                          form, multipart, bodyStream)
-  if client.options.middleware.len == 0: return runCore(client, req)
+  if client.config.middleware.len == 0: return runCore(client, req)
   let ctx = NaviContext(req: req, clientp: unsafeAddr client)
   ctx.next()
   ctx.res
@@ -121,8 +126,8 @@ proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
              headers = initHeaders()): Response =
   ## Perform a request and deliver the response body to `sink` as it arrives.
   ## The returned Response carries status and headers but an empty body.
-  let req = buildRequest(client.options, verb, target, headers)
-  if client.options.middleware.len == 0: return runCoreStream(client, req, sink)
+  let req = buildRequest(client.config, verb, target, headers)
+  if client.config.middleware.len == 0: return runCoreStream(client, req, sink)
   let ctx = NaviContext(req: req, clientp: unsafeAddr client, sink: sink)
   ctx.next()
   ctx.res
@@ -144,7 +149,7 @@ proc transportGroup(client: Navi, items: seq[BatchItem],
   result.setLen(members.len)
   let url0 = items[members[0]].req.url
   let origin = originKey(url0)
-  let alpn = if client.options.wantsH2 and url0.isTls: @["h2", "http/1.1"] else: @[]
+  let alpn = if client.config.wantsH2 and url0.isTls: @["h2", "http/1.1"] else: @[]
 
   var (found, pc) = popIdle(client.pool, origin)
   var transport: Conn
@@ -153,8 +158,8 @@ proc transportGroup(client: Navi, items: seq[BatchItem],
     transport = pc.transport
     h2 = pc.h2
   else:
-    transport = connect(url0.host, url0.port, url0.isTls, client.options.tls,
-                        resolveProxy(client.options, url0), alpn, client.options.timeoutMs)
+    transport = connect(url0.host, url0.port, url0.isTls, client.config.tls,
+                        resolveProxy(client.config, url0), alpn, client.config.timeoutMs)
     pc = PooledConn[Conn](transport: transport)
     if transport.protocol == "h2":
       h2 = initH2Conn()
@@ -217,8 +222,8 @@ proc transportGroup(client: Navi, items: seq[BatchItem],
         if not (keep and pushIdle(client.pool, origin, pc)): transport.close()
       elif not keep:
         transport.close()
-        transport = connect(url0.host, url0.port, url0.isTls, client.options.tls,
-                            resolveProxy(client.options, url0), alpn, client.options.timeoutMs)
+        transport = connect(url0.host, url0.port, url0.isTls, client.config.tls,
+                            resolveProxy(client.config, url0), alpn, client.config.timeoutMs)
         pc = PooledConn[Conn](transport: transport)
 
 proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
@@ -231,9 +236,9 @@ proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
   ## When middleware is configured it wraps each request individually, which
   ## forgoes the shared-connection multiplexing (every request stands alone).
   result.setLen(targets.len)
-  if client.options.middleware.len > 0:
+  if client.config.middleware.len > 0:
     for i, target in targets:
-      let ctx = NaviContext(req: buildRequest(client.options, GET, target),
+      let ctx = NaviContext(req: buildRequest(client.config, GET, target),
                         clientp: unsafeAddr client)
       try:
         ctx.next()
@@ -244,7 +249,7 @@ proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
 
   var pending: seq[BatchItem]
   for i, target in targets:
-    pending.add BatchItem(idx: i, req: buildRequest(client.options, GET, target))
+    pending.add BatchItem(idx: i, req: buildRequest(client.config, GET, target))
 
   while pending.len > 0:
     for pi in 0 ..< pending.len:
@@ -261,15 +266,15 @@ proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
       for k in 0 ..< members.len:
         var item = pending[members[k]]
         var resp = raw[k]
-        decodeBody(resp, client.options)
+        decodeBody(resp, client.config)
         storeCookies(client.jar, item.req.url, resp)
         let location = resp.headers.get("location")
-        if client.options.redirectLimit > 0 and item.hops < client.options.redirectLimit and
+        if client.config.redirectLimit > 0 and item.hops < client.config.redirectLimit and
            isRedirect(resp.status) and location.len > 0:
           item.req = redirectRequest(item.req, resp.status, location)
           inc item.hops
           nextRound.add item
-        elif item.attempt < client.options.retryLimit and
+        elif item.attempt < client.config.retryLimit and
              isRetryableVerb(item.req.verb) and isRetryableStatus(resp.status):
           inc item.attempt
           backoff = max(backoff, backoffMs(item.attempt, resp))
@@ -301,8 +306,8 @@ proc websocket*(client: Navi, url: string, headers = initHeaders()): WebSocket =
   ## http/https); `wss` uses TLS. Does the HTTP/1.1 Upgrade over the transport and
   ## validates `Sec-WebSocket-Accept`. Use `send`, `receive`, and `close`.
   let u = toWsUrl(url)
-  let conn = connect(u.host, u.port, u.isTls, client.options.tls,
-                     resolveProxy(client.options, u), @[], client.options.timeoutMs)
+  let conn = connect(u.host, u.port, u.isTls, client.config.tls,
+                     resolveProxy(client.config, u), @[], client.config.timeoutMs)
   # Close the connection unless the handshake completes -- a send/recv error mid
   # handshake would otherwise leak the socket (and its SSL_CTX for wss).
   var handshakeOk = false
