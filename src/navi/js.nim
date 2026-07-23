@@ -46,7 +46,8 @@ type
     ## it cannot capture): read/modify `ctx.req`, `await ctx.next()` to
     ## proceed -- or skip it to short-circuit -- then read/modify `ctx.res`.
 
-  NaviConfig* = object of NaviConfigBase
+  NaviConfig* {.requiresInit.} = object of NaviConfigBase
+    ## `requiresInit`: build it with `newNaviConfig()`, not a bare `NaviConfig(...)`.
     middleware*: seq[Middleware]
 
   Navi* = object
@@ -54,11 +55,14 @@ type
     jar: CookieJar          ## kept off-browser; nil in a browser (its store owns cookies)
 
 proc newNaviConfig*(): NaviConfig =
-  ## Safe defaults, minus decompression: the browser decodes bodies and forbids
-  ## the Accept-Encoding request header, so navi does not add it. TLS and HTTP
-  ## version negotiation are the runtime's.
-  result.withDefaults()
-  result.decompress = false
+  ## The only way to build a config (`NaviConfig` requires every field). Safe
+  ## defaults, minus decompression: the browser decodes bodies and forbids the
+  ## Accept-Encoding request header, so navi does not add it. TLS and HTTP version
+  ## negotiation are the runtime's (so `http` is unused here).
+  NaviConfig(
+    prefixUrl: "", headers: initHeaders(), http: {}, tls: defaultTls(),
+    decompress: false, throwHttpErrors: true, maxRedirects: 20, maxRetries: 2,
+    auth: Auth(), proxy: "", timeout: 0, middleware: @[])
 
 # A browser owns the cookie store (and hides Set-Cookie from fetch); Node, Deno,
 # Bun, and Workers do not, so navi keeps the jar there. `document` exists only in

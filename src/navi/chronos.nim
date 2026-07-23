@@ -32,7 +32,8 @@ type
     ## proceed -- or skip it to short-circuit -- then read/modify `ctx.res`.
     ## `gcsafe, raises: []` keep it within chronos's strict effect tracking.
 
-  NaviConfig* = object of NaviConfigBase
+  NaviConfig* {.requiresInit.} = object of NaviConfigBase
+    ## `requiresInit`: build it with `newNaviConfig()`, not a bare `NaviConfig(...)`.
     middleware*: seq[Middleware]
 
   Navi* = object
@@ -41,9 +42,12 @@ type
     jar*: CookieJar
 
 proc newNaviConfig*(): NaviConfig =
-  ## A config with the safe defaults set. Prefer this over a bare `NaviConfig()`.
-  result.withDefaults()
-  result.http = {H1, H2}
+  ## The only way to build a config (`NaviConfig` requires every field). Sets the
+  ## safe defaults; override the fields you want, then pass it to `newNavi`.
+  NaviConfig(
+    prefixUrl: "", headers: initHeaders(), http: {H1, H2}, tls: defaultTls(),
+    decompress: true, throwHttpErrors: true, maxRedirects: 20, maxRetries: 2,
+    auth: Auth(), proxy: "", timeout: 0, middleware: @[])
 
 proc newNavi*(options = newNaviConfig()): Navi =
   Navi(options: options, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())

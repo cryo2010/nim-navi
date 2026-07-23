@@ -22,7 +22,9 @@ doAssert iters >= minIters, "NAVI_VG_ITERS must be >= " & $minIters & " (got " &
 
 proc exercise(): int =
   ## Returns the number of requests that completed with 200.
-  let api = newNavi(NaviConfig(tls: TlsConfig(verify: true, caFile: cert)))
+  var cfg = newNaviConfig()
+  cfg.tls.caFile = cert
+  let api = newNavi(cfg)
   for _ in 0 ..< iters:
     let r = api.get(url)
     doAssert r.status == 200, "unexpected status " & $r.status
@@ -33,9 +35,9 @@ proc exerciseFailedHandshake(): int =
   ## Verification on but no CA, so the server's self-signed cert is rejected and
   ## connect() raises during the TLS handshake. The SSL_CTX it allocated must be
   ## freed on that path too -- a regression guard for the connect-cleanup defer.
-  let api = newNavi(NaviConfig(
-    tls: TlsConfig(verify: true),   # no caFile -> the cert is untrusted
-    maxRetries: 0))                 # one connect attempt per request
+  var cfg = newNaviConfig()
+  cfg.maxRetries = 0   # verify on (default), no caFile -> cert untrusted; one attempt
+  let api = newNavi(cfg)
   for _ in 0 ..< iters:
     var raised = false
     try: discard api.get(url)

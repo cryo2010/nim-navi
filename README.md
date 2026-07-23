@@ -186,8 +186,9 @@ discard main()   # a browser or Node runs the returned Promise
 
 Build a config with `newNaviConfig()`, which sets the safe defaults (verification
 on, decompression on, 2 retries, 20 redirects); then set the fields you want and
-pass it to `newNavi`. Prefer this over a bare `NaviConfig(...)` literal, which
-leaves every unmentioned field zeroed (including `verify`, i.e. off).
+pass it to `newNavi`. `NaviConfig` has `{.requiresInit.}`, so a bare or partial
+`NaviConfig(...)` literal is a compile error; `newNaviConfig()` is the only way
+to build one, which keeps the defaults from being silently zeroed.
 
 ```nim
 var cfg = newNaviConfig()
@@ -199,12 +200,14 @@ let api = newNavi(cfg)
 let user = api.get("users/42").data
 ```
 
-Derive a client that layers new defaults over an existing one. `extend` takes a
-sparse override: only the fields you set (prefixUrl, headers, http, auth, proxy)
-layer over the parent, and everything else is inherited:
+Derive a client that layers new defaults over an existing one. Build the override
+with `newNaviConfig()` too; `extend` layers its identity fields (prefixUrl,
+headers, http, auth, proxy) over the parent and inherits the rest:
 
 ```nim
-let authed = api.extend(NaviConfig(headers: initHeaders({"x-api-key": "..."})))
+var ovr = newNaviConfig()
+ovr.headers = initHeaders({"x-api-key": "..."})
+let authed = api.extend(ovr)
 ```
 
 ### Requests
@@ -477,8 +480,8 @@ connection pool and cookie jar.
 ### NaviConfig
 
 Build one with `newNaviConfig()`, which sets the defaults below, then assign the
-fields you want. A bare `NaviConfig()` leaves every field at its zero value
-(e.g. `verify = false`), so prefer `newNaviConfig()`.
+fields you want. `NaviConfig` has `{.requiresInit.}`, so a bare or partial
+`NaviConfig(...)` is a compile error; `newNaviConfig()` is the only builder.
 
 - **prefixUrl** `string`: prepended to relative request targets.
 - **headers** `Headers`: sent on every request (merged with per-call headers).

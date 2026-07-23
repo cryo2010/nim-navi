@@ -36,7 +36,10 @@ type
     ## skip it to short-circuit -- then read/modify `ctx.res`. Run in order;
     ## index 0 is the outermost.
 
-  NaviConfig* = object of NaviConfigBase
+  NaviConfig* {.requiresInit.} = object of NaviConfigBase
+    ## `requiresInit`, so it cannot be built with a bare/partial `NaviConfig(...)`
+    ## (which would leave fields zeroed, e.g. verify off). Build it with
+    ## `newNaviConfig()`.
     middleware*: seq[Middleware]
 
   Navi* = object
@@ -45,10 +48,13 @@ type
     jar*: CookieJar
 
 proc newNaviConfig*(): NaviConfig =
-  ## A config with the safe defaults set (verify on, decompress on, retries 2,
-  ## redirects 20). Prefer this over a bare `NaviConfig()`, which zeroes fields.
-  result.withDefaults()
-  result.http = {H1, H2} # negotiate h2 over TLS via ALPN, fall back to h1
+  ## The only way to build a config: `NaviConfig` requires every field. Sets the
+  ## safe defaults (verify on, decompress on, 2 retries, 20 redirects); override
+  ## the fields you want, then pass it to `newNavi`.
+  NaviConfig(
+    prefixUrl: "", headers: initHeaders(), http: {H1, H2}, tls: defaultTls(),
+    decompress: true, throwHttpErrors: true, maxRedirects: 20, maxRetries: 2,
+    auth: Auth(), proxy: "", timeout: 0, middleware: @[])
 
 proc newNavi*(options = newNaviConfig()): Navi =
   ## Create a client. `options` supplies defaults (prefixUrl, headers, TLS,

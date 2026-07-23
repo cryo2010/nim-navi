@@ -52,9 +52,9 @@ type
   NaviConfigBase* = object of RootObj
     ## Backend-agnostic client defaults, applied to every request and inheritable
     ## via `.extend`. Each entry module derives its own `NaviConfig` from this,
-    ## adding a backend-specific `middleware` field. Build one with `newNaviConfig`
-    ## so the safe defaults are set; a bare `NaviConfig()` leaves fields zeroed
-    ## (e.g. verification off), which is why `newNavi` defaults to `newNaviConfig()`.
+    ## adding a backend-specific `middleware` field. The derived `NaviConfig` has
+    ## `{.requiresInit.}`, so it can only be built with `newNaviConfig` (a bare or
+    ## partial `NaviConfig(...)` is a compile error), keeping the defaults intact.
     prefixUrl*: string
     headers*: Headers
     http*: set[HttpVersion]
@@ -91,21 +91,12 @@ proc wantsH2*(opts: NaviConfigBase): bool =
   ## An unset `http` (empty set) means "negotiate h2 where possible".
   opts.http.card == 0 or H2 in opts.http
 
-proc withDefaults*[T: NaviConfigBase](cfg: var T) =
-  ## Fill the backend-agnostic defaults on a freshly-constructed config. Each
-  ## entry's `newNaviConfig` calls this, then sets its own backend specifics.
-  cfg.tls = defaultTls()
-  cfg.decompress = true
-  cfg.throwHttpErrors = true
-  cfg.maxRedirects = 20
-  cfg.maxRetries = 2
-
 proc mergeBase*[T: NaviConfigBase](base, overrides: T): T =
   ## Layer `overrides`' addressing/identity fields over `base` for `.extend`,
-  ## preserving `base`'s policy knobs and derived fields (e.g. middleware). Only
-  ## fields with a natural "unset" value take effect, so a sparse
-  ## `NaviConfig(prefixUrl: ...)` override layers cleanly. To change the numeric
-  ## or bool policy, build a full config with `newNaviConfig`.
+  ## preserving `base`'s policy knobs and derived fields (e.g. middleware). The
+  ## override is a full `newNaviConfig`; only fields with a natural "unset" value
+  ## (prefixUrl, headers, http, auth, proxy) take effect, so its defaults for the
+  ## other fields do not clobber `base`.
   result = base
   if overrides.prefixUrl.len > 0: result.prefixUrl = overrides.prefixUrl
   result.headers = merge(base.headers, overrides.headers)

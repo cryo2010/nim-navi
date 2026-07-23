@@ -116,7 +116,9 @@ suite "chronos websocket client end to end":
     while not stallReady: os.sleep(5)
 
     proc run(): Future[string] {.async.} =
-      let api = newNavi(NaviConfig(timeout: 600))
+      var cfg = newNaviConfig()
+      cfg.timeout = 600
+      let api = newNavi(cfg)
       try:
         discard await api.websocket("ws://127.0.0.1:" & $port & "/")
         return "opened"

@@ -16,7 +16,9 @@ const invalid = [
 
 suite "badssl TLS client conformance":
   test "rejects invalid certificates when verify is on (default)":
-    let api = newNavi(NaviConfig(maxRetries: 0))
+    var cfg = newNaviConfig()
+    cfg.maxRetries = 0
+    let api = newNavi(cfg)
     for url in invalid:
       var raised = false
       try:
@@ -27,9 +29,14 @@ suite "badssl TLS client conformance":
       check raised
 
   test "accepts a valid certificate":
-    let api = newNavi(NaviConfig(maxRetries: 0))
+    var cfg = newNaviConfig()
+    cfg.maxRetries = 0
+    let api = newNavi(cfg)
     check api.get("https://badssl.com/").status == 200
 
   test "verify = false accepts an invalid certificate":
-    let api = newNavi(NaviConfig(tls: TlsConfig(verify: false), maxRetries: 0))
+    var cfg = newNaviConfig()
+    cfg.tls.verify = false
+    cfg.maxRetries = 0
+    let api = newNavi(cfg)
     check api.get("https://self-signed.badssl.com/").status == 200
