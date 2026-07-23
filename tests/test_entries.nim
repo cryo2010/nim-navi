@@ -441,5 +441,5 @@ suite "sync entry end to end":
     var ovr = newNaviConfig()
     ovr.prefixUrl = "http://api.test"
     let child = base.extend(ovr)
-    check child.options.prefixUrl == "http://api.test"
-    check child.options.headers.get("x-base") == "1"
+    check child.config.prefixUrl == "http://api.test"
+    check child.config.headers.get("x-base") == "1"

@@ -34,7 +34,7 @@ type
     middleware*: seq[Middleware]
 
   Navi* = object
-    options*: NaviConfig
+    config: NaviConfig
     pool*: Pool[PooledConn[Conn]]
     jar*: CookieJar
     muxes: TableRef[string, H2Mux]              ## live shared h2 connections
@@ -48,16 +48,21 @@ proc newNaviConfig*(): NaviConfig =
     decompress: true, throwHttpErrors: true, maxRedirects: 20, maxRetries: 2,
     auth: Auth(), proxy: "", timeout: 0, middleware: @[])
 
-proc newNavi*(options = newNaviConfig()): Navi =
-  Navi(options: options,
+proc newNavi*(config = newNaviConfig()): Navi =
+  Navi(config: config,
        pool: newPool[PooledConn[Conn]](), jar: newCookieJar(),
        muxes: newTable[string, H2Mux](),
        pendingMux: newTable[string, Future[H2Mux]]())
 
-proc extend*(client: Navi, options: NaviConfig): Navi =
-  var merged = mergeBase(client.options, options)
-  merged.middleware = client.options.middleware & options.middleware
-  Navi(options: merged,
+proc config*(client: Navi): lent NaviConfig = client.config
+  ## Read-only view of the client's config. Config is fixed at construction;
+  ## build a fresh client (or `extend`) to change it rather than mutating a live
+  ## one, so its pooled connections stay consistent with its settings.
+
+proc extend*(client: Navi, config: NaviConfig): Navi =
+  var merged = mergeBase(client.config, config)
+  merged.middleware = client.config.middleware & config.middleware
+  Navi(config: merged,
        pool: newPool[PooledConn[Conn]](), jar: newCookieJar(),
        muxes: newTable[string, H2Mux](),
        pendingMux: newTable[string, Future[H2Mux]]())
@@ -77,7 +82,7 @@ proc muxRequest(client: Navi, mux: H2Mux, req: Request,
   var r = toResponse(await mux.request(h2HeaderList(req), req.body))
   # For a streaming request the h2 body is buffered by the mux; decode it once
   # before handing it to the sink (the buffered path decodes via decodeBody).
-  if not sink.isNil and client.options.wantsDecompress and r.body.len > 0:
+  if not sink.isNil and client.config.wantsDecompress and r.body.len > 0:
     let dec = newStreamDecoder(r.headers.get("content-encoding"))
     if dec != nil: r.body = dec.update(r.body.toOpenArrayByte(0, r.body.high))
   applySink(r, sink)
@@ -86,7 +91,7 @@ proc muxRequest(client: Navi, mux: H2Mux, req: Request,
 proc h1OnConn(client: Navi, conn: Conn, origin: string, req: Request,
               sink: BodySink): Future[Response] {.async.} =
   var keep = false
-  result = h1Exchange(conn, req, sink, keep, client.options.wantsDecompress)
+  result = h1Exchange(conn, req, sink, keep, client.config.wantsDecompress)
   let pc = PooledConn[Conn](transport: conn)
   if not (keep and pushIdle(client.pool, origin, pc)):
     await close(conn)
@@ -96,7 +101,7 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
   ## pool http/1.1. Concurrent connects to the same new origin are coalesced so a
   ## cold burst still ends up on one h2 connection.
   let origin = originKey(req.url)
-  let wantH2 = client.options.wantsH2 and req.url.isTls
+  let wantH2 = client.config.wantsH2 and req.url.isTls
 
   if wantH2:
     # 1. A live shared connection, or one currently being established.
@@ -113,7 +118,7 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
   if found:
     try:
       var keep = false
-      result = h1Exchange(pc.transport, req, sink, keep, client.options.wantsDecompress)
+      result = h1Exchange(pc.transport, req, sink, keep, client.config.wantsDecompress)
       if not (keep and pushIdle(client.pool, origin, pc)): await close(pc.transport)
       return
     except CatchableError:
@@ -121,7 +126,7 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
 
   # 3. Open a fresh connection.
   var rq = req
-  let proxyTarget = resolveProxy(client.options, rq.url)
+  let proxyTarget = resolveProxy(client.config, rq.url)
   rq.absoluteForm = proxyTarget.isSet and not rq.url.isTls
   let alpn = if wantH2: @["h2", "http/1.1"] else: @[]
 
@@ -130,7 +135,7 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
     client.pendingMux[origin] = pending
     try:
       let conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
-                               client.options.tls, proxyTarget, alpn)
+                               client.config.tls, proxyTarget, alpn)
       if conn.protocol == "h2":
         let mux = await newH2Mux(conn)
         client.muxes[origin] = mux
@@ -147,7 +152,7 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
       raise
 
   let conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
-                           client.options.tls, proxyTarget, alpn)
+                           client.config.tls, proxyTarget, alpn)
   result = await client.h1OnConn(conn, origin, rq, sink)
 
 proc doRequest(client: Navi, req: Request): Future[Response] {.async.} =
@@ -159,7 +164,7 @@ proc doStream(client: Navi, req: Request, sink: BodySink): Future[Response] {.as
 proc withDeadline(client: Navi, fut: Future[Response]): Future[Response] {.async.} =
   ## Bound the whole request (all attempts) by `timeout`. On expiry, raise
   ## TimeoutError; the abandoned future runs to completion in the background.
-  let ms = client.options.timeoutMs
+  let ms = client.config.timeoutMs
   if ms <= 0:
     return await fut
   if await withTimeout(fut, ms):
@@ -167,12 +172,12 @@ proc withDeadline(client: Navi, fut: Future[Response]): Future[Response] {.async
   raise newException(TimeoutError, "navi: request timed out after " & $ms & " ms")
 
 proc client*(ctx: NaviContext): Navi = ctx.clientp[]
-  ## The client handling this request (e.g. to read `ctx.client.options`).
+  ## The client handling this request (e.g. to read `ctx.client.config`).
 
 proc next*(ctx: NaviContext): Future[void] {.async.} =
   ## Run the rest of the chain: the next middleware, or -- once they are
   ## exhausted -- the request itself. The outcome lands in `ctx.res`.
-  let mws = ctx.clientp[].options.middleware
+  let mws = ctx.clientp[].config.middleware
   if ctx.idx >= mws.len:
     if ctx.sink.isNil:
       ctx.res = await doRequest(ctx.clientp[], ctx.req)
@@ -192,9 +197,9 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
               form: seq[(string, string)] = @[], multipart: Multipart = @[],
               bodyStream: BodyProducer = nil): Future[Response] {.async.} =
   ## Perform a request; configured middleware wraps the whole call.
-  let req = buildRequest(client.options, verb, target, headers, body, json,
+  let req = buildRequest(client.config, verb, target, headers, body, json,
                          form, multipart, bodyStream)
-  if client.options.middleware.len == 0:
+  if client.config.middleware.len == 0:
     return await client.withDeadline(doRequest(client, req))
   let ctx = NaviContext(req: req, clientp: unsafeAddr client)
   return await client.withDeadline(runChain(ctx))
@@ -202,8 +207,8 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
              headers = initHeaders()): Future[Response] {.async.} =
   ## Deliver the response body to `sink` as it arrives; Response.body is empty.
-  let req = buildRequest(client.options, verb, target, headers)
-  if client.options.middleware.len == 0:
+  let req = buildRequest(client.config, verb, target, headers)
+  if client.config.middleware.len == 0:
     return await client.withDeadline(doStream(client, req, sink))
   let ctx = NaviContext(req: req, clientp: unsafeAddr client, sink: sink)
   return await client.withDeadline(runChain(ctx))
@@ -233,8 +238,8 @@ proc websocket*(client: Navi, url: string,
   ## http/https); `wss` uses TLS. Does the HTTP/1.1 Upgrade over the transport and
   ## validates `Sec-WebSocket-Accept`. Use `send`, `receive`, and `close`.
   let u = toWsUrl(url)
-  let conn = await connect(u.host, u.port, u.isTls, client.options.tls,
-                           resolveProxy(client.options, u), @[])
+  let conn = await connect(u.host, u.port, u.isTls, client.config.tls,
+                           resolveProxy(client.config, u), @[])
   let key = genKey()
   # Close the connection on any handshake failure (its close is async, so this
   # uses try/except rather than defer).

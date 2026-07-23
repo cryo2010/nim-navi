@@ -89,9 +89,9 @@ template poolTransport*(client, req, sink: typed): Response =
   mixin connect, sendAll, recvSome, close, await
   block:
     var rq = req
-    let proxy = resolveProxy(client.options, rq.url)
+    let proxy = resolveProxy(client.config, rq.url)
     rq.absoluteForm = proxy.isSet and not rq.url.isTls
-    let alpn = if client.options.wantsH2 and rq.url.isTls:
+    let alpn = if client.config.wantsH2 and rq.url.isTls:
                  @["h2", "http/1.1"] else: @[]
     let key = originKey(rq.url)
     var resp: Response
@@ -101,12 +101,12 @@ template poolTransport*(client, req, sink: typed): Response =
     if found:
       try:
         if pc.h2 != nil:
-          resp = h2Stream(pc.transport, pc.h2, rq, sink, client.options.wantsDecompress)
+          resp = h2Stream(pc.transport, pc.h2, rq, sink, client.config.wantsDecompress)
           if not (pc.h2.canReuse and pushIdle(client.pool, key, pc)):
             await close(pc.transport)
         else:
           var keep = false
-          resp = h1Exchange(pc.transport, rq, sink, keep, client.options.wantsDecompress)
+          resp = h1Exchange(pc.transport, rq, sink, keep, client.config.wantsDecompress)
           if not (keep and pushIdle(client.pool, key, pc)):
             await close(pc.transport)
         served = true
@@ -115,18 +115,18 @@ template poolTransport*(client, req, sink: typed): Response =
 
     if not served:
       let transport = await connect(rq.url.host, rq.url.port, rq.url.isTls,
-                                    client.options.tls, proxy, alpn,
-                                    client.options.timeoutMs)
+                                    client.config.tls, proxy, alpn,
+                                    client.config.timeoutMs)
       var npc = PooledConn[typeof(transport)](transport: transport)
       if transport.protocol == "h2":
         npc.h2 = initH2Conn()
         await sendAll(transport, npc.h2.preamble())
-        resp = h2Stream(transport, npc.h2, rq, sink, client.options.wantsDecompress)
+        resp = h2Stream(transport, npc.h2, rq, sink, client.config.wantsDecompress)
         if not (npc.h2.canReuse and pushIdle(client.pool, key, npc)):
           await close(transport)
       else:
         var keep = false
-        resp = h1Exchange(transport, rq, sink, keep, client.options.wantsDecompress)
+        resp = h1Exchange(transport, rq, sink, keep, client.config.wantsDecompress)
         if not (keep and pushIdle(client.pool, key, npc)):
           await close(transport)
     resp
@@ -146,12 +146,12 @@ template maybeDigest(client, rreq, resp: typed) =
   ## On a 401 Digest challenge, when digest auth is configured and the request
   ## carries no Authorization yet, compute the response and retry once. Expands
   ## inline so the retry's `await`s run in the caller's async proc.
-  if resp.status == 401 and client.options.auth.kind == akDigest and
+  if resp.status == 401 and client.config.auth.kind == akDigest and
      not rreq.headers.contains("authorization"):
     let chal = bestChallenge(resp.headers.getAll("www-authenticate"))
     if chal.isSome:
       let auth = digestAuthHeader(
-        client.options.auth.user, client.options.auth.pass,
+        client.config.auth.user, client.config.auth.pass,
         $rreq.verb, rreq.url.requestTarget, chal.get)
       if auth.len > 0:                 # "" means the challenge algorithm is unsupported
         rreq.headers["authorization"] = auth
@@ -162,11 +162,11 @@ template followRedirects(client, startReq, resp: typed) =
   ## `await`s run in the caller's async proc.
   var rreq = startReq
   var hops = 0
-  let limit = client.options.redirectLimit
+  let limit = client.config.redirectLimit
   while true:
     resp = run(client, rreq, BodySink(nil))
     maybeDigest(client, rreq, resp)
-    decodeBody(resp, client.options)
+    decodeBody(resp, client.config)
     let location = resp.headers.get("location")
     if limit > 0 and hops < limit and isRedirect(resp.status) and location.len > 0:
       rreq = redirectRequest(rreq, resp.status, location)
@@ -183,7 +183,7 @@ template performRequest*(client, req0: typed): Response =
     var req = req0
     var resp: Response
     var attempt = 0
-    let maxRetries = client.options.retryLimit
+    let maxRetries = client.config.retryLimit
     while true:
       var gotResp = false
       try:
@@ -198,7 +198,7 @@ template performRequest*(client, req0: typed): Response =
         break
       inc attempt
       await sleep(backoffMs(attempt, resp))
-    if client.options.wantsThrow and not resp.ok:
+    if client.config.wantsThrow and not resp.ok:
       raiseHttpError(req, resp)
     resp
 
@@ -208,6 +208,6 @@ template performStream*(client, req, sink: typed): Response =
   ## decompressed); a non-2xx still raises HttpError unless disabled.
   block:
     let resp = run(client, req, sink)
-    if client.options.wantsThrow and not resp.ok:
+    if client.config.wantsThrow and not resp.ok:
       raiseHttpError(req, resp)
     resp
