@@ -318,7 +318,7 @@ suite "sync entry end to end":
     startRaw(th, port, payload)
 
     var cfg = newNaviConfig()
-    cfg.maxRetries = 0
+    cfg.retry.limit = 0
     cfg.throwHttpErrors = false
     let api = newNavi(cfg)
     let res = api.get("http://127.0.0.1:" & $port & "/")
@@ -332,7 +332,7 @@ suite "sync entry end to end":
 
     var cfg = newNaviConfig()
     cfg.timeout = 200
-    cfg.maxRetries = 0
+    cfg.retry.limit = 0
     let api = newNavi(cfg)
     var raised = false
     try:
@@ -443,3 +443,90 @@ suite "sync entry end to end":
     let child = base.extend(ovr)
     check child.config.prefixUrl == "http://api.test"
     check child.config.headers.get("x-base") == "1"
+
+  test "params appends an encoded query string to the target":
+    const port = 8951
+    var th: Thread[ServerCtx]
+    startEchoLine(th, port)
+
+    let api = newNavi()
+    let res = api.get("http://127.0.0.1:" & $port & "/search",
+                      params = @[("q", "test"), ("n", "2")])
+    check res.status == 200
+    check res.body == "GET /search?q=test&n=2 HTTP/1.1"
+    joinThread(th)
+
+  test "maxResponseBytes rejects an oversized buffered body":
+    const port = 8952
+    let payload = "HTTP/1.1 200 OK\r\nContent-Length: 50\r\n" &
+                  "Connection: close\r\n\r\n" & repeat('x', 50)
+    var th: Thread[ServerCtx]
+    startRaw(th, port, payload)
+
+    var cfg = newNaviConfig()
+    cfg.maxResponseBytes = 10
+    let api = newNavi(cfg)
+    expect ResponseTooLargeError:
+      discard api.get("http://127.0.0.1:" & $port & "/")
+    joinThread(th)
+
+  test "maxResponseBytes allows a body within the limit":
+    const port = 8953
+    let payload = "HTTP/1.1 200 OK\r\nContent-Length: 50\r\n" &
+                  "Connection: close\r\n\r\n" & repeat('x', 50)
+    var th: Thread[ServerCtx]
+    startRaw(th, port, payload)
+
+    var cfg = newNaviConfig()
+    cfg.maxResponseBytes = 100
+    let api = newNavi(cfg)
+    let res = api.get("http://127.0.0.1:" & $port & "/")
+    check res.body.len == 50
+    joinThread(th)
+
+  test "maxResponseBytes caps a streamed body incrementally":
+    const port = 8954
+    let payload = "HTTP/1.1 200 OK\r\nContent-Length: 50\r\n" &
+                  "Connection: close\r\n\r\n" & repeat('y', 50)
+    var th: Thread[ServerCtx]
+    startRaw(th, port, payload)
+
+    var cfg = newNaviConfig()
+    cfg.maxResponseBytes = 10
+    let api = newNavi(cfg)
+    expect ResponseTooLargeError:
+      discard api.stream(GET, "http://127.0.0.1:" & $port & "/",
+        sink = proc(data: openArray[byte]) = discard)
+    joinThread(th)
+
+  test "retry statuses are configurable":
+    const port = 8955
+    let payload = "HTTP/1.1 503 Service Unavailable\r\n" &
+                  "Content-Length: 0\r\nConnection: close\r\n\r\n"
+    var th: Thread[ServerCtx]
+    startRaw(th, port, payload)
+
+    var cfg = newNaviConfig()
+    cfg.retry.statuses = @[500]     # 503 no longer eligible, so no retry
+    cfg.throwHttpErrors = false
+    let api = newNavi(cfg)
+    let res = api.get("http://127.0.0.1:" & $port & "/")
+    check res.status == 503
+    joinThread(th)
+
+  test "a cancelled token aborts before dispatch":
+    let api = newNavi()
+    let tok = newCancelToken()
+    tok.cancel()
+    expect RequestCancelledError:
+      discard api.get("http://127.0.0.1:1/", cancel = tok)
+
+  test "an un-cancelled token leaves the request unaffected":
+    const port = 8956
+    var th: Thread[ServerCtx]
+    startServer(th, port)
+
+    let api = newNavi()
+    let res = api.get("http://127.0.0.1:" & $port & "/", cancel = newCancelToken())
+    check res.status == 200
+    joinThread(th)

@@ -11,7 +11,7 @@ when not defined(js):
 
 import std/[asyncjs, jsffi]
 from std/strutils import cmpIgnoreCase
-import ../core/[headers, url, request, response]
+import ../core/[headers, url, request, response, cancel]
 
 # --- fetch / DOM bindings ---
 proc fetch(url: cstring, init: JsObject): Future[JsObject] {.importjs: "fetch(#, #)".}
@@ -25,8 +25,12 @@ proc bodyReader(res: JsObject): JsObject {.importjs: "#.body.getReader()".}
 proc readChunk(reader: JsObject): Future[JsObject] {.importjs: "#.read()".}
 proc setTimeout(cb: proc (), ms: int) {.importjs: "setTimeout(#, #)".}
 proc abortAfter(ms: int): JsObject {.importjs: "AbortSignal.timeout(#)".}
+proc newAbortController(): JsObject {.importjs: "new AbortController()".}
+proc abort(c: JsObject) {.importjs: "#.abort()".}
+proc signalOf(c: JsObject): JsObject {.importjs: "#.signal".}
+proc anySignal(a, b: JsObject): JsObject {.importjs: "AbortSignal.any([#, #])".}
 
-proc buildInit(req: Request, timeout: int): JsObject =
+proc buildInit(req: Request, signal: JsObject, hasSignal: bool): JsObject =
   result = newJsObject()
   result["method"] = cstring($req.verb)
   let h = newHeaders()
@@ -37,8 +41,8 @@ proc buildInit(req: Request, timeout: int): JsObject =
     result["body"] = cstring(req.body)
   result["redirect"] = cstring("follow")      # the browser follows redirects
   result["credentials"] = cstring("include")  # and owns the cookie jar
-  if timeout > 0:
-    result["signal"] = abortAfter(timeout)    # fetch aborts after `timeout` ms
+  if hasSignal:
+    result["signal"] = signal   # aborts on timeout and/or the caller's cancel
 
 proc readHeaders(res: JsObject): Headers =
   result = initHeaders()
@@ -73,17 +77,32 @@ proc drainToSink(res: JsObject, sink: BodySink) {.async.} =
       bytes[i] = byte(arr[i].to(int))
     sink(bytes)
 
-proc fetchExchange*(req: Request, sink: BodySink, timeout = 0): Future[Response] {.async.} =
+proc fetchExchange*(req: Request, sink: BodySink, timeout = 0,
+                    cancel: CancelToken = nil): Future[Response] {.async.} =
   ## One request/response through `fetch`. With a `sink`, the body streams to it
   ## and `Response.body` is left empty; otherwise the body is buffered. A nonzero
-  ## `timeout` aborts the fetch after that many ms (surfaces as a fetch failure).
+  ## `timeout` aborts the fetch after that many ms; `cancel` aborts it on demand.
+  var controller: JsObject
+  let wantCancel = cancel != nil
+  if wantCancel:
+    controller = newAbortController()
+    cancel.armHook(proc() {.gcsafe, raises: [].} = controller.abort())
+  var signal: JsObject
+  if wantCancel and timeout > 0: signal = anySignal(signalOf(controller), abortAfter(timeout))
+  elif wantCancel:               signal = signalOf(controller)
+  elif timeout > 0:              signal = abortAfter(timeout)
   var res: JsObject
   try:
-    res = await fetch(cstring(req.url.absoluteTarget), buildInit(req, timeout))
-  except:  # noqa: bare — a fetch rejection is a native JS error (no Nim m_type),
+    res = await fetch(cstring(req.url.absoluteTarget),
+                      buildInit(req, signal, wantCancel or timeout > 0))
+  except:  # noqa: bare - a fetch rejection is a native JS error (no Nim m_type),
            # so a typed `except` would re-raise it. Surface it as a Nim exception
            # the retry loop and user `try/except` can handle like any transport error.
+    if wantCancel and cancel.cancelled:
+      raise newException(RequestCancelledError, "navi: request cancelled")
     raise newException(IOError, "navi: fetch failed: " & getCurrentExceptionMsg())
+  finally:
+    if wantCancel: cancel.disarmHook()
   if sink.isNil:
     result = toResponse(res, $(await jsText(res)))
   else:

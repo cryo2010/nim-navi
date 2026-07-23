@@ -36,7 +36,7 @@ proc exerciseFailedHandshake(): int =
   ## connect() raises during the TLS handshake. The SSL_CTX it allocated must be
   ## freed on that path too -- a regression guard for the connect-cleanup defer.
   var cfg = newNaviConfig()
-  cfg.maxRetries = 0   # verify on (default), no caFile -> cert untrusted; one attempt
+  cfg.retry.limit = 0   # verify on (default), no caFile -> cert untrusted; one attempt
   let api = newNavi(cfg)
   for _ in 0 ..< iters:
     var raised = false

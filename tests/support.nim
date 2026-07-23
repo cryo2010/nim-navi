@@ -39,6 +39,34 @@ proc startRaw*(th: var Thread[ServerCtx], port: int, payload: string) =
   createThread(th, serveRaw, ServerCtx(port: port, ready: addr ready, payload: payload))
   while not ready: discard
 
+proc serveEchoLine(ctx: ServerCtx) {.thread.} =
+  ## Read one request and reply 200 with the request line (verb target version)
+  ## as the body, so a test can assert the exact target that was sent.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.listen()
+  ctx.ready[] = true
+  var client: Socket
+  server.accept(client)
+  var req = ""
+  while true:
+    let c = client.recv(1)
+    if c.len == 0: break
+    req.add c
+    if req.len >= 4 and req[^4 .. ^1] == "\r\n\r\n": break
+  let line = req.splitLines()[0]
+  client.send("HTTP/1.1 200 OK\r\nContent-Length: " & $line.len &
+              "\r\nConnection: close\r\n\r\n" & line)
+  client.close()
+  server.close()
+
+proc startEchoLine*(th: var Thread[ServerCtx], port: int) =
+  ## Serve a single connection that echoes the request line as the body.
+  var ready = false
+  createThread(th, serveEchoLine, ServerCtx(port: port, ready: addr ready))
+  while not ready: discard
+
 proc serveHang(ctx: ServerCtx) {.thread.} =
   ## Accept a connection, read the request, then never reply (for timeout tests).
   var server = newSocket()

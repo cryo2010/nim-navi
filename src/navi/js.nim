@@ -40,6 +40,7 @@ type
     res*: Response           ## the response; set by `next`, adjust it after
     clientp: ptr Navi        ## the owning client (see `client`); valid for the call
     sink: BodySink           ## non-nil for a streaming request
+    cancel: CancelToken      ## caller's cancellation token, or nil
     idx: int                 ## index of the next middleware to run
   Middleware* = proc(ctx: NaviContext): Future[void] {.nimcall.}
     ## A middleware step; may be async. Deliberately `nimcall` (not a closure, so
@@ -61,7 +62,8 @@ proc newNaviConfig*(): NaviConfig =
   ## negotiation are the runtime's (so `http` is unused here).
   NaviConfig(
     prefixUrl: "", headers: initHeaders(), http: {}, tls: defaultTls(),
-    decompress: false, throwHttpErrors: true, maxRedirects: 20, maxRetries: 2,
+    decompress: false, throwHttpErrors: true, maxRedirects: 20,
+    retry: defaultRetryPolicy(), maxResponseBytes: 0,
     auth: Auth(), proxy: "", timeout: 0, middleware: @[])
 
 # A browser owns the cookie store (and hides Set-Cookie from fetch); Node, Deno,
@@ -97,38 +99,44 @@ proc maybeThrow(client: Navi, req: Request, resp: Response) =
       msg: $req.verb & " " & $req.url & " -> " & $resp.status & " " & resp.reason,
       response: resp)
 
-proc runCore(client: Navi, req0: Request): Future[Response] {.async.} =
+proc runCore(client: Navi, req0: Request, cancel: CancelToken): Future[Response] {.async.} =
   ## The innermost `next`: buffered request with the policy navi owns here (cookie
-  ## jar, retries with backoff, throw-on-non-2xx). Redirects and decoding are the
-  ## runtime's.
+  ## jar, retries with backoff, size cap, throw-on-non-2xx). Redirects and decoding
+  ## are the runtime's.
   var req = req0
   var resp: Response
   var attempt = 0
-  let maxRetries = client.config.retryLimit
+  let policy = client.config.retry
   while true:
+    throwIfCancelled(cancel)
     var failed = false
     if not client.jar.isNil: applyCookies(client.jar, req)
     try:
-      resp = await fetchExchange(req, nil, client.config.timeoutMs)
+      resp = await fetchExchange(req, nil, client.config.timeoutMs, cancel)
     except CatchableError:
-      if not (attempt < maxRetries and isRetryableVerb(req.verb)):
+      throwIfCancelled(cancel)   # a cancel is not a retryable failure
+      if not (attempt < policy.limit and isRetryableVerb(req.verb, policy)):
         raise   # not retryable: propagate the fetch error
       failed = true
     if not failed and not client.jar.isNil:
       storeCookies(client.jar, req.url, resp)
     if not failed and
-       not (attempt < maxRetries and isRetryableVerb(req.verb) and
-            isRetryableStatus(resp.status)):
+       not (attempt < policy.limit and isRetryableVerb(req.verb, policy) and
+            isRetryableStatus(resp.status, policy)):
       break
     inc attempt
-    await sleep(backoffMs(attempt, resp))
+    await sleep(backoffMs(attempt, resp, policy))
+  enforceMaxResponse(resp, client.config.maxResponseBytes)
   client.maybeThrow(req, resp)
   result = resp
 
-proc runCoreStream(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
+proc runCoreStream(client: Navi, req: Request, sink: BodySink,
+                   cancel: CancelToken): Future[Response] {.async.} =
+  throwIfCancelled(cancel)
   var rq = req
   if not client.jar.isNil: applyCookies(client.jar, rq)
-  var resp = await fetchExchange(rq, sink, client.config.timeoutMs)
+  let limited = limitedSink(sink, client.config.maxResponseBytes)
+  var resp = await fetchExchange(rq, limited, client.config.timeoutMs, cancel)
   if not client.jar.isNil: storeCookies(client.jar, rq.url, resp)
   client.maybeThrow(rq, resp)
   result = resp
@@ -142,9 +150,9 @@ proc next*(ctx: NaviContext): Future[void] {.async.} =
   let mws = ctx.clientp[].config.middleware
   if ctx.idx >= mws.len:
     if ctx.sink.isNil:
-      ctx.res = await runCore(ctx.clientp[], ctx.req)
+      ctx.res = await runCore(ctx.clientp[], ctx.req, ctx.cancel)
     else:
-      ctx.res = await runCoreStream(ctx.clientp[], ctx.req, ctx.sink)
+      ctx.res = await runCoreStream(ctx.clientp[], ctx.req, ctx.sink, ctx.cancel)
   else:
     let m = mws[ctx.idx]
     inc ctx.idx
@@ -156,22 +164,25 @@ proc runChain(ctx: NaviContext): Future[Response] {.async.} =
 
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = "", json: JsonNode = nil,
-              form: seq[(string, string)] = @[],
-              multipart: Multipart = @[]): Future[Response] {.async.} =
-  ## Perform a request; configured middleware wraps the whole call.
+              form: seq[(string, string)] = @[], multipart: Multipart = @[],
+              params: seq[(string, string)] = @[],
+              cancel: CancelToken = nil): Future[Response] {.async.} =
+  ## Perform a request; configured middleware wraps the whole call. `params` are
+  ## appended to the URL query; `cancel` aborts the fetch.
   let req = buildRequest(client.config, verb, target, headers, body, json, form,
-                         multipart, nil)
-  if client.config.middleware.len == 0: return await runCore(client, req)
-  let ctx = NaviContext(req: req, clientp: unsafeAddr client)
+                         multipart, nil, params)
+  if client.config.middleware.len == 0: return await runCore(client, req, cancel)
+  let ctx = NaviContext(req: req, clientp: unsafeAddr client, cancel: cancel)
   return await runChain(ctx)
 
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
-             headers = initHeaders()): Future[Response] {.async.} =
+             headers = initHeaders(), params: seq[(string, string)] = @[],
+             cancel: CancelToken = nil): Future[Response] {.async.} =
   ## Deliver the response body to `sink` as it arrives; `Response.body` stays
   ## empty. Not retried (the stream is consumed as it is read).
-  let req = buildRequest(client.config, verb, target, headers)
-  if client.config.middleware.len == 0: return await runCoreStream(client, req, sink)
-  let ctx = NaviContext(req: req, clientp: unsafeAddr client, sink: sink)
+  let req = buildRequest(client.config, verb, target, headers, params = params)
+  if client.config.middleware.len == 0: return await runCoreStream(client, req, sink, cancel)
+  let ctx = NaviContext(req: req, clientp: unsafeAddr client, sink: sink, cancel: cancel)
   return await runChain(ctx)
 
 proc websocket*(client: Navi, url: string,
