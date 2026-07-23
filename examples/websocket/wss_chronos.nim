@@ -13,7 +13,9 @@ import navi/chronos
 const message = "hello from the chronos backend (wss)"
 
 proc main() {.async.} =
-  let api = newNavi(NaviOptions(tls: TlsConfig(verify: some(false))))
+  var cfg = newNaviConfig()
+  cfg.tls.verify = false   # the demo server uses a self-signed cert
+  let api = newNavi(cfg)
   let ws = await api.websocket("wss://127.0.0.1:9701/")
   await ws.send(message)
   echo "sent: ", message

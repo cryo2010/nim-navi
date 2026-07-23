@@ -324,7 +324,7 @@ proc decodingSink*(encoding: string, inner: BodySink): BodySink =
     let plain = dec.update(data)
     if plain.len > 0: inner(plain.toOpenArrayByte(0, plain.high))
 
-proc decodeBody*(resp: var Response, opts: NaviOptionsBase) =
+proc decodeBody*(resp: var Response, opts: NaviConfigBase) =
   ## Decompress the body in place per Content-Encoding, then drop the headers
   ## that described the encoded form. No-op when decompression is disabled or
   ## the encoding is identity/unknown.

@@ -49,21 +49,23 @@ type
     H2 = "HTTP/2"
     H3 = "HTTP/3"
 
-  NaviOptionsBase* = object of RootObj
+  NaviConfigBase* = object of RootObj
     ## Backend-agnostic client defaults, applied to every request and inheritable
-    ## via `.extend`. Each entry module derives its own `NaviOptions` from this,
-    ## adding a backend-specific `hooks` field.
+    ## via `.extend`. Each entry module derives its own `NaviConfig` from this,
+    ## adding a backend-specific `middleware` field. The derived `NaviConfig` has
+    ## `{.requiresInit.}`, so it can only be built with `newNaviConfig` (a bare or
+    ## partial `NaviConfig(...)` is a compile error), keeping the defaults intact.
     prefixUrl*: string
     headers*: Headers
     http*: set[HttpVersion]
     tls*: TlsConfig
-    decompress*: Option[bool]      ## decode gzip/deflate bodies (default on)
-    throwHttpErrors*: Option[bool]  ## raise HttpError on non-2xx (default on)
-    maxRedirects*: Option[int]      ## redirects to follow, 0 disables (default 20)
-    maxRetries*: Option[int]        ## retry attempts for transient failures (default 2)
+    decompress*: bool               ## decode gzip/deflate bodies (default on)
+    throwHttpErrors*: bool          ## raise HttpError on non-2xx (default on)
+    maxRedirects*: int              ## redirects to follow, 0 disables (default 20)
+    maxRetries*: int                ## retry attempts for transient failures (default 2)
     auth*: Auth                     ## Authorization applied to every request
-    proxy*: Option[string]          ## proxy URL; none falls back to env vars
-    timeout*: Option[int]           ## request timeout in ms; none (default) disables
+    proxy*: string                  ## proxy URL; "" falls back to env vars
+    timeout*: int                   ## request timeout in ms; 0 (default) disables
 
   BodyProducer* = proc(): string {.closure, raises: [CatchableError].}
     ## Pull-based upload source: returns the next chunk, or "" at end of body.
@@ -78,34 +80,31 @@ type
     bodyStream*: BodyProducer  ## when set, the body is streamed chunked
     absoluteForm*: bool         ## use absolute-URI on the request line (http proxy)
 
-# Readers take the base by value; a derived NaviOptions slices to it cleanly.
-proc wantsDecompress*(opts: NaviOptionsBase): bool = opts.decompress.get(true)
-proc wantsThrow*(opts: NaviOptionsBase): bool = opts.throwHttpErrors.get(true)
-proc redirectLimit*(opts: NaviOptionsBase): int = opts.maxRedirects.get(20)
-proc retryLimit*(opts: NaviOptionsBase): int = opts.maxRetries.get(2)
-proc timeoutMs*(opts: NaviOptionsBase): int = opts.timeout.get(0)
+# Readers take the base by value; a derived NaviConfig slices to it cleanly.
+proc wantsDecompress*(opts: NaviConfigBase): bool = opts.decompress
+proc wantsThrow*(opts: NaviConfigBase): bool = opts.throwHttpErrors
+proc redirectLimit*(opts: NaviConfigBase): int = opts.maxRedirects
+proc retryLimit*(opts: NaviConfigBase): int = opts.maxRetries
+proc timeoutMs*(opts: NaviConfigBase): int = opts.timeout
   ## Request timeout in milliseconds; 0 means no timeout.
-proc wantsH2*(opts: NaviOptionsBase): bool =
+proc wantsH2*(opts: NaviConfigBase): bool =
   ## An unset `http` (empty set) means "negotiate h2 where possible".
   opts.http.card == 0 or H2 in opts.http
 
-proc mergeBase*[T: NaviOptionsBase](base, overrides: T): T =
-  ## Layer `overrides`' base fields over `base` for `.extend`, preserving any
-  ## derived fields (e.g. hooks) from `base`. Generic so it returns the derived
-  ## type. Only fields the caller set take effect.
+proc mergeBase*[T: NaviConfigBase](base, overrides: T): T =
+  ## Layer `overrides`' addressing/identity fields over `base` for `.extend`,
+  ## preserving `base`'s policy knobs and derived fields (e.g. middleware). The
+  ## override is a full `newNaviConfig`; only fields with a natural "unset" value
+  ## (prefixUrl, headers, http, auth, proxy) take effect, so its defaults for the
+  ## other fields do not clobber `base`.
   result = base
   if overrides.prefixUrl.len > 0: result.prefixUrl = overrides.prefixUrl
   result.headers = merge(base.headers, overrides.headers)
   if overrides.http.card > 0: result.http = overrides.http
-  if overrides.decompress.isSome: result.decompress = overrides.decompress
-  if overrides.throwHttpErrors.isSome:
-    result.throwHttpErrors = overrides.throwHttpErrors
-  if overrides.maxRedirects.isSome: result.maxRedirects = overrides.maxRedirects
-  if overrides.maxRetries.isSome: result.maxRetries = overrides.maxRetries
   if overrides.auth.kind != akNone: result.auth = overrides.auth
-  if overrides.proxy.isSome: result.proxy = overrides.proxy
+  if overrides.proxy.len > 0: result.proxy = overrides.proxy
 
-proc buildRequest*(opts: NaviOptionsBase, verb: HttpVerb, target: string,
+proc buildRequest*(opts: NaviConfigBase, verb: HttpVerb, target: string,
                    headers: Headers = initHeaders(), body = "",
                    json: JsonNode = nil, form: seq[(string, string)] = @[],
                    multipart: Multipart = @[],

@@ -4,7 +4,7 @@
 ## variables (HTTP_PROXY/HTTPS_PROXY and lowercase forms), with NO_PROXY
 ## exclusions honored either way.
 
-import std/[options, os, strutils]
+import std/[os, strutils]
 import ./url, ./request
 import ../backend/api
 
@@ -25,9 +25,9 @@ proc excluded(host: string): bool =
     let h = host.toLowerAscii
     if h == entry or h.endsWith("." & entry): return true
 
-proc resolveProxy*(opts: NaviOptionsBase, url: Url): ProxyTarget =
+proc resolveProxy*(opts: NaviConfigBase, url: Url): ProxyTarget =
   ## The proxy to dial for `url`, or a direct target when none applies.
-  let raw = if opts.proxy.isSome: opts.proxy.get else: envProxy(url)
+  let raw = if opts.proxy.len > 0: opts.proxy else: envProxy(url)
   if raw.len == 0 or excluded(url.host):
     return direct()
   let u = parseUrl(raw)

@@ -10,7 +10,9 @@ const message = "hello from the sync backend (wss)"
 
 # verify is off because the demo server uses a self-signed cert. A real
 # deployment would verify against a trusted CA: TlsConfig(caFile: "ca.pem").
-let api = newNavi(NaviOptions(tls: TlsConfig(verify: some(false))))
+var cfg = newNaviConfig()
+cfg.tls.verify = false   # the demo server uses a self-signed cert
+let api = newNavi(cfg)
 let ws = api.websocket("wss://127.0.0.1:9701/")
 ws.send(message)
 echo "sent: ", message

@@ -36,24 +36,32 @@ type
     ## skip it to short-circuit -- then read/modify `ctx.res`. Run in order;
     ## index 0 is the outermost.
 
-  NaviOptions* = object of NaviOptionsBase
+  NaviConfig* {.requiresInit.} = object of NaviConfigBase
+    ## `requiresInit`, so it cannot be built with a bare/partial `NaviConfig(...)`
+    ## (which would leave fields zeroed, e.g. verify off). Build it with
+    ## `newNaviConfig()`.
     middleware*: seq[Middleware]
 
   Navi* = object
-    options*: NaviOptions
+    options*: NaviConfig
     pool*: Pool[PooledConn[Conn]]
     jar*: CookieJar
 
-proc defaultOptions*(): NaviOptions =
-  result.http = {H1, H2} # negotiate h2 over TLS via ALPN, fall back to h1
-  result.tls = defaultTls()
+proc newNaviConfig*(): NaviConfig =
+  ## The only way to build a config: `NaviConfig` requires every field. Sets the
+  ## safe defaults (verify on, decompress on, 2 retries, 20 redirects); override
+  ## the fields you want, then pass it to `newNavi`.
+  NaviConfig(
+    prefixUrl: "", headers: initHeaders(), http: {H1, H2}, tls: defaultTls(),
+    decompress: true, throwHttpErrors: true, maxRedirects: 20, maxRetries: 2,
+    auth: Auth(), proxy: "", timeout: 0, middleware: @[])
 
-proc newNavi*(options = defaultOptions()): Navi =
+proc newNavi*(options = newNaviConfig()): Navi =
   ## Create a client. `options` supplies defaults (prefixUrl, headers, TLS,
   ## middleware, …).
   Navi(options: options, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
-proc extend*(client: Navi, options: NaviOptions): Navi =
+proc extend*(client: Navi, options: NaviConfig): Navi =
   ## Derive a new client, layering `options` over this client's (middleware is
   ## appended). The derived client gets its own connection pool and cookie jar.
   var merged = mergeBase(client.options, options)

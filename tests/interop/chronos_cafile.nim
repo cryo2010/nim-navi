@@ -16,15 +16,16 @@ let
   ca = getEnv("NAVI_CAFILE_CA")
 
 proc statusWithCa(url, caFile: string): Future[int] {.async.} =
-  let api = newNavi(NaviOptions(
-    tls: TlsConfig(verify: some(true), caFile: caFile),
-    throwHttpErrors: some(false)))
+  var cfg = newNaviConfig()
+  cfg.tls.caFile = caFile
+  cfg.throwHttpErrors = false
+  let api = newNavi(cfg)
   (await api.get(url)).status
 
 proc rejectedWithoutCa(url: string): Future[bool] {.async.} =
   ## verify:true with no custom CA: our CA is not among BearSSL's Mozilla anchors,
   ## so the handshake is rejected at connect.
-  let api = newNavi(NaviOptions(tls: TlsConfig(verify: some(true))))
+  let api = newNavi(newNaviConfig())   # verify on (default), no caFile
   try:
     discard await api.get(url)
     return false                    # handshake unexpectedly succeeded

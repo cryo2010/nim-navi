@@ -9,7 +9,9 @@ const message = "hello from the asyncdispatch backend (wss)"
 
 proc main() {.async.} =
   # verify is off for the demo's self-signed cert (use caFile in production).
-  let api = newNavi(NaviOptions(tls: TlsConfig(verify: some(false))))
+  var cfg = newNaviConfig()
+  cfg.tls.verify = false
+  let api = newNavi(cfg)
   let ws = await api.websocket("wss://127.0.0.1:9701/")
   await ws.send(message)
   echo "sent: ", message
