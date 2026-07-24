@@ -42,10 +42,11 @@ type
     sink: BodySink           ## non-nil for a streaming request
     cancel: CancelToken      ## caller's cancellation token, or nil
     idx: int                 ## index of the next middleware to run
-  Middleware* = proc(ctx: NaviContext): Future[void] {.nimcall.}
-    ## A middleware step; may be async. Deliberately `nimcall` (not a closure, so
-    ## it cannot capture): read/modify `ctx.req`, `await ctx.next()` to
-    ## proceed -- or skip it to short-circuit -- then read/modify `ctx.res`.
+  Middleware* = proc(ctx: NaviContext): Future[void] {.closure.}
+    ## A middleware step; may be async. A closure, so it can capture: read/modify
+    ## `ctx.req`, `await ctx.next()` to proceed -- or skip it to short-circuit --
+    ## then read/modify `ctx.res`. Write a factory `proc bearer(token): Middleware`
+    ## to close over per-instance config.
 
   NaviConfig* {.requiresInit.} = object of NaviConfigBase
     ## `requiresInit`: build it with `newNaviConfig()`, not a bare `NaviConfig(...)`.

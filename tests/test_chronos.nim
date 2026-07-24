@@ -32,3 +32,20 @@ suite "chronos entry end to end":
     expect RequestCancelledError:
       waitFor run(newNavi(), "http://127.0.0.1:" & $port & "/")
     joinThread(th)
+
+  test "closure middleware captures config and modifies the request":
+    const port = 8967
+    var th: Thread[ServerCtx]
+    startBodyEcho(th, port)  # echoes each request header back as x-echo-<name>
+
+    proc bearerMw(token: string): Middleware =
+      result = proc(ctx: NaviContext) {.async: (raises: [CatchableError]).} =
+        ctx.req.headers["authorization"] = "Bearer " & token  # captures token
+        await ctx.next()
+
+    var cfg = newNaviConfig()
+    cfg.middleware = @[bearerMw("captured-42")]
+    let api = newNavi(cfg)
+    let res = waitFor api.post("http://127.0.0.1:" & $port & "/", body = "x")
+    check res.headers.get("x-echo-authorization") == "Bearer captured-42"
+    joinThread(th)

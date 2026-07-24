@@ -352,19 +352,20 @@ calls `ctx.next()` to run the rest of the chain, and then inspects or replaces
 is the outermost layer; everything before the `ctx.next()` call is "before" and
 everything after is "after".
 
-Middleware are **`nimcall` procs, not closures**, so they cannot capture local
-variables; shared state lives at module scope or on the `NaviContext`. Write them as
-top-level procs:
+Middleware are **closures**, so a factory can capture per-instance config and
+return a configured step. Write a plain `proc(ctx: NaviContext)` for a fixed
+step, or a factory `proc(...): Middleware` that closes over settings:
 
 ```nim
-proc trace(ctx: NaviContext) =                 # sync (import navi)
-  ctx.req.headers["x-trace-id"] = newTraceId()   # before
-  let t0 = epochTime()
-  ctx.next()
-  log(ctx.req.verb, ctx.res.status, epochTime() - t0)   # after
+proc trace(prefix: string): Middleware =       # sync (import navi)
+  result = proc(ctx: NaviContext) =
+    ctx.req.headers["x-trace-id"] = newTraceId()               # before (captures prefix)
+    let t0 = epochTime()
+    ctx.next()
+    log(prefix, ctx.req.verb, ctx.res.status, epochTime() - t0)  # after
 
 var cfg = newNaviConfig()
-cfg.middleware = @[Middleware(trace)]
+cfg.middleware = @[trace("api")]
 let api = newNavi(cfg)
 ```
 
@@ -392,13 +393,12 @@ Middleware wraps the whole request including the built-in retries and redirects,
 so it runs once per call; to act on each retry, implement the retry loop in a
 middleware. It does not apply to `websocket()`.
 
-Because middleware cannot capture, cross-request state lives at module scope or
-on the `NaviContext`. One backend caveat: on `navi/chronos` the middleware type
-is `gcsafe`, so a middleware there may read and write value-type globals (an
-`int` counter, say) but not globals that hold GC'd memory (`string`, `seq`,
-`ref`, `Table`), not even a `let` one. Keep such state on the `NaviContext`, or
-guard the access with `{.cast(gcsafe).}` if the program is single-threaded (navi
-clients are). The other three backends have no such restriction.
+Per-instance config is captured by a middleware factory (or kept on the
+`NaviContext`). On `navi/chronos` the middleware type is
+`proc(ctx: NaviContext): Future[void] {.async: (raises: [CatchableError]).}` --
+that pragma is how chronos types a raises-aware async callback, so write your
+closure with the same `{.async: (raises: [CatchableError]).}`; the other backends
+infer it from a plain `{.async.}`.
 
 ### Decompression
 
@@ -551,10 +551,11 @@ fields you want. `NaviConfig` has `{.requiresInit.}`, so a bare or partial
 - **proxy** `string`: proxy URL. `""` (default) falls back to `HTTP(S)_PROXY` /
   `NO_PROXY`.
 - **middleware** `seq[Middleware]`: onion-style steps run in order, with
-  `middleware[0]` outermost. Each is a `nimcall` `proc(ctx: NaviContext)` (sync) or
+  `middleware[0]` outermost. Each is a closure `proc(ctx: NaviContext)` (sync) or
   `proc(ctx: NaviContext): Future[void]` (async): modify `ctx.req`, call
   `ctx.next()` to proceed, then inspect or replace `ctx.res`, or skip
-  `next` to short-circuit without sending. See [Middleware](#middleware).
+  `next` to short-circuit without sending. A factory `proc(...): Middleware` can
+  capture per-instance config. See [Middleware](#middleware).
 
 ### Response
 
