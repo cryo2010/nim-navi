@@ -139,7 +139,7 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
       let conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
                                client.config.tls, proxyTarget, alpn)
       if conn.protocol == "h2":
-        let mux = await newH2Mux(conn)
+        let mux = await newH2Mux(conn, client.config.maxResponseBytes)
         client.muxes[origin] = mux
         client.pendingMux.del(origin)
         pending.complete(mux)

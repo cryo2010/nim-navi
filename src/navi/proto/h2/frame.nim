@@ -26,6 +26,7 @@ type
 
   FrameDecoder* = object
     buf: string
+    frameSizeError: bool   ## a peer frame declared a length over the max frame size
 
 const
   # Frame flags (meaning depends on frame type).
@@ -45,6 +46,15 @@ const
 
   connectionPreface* = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
   defaultMaxFrameSize* = 16384
+
+  # HTTP/2 error codes (RFC 9113 section 7), used in RST_STREAM / GOAWAY.
+  errNoError* = 0x0'u32
+  errProtocolError* = 0x1'u32
+  errFlowControlError* = 0x3'u32
+  errFrameSizeError* = 0x6'u32
+  errRefusedStream* = 0x7'u32
+  errCancel* = 0x8'u32
+  errEnhanceYourCalm* = 0xb'u32
 
 proc u24(n: int): string =
   result = newString(3)
@@ -83,10 +93,16 @@ proc feed*(d: var FrameDecoder, data: openArray[char]) =
   for i in 0 ..< data.len:
     d.buf[start + i] = data[i]
 
+proc frameSizeError*(d: FrameDecoder): bool = d.frameSizeError
+  ## A peer frame declared a length over `defaultMaxFrameSize` (FRAME_SIZE_ERROR).
+
 proc next*(d: var FrameDecoder, frame: var Frame): bool =
   ## Pop the next complete frame, if one is fully buffered.
   if d.buf.len < 9: return false
   let length = readU24(d.buf, 0)
+  if length > defaultMaxFrameSize:      # reject before buffering the oversized payload
+    d.frameSizeError = true
+    return false
   let total = 9 + length
   if d.buf.len < total: return false
   frame.typ = uint8(d.buf[3])
@@ -118,6 +134,9 @@ proc encodePing*(data: string, ack = false): string =
 
 proc encodeRstStream*(streamId: uint32, errorCode: uint32): string =
   encodeFrame(ftRstStream, 0, streamId, u32(errorCode))
+
+proc encodeGoAway*(lastStreamId: uint32, errorCode: uint32): string =
+  encodeFrame(ftGoAway, 0, 0, u32(lastStreamId and 0x7fffffff'u32) & u32(errorCode))
 
 proc encodeData*(streamId: uint32, data: string, endStream: bool): string =
   encodeFrame(ftData, if endStream: flagEndStream else: 0, streamId, data)

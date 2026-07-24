@@ -9,6 +9,7 @@
 
 import std/[asyncdispatch, tables, deques]
 import ../proto/h2/conn
+import ../core/response          # for ResponseTooLargeError
 import ./asyncdispatch as be
 
 type
@@ -36,18 +37,30 @@ proc dispatch(mux: H2Mux) =
     let fut = mux.waiters[sid]
     if fut.finished: continue
     if mux.h2.streamReset(sid):
+      let tooLarge = mux.h2.streamTooLarge(sid)
+      let unprocessed = mux.h2.streamUnprocessed(sid)
       discard mux.h2.takeResponse(sid)
       mux.waiters.del(sid)
       mux.releaseSlot()
-      fut.fail(newException(IOError, "navi: http/2 stream reset"))
+      if tooLarge:
+        fut.fail(newException(ResponseTooLargeError,
+          "navi: response exceeded maxResponseBytes"))
+      elif unprocessed:
+        fut.fail(newException(UnprocessedError, "navi: http/2 request not processed"))
+      else:
+        fut.fail(newException(IOError, "navi: http/2 stream reset"))
     elif mux.h2.streamEnded(sid):
       let resp = mux.h2.takeResponse(sid)
       mux.waiters.del(sid)
       mux.releaseSlot()
       fut.complete(resp)
     elif mux.h2.goneAway:
+      let unprocessed = mux.h2.streamUnprocessed(sid)
       mux.waiters.del(sid)
-      fut.fail(newException(IOError, "navi: http/2 connection went away"))
+      if unprocessed:              # above GOAWAY's last id: not processed, retryable
+        fut.fail(newException(UnprocessedError, "navi: http/2 request not processed"))
+      else:
+        fut.fail(newException(IOError, "navi: http/2 connection went away"))
 
 proc failAll(mux: H2Mux, msg: string) =
   mux.alive = false
@@ -78,8 +91,9 @@ proc reader(mux: H2Mux) {.async.} =
       let chunk = await be.recvSome(mux.transport)
       if chunk.len == 0: break                 # peer closed
       let toSend = mux.h2.feed(chunk)
-      if toSend.len > 0: await mux.send(toSend)
+      if toSend.len > 0: await mux.send(toSend)   # includes a GOAWAY on a conn error
       mux.dispatch()
+      if mux.h2.connError.len > 0: break          # fatal: fail all in-flight below
       if mux.h2.goneAway and mux.waiters.len == 0: break
   except CatchableError:
     discard
@@ -87,10 +101,10 @@ proc reader(mux: H2Mux) {.async.} =
   try: await be.close(mux.transport)
   except CatchableError: discard
 
-proc newH2Mux*(transport: be.Conn): Future[H2Mux] {.async.} =
+proc newH2Mux*(transport: be.Conn, maxBody = 0): Future[H2Mux] {.async.} =
   ## Take ownership of a freshly connected h2 transport, send the preface, and
   ## start the background reader.
-  let mux = H2Mux(transport: transport, h2: initH2Conn(), alive: true,
+  let mux = H2Mux(transport: transport, h2: initH2Conn(maxBody), alive: true,
                   waiters: initTable[uint32, Future[H2Response]](),
                   pendingSlots: initDeque[Future[void]]())
   await be.sendAll(transport, mux.h2.preamble())

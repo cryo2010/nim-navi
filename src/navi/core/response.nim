@@ -24,6 +24,11 @@ type
   ResponseTooLargeError* = object of CatchableError
     ## Raised when a response body exceeds the configured `maxResponseBytes`.
 
+  UnprocessedError* = object of CatchableError
+    ## Raised when the peer signalled (HTTP/2 REFUSED_STREAM or a GOAWAY above the
+    ## stream id) that the request was not processed. Safe to retry regardless of
+    ## method idempotency; the retry layer does so automatically.
+
 proc initResponse*(status: int; reason, httpVersion: string; headers: Headers;
                    body: string): Response =
   ## Build a Response with an allocated JSON cache slot. Used by the protocol

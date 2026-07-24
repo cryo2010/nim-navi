@@ -170,7 +170,7 @@ proc transportGroup(client: Navi, items: seq[BatchItem],
                         resolveProxy(client.config, url0), alpn, client.config.timeoutMs)
     pc = PooledConn[Conn](transport: transport)
     if transport.protocol == "h2":
-      h2 = initH2Conn()
+      h2 = initH2Conn(client.config.maxResponseBytes)
       pc.h2 = h2
       transport.sendAll(h2.preamble())
 
