@@ -45,7 +45,8 @@ proc newNaviConfig*(): NaviConfig =
   ## safe defaults; override the fields you want, then pass it to `newNavi`.
   NaviConfig(
     prefixUrl: "", headers: initHeaders(), http: {H1, H2}, tls: defaultTls(),
-    decompress: true, throwHttpErrors: true, maxRedirects: 20, maxRetries: 2,
+    decompress: true, throwHttpErrors: true, maxRedirects: 20,
+    retry: defaultRetryPolicy(), maxResponseBytes: 0,
     auth: Auth(), proxy: "", timeout: 0, middleware: @[])
 
 proc newNavi*(config = newNaviConfig()): Navi =
@@ -161,15 +162,33 @@ proc doRequest(client: Navi, req: Request): Future[Response] {.async.} =
 proc doStream(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
   result = performStream(client, req, sink)
 
-proc withDeadline(client: Navi, fut: Future[Response]): Future[Response] {.async.} =
-  ## Bound the whole request (all attempts) by `timeout`. On expiry, raise
-  ## TimeoutError; the abandoned future runs to completion in the background.
+proc guard(client: Navi, fut: Future[Response],
+           cancel: CancelToken): Future[Response] {.async.} =
+  ## Bound the whole request (all attempts) by `timeout` and `cancel`. On expiry
+  ## or cancellation the abandoned future runs to completion in the background
+  ## (asyncdispatch has no true cancellation); its socket is later reclaimed.
   let ms = client.config.timeoutMs
-  if ms <= 0:
+  if ms <= 0 and cancel == nil:
     return await fut
-  if await withTimeout(fut, ms):
-    return fut.read
-  raise newException(TimeoutError, "navi: request timed out after " & $ms & " ms")
+  var cancelFut = newFuture[void]("navi.cancel")
+  if cancel != nil:
+    cancel.armHook(proc() {.gcsafe, raises: [].} =
+      # complete() only raises if already finished, which the guard rules out.
+      {.cast(raises: []).}:
+        if not cancelFut.finished: cancelFut.complete())
+  try:
+    if ms > 0:
+      await fut or cancelFut or sleepAsync(ms)
+    else:
+      await fut or cancelFut
+    if fut.finished:
+      return fut.read
+    if cancel != nil and cancel.cancelled:
+      raise newException(RequestCancelledError, "navi: request cancelled")
+    raise newException(TimeoutError, "navi: request timed out after " & $ms & " ms")
+  finally:
+    if cancel != nil: cancel.disarmHook()
+    if not cancelFut.finished: cancelFut.complete()
 
 proc client*(ctx: NaviContext): Navi = ctx.clientp[]
   ## The client handling this request (e.g. to read `ctx.client.config`).
@@ -195,23 +214,27 @@ proc runChain(ctx: NaviContext): Future[Response] {.async.} =
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = "", json: JsonNode = nil,
               form: seq[(string, string)] = @[], multipart: Multipart = @[],
-              bodyStream: BodyProducer = nil): Future[Response] {.async.} =
-  ## Perform a request; configured middleware wraps the whole call.
+              bodyStream: BodyProducer = nil,
+              params: seq[(string, string)] = @[],
+              cancel: CancelToken = nil): Future[Response] {.async.} =
+  ## Perform a request; configured middleware wraps the whole call. `params` are
+  ## appended to the URL query; `cancel` aborts the in-flight request.
   let req = buildRequest(client.config, verb, target, headers, body, json,
-                         form, multipart, bodyStream)
+                         form, multipart, bodyStream, params)
   if client.config.middleware.len == 0:
-    return await client.withDeadline(doRequest(client, req))
+    return await client.guard(doRequest(client, req), cancel)
   let ctx = NaviContext(req: req, clientp: unsafeAddr client)
-  return await client.withDeadline(runChain(ctx))
+  return await client.guard(runChain(ctx), cancel)
 
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
-             headers = initHeaders()): Future[Response] {.async.} =
+             headers = initHeaders(), params: seq[(string, string)] = @[],
+             cancel: CancelToken = nil): Future[Response] {.async.} =
   ## Deliver the response body to `sink` as it arrives; Response.body is empty.
-  let req = buildRequest(client.config, verb, target, headers)
+  let req = buildRequest(client.config, verb, target, headers, params = params)
   if client.config.middleware.len == 0:
-    return await client.withDeadline(doStream(client, req, sink))
+    return await client.guard(doStream(client, req, sink), cancel)
   let ctx = NaviContext(req: req, clientp: unsafeAddr client, sink: sink)
-  return await client.withDeadline(runChain(ctx))
+  return await client.guard(runChain(ctx), cancel)
 
 include navi/private/verbs
 

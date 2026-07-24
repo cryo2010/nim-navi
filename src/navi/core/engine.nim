@@ -11,7 +11,7 @@
 ## attempt is retried once on a fresh connection.
 
 import ./headers, ./url, ./request, ./response, ./pool, ./decompress, ./redirect,
-       ./retry, ./cookies, ./proxy, ./session, ./h2glue, ./digest
+       ./retry, ./cookies, ./proxy, ./session, ./h2glue, ./digest, ./cancel
 import ../proto/h1
 import ../proto/h2/conn
 
@@ -174,40 +174,46 @@ template followRedirects(client, startReq, resp: typed) =
     else:
       break
 
-template performRequest*(client, req0: typed): Response =
+template performRequest*(client, req0: typed; cancel: CancelToken = nil): Response =
   ## Buffered request with the full policy layer: retries with backoff, redirect
-  ## following, decompression, and throw-on-non-2xx. Middleware (which can wrap,
-  ## short-circuit, or observe) is composed around this by the entry module.
+  ## following, decompression, size cap, and throw-on-non-2xx. Middleware (which
+  ## can wrap, short-circuit, or observe) is composed around this by the entry
+  ## module. `cancel` is checked between attempts (cooperative on the sync
+  ## backend; the async backends also abort in-flight via their guard).
   mixin sleep
   block:
     var req = req0
     var resp: Response
     var attempt = 0
-    let maxRetries = client.config.retryLimit
+    let policy = client.config.retry
     while true:
+      throwIfCancelled(cancel)
       var gotResp = false
       try:
         followRedirects(client, req, resp)
         gotResp = true
       except CatchableError:
-        if not (attempt < maxRetries and isRetryableVerb(req.verb)):
+        if not (attempt < policy.limit and isRetryableVerb(req.verb, policy)):
           raise # not retryable: propagate the transport error
       if gotResp and
-         not (attempt < maxRetries and isRetryableVerb(req.verb) and
-              isRetryableStatus(resp.status)):
+         not (attempt < policy.limit and isRetryableVerb(req.verb, policy) and
+              isRetryableStatus(resp.status, policy)):
         break
       inc attempt
-      await sleep(backoffMs(attempt, resp))
+      await sleep(backoffMs(attempt, resp, policy))
+    enforceMaxResponse(resp, client.config.maxResponseBytes)
     if client.config.wantsThrow and not resp.ok:
       raiseHttpError(req, resp)
     resp
 
-template performStream*(client, req, sink: typed): Response =
+template performStream*(client, req, sink: typed; cancel: CancelToken = nil): Response =
   ## Streaming request: body chunks are delivered to `sink` as they arrive and
-  ## `Response.body` is left empty. Chunks are delivered as received (not
-  ## decompressed); a non-2xx still raises HttpError unless disabled.
+  ## `Response.body` is left empty. The size cap is enforced incrementally on the
+  ## bytes delivered; a non-2xx still raises HttpError unless disabled.
   block:
-    let resp = run(client, req, sink)
+    throwIfCancelled(cancel)
+    let limited = limitedSink(sink, client.config.maxResponseBytes)
+    let resp = run(client, req, limited)
     if client.config.wantsThrow and not resp.ok:
       raiseHttpError(req, resp)
     resp

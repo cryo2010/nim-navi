@@ -28,3 +28,19 @@ suite "asyncdispatch entry end to end":
     check res.status == 200
     check res.body == "recovered"
     joinThread(th)
+
+  test "cancel aborts an in-flight request":
+    const port = 8968
+    var th: Thread[ServerCtx]
+    startHang(th, port)  # accepts, reads the request, never replies
+
+    let api = newNavi()
+    proc run(): Future[void] {.async.} =
+      let tok = newCancelToken()
+      let f = api.get("http://127.0.0.1:" & $port & "/", cancel = tok)
+      await sleepAsync(50)                # let the request reach the hung server
+      tok.cancel()
+      discard await f
+    expect RequestCancelledError:
+      waitFor run()
+    joinThread(th)

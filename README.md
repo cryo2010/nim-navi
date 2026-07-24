@@ -280,17 +280,57 @@ let api = newNavi(cfg)
 
 ### Retries, redirects, and timeouts
 
-Idempotent requests that hit a transient failure (network error or 408/413/429/500/502/503/504) are retried with capped exponential backoff, honoring `Retry-After`. Redirects are followed by default.
+Idempotent requests that hit a transient failure (network error or 408/413/429/500/502/503/504) are retried with capped exponential backoff, honoring `Retry-After` (both the seconds and HTTP-date forms). Redirects are followed by default.
 
 ```nim
 var cfg = newNaviConfig()
-cfg.maxRetries = 3     # default 2
-cfg.maxRedirects = 5   # default 20; 0 disables
-cfg.timeout = 5000     # 5s; 0 (default) disables. Raises TimeoutError.
+cfg.retry.limit = 3        # default 2; 0 disables retries
+cfg.maxRedirects = 5       # default 20; 0 disables
+cfg.timeout = 5000         # 5s; 0 (default) disables. Raises TimeoutError.
 let api = newNavi(cfg)
 ```
 
+The whole retry policy is configurable via `cfg.retry` (a `RetryPolicy`):
+
+```nim
+var cfg = newNaviConfig()
+cfg.retry.limit = 5
+cfg.retry.methods = {GET, HEAD}            # verbs eligible for retry
+cfg.retry.statuses = @[429, 503]           # response statuses that trigger one
+cfg.retry.backoffCap = 30_000              # cap the wait between attempts (ms)
+```
+
 `timeout` is per socket read on the sync backend and bounds the whole request (including retries) on the async backends.
+
+### Query parameters
+
+Pass `params` on any verb to append an url-encoded query string to the target (resolved against `prefixUrl` first):
+
+```nim
+let res = api.get("/search", params = @[("q", "http client"), ("page", "2")])
+# GET /search?q=http+client&page=2
+```
+
+### Cancellation
+
+Pass a `CancelToken` to abort a request. On the async backends (asyncdispatch/chronos/js) `cancel()` aborts the in-flight request; on the sync backend it is cooperative (checked between attempts, so it cannot interrupt a socket read already blocked in a syscall -- use `timeout` for that). A cancelled request raises `RequestCancelledError`.
+
+```nim
+let tok = newCancelToken()
+let fut = api.get("https://slow.example", cancel = tok)
+# ... later, from a timer or another task:
+tok.cancel()
+```
+
+### Response size limits
+
+`maxResponseBytes` caps the response body; a larger response raises `ResponseTooLargeError`. Streaming enforces the cap incrementally (per chunk); buffered requests enforce it on the assembled body. On the native backends the cap counts decompressed bytes, so it also guards against decompression bombs.
+
+```nim
+var cfg = newNaviConfig()
+cfg.maxResponseBytes = 10 * 1024 * 1024   # 10 MiB; 0 (default) is unlimited
+let api = newNavi(cfg)
+```
 
 ### Auth, cookies, and proxy
 
@@ -448,20 +488,22 @@ inherited via `extend`. Returns a `Navi`. Read it back (read-only) via
 `client.config`; the config is fixed at construction, so build a fresh client or
 `extend` to change it rather than mutating a live one.
 
-### client.get / head / delete / options (target, headers = initHeaders())
-### client.post / put / patch (target, body = "", json = nil, form = @[], headers = initHeaders())
+### client.get / head / delete / options (target, headers = initHeaders(), params = @[], cancel = nil)
+### client.post / put / patch (target, body = "", json = nil, form = @[], headers = initHeaders(), params = @[], cancel = nil)
 
 Make a request with that verb. A relative `target` resolves against `prefixUrl`.
 `json` and `form` encode the body and set a matching `Content-Type` unless you
-supplied one. Returns a `Response` on the sync backend, or a `Future[Response]`
-on `navi/asyncdispatch`, `navi/chronos`, and `navi/js`.
+supplied one. `params: seq[(string, string)]` appends an url-encoded query string;
+`cancel: CancelToken` aborts the request (raising `RequestCancelledError`).
+Returns a `Response` on the sync backend, or a `Future[Response]` on
+`navi/asyncdispatch`, `navi/chronos`, and `navi/js`.
 
-### client.request(verb, target, headers = initHeaders(), body = "", json = nil, form = @[], bodyStream = nil)
+### client.request(verb, target, headers = initHeaders(), body = "", json = nil, form = @[], bodyStream = nil, params = @[], cancel = nil)
 
 Any verb explicitly. `bodyStream: proc(): string` streams an upload as chunked
 transfer-encoding (return `""` to end). Not available on `navi/js`.
 
-### client.stream(verb, target, sink, headers = initHeaders())
+### client.stream(verb, target, sink, headers = initHeaders(), params = @[], cancel = nil)
 
 Deliver the response body to `sink: proc(data: openArray[byte])` as it arrives;
 the returned `Response.body` stays empty.
@@ -494,7 +536,12 @@ fields you want. `NaviConfig` has `{.requiresInit.}`, so a bare or partial
 - **decompress** `bool`: decode gzip/deflate response bodies. Default on.
 - **throwHttpErrors** `bool`: raise `HttpError` on a non-2xx response. Default on.
 - **maxRedirects** `int`: redirects to follow. Default 20; 0 disables.
-- **maxRetries** `int`: retry attempts for transient failures. Default 2.
+- **retry** `RetryPolicy`: `limit` (attempts, default 2, 0 disables), `methods`
+  (verbs eligible, default the idempotent ones), `statuses` (response codes that
+  trigger a retry), and `backoffCap` (ms ceiling on the wait between attempts).
+- **maxResponseBytes** `int`: cap on the response body size. A larger response
+  raises `ResponseTooLargeError`. 0 (default) is unlimited. Enforced incrementally
+  when streaming; counts decompressed bytes on the native backends.
 - **timeout** `int`: request timeout in milliseconds. 0 (default) disables it. A
   stalled request raises `TimeoutError`. The sync backend applies it per socket
   read; the async backends bound the whole request.
@@ -524,12 +571,15 @@ fields you want. `NaviConfig` has `{.requiresInit.}`, so a bare or partial
 ### HttpError
 
 Raised for a non-2xx response when `throwHttpErrors` is on. Carries the full
-response as `.response`.
+response as `.response`. Other request errors: `TimeoutError` (exceeded
+`timeout`), `RequestCancelledError` (a `CancelToken` was cancelled), and
+`ResponseTooLargeError` (body exceeded `maxResponseBytes`).
 
 ### Helpers
 
 - **initHeaders(pairs)**: build a case-insensitive, order-preserving `Headers`.
 - **basicAuth(user, pass)** / **bearerAuth(token)** / **digestAuth(user, pass)**: construct an `Auth`.
+- **newCancelToken()**: a `CancelToken`; pass it as `cancel` and call `.cancel()` to abort.
 
 ## Roadmap
 

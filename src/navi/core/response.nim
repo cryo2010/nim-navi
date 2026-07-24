@@ -21,6 +21,9 @@ type
   TimeoutError* = object of CatchableError
     ## Raised when a request exceeds the configured `timeout`.
 
+  ResponseTooLargeError* = object of CatchableError
+    ## Raised when a response body exceeds the configured `maxResponseBytes`.
+
 proc initResponse*(status: int; reason, httpVersion: string; headers: Headers;
                    body: string): Response =
   ## Build a Response with an allocated JSON cache slot. Used by the protocol
@@ -31,6 +34,14 @@ proc initResponse*(status: int; reason, httpVersion: string; headers: Headers;
     # The JS backend can't allocate this ref-to-a-ref cell; leaving it nil makes
     # `data` reparse each call instead of caching (see the nil branch there).
     new(result.dataCache)
+
+proc enforceMaxResponse*(r: Response, limit: int) =
+  ## Raise `ResponseTooLargeError` if a buffered body exceeds `limit` (0 = off).
+  ## The streaming path enforces the same cap incrementally via `limitedSink`.
+  if limit > 0 and r.body.len > limit:
+    raise newException(ResponseTooLargeError,
+      "navi: response body of " & $r.body.len & " bytes exceeds " &
+      "maxResponseBytes (" & $limit & ")")
 
 proc ok*(r: Response): bool {.inline.} =
   ## True for 2xx status codes.

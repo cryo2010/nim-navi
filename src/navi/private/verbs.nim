@@ -5,29 +5,39 @@
 ## (Response for the sync entry, Future[Response] for the async ones), so this
 ## one definition serves all three.
 
-proc get*(client: Navi, target: string, headers = initHeaders()): auto =
-  client.request(GET, target, headers)
+proc get*(client: Navi, target: string, headers = initHeaders(),
+          params: seq[(string, string)] = @[], cancel: CancelToken = nil): auto =
+  client.request(GET, target, headers, params = params, cancel = cancel)
 
-proc head*(client: Navi, target: string, headers = initHeaders()): auto =
-  client.request(HEAD, target, headers)
+proc head*(client: Navi, target: string, headers = initHeaders(),
+           params: seq[(string, string)] = @[], cancel: CancelToken = nil): auto =
+  client.request(HEAD, target, headers, params = params, cancel = cancel)
 
-proc delete*(client: Navi, target: string, headers = initHeaders()): auto =
-  client.request(DELETE, target, headers)
+proc delete*(client: Navi, target: string, headers = initHeaders(),
+             params: seq[(string, string)] = @[], cancel: CancelToken = nil): auto =
+  client.request(DELETE, target, headers, params = params, cancel = cancel)
 
-proc options*(client: Navi, target: string, headers = initHeaders()): auto =
-  client.request(OPTIONS, target, headers)
+proc options*(client: Navi, target: string, headers = initHeaders(),
+              params: seq[(string, string)] = @[], cancel: CancelToken = nil): auto =
+  client.request(OPTIONS, target, headers, params = params, cancel = cancel)
 
 proc post*(client: Navi, target: string, body = "", json: JsonNode = nil,
            form: seq[(string, string)] = @[], multipart: Multipart = @[],
-           headers = initHeaders()): auto =
-  client.request(POST, target, headers, body, json, form, multipart)
+           headers = initHeaders(), params: seq[(string, string)] = @[],
+           cancel: CancelToken = nil): auto =
+  client.request(POST, target, headers, body, json, form, multipart,
+                 params = params, cancel = cancel)
 
 proc put*(client: Navi, target: string, body = "", json: JsonNode = nil,
           form: seq[(string, string)] = @[], multipart: Multipart = @[],
-          headers = initHeaders()): auto =
-  client.request(PUT, target, headers, body, json, form, multipart)
+          headers = initHeaders(), params: seq[(string, string)] = @[],
+          cancel: CancelToken = nil): auto =
+  client.request(PUT, target, headers, body, json, form, multipart,
+                 params = params, cancel = cancel)
 
 proc patch*(client: Navi, target: string, body = "", json: JsonNode = nil,
             form: seq[(string, string)] = @[], multipart: Multipart = @[],
-            headers = initHeaders()): auto =
-  client.request(PATCH, target, headers, body, json, form, multipart)
+            headers = initHeaders(), params: seq[(string, string)] = @[],
+            cancel: CancelToken = nil): auto =
+  client.request(PATCH, target, headers, body, json, form, multipart,
+                 params = params, cancel = cancel)

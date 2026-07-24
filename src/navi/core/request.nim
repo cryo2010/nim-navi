@@ -49,6 +49,13 @@ type
     H2 = "HTTP/2"
     H3 = "HTTP/3"
 
+  RetryPolicy* = object
+    ## When and how a request is retried. `newNaviConfig` seeds `defaultRetryPolicy`.
+    limit*: int                     ## retry attempts, 0 disables (default 2)
+    methods*: set[HttpVerb]         ## verbs eligible for retry (idempotent by default)
+    statuses*: seq[int]             ## response statuses that trigger a retry
+    backoffCap*: int                ## upper bound on the wait between attempts, ms
+
   NaviConfigBase* = object of RootObj
     ## Backend-agnostic client defaults, applied to every request and inheritable
     ## via `.extend`. Each entry module derives its own `NaviConfig` from this,
@@ -62,7 +69,8 @@ type
     decompress*: bool               ## decode gzip/deflate bodies (default on)
     throwHttpErrors*: bool          ## raise HttpError on non-2xx (default on)
     maxRedirects*: int              ## redirects to follow, 0 disables (default 20)
-    maxRetries*: int                ## retry attempts for transient failures (default 2)
+    retry*: RetryPolicy             ## retry policy for transient failures
+    maxResponseBytes*: int          ## cap on response body size; 0 (default) unlimited
     auth*: Auth                     ## Authorization applied to every request
     proxy*: string                  ## proxy URL; "" falls back to env vars
     timeout*: int                   ## request timeout in ms; 0 (default) disables
@@ -80,11 +88,37 @@ type
     bodyStream*: BodyProducer  ## when set, the body is streamed chunked
     absoluteForm*: bool         ## use absolute-URI on the request line (http proxy)
 
+proc defaultRetryPolicy*(): RetryPolicy =
+  ## Retry idempotent methods up to twice on transient statuses, backing off
+  ## exponentially up to 10s. `newNaviConfig` uses this; override `config.retry`
+  ## (or its fields) to change the count, methods, statuses, or backoff cap.
+  RetryPolicy(
+    limit: 2,
+    methods: {GET, HEAD, PUT, DELETE, OPTIONS},
+    statuses: @[408, 413, 429, 500, 502, 503, 504],
+    backoffCap: 10_000)
+
+proc limitedSink*(inner: BodySink, limit: int): BodySink =
+  ## Wrap `inner` so the cumulative bytes delivered are capped at `limit`, raising
+  ## `ResponseTooLargeError` once exceeded (the overflowing chunk is not
+  ## delivered). Returns `inner` unchanged when the limit is disabled (0) or there
+  ## is no sink. On the native backends this wraps the user's sink *inside*
+  ## `decodingSink`, so the cap counts decompressed bytes (a decompression-bomb
+  ## guard); the browser decodes for the js backend, so it counts wire bytes there.
+  if inner == nil or limit <= 0: return inner
+  var seen = 0
+  result = proc(data: openArray[byte]) =
+    seen += data.len
+    if seen > limit:
+      raise newException(ResponseTooLargeError,
+        "navi: response exceeded maxResponseBytes (" & $limit & ")")
+    inner(data)
+
 # Readers take the base by value; a derived NaviConfig slices to it cleanly.
 proc wantsDecompress*(opts: NaviConfigBase): bool = opts.decompress
 proc wantsThrow*(opts: NaviConfigBase): bool = opts.throwHttpErrors
 proc redirectLimit*(opts: NaviConfigBase): int = opts.maxRedirects
-proc retryLimit*(opts: NaviConfigBase): int = opts.maxRetries
+proc retryLimit*(opts: NaviConfigBase): int = opts.retry.limit
 proc timeoutMs*(opts: NaviConfigBase): int = opts.timeout
   ## Request timeout in milliseconds; 0 means no timeout.
 proc wantsH2*(opts: NaviConfigBase): bool =
@@ -108,12 +142,16 @@ proc buildRequest*(opts: NaviConfigBase, verb: HttpVerb, target: string,
                    headers: Headers = initHeaders(), body = "",
                    json: JsonNode = nil, form: seq[(string, string)] = @[],
                    multipart: Multipart = @[],
-                   bodyStream: BodyProducer = nil): Request =
+                   bodyStream: BodyProducer = nil,
+                   params: seq[(string, string)] = @[]): Request =
   ## Resolve `target` against the client's prefixUrl, merge headers, and encode
   ## the body. `json`, `form`, and `multipart` take precedence over `body` (in
   ## that order) and set a matching Content-Type unless the caller supplied one.
+  ## `params` are appended to the resolved URL's query string (url-encoded).
   result.verb = verb
   result.url = join(opts.prefixUrl, target)
+  if params.len > 0:
+    result.url = result.url.withQuery(params)
   result.headers = merge(opts.headers, headers)
   result.bodyStream = bodyStream
   if json != nil:
