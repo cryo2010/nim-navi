@@ -47,7 +47,8 @@ type
   HttpVersion* = enum
     H1 = "HTTP/1.1"
     H2 = "HTTP/2"
-    H3 = "HTTP/3"
+    # H3 is intentionally absent until HTTP/3 is real: a config of `http: {H3}`
+    # would otherwise silently fall back to HTTP/1.1 (no ALPN h2 offered).
 
   RetryPolicy* = object
     ## When and how a request is retried. `newNaviConfig` seeds `defaultRetryPolicy`.
