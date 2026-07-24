@@ -3,7 +3,7 @@
 ## Nothing here performs I/O: `buildRequest` merges instance defaults with
 ## per-call arguments into a concrete `Request` that any backend can execute.
 
-import std/[options, json, base64]
+import std/[options, json, base64, tables]
 from std/uri import encodeQuery
 import ./headers, ./url, ./response, ./multipart
 import ../backend/api
@@ -138,6 +138,16 @@ proc mergeBase*[T: NaviConfigBase](base, overrides: T): T =
   if overrides.http.card > 0: result.http = overrides.http
   if overrides.auth.kind != akNone: result.auth = overrides.auth
   if overrides.proxy.len > 0: result.proxy = overrides.proxy
+
+proc toQuery*(pairs: openArray[(string, string)]): seq[(string, string)] = @pairs
+  ## Query params from a seq or array literal (incl. `@[...]`, `@{...}`, `{...}`).
+proc toQuery*(t: OrderedTable[string, string]): seq[(string, string)] =
+  ## Query params from an ordered table (insertion order preserved).
+  for k, v in t: result.add (k, v)
+proc toQuery*(t: Table[string, string]): seq[(string, string)] =
+  ## Query params from a table. A `Table`'s iteration order is unspecified, so
+  ## use an `OrderedTable` or the pairs / `@{}` form when query order matters.
+  for k, v in t: result.add (k, v)
 
 proc buildRequest*(opts: NaviConfigBase, verb: HttpVerb, target: string,
                    headers: Headers = initHeaders(), body = "",
