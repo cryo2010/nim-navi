@@ -9,14 +9,15 @@ import ./support
 
 var serverReady: bool
 
-# Middleware are nimcall procs (no capture), so shared state is module-level.
-var mwObservedStatus: int
-proc addAuthMw(ctx: NaviContext) {.nimcall.} =
-  ctx.req.headers["authorization"] = "Wrapped"   # before
-  ctx.next()
-  mwObservedStatus = ctx.res.status              # after
-proc cannedMw(ctx: NaviContext) {.nimcall.} =
-  ctx.res = initResponse(299, "Short", "", initHeaders(), "from middleware")
+# Middleware are closures, so config is captured by a factory (no module globals).
+proc authMw(headerValue: string, observed: ref int): NaviMiddleware =
+  result = proc(ctx: NaviContext) =
+    ctx.req.headers["authorization"] = headerValue  # before  (captures headerValue)
+    ctx.next()
+    observed[] = ctx.res.status                      # after   (captures observed)
+proc cannedMw(status: int, body: string): NaviMiddleware =
+  result = proc(ctx: NaviContext) =                  # short-circuit: never calls next
+    ctx.res = initResponse(status, "Short", "", initHeaders(), body)
 
 proc serve(port: int) {.thread.} =
   var server = newSocket()
@@ -363,20 +364,20 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)
 
-    mwObservedStatus = 0
+    let observed = new(int)
     var cfg = newNaviConfig()
-    cfg.middleware = @[Middleware(addAuthMw)]
+    cfg.middleware = @[authMw("Wrapped", observed)]   # captured header + observer cell
     let api = newNavi(cfg)
     let res = api.post("http://127.0.0.1:" & $port & "/", body = "x")
     check res.headers.get("x-echo-authorization") == "Wrapped"
-    check mwObservedStatus == 200
+    check observed[] == 200
     joinThread(th)
 
   test "middleware can short-circuit without sending a request":
     # No server here: if the request were dialed it would fail to connect, so a
     # 299 proves `ctx.next()` was never called.
     var cfg = newNaviConfig()
-    cfg.middleware = @[Middleware(cannedMw)]
+    cfg.middleware = @[cannedMw(299, "from middleware")]
     let api = newNavi(cfg)
     let res = api.get("http://127.0.0.1:1/")
     check res.status == 299
