@@ -13,9 +13,15 @@ proc serverResponse(streamId: uint32, status: string, headers: seq[HeaderPair],
     endStream = false, endHeaders = true)
   result.add encodeData(streamId, body, endStream = true)
 
+proc newServerConn(maxBody = 0): H2Conn =
+  ## A connection that has already consumed the server's opening SETTINGS preface,
+  ## so a test can feed response / control frames without re-sending it.
+  result = initH2Conn(maxBody)
+  discard result.feed(encodeSettings([]))
+
 suite "h2 client connection":
   test "sends preface and SETTINGS":
-    let c = initH2Conn()
+    let c = newServerConn()
     let pre = c.preamble()
     check pre.startsWith(connectionPreface)
     var d: FrameDecoder
@@ -27,7 +33,7 @@ suite "h2 client connection":
     check f.typ == uint8(ftWindowUpdate)
 
   test "encodes a request as a HEADERS frame with pseudo-headers":
-    let c = initH2Conn()
+    let c = newServerConn()
     let id = c.openStream()
     check id == 1'u32
     let wire = c.encodeRequest(id, @[
@@ -46,7 +52,7 @@ suite "h2 client connection":
       (":authority", "example.com")]
 
   test "assembles a response and acks control frames":
-    let c = initH2Conn()
+    let c = newServerConn()
     let id = c.openStream()
     var server = encodeSettings([])
     server.add serverResponse(id, "200", @[("content-type", "text/plain")], "hello")
@@ -66,7 +72,7 @@ suite "h2 client connection":
     check (f.flags and flagAck) != 0
 
   test "assigns odd, incrementing stream ids and reuses one connection":
-    let c = initH2Conn()
+    let c = newServerConn()
     let a = c.openStream()
     let b = c.openStream()
     check a == 1'u32
@@ -80,21 +86,21 @@ suite "h2 client connection":
     check c.takeResponse(b).body == "second"
 
   test "reports a stream reset":
-    let c = initH2Conn()
+    let c = newServerConn()
     let id = c.openStream()
     discard c.feed(encodeRstStream(id, 1))
     check c.streamDone(id)
     check c.streamReset(id)
 
   test "GOAWAY marks the connection unreusable":
-    let c = initH2Conn()
+    let c = newServerConn()
     check c.canReuse()
     discard c.feed(encodeFrame(ftGoAway, 0, 0, "\x00\x00\x00\x00\x00\x00\x00\x00"))
     check c.goneAway
     check not c.canReuse()
 
   test "responds to a server PING with an ACK":
-    let c = initH2Conn()
+    let c = newServerConn()
     let toSend = c.feed(encodePing("01234567"))
     var d: FrameDecoder
     d.feed(toSend)
@@ -114,7 +120,7 @@ proc firstFrameOfType(s: string, typ: FrameType): bool =
 
 suite "h2 client DoS limits":
   test "RSTs a CONTINUATION flood instead of buffering unbounded headers":
-    let c = initH2Conn()
+    let c = newServerConn()
     let id = c.openStream()
     # A HEADERS frame with END_STREAM but never END_HEADERS, then a flood of
     # CONTINUATION frames -- the shape of the HTTP/2 CONTINUATION flood.
@@ -127,7 +133,7 @@ suite "h2 client DoS limits":
     check firstFrameOfType(toSend, ftRstStream)
 
   test "RSTs a response body that exceeds maxResponseBytes":
-    let c = initH2Conn(maxBody = 10)       # 10-byte cap
+    let c = newServerConn(maxBody = 10)       # 10-byte cap
     let id = c.openStream()
     var server = encodeHeaders(id,
       (HpackEncoder()).encode(@[(":status", "200")]), endStream = false, endHeaders = true)
@@ -138,7 +144,7 @@ suite "h2 client DoS limits":
     check firstFrameOfType(toSend, ftRstStream)
 
   test "a body within maxResponseBytes is delivered normally":
-    let c = initH2Conn(maxBody = 100)
+    let c = newServerConn(maxBody = 100)
     let id = c.openStream()
     discard c.feed(serverResponse(id, "200", @[], "short body"))
     check c.streamDone(id)
@@ -147,21 +153,21 @@ suite "h2 client DoS limits":
 
 suite "h2 retry classification":
   test "REFUSED_STREAM marks the stream unprocessed (safe to retry)":
-    let c = initH2Conn()
+    let c = newServerConn()
     let id = c.openStream()
     discard c.feed(encodeRstStream(id, errRefusedStream))
     check c.streamReset(id)
     check c.streamUnprocessed(id)
 
   test "a non-refused RST_STREAM is not unprocessed":
-    let c = initH2Conn()
+    let c = newServerConn()
     let id = c.openStream()
     discard c.feed(encodeRstStream(id, errProtocolError))   # processed then failed
     check c.streamReset(id)
     check not c.streamUnprocessed(id)
 
   test "streams above GOAWAY's last-processed id are unprocessed":
-    let c = initH2Conn()
+    let c = newServerConn()
     let a = c.openStream()   # id 1
     let b = c.openStream()   # id 3
     let d = c.openStream()   # id 5
@@ -176,7 +182,7 @@ proc headForStream(id: uint32): string =
 
 suite "h2 receive-side flow control":
   test "advertises a larger initial window in SETTINGS":
-    let c = initH2Conn()
+    let c = newServerConn()
     var d: FrameDecoder
     d.feed(c.preamble()[connectionPreface.len .. ^1])
     var f: Frame
@@ -188,7 +194,7 @@ suite "h2 receive-side flow control":
     check initWin > 65535'u32                    # bigger than the 64 KiB default
 
   test "batches WINDOW_UPDATEs (no ack for a small body)":
-    let c = initH2Conn()
+    let c = newServerConn()
     let id = c.openStream()
     var server = headForStream(id)
     server.add encodeData(id, repeat("x", 1000), endStream = false)   # well under threshold
@@ -196,7 +202,7 @@ suite "h2 receive-side flow control":
     check not firstFrameOfType(toSend, ftWindowUpdate)
 
   test "replenishes once consumed crosses the threshold":
-    let c = initH2Conn()
+    let c = newServerConn()
     let id = c.openStream()
     var server = headForStream(id)
     for _ in 0 ..< 270:                          # 270 x 16000 = 4.32 MB > 4 MiB
@@ -214,7 +220,7 @@ proc dataBytes(s: string): int =
 
 suite "h2 send-side flow control":
   test "caps the initial body to the window and releases on WINDOW_UPDATE":
-    let c = initH2Conn()
+    let c = newServerConn()
     let sid = c.openStream()
     let body = repeat("x", 200_000)          # > the 65535 default send window
     let head = @[(":method", "POST"), (":scheme", "https"),
@@ -232,14 +238,14 @@ suite "h2 send-side flow control":
 
 suite "h2 max concurrent streams":
   test "reads the peer's MAX_CONCURRENT_STREAMS from SETTINGS":
-    let c = initH2Conn()
+    let c = newServerConn()
     check c.maxConcurrentStreams == int.high        # unlimited until advertised
     discard c.feed(encodeSettings({settingsMaxConcurrentStreams: 3'u32}))
     check c.maxConcurrentStreams == 3
 
 suite "h2 CONTINUATION on send":
   test "splits a large header block across HEADERS and CONTINUATION frames":
-    let c = initH2Conn()
+    let c = newServerConn()
     let sid = c.openStream()
     let big = repeat("v", 20_000)          # forces the block over the 16384 frame size
     let want = @[(":method", "GET"), (":scheme", "https"), (":path", "/"),
@@ -264,3 +270,24 @@ suite "h2 CONTINUATION on send":
     for fr in frames: hb.add fr.payload
     var dec = initHpackDecoder()
     check dec.decode(hb) == want                           # reassembles losslessly
+
+suite "h2 connection errors":
+  test "rejects a server whose first frame is not SETTINGS":
+    let c = initH2Conn()                       # deliberately NOT pre-fed a preface
+    let toSend = c.feed(encodePing("01234567"))  # first frame is PING, not SETTINGS
+    check c.connError.len > 0
+    check not c.canReuse()
+    check firstFrameOfType(toSend, ftGoAway)
+
+  test "rejects a frame larger than the max frame size":
+    let c = newServerConn()
+    let oversized = encodeFrame(ftData, 0, 1'u32, repeat("x", 20_000))  # > 16384
+    let toSend = c.feed(oversized)
+    check c.connError.len > 0
+    check firstFrameOfType(toSend, ftGoAway)
+
+  test "rejects an unexpected PUSH_PROMISE (push disabled)":
+    let c = newServerConn()
+    let toSend = c.feed(encodeFrame(ftPushPromise, 0, 1'u32, "\x00\x00\x00\x02hdr"))
+    check c.connError.len > 0
+    check firstFrameOfType(toSend, ftGoAway)

@@ -43,6 +43,8 @@ type
     maxFrameSize: int
     maxBodyBytes: int            ## cap on a response body; 0 disables (maxResponseBytes)
     streams: Table[uint32, Stream]
+    sawFirstFrame: bool          ## the server's first frame must be SETTINGS (the preface)
+    fatal: string                ## non-empty once a connection error tore the conn down
     goneAway*: bool
     goAwayLastId: uint32
     connSendWindow: int          ## connection-level send window (shared by streams)
@@ -153,7 +155,19 @@ proc applyHeaders(c: H2Conn, s: Stream) =
   s.hdrBuf.setLen(0)
   if s.hdrEndStream: s.ended = true
 
+proc connFail(c: H2Conn, code: uint32, reason: string, outbuf: var string) =
+  ## Fatal connection error: send GOAWAY and mark the connection unusable. Every
+  ## stream then reports done (see `streamDone`), so drivers unwind and close.
+  if c.fatal.len == 0:
+    c.fatal = reason
+    outbuf.add encodeGoAway(0, code)
+
 proc handle(c: H2Conn, f: Frame, outbuf: var string) =
+  if not c.sawFirstFrame:                     # RFC 9113 3.4: server preface is SETTINGS
+    c.sawFirstFrame = true
+    if f.typ != uint8(ftSettings):
+      c.connFail(errProtocolError, "server preface: first frame not SETTINGS", outbuf)
+      return
   case f.typ
   of uint8(ftSettings):
     if (f.flags and flagAck) == 0:
@@ -217,8 +231,11 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
       if s != nil:
         s.sendWindow += inc
         c.flushSend(f.streamId, s, outbuf)
+  of uint8(ftPushPromise):
+    # We advertised SETTINGS_ENABLE_PUSH=0, so a PUSH_PROMISE is a PROTOCOL_ERROR.
+    c.connFail(errProtocolError, "unexpected PUSH_PROMISE (push disabled)", outbuf)
   else:
-    discard # PRIORITY, PUSH_PROMISE (push disabled): ignore
+    discard # PRIORITY, unknown types: ignore
 
 proc feed*(c: H2Conn, data: string): string =
   ## Consume received bytes; return control bytes (ACKs, window updates) to send.
@@ -226,10 +243,16 @@ proc feed*(c: H2Conn, data: string): string =
   var f: Frame
   while c.frames.next(f):
     c.handle(f, result)
+  if c.frames.frameSizeError:                 # a peer frame exceeded the max frame size
+    c.connFail(errFrameSizeError, "frame size error", result)
+
+proc connError*(c: H2Conn): string = c.fatal
+  ## Non-empty when a connection error (bad preface, oversized frame, unexpected
+  ## PUSH_PROMISE) tore the connection down; the request should fail and not reuse it.
 
 proc streamDone*(c: H2Conn, streamId: uint32): bool =
   ## True when the stream has ended (or been reset), or the connection is gone.
-  if c.goneAway: return true
+  if c.goneAway or c.fatal.len > 0: return true
   let s = c.streams.getOrDefault(streamId)
   s != nil and s.ended
 
@@ -261,4 +284,4 @@ proc takeResponse*(c: H2Conn, streamId: uint32): H2Response =
     result = s.resp
     c.streams.del(streamId)
 
-proc canReuse*(c: H2Conn): bool = not c.goneAway
+proc canReuse*(c: H2Conn): bool = not c.goneAway and c.fatal.len == 0

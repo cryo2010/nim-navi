@@ -70,7 +70,10 @@ template h2Stream(transport, h2, req, sink, decompress: typed): Response =
     let wasReset = h2.streamReset(sid)
     let tooLarge = h2.streamTooLarge(sid)
     let unprocessed = h2.streamUnprocessed(sid)
+    let connErr = h2.connError
     var r = toResponse(h2.takeResponse(sid))
+    if connErr.len > 0:            # bad preface / oversized frame / unexpected push
+      raise newException(IOError, "navi: http/2 " & connErr)
     if tooLarge:
       raise newException(ResponseTooLargeError,
         "navi: response exceeded maxResponseBytes")

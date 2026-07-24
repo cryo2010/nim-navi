@@ -91,8 +91,9 @@ proc reader(mux: H2Mux) {.async.} =
       let chunk = await be.recvSome(mux.transport)
       if chunk.len == 0: break                 # peer closed
       let toSend = mux.h2.feed(chunk)
-      if toSend.len > 0: await mux.send(toSend)
+      if toSend.len > 0: await mux.send(toSend)   # includes a GOAWAY on a conn error
       mux.dispatch()
+      if mux.h2.connError.len > 0: break          # fatal: fail all in-flight below
       if mux.h2.goneAway and mux.waiters.len == 0: break
   except CatchableError:
     discard
