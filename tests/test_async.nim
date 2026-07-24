@@ -50,7 +50,7 @@ suite "asyncdispatch entry end to end":
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)  # echoes each request header back as x-echo-<name>
 
-    proc bearerMw(token: string): Middleware =
+    proc bearerMw(token: string): NaviMiddleware =
       result = proc(ctx: NaviContext) {.async.} =
         ctx.req.headers["authorization"] = "Bearer " & token  # captures token
         await ctx.next()

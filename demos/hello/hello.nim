@@ -24,7 +24,7 @@ proc echoUrl(ctx: NaviContext): Future[void] {.async.} =
 proc main() {.async.} =
   let url = $getEnv("HELLO_URL", "http://localhost:8080/hello")
   var cfg = newNaviConfig()
-  cfg.middleware = @[Middleware(echoUrl)]   # top-level proc; convert to the closure type
+  cfg.middleware = @[NaviMiddleware(echoUrl)]   # top-level proc; convert to the closure type
   let api = newNavi(cfg)
 
   try:

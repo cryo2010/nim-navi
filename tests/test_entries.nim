@@ -10,12 +10,12 @@ import ./support
 var serverReady: bool
 
 # Middleware are closures, so config is captured by a factory (no module globals).
-proc authMw(headerValue: string, observed: ref int): Middleware =
+proc authMw(headerValue: string, observed: ref int): NaviMiddleware =
   result = proc(ctx: NaviContext) =
     ctx.req.headers["authorization"] = headerValue  # before  (captures headerValue)
     ctx.next()
     observed[] = ctx.res.status                      # after   (captures observed)
-proc cannedMw(status: int, body: string): Middleware =
+proc cannedMw(status: int, body: string): NaviMiddleware =
   result = proc(ctx: NaviContext) =                  # short-circuit: never calls next
     ctx.res = initResponse(status, "Short", "", initHeaders(), body)
 

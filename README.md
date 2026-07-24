@@ -354,10 +354,10 @@ everything after is "after".
 
 Middleware are **closures**, so a factory can capture per-instance config and
 return a configured step. Write a plain `proc(ctx: NaviContext)` for a fixed
-step, or a factory `proc(...): Middleware` that closes over settings:
+step, or a factory `proc(...): NaviMiddleware` that closes over settings:
 
 ```nim
-proc trace(prefix: string): Middleware =       # sync (import navi)
+proc trace(prefix: string): NaviMiddleware =       # sync (import navi)
   result = proc(ctx: NaviContext) =
     ctx.req.headers["x-trace-id"] = newTraceId()               # before (captures prefix)
     let t0 = epochTime()
@@ -550,11 +550,11 @@ fields you want. `NaviConfig` has `{.requiresInit.}`, so a bare or partial
   digest answers the server's 401 challenge (MD5 or SHA-256) on a one-shot retry.
 - **proxy** `string`: proxy URL. `""` (default) falls back to `HTTP(S)_PROXY` /
   `NO_PROXY`.
-- **middleware** `seq[Middleware]`: onion-style steps run in order, with
+- **middleware** `seq[NaviMiddleware]`: onion-style steps run in order, with
   `middleware[0]` outermost. Each is a closure `proc(ctx: NaviContext)` (sync) or
   `proc(ctx: NaviContext): Future[void]` (async): modify `ctx.req`, call
   `ctx.next()` to proceed, then inspect or replace `ctx.res`, or skip
-  `next` to short-circuit without sending. A factory `proc(...): Middleware` can
+  `next` to short-circuit without sending. A factory `proc(...): NaviMiddleware` can
   capture per-instance config. See [Middleware](#middleware).
 
 ### Response
