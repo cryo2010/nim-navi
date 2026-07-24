@@ -30,6 +30,7 @@ type
     tooLarge: bool        ## response body exceeded maxBodyBytes (we RST'd it)
     hdrBuf: string
     hdrEndStream: bool
+    recvPending: int      ## received bytes not yet acked with a WINDOW_UPDATE
     sendBuf: string       ## request body not yet on the wire (flow-control bound)
     sendOff: int          ## bytes of sendBuf already sent
     sendWindow: int       ## per-stream send window (peer's INITIAL_WINDOW_SIZE)
@@ -45,6 +46,7 @@ type
     goneAway*: bool
     goAwayLastId: uint32
     connSendWindow: int          ## connection-level send window (shared by streams)
+    connRecvPending: int         ## received bytes not yet acked at the connection level
     peerInitialWindow: int       ## peer's SETTINGS_INITIAL_WINDOW_SIZE
     maxConcurrent: int           ## peer's SETTINGS_MAX_CONCURRENT_STREAMS
 
@@ -55,6 +57,13 @@ const
     ## memory against a CONTINUATION flood -- a peer sending endless CONTINUATION
     ## frames without END_HEADERS (CVE-2024-27316 and related). Generous for real
     ## headers; a stream that exceeds it is RST'd.
+  recvWindowSize = 8 * 1024 * 1024
+    ## Per-stream receive window we advertise (SETTINGS_INITIAL_WINDOW_SIZE), so a
+    ## single download is not throttled to the 64 KiB default per round trip.
+  streamReplenish = recvWindowSize div 2
+  connReplenish = 4 * 1024 * 1024
+    ## Batch flow-control replenishment: emit a WINDOW_UPDATE only when consumed-
+    ## but-unacked bytes cross these thresholds, instead of one per DATA frame.
 
 proc initH2Conn*(maxBody = 0): H2Conn =
   H2Conn(dec: initHpackDecoder(), nextId: 1, maxFrameSize: defaultMaxFrameSize,
@@ -66,10 +75,12 @@ proc maxConcurrentStreams*(c: H2Conn): int = c.maxConcurrent
   ## The peer's SETTINGS_MAX_CONCURRENT_STREAMS (int.high if not advertised).
 
 proc preamble*(c: H2Conn): string =
-  ## Connection preface, our SETTINGS (server push disabled), and a large
-  ## connection-level WINDOW_UPDATE so downloads are not throttled.
+  ## Connection preface, our SETTINGS (server push disabled, a large per-stream
+  ## receive window), and a large connection-level WINDOW_UPDATE so downloads are
+  ## not throttled to the 64 KiB default.
   result = connectionPreface
-  result.add encodeSettings({settingsEnablePush: 0'u32})
+  result.add encodeSettings({settingsEnablePush: 0'u32,
+                             settingsInitialWindowSize: uint32(recvWindowSize)})
   result.add encodeWindowUpdate(0, 0x3fff0000'u32)
 
 proc openStream*(c: H2Conn): uint32 =
@@ -118,6 +129,19 @@ proc encodeRequest*(c: H2Conn, streamId: uint32, headers: openArray[HeaderPair],
     let s = c.streams[streamId]
     s.sendBuf = body
     c.flushSend(streamId, s, result)
+
+proc replenishRecv(c: H2Conn, sid: uint32, s: Stream, n: int, outbuf: var string) =
+  ## Give back receive-window credit for `n` consumed bytes, batched: emit a
+  ## WINDOW_UPDATE only once the unacked total crosses the threshold, so a large
+  ## download costs a handful of control frames instead of one per DATA frame.
+  s.recvPending += n
+  if s.recvPending >= streamReplenish:
+    outbuf.add encodeWindowUpdate(sid, uint32(s.recvPending))
+    s.recvPending = 0
+  c.connRecvPending += n
+  if c.connRecvPending >= connReplenish:
+    outbuf.add encodeWindowUpdate(0, uint32(c.connRecvPending))
+    c.connRecvPending = 0
 
 proc applyHeaders(c: H2Conn, s: Stream) =
   for (name, value) in c.dec.decode(s.hdrBuf):
@@ -173,8 +197,7 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
         s.reset = true; s.ended = true; s.tooLarge = true
       else:
         if f.payload.len > 0:
-          outbuf.add encodeWindowUpdate(0, uint32(f.payload.len))
-          outbuf.add encodeWindowUpdate(f.streamId, uint32(f.payload.len))
+          c.replenishRecv(f.streamId, s, f.payload.len, outbuf)
         if (f.flags and flagEndStream) != 0: s.ended = true
   of uint8(ftRstStream):
     let s = c.streams.getOrDefault(f.streamId)

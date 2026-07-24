@@ -170,6 +170,40 @@ suite "h2 retry classification":
     check c.streamUnprocessed(b)        # id 3 > 1: not processed
     check c.streamUnprocessed(d)        # id 5 > 1: not processed
 
+proc headForStream(id: uint32): string =
+  encodeHeaders(id, (HpackEncoder()).encode(@[(":status", "200")]),
+                endStream = false, endHeaders = true)
+
+suite "h2 receive-side flow control":
+  test "advertises a larger initial window in SETTINGS":
+    let c = initH2Conn()
+    var d: FrameDecoder
+    d.feed(c.preamble()[connectionPreface.len .. ^1])
+    var f: Frame
+    check d.next(f)
+    check f.typ == uint8(ftSettings)
+    var initWin = 0'u32
+    for (id, v) in parseSettings(f.payload):
+      if id == settingsInitialWindowSize: initWin = v
+    check initWin > 65535'u32                    # bigger than the 64 KiB default
+
+  test "batches WINDOW_UPDATEs (no ack for a small body)":
+    let c = initH2Conn()
+    let id = c.openStream()
+    var server = headForStream(id)
+    server.add encodeData(id, repeat("x", 1000), endStream = false)   # well under threshold
+    let toSend = c.feed(server)
+    check not firstFrameOfType(toSend, ftWindowUpdate)
+
+  test "replenishes once consumed crosses the threshold":
+    let c = initH2Conn()
+    let id = c.openStream()
+    var server = headForStream(id)
+    for _ in 0 ..< 270:                          # 270 x 16000 = 4.32 MB > 4 MiB
+      server.add encodeData(id, repeat("x", 16000), endStream = false)
+    let toSend = c.feed(server)
+    check firstFrameOfType(toSend, ftWindowUpdate)
+
 proc dataBytes(s: string): int =
   ## Total DATA-frame payload bytes in a serialized frame sequence.
   var d: FrameDecoder
