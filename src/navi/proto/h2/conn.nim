@@ -26,6 +26,7 @@ type
     resp: H2Response
     ended: bool
     reset: bool
+    refused: bool         ## RST_STREAM(REFUSED_STREAM): server did not process it
     tooLarge: bool        ## response body exceeded maxBodyBytes (we RST'd it)
     hdrBuf: string
     hdrEndStream: bool
@@ -178,6 +179,8 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
   of uint8(ftRstStream):
     let s = c.streams.getOrDefault(f.streamId)
     if s != nil:
+      if f.payload.len >= 4 and readU32(f.payload, 0) == errRefusedStream:
+        s.refused = true                       # not processed -> safe to retry
       s.reset = true
       s.ended = true
   of uint8(ftWindowUpdate):
@@ -220,6 +223,13 @@ proc streamTooLarge*(c: H2Conn, streamId: uint32): bool =
   ## The stream was RST because its body exceeded `maxBodyBytes`.
   let s = c.streams.getOrDefault(streamId)
   s != nil and s.tooLarge
+
+proc streamUnprocessed*(c: H2Conn, streamId: uint32): bool =
+  ## The peer signalled the request was not processed -- RST_STREAM with
+  ## REFUSED_STREAM, or a stream id above GOAWAY's last-processed id -- so it is
+  ## safe to retry even a non-idempotent method.
+  let s = c.streams.getOrDefault(streamId)
+  (s != nil and s.refused) or (c.goneAway and streamId > c.goAwayLastId)
 
 proc takeResponse*(c: H2Conn, streamId: uint32): H2Response =
   ## Return the stream's response and drop the stream.

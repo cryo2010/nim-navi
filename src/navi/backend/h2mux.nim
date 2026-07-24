@@ -38,12 +38,15 @@ proc dispatch(mux: H2Mux) =
     if fut.finished: continue
     if mux.h2.streamReset(sid):
       let tooLarge = mux.h2.streamTooLarge(sid)
+      let unprocessed = mux.h2.streamUnprocessed(sid)
       discard mux.h2.takeResponse(sid)
       mux.waiters.del(sid)
       mux.releaseSlot()
       if tooLarge:
         fut.fail(newException(ResponseTooLargeError,
           "navi: response exceeded maxResponseBytes"))
+      elif unprocessed:
+        fut.fail(newException(UnprocessedError, "navi: http/2 request not processed"))
       else:
         fut.fail(newException(IOError, "navi: http/2 stream reset"))
     elif mux.h2.streamEnded(sid):
@@ -52,8 +55,12 @@ proc dispatch(mux: H2Mux) =
       mux.releaseSlot()
       fut.complete(resp)
     elif mux.h2.goneAway:
+      let unprocessed = mux.h2.streamUnprocessed(sid)
       mux.waiters.del(sid)
-      fut.fail(newException(IOError, "navi: http/2 connection went away"))
+      if unprocessed:              # above GOAWAY's last id: not processed, retryable
+        fut.fail(newException(UnprocessedError, "navi: http/2 request not processed"))
+      else:
+        fut.fail(newException(IOError, "navi: http/2 connection went away"))
 
 proc failAll(mux: H2Mux, msg: string) =
   mux.alive = false

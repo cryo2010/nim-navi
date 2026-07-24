@@ -145,6 +145,31 @@ suite "h2 client DoS limits":
     check not c.streamTooLarge(id)
     check c.takeResponse(id).body == "short body"
 
+suite "h2 retry classification":
+  test "REFUSED_STREAM marks the stream unprocessed (safe to retry)":
+    let c = initH2Conn()
+    let id = c.openStream()
+    discard c.feed(encodeRstStream(id, errRefusedStream))
+    check c.streamReset(id)
+    check c.streamUnprocessed(id)
+
+  test "a non-refused RST_STREAM is not unprocessed":
+    let c = initH2Conn()
+    let id = c.openStream()
+    discard c.feed(encodeRstStream(id, errProtocolError))   # processed then failed
+    check c.streamReset(id)
+    check not c.streamUnprocessed(id)
+
+  test "streams above GOAWAY's last-processed id are unprocessed":
+    let c = initH2Conn()
+    let a = c.openStream()   # id 1
+    let b = c.openStream()   # id 3
+    let d = c.openStream()   # id 5
+    discard c.feed(encodeFrame(ftGoAway, 0, 0, "\x00\x00\x00\x01\x00\x00\x00\x00"))
+    check not c.streamUnprocessed(a)    # id 1 == last-processed: may have run
+    check c.streamUnprocessed(b)        # id 3 > 1: not processed
+    check c.streamUnprocessed(d)        # id 5 > 1: not processed
+
 proc dataBytes(s: string): int =
   ## Total DATA-frame payload bytes in a serialized frame sequence.
   var d: FrameDecoder
