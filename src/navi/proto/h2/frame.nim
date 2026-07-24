@@ -46,6 +46,15 @@ const
   connectionPreface* = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
   defaultMaxFrameSize* = 16384
 
+  # HTTP/2 error codes (RFC 9113 section 7), used in RST_STREAM / GOAWAY.
+  errNoError* = 0x0'u32
+  errProtocolError* = 0x1'u32
+  errFlowControlError* = 0x3'u32
+  errFrameSizeError* = 0x6'u32
+  errRefusedStream* = 0x7'u32
+  errCancel* = 0x8'u32
+  errEnhanceYourCalm* = 0xb'u32
+
 proc u24(n: int): string =
   result = newString(3)
   result[0] = char((n shr 16) and 0xff)

@@ -68,7 +68,11 @@ template h2Stream(transport, h2, req, sink, decompress: typed): Response =
       let toSend = h2.feed(chunk)
       if toSend.len > 0: await sendAll(transport, toSend)
     let wasReset = h2.streamReset(sid)
+    let tooLarge = h2.streamTooLarge(sid)
     var r = toResponse(h2.takeResponse(sid))
+    if tooLarge:
+      raise newException(ResponseTooLargeError,
+        "navi: response exceeded maxResponseBytes")
     if wasReset or r.status == 0:  # reset, or gone away before a response
       raise newException(IOError, "navi: http/2 request did not complete")
     if not sink.isNil and r.body.len > 0:
@@ -119,7 +123,7 @@ template poolTransport*(client, req, sink: typed): Response =
                                     client.config.timeoutMs)
       var npc = PooledConn[typeof(transport)](transport: transport)
       if transport.protocol == "h2":
-        npc.h2 = initH2Conn()
+        npc.h2 = initH2Conn(client.config.maxResponseBytes)
         await sendAll(transport, npc.h2.preamble())
         resp = h2Stream(transport, npc.h2, rq, sink, client.config.wantsDecompress)
         if not (npc.h2.canReuse and pushIdle(client.pool, key, npc)):

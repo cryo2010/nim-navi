@@ -9,6 +9,7 @@
 
 import std/[asyncdispatch, tables, deques]
 import ../proto/h2/conn
+import ../core/response          # for ResponseTooLargeError
 import ./asyncdispatch as be
 
 type
@@ -36,10 +37,15 @@ proc dispatch(mux: H2Mux) =
     let fut = mux.waiters[sid]
     if fut.finished: continue
     if mux.h2.streamReset(sid):
+      let tooLarge = mux.h2.streamTooLarge(sid)
       discard mux.h2.takeResponse(sid)
       mux.waiters.del(sid)
       mux.releaseSlot()
-      fut.fail(newException(IOError, "navi: http/2 stream reset"))
+      if tooLarge:
+        fut.fail(newException(ResponseTooLargeError,
+          "navi: response exceeded maxResponseBytes"))
+      else:
+        fut.fail(newException(IOError, "navi: http/2 stream reset"))
     elif mux.h2.streamEnded(sid):
       let resp = mux.h2.takeResponse(sid)
       mux.waiters.del(sid)
@@ -87,10 +93,10 @@ proc reader(mux: H2Mux) {.async.} =
   try: await be.close(mux.transport)
   except CatchableError: discard
 
-proc newH2Mux*(transport: be.Conn): Future[H2Mux] {.async.} =
+proc newH2Mux*(transport: be.Conn, maxBody = 0): Future[H2Mux] {.async.} =
   ## Take ownership of a freshly connected h2 transport, send the preface, and
   ## start the background reader.
-  let mux = H2Mux(transport: transport, h2: initH2Conn(), alive: true,
+  let mux = H2Mux(transport: transport, h2: initH2Conn(maxBody), alive: true,
                   waiters: initTable[uint32, Future[H2Response]](),
                   pendingSlots: initDeque[Future[void]]())
   await be.sendAll(transport, mux.h2.preamble())

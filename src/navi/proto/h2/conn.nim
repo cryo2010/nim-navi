@@ -26,6 +26,7 @@ type
     resp: H2Response
     ended: bool
     reset: bool
+    tooLarge: bool        ## response body exceeded maxBodyBytes (we RST'd it)
     hdrBuf: string
     hdrEndStream: bool
     sendBuf: string       ## request body not yet on the wire (flow-control bound)
@@ -38,6 +39,7 @@ type
     frames: FrameDecoder
     nextId: uint32
     maxFrameSize: int
+    maxBodyBytes: int            ## cap on a response body; 0 disables (maxResponseBytes)
     streams: Table[uint32, Stream]
     goneAway*: bool
     goAwayLastId: uint32
@@ -45,11 +47,17 @@ type
     peerInitialWindow: int       ## peer's SETTINGS_INITIAL_WINDOW_SIZE
     maxConcurrent: int           ## peer's SETTINGS_MAX_CONCURRENT_STREAMS
 
-const defaultWindow = 65535      ## HTTP/2 default flow-control window (RFC 9113)
+const
+  defaultWindow = 65535          ## HTTP/2 default flow-control window (RFC 9113)
+  maxHeaderListBytes = 128 * 1024
+    ## Cap on a single response's accumulated (compressed) header block. Bounds
+    ## memory against a CONTINUATION flood -- a peer sending endless CONTINUATION
+    ## frames without END_HEADERS (CVE-2024-27316 and related). Generous for real
+    ## headers; a stream that exceeds it is RST'd.
 
-proc initH2Conn*(): H2Conn =
+proc initH2Conn*(maxBody = 0): H2Conn =
   H2Conn(dec: initHpackDecoder(), nextId: 1, maxFrameSize: defaultMaxFrameSize,
-         streams: initTable[uint32, Stream](),
+         maxBodyBytes: maxBody, streams: initTable[uint32, Stream](),
          connSendWindow: defaultWindow, peerInitialWindow: defaultWindow,
          maxConcurrent: int.high)   # RFC 9113: unlimited until the peer says otherwise
 
@@ -146,19 +154,27 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
     c.goAwayLastId = readU32(f.payload, 0) and 0x7fffffff'u32
   of uint8(ftHeaders), uint8(ftContinuation):
     let s = c.streams.getOrDefault(f.streamId)
-    if s != nil:
+    if s != nil and not s.reset:
       s.hdrBuf.add f.payload
-      if f.typ == uint8(ftHeaders):
-        s.hdrEndStream = (f.flags and flagEndStream) != 0
-      if (f.flags and flagEndHeaders) != 0: c.applyHeaders(s)
+      if s.hdrBuf.len > maxHeaderListBytes:       # CONTINUATION flood: bound and RST
+        outbuf.add encodeRstStream(f.streamId, errEnhanceYourCalm)
+        s.reset = true; s.ended = true; s.hdrBuf.setLen(0)
+      else:
+        if f.typ == uint8(ftHeaders):
+          s.hdrEndStream = (f.flags and flagEndStream) != 0
+        if (f.flags and flagEndHeaders) != 0: c.applyHeaders(s)
   of uint8(ftData):
     let s = c.streams.getOrDefault(f.streamId)
-    if s != nil:
+    if s != nil and not s.reset:
       s.resp.body.add f.payload
-      if f.payload.len > 0:
-        outbuf.add encodeWindowUpdate(0, uint32(f.payload.len))
-        outbuf.add encodeWindowUpdate(f.streamId, uint32(f.payload.len))
-      if (f.flags and flagEndStream) != 0: s.ended = true
+      if c.maxBodyBytes > 0 and s.resp.body.len > c.maxBodyBytes:  # over the size cap: RST
+        outbuf.add encodeRstStream(f.streamId, errCancel)
+        s.reset = true; s.ended = true; s.tooLarge = true
+      else:
+        if f.payload.len > 0:
+          outbuf.add encodeWindowUpdate(0, uint32(f.payload.len))
+          outbuf.add encodeWindowUpdate(f.streamId, uint32(f.payload.len))
+        if (f.flags and flagEndStream) != 0: s.ended = true
   of uint8(ftRstStream):
     let s = c.streams.getOrDefault(f.streamId)
     if s != nil:
@@ -199,6 +215,11 @@ proc streamEnded*(c: H2Conn, streamId: uint32): bool =
 proc streamReset*(c: H2Conn, streamId: uint32): bool =
   let s = c.streams.getOrDefault(streamId)
   s != nil and s.reset
+
+proc streamTooLarge*(c: H2Conn, streamId: uint32): bool =
+  ## The stream was RST because its body exceeded `maxBodyBytes`.
+  let s = c.streams.getOrDefault(streamId)
+  s != nil and s.tooLarge
 
 proc takeResponse*(c: H2Conn, streamId: uint32): H2Response =
   ## Return the stream's response and drop the stream.

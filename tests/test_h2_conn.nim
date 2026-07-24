@@ -104,6 +104,47 @@ suite "h2 client connection":
     check (f.flags and flagAck) != 0
     check f.payload == "01234567"
 
+proc firstFrameOfType(s: string, typ: FrameType): bool =
+  ## True if `s` contains a frame of the given type.
+  var d: FrameDecoder
+  d.feed(s)
+  var f: Frame
+  while d.next(f):
+    if f.typ == uint8(typ): return true
+
+suite "h2 client DoS limits":
+  test "RSTs a CONTINUATION flood instead of buffering unbounded headers":
+    let c = initH2Conn()
+    let id = c.openStream()
+    # A HEADERS frame with END_STREAM but never END_HEADERS, then a flood of
+    # CONTINUATION frames -- the shape of the HTTP/2 CONTINUATION flood.
+    var flood = encodeHeaders(id, repeat("A", 16000), endStream = false, endHeaders = false)
+    var control = ""
+    for _ in 0 ..< 16:                     # 16 x 16000 = 256000 > 128 KiB cap
+      control.add c.feed(encodeContinuation(id, repeat("B", 16000), endHeaders = false))
+    let toSend = c.feed(flood) & control
+    check c.streamReset(id)                # bounded and reset, not OOM
+    check firstFrameOfType(toSend, ftRstStream)
+
+  test "RSTs a response body that exceeds maxResponseBytes":
+    let c = initH2Conn(maxBody = 10)       # 10-byte cap
+    let id = c.openStream()
+    var server = encodeHeaders(id,
+      (HpackEncoder()).encode(@[(":status", "200")]), endStream = false, endHeaders = true)
+    server.add encodeData(id, repeat("x", 50), endStream = true)   # 50 > 10
+    let toSend = c.feed(server)
+    check c.streamReset(id)
+    check c.streamTooLarge(id)
+    check firstFrameOfType(toSend, ftRstStream)
+
+  test "a body within maxResponseBytes is delivered normally":
+    let c = initH2Conn(maxBody = 100)
+    let id = c.openStream()
+    discard c.feed(serverResponse(id, "200", @[], "short body"))
+    check c.streamDone(id)
+    check not c.streamTooLarge(id)
+    check c.takeResponse(id).body == "short body"
+
 proc dataBytes(s: string): int =
   ## Total DATA-frame payload bytes in a serialized frame sequence.
   var d: FrameDecoder
