@@ -304,12 +304,14 @@ cfg.retry.backoffCap = 30_000              # cap the wait between attempts (ms)
 
 ### Query parameters
 
-Pass `params` on any verb to append an url-encoded query string to the target (resolved against `prefixUrl` first):
+Pass `params` on any verb to append an url-encoded query string to the target (resolved against `prefixUrl` first). It accepts a seq/array of pairs, the map-like `@{}` (or bare `{}`) form, or a `Table` / `OrderedTable`:
 
 ```nim
-let res = api.get("/search", params = @[("q", "http client"), ("page", "2")])
+let res = api.get("/search", params = @{"q": "http client", "page": "2"})
 # GET /search?q=http+client&page=2
 ```
+
+Pairs preserve order and allow duplicate keys (`@{"tag": "a", "tag": "b"}` gives `?tag=a&tag=b`), which a plain `Table` cannot; use pairs, `@{}`, or an `OrderedTable` when order or repeats matter.
 
 ### Cancellation
 
@@ -493,7 +495,8 @@ inherited via `extend`. Returns a `Navi`. Read it back (read-only) via
 
 Make a request with that verb. A relative `target` resolves against `prefixUrl`.
 `json` and `form` encode the body and set a matching `Content-Type` unless you
-supplied one. `params: seq[(string, string)]` appends an url-encoded query string;
+supplied one. `params` appends an url-encoded query string and accepts pairs
+(`@[...]` / `@{...}` / `{...}`) or a `Table` / `OrderedTable`;
 `cancel: CancelToken` aborts the request (raising `RequestCancelledError`).
 Returns a `Response` on the sync backend, or a `Future[Response]` on
 `navi/asyncdispatch`, `navi/chronos`, and `navi/js`.

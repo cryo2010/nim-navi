@@ -1,7 +1,7 @@
 ## End-to-end test of the sync entry module against an in-process TCP server.
 
 import unittest
-import std/[net, os, strutils]
+import std/[net, os, strutils, tables]
 import navi
 import navi/core/pool
 import navi/core/response  # for the `response.TimeoutError` qualifier
@@ -445,14 +445,26 @@ suite "sync entry end to end":
     check child.config.prefixUrl == "http://api.test"
     check child.config.headers.get("x-base") == "1"
 
-  test "params appends an encoded query string to the target":
+  test "params (map-like @{}) appends an encoded query string to the target":
     const port = 8951
     var th: Thread[ServerCtx]
     startEchoLine(th, port)
 
     let api = newNavi()
     let res = api.get("http://127.0.0.1:" & $port & "/search",
-                      params = @[("q", "test"), ("n", "2")])
+                      params = @{"q": "test", "n": "2"})
+    check res.status == 200
+    check res.body == "GET /search?q=test&n=2 HTTP/1.1"
+    joinThread(th)
+
+  test "params accepts an OrderedTable (order preserved)":
+    const port = 8950
+    var th: Thread[ServerCtx]
+    startEchoLine(th, port)
+
+    let api = newNavi()
+    let res = api.get("http://127.0.0.1:" & $port & "/search",
+                      params = {"q": "test", "n": "2"}.toOrderedTable)
     check res.status == 200
     check res.body == "GET /search?q=test&n=2 HTTP/1.1"
     joinThread(th)
