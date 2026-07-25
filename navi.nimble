@@ -16,23 +16,16 @@ requires "checksums >= 0.2.2"   # MD5 + SHA-256 (sha2 API) for Digest auth; 0.2.
 # Optional: only needed when you `import navi/chronos`.
 # requires "chronos >= 4.0.0"
 
-task test, "Run the test suite":
-  # Memory manager is selectable via NAVI_MM (orc/arc) for the CI matrix.
-  let mm = getEnv("NAVI_MM", "orc")
-  var opts = "--hints:off --mm:" & mm
-  # NAVI_SANITIZE=1 builds the suite under AddressSanitizer + UBSan (the CI
-  # memory-safety job). -d:useMalloc routes Nim allocations through malloc so
-  # ASan can see them; -g and frame pointers give symbolized reports.
-  if getEnv("NAVI_SANITIZE").len > 0:
-    let san = "-fsanitize=address,undefined -fno-omit-frame-pointer -g"
-    opts.add " -d:useMalloc --passC:\"" & san &
-             "\" --passL:\"-fsanitize=address,undefined\""
-  let suites = ["test_h1", "test_h2_frame", "test_h2_hpack", "test_h2_hpack_corpus",
-                "test_h2_huffman", "test_h2_conn", "test_cookies", "test_digest",
-                "test_entries", "test_stream_decompress", "test_ws", "test_ws_async",
-                "test_async", "test_chronos", "test_ws_chronos"]
-  for s in suites:
-    exec "nim c -r " & opts & " tests/" & s & ".nim"
+task test, "Run the test suite (delegates to tests/run.sh)":
+  # The suite list and build options live in tests/run.sh, so there is one source
+  # of truth shared with CI. NAVI_MM (orc/arc) and NAVI_SANITIZE=1 are read from
+  # the environment by the script.
+  #
+  # WARNING: `nimble` does not propagate a task's exit code (nim-lang/nimble#1802)
+  # -- on this nimble a failing test still makes `nimble test` exit 0. A failure
+  # is visible in the output, but CI runs `bash tests/run.sh` directly so a real
+  # failure actually fails the job.
+  exec "bash tests/run.sh"
 
 task leak, "Memory-growth check: every verb + request in a 100,000x loop":
   # Not in the default `test` suites (800k requests); its own PR job. NAVI_MM

@@ -12,7 +12,7 @@ jobs:
       fail-fast: false
       matrix:
         mm: [orc, arc]
-    name: nimble test (--mm:${{ matrix.mm }})
+    name: tests (--mm:${{ matrix.mm }})
     steps:
       - uses: actions/checkout@v4
 
@@ -33,8 +33,12 @@ jobs:
       - name: Install brotli/zstd
         run: sudo apt-get update && sudo apt-get install -y libbrotli1 libzstd1
 
+      # Run the suite directly (not `nimble test`): nimble does not reliably
+      # propagate a task's exit code (nim-lang/nimble#1802), so a failing suite
+      # under `nimble test` can pass CI. tests/run.sh runs `nim c -r` per suite
+      # under `set -e`, so a failure fails the job.
       - name: Run tests
-        run: nimble test
+        run: bash tests/run.sh
         env:
           NAVI_MM: ${{ matrix.mm }}
 
@@ -118,7 +122,7 @@ jobs:
         run: nimble install -y checksums
 
       # Rebuilds and runs the whole suite under AddressSanitizer + UBSan
-      # (NAVI_SANITIZE=1, see the nimble `test` task). Catches heap overflows,
+      # (NAVI_SANITIZE=1, see tests/run.sh). Catches heap overflows,
       # use-after-free, and undefined behavior in the sans-io parsers and buffer
       # handling that a passing test would otherwise hide. Leak detection is off:
       # short-lived test processes leak by design (no teardown), and it is not
@@ -127,7 +131,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libbrotli1 libzstd1
 
       - name: Run tests under ASan/UBSan
-        run: nimble test
+        run: bash tests/run.sh
         env:
           NAVI_MM: orc
           NAVI_SANITIZE: "1"
