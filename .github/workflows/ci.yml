@@ -12,7 +12,10 @@ jobs:
       fail-fast: false
       matrix:
         mm: [orc, arc]
-    name: tests (--mm:${{ matrix.mm }})
+    # Display name kept as "nimble test (...)" to match the required status check
+    # in the branch ruleset: renaming a required check leaves it "Expected" and
+    # never run, blocking merge. The step below runs tests/run.sh, not `nimble test`.
+    name: nimble test (--mm:${{ matrix.mm }})
     steps:
       - uses: actions/checkout@v4
 
