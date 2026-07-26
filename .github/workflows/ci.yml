@@ -99,8 +99,10 @@ jobs:
           node-version: "22"
       - name: Install checksums
         run: nimble install -y checksums   # the native echo server pulls in proto/ws
+      # Run the script directly (not `nimble wsjs`): nimble does not propagate a
+      # task's exit code (nim-lang/nimble#1802). jsws.sh uses `set -e`.
       - name: navi/js WebSocket runtime test
-        run: nimble wsjs
+        run: bash tests/interop/jsws.sh
 
   sanitize:
     runs-on: ubuntu-latest
@@ -159,13 +161,15 @@ jobs:
       - name: Install nghttpd
         run: sudo apt-get update && sudo apt-get install -y nghttp2-server
 
+      # Scripts run directly (not `nimble interop`/`nimble mtls`): nimble does not
+      # propagate a task's exit code (nim-lang/nimble#1802). Both use `set -e`.
       - name: Run the interop suite
-        run: nimble interop
+        run: bash tests/interop/run.sh
 
       # Mutual-TLS: an OpenSSL server that requires a client certificate,
       # validating TlsConfig.certFile/keyFile on the sync (OpenSSL) backend.
       - name: Run the mTLS interop test
-        run: nimble mtls
+        run: bash tests/interop/mtls.sh
 
   leak:
     runs-on: ubuntu-latest
@@ -189,10 +193,10 @@ jobs:
       # Exercises every verb + request 100,000x (800k requests) against an
       # in-process keep-alive server and asserts the Nim heap stays flat. Run
       # under both managers: an orc/arc growth gap would mean a reference cycle.
+      # Run directly (not `nimble leak`): nimble does not propagate a task's exit
+      # code (nim-lang/nimble#1802), so a growing heap could pass CI.
       - name: Run the leak check
-        run: nimble leak
-        env:
-          NAVI_MM: ${{ matrix.mm }}
+        run: nim c -r -d:release --hints:off --mm:${{ matrix.mm }} tests/leak.nim
 
   valgrind:
     runs-on: ubuntu-latest
@@ -233,7 +237,10 @@ jobs:
       # LeakSanitizer sees what getOccupiedMem cannot: zlib/brotli/zstd contexts
       # that a dropped defer/=destroy would leak. detect_leaks=1 is the Linux
       # default under ASan, set explicitly for clarity.
+      # Run directly (not `nimble leakSanitize`): nimble does not propagate a
+      # task's exit code (nim-lang/nimble#1802), so a LeakSanitizer failure could
+      # pass CI.
       - name: Run the codec leak check
-        run: nimble leakSanitize
+        run: nim c -r --mm:orc -d:useMalloc --hints:off --passC:-fsanitize=address --passL:-fsanitize=address tests/leak_sanitize.nim
         env:
           ASAN_OPTIONS: detect_leaks=1
