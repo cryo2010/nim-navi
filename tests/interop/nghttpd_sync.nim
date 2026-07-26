@@ -69,6 +69,14 @@ suite "nghttpd interop (sync, http/2)":
     check res.httpVersion == "HTTP/2"
     check res.body == "hello from nghttpd\n"      # exact: no stray pad bytes
 
+  test "does not surface an h2 trailer as a response header":
+    # The padded server also sends a trailing HEADERS block (--trailer); navi
+    # decodes it for HPACK sync but must not expose it as a header (RFC 9113 8.1).
+    let res = client().get(padded & "/small.txt")
+    check res.status == 200
+    check res.body == "hello from nghttpd\n"
+    check not res.headers.contains("x-navi-trailer")
+
   test "reads a multi-frame padded body intact":
     let res = client().get(padded & "/large.bin")
     check res.status == 200

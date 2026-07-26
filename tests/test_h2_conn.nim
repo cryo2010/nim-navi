@@ -339,3 +339,63 @@ suite "h2 frame padding":
     let toSend = c.feed(server)
     check c.connError.len > 0
     check firstFrameOfType(toSend, ftGoAway)
+
+proc hasConnWindowUpdate(s: string): bool =
+  ## True if `s` contains a connection-level (stream 0) WINDOW_UPDATE.
+  var d: FrameDecoder
+  d.feed(s)
+  var f: Frame
+  while d.next(f):
+    if f.typ == uint8(ftWindowUpdate) and f.streamId == 0'u32: return true
+
+suite "h2 interim responses and trailers":
+  test "ignores a 1xx interim HEADERS block before the final response":
+    let c = newServerConn()
+    let id = c.openStream()
+    let enc = HpackEncoder()                       # one server-side HPACK stream
+    var server = encodeHeaders(id,
+      enc.encode(@[(":status", "103"), ("link", "</s.css>; rel=preload")]),
+      endStream = false, endHeaders = true)
+    server.add encodeHeaders(id,
+      enc.encode(@[(":status", "200"), ("content-type", "text/html")]),
+      endStream = false, endHeaders = true)
+    server.add encodeData(id, "body", endStream = true)
+    discard c.feed(server)
+    check c.streamDone(id)
+    let resp = c.takeResponse(id)
+    check resp.status == 200                        # final status, not 103
+    check resp.headers == @[("content-type", "text/html")]  # 103 "link" did not leak
+    check resp.body == "body"
+
+  test "does not surface trailers as response headers":
+    let c = newServerConn()
+    let id = c.openStream()
+    let enc = HpackEncoder()
+    var server = encodeHeaders(id,
+      enc.encode(@[(":status", "200"), ("content-type", "text/plain")]),
+      endStream = false, endHeaders = true)
+    server.add encodeData(id, "hello", endStream = false)
+    server.add encodeHeaders(id, enc.encode(@[("grpc-status", "0")]),
+                             endStream = true, endHeaders = true)   # trailers
+    discard c.feed(server)
+    check c.streamDone(id)
+    let resp = c.takeResponse(id)
+    check resp.status == 200
+    check resp.body == "hello"
+    check resp.headers == @[("content-type", "text/plain")]  # grpc-status trailer dropped
+
+suite "h2 flow control on reset streams":
+  test "counts DATA on a reset stream toward the connection window":
+    # A tiny body cap makes the first DATA reset the stream; the server then keeps
+    # sending DATA in-flight on that stream. It must still replenish the connection
+    # flow-control window (RFC 9113 6.9.1), or a pooled connection slowly stalls.
+    let c = newServerConn(maxBody = 10)
+    let id = c.openStream()
+    var server = headForStream(id)
+    server.add encodeData(id, repeat("x", 50), endStream = false)   # 50 > 10 -> RST
+    discard c.feed(server)
+    check c.streamReset(id)
+    var more = ""
+    for _ in 0 ..< 270: more.add encodeData(id, repeat("x", 16000), endStream = false)
+    let toSend = c.feed(more)                       # 270 x 16000 = 4.32 MB > connReplenish
+    check hasConnWindowUpdate(toSend)               # connection window given back

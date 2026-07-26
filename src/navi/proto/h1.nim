@@ -105,6 +105,15 @@ proc parseStatusLine(p: var H1Parser, line: string) =
   p.state = stHeaders
 
 proc finishHeaders(p: var H1Parser) =
+  if p.status in 100 .. 199:
+    # Interim response (100 Continue, 103 Early Hints, ...): it has no body, and
+    # its status/headers are not the final response (RFC 9110 15.2). Drop them and
+    # read the final response that follows on the same connection.
+    p.status = 0
+    p.reason = ""
+    p.headers = initHeaders()
+    p.state = stStatusLine
+    return
   if p.sinkFactory != nil:      # now that headers are known, choose the sink
     # single-threaded client; the factory need not be gcsafe (see emitBody).
     {.cast(gcsafe).}:
