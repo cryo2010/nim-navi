@@ -1,7 +1,7 @@
 ## Manual smoke test: fetch several URLs concurrently, multiplexed over one
 ## HTTP/2 connection. Not in the deterministic suite (needs the network).
 ##
-##   nim c -r examples/parallel.nim
+##   nim c -r examples/concurrency/parallel.nim
 
 import navi
 

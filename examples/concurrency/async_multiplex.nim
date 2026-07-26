@@ -1,7 +1,7 @@
 ## Manual smoke test: concurrent async requests multiplexed over one HTTP/2
 ## connection (ky-style Promise.all). Needs the network.
 ##
-##   nim c -r examples/async_multiplex.nim
+##   nim c -r examples/concurrency/async_multiplex.nim
 
 import std/asyncdispatch
 import navi/asyncdispatch

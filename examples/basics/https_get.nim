@@ -1,7 +1,7 @@
 ## Manual smoke test: a real HTTPS GET. Not part of the deterministic suite
 ## because it depends on the network.
 ##
-##   nim c -r examples/https_get.nim
+##   nim c -r examples/basics/https_get.nim
 
 import navi
 
