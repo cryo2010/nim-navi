@@ -10,6 +10,7 @@ import std/[os, strutils]
 import navi
 
 let base = getEnv("NAVI_INTEROP_URL")
+let padded = getEnv("NAVI_INTEROP_PADDED_URL")   # nghttpd started with -b (frame padding)
 let cert = getEnv("NAVI_INTEROP_CERT")
 
 proc client(): Navi =
@@ -59,6 +60,19 @@ suite "nghttpd interop (sync, http/2)":
     for r in res:
       check r.status == 200
       check r.body == "hello from nghttpd\n"
+
+  test "reads a padded response without corruption (HEADERS + DATA padding)":
+    # nghttpd -b pads frames; navi must strip the pad-length byte and padding, or
+    # HPACK decoding and the body break (see fix for the h2 PADDED flag).
+    let res = client().get(padded & "/small.txt")
+    check res.status == 200
+    check res.httpVersion == "HTTP/2"
+    check res.body == "hello from nghttpd\n"      # exact: no stray pad bytes
+
+  test "reads a multi-frame padded body intact":
+    let res = client().get(padded & "/large.bin")
+    check res.status == 200
+    check res.body.len == 262144                   # every padded DATA frame stripped
 
   test "many h2 requests over TLS do not grow the heap":
     # Exercises the h2 connection, HPACK encoder/decoder tables, and pool reuse

@@ -162,6 +162,21 @@ proc connFail(c: H2Conn, code: uint32, reason: string, outbuf: var string) =
     c.fatal = reason
     outbuf.add encodeGoAway(0, code)
 
+proc unpad(c: H2Conn, f: Frame, frag: var string, outbuf: var string): bool =
+  ## Strip DATA/HEADERS padding (RFC 9113 6.1/6.2): the first payload byte is the
+  ## pad length, and that many trailing bytes are the padding. Sets `frag` to the
+  ## content in between. A pad length that meets or exceeds the payload is a
+  ## PROTOCOL_ERROR (GOAWAY sent, returns false).
+  if f.payload.len < 1:
+    c.connFail(errProtocolError, "padded frame with no pad length", outbuf)
+    return false
+  let padLen = int(uint8(f.payload[0]))
+  if padLen > f.payload.len - 1:
+    c.connFail(errProtocolError, "padding exceeds frame payload", outbuf)
+    return false
+  frag = f.payload[1 ..< f.payload.len - padLen]
+  true
+
 proc handle(c: H2Conn, f: Frame, outbuf: var string) =
   if not c.sawFirstFrame:                     # RFC 9113 3.4: server preface is SETTINGS
     c.sawFirstFrame = true
@@ -194,7 +209,19 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
   of uint8(ftHeaders), uint8(ftContinuation):
     let s = c.streams.getOrDefault(f.streamId)
     if s != nil and not s.reset:
-      s.hdrBuf.add f.payload
+      var frag = f.payload
+      if f.typ == uint8(ftHeaders):
+        # Only HEADERS carries padding / priority; a CONTINUATION is a raw
+        # fragment. Strip the pad byte + trailing padding, then the 5-byte
+        # priority block (stream dependency + weight), so what is left is the
+        # header block fragment HPACK expects.
+        if (f.flags and flagPadded) != 0 and not c.unpad(f, frag, outbuf): return
+        if (f.flags and flagPriority) != 0:
+          if frag.len < 5:
+            c.connFail(errProtocolError, "HEADERS priority block truncated", outbuf)
+            return
+          frag = frag[5 ..< frag.len]
+      s.hdrBuf.add frag
       if s.hdrBuf.len > maxHeaderListBytes:       # CONTINUATION flood: bound and RST
         outbuf.add encodeRstStream(f.streamId, errEnhanceYourCalm)
         s.reset = true; s.ended = true; s.hdrBuf.setLen(0)
@@ -205,11 +232,15 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
   of uint8(ftData):
     let s = c.streams.getOrDefault(f.streamId)
     if s != nil and not s.reset:
-      s.resp.body.add f.payload
+      var data = f.payload
+      if (f.flags and flagPadded) != 0 and not c.unpad(f, data, outbuf): return
+      s.resp.body.add data
       if c.maxBodyBytes > 0 and s.resp.body.len > c.maxBodyBytes:  # over the size cap: RST
         outbuf.add encodeRstStream(f.streamId, errCancel)
         s.reset = true; s.ended = true; s.tooLarge = true
       else:
+        # Flow control counts the whole DATA payload -- pad length byte and
+        # padding included (RFC 9113 6.9.1) -- though only `data` reaches the body.
         if f.payload.len > 0:
           c.replenishRecv(f.streamId, s, f.payload.len, outbuf)
         if (f.flags and flagEndStream) != 0: s.ended = true

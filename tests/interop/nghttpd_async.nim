@@ -9,9 +9,27 @@ import std/os
 import navi/asyncdispatch
 
 let base = getEnv("NAVI_INTEROP_URL")
+let padded = getEnv("NAVI_INTEROP_PADDED_URL")   # nghttpd started with -b (frame padding)
 let cert = getEnv("NAVI_INTEROP_CERT")
 
 suite "nghttpd interop (asyncdispatch, http/2 mux)":
+  test "reads a padded response without corruption over the mux":
+    # nghttpd -b pads frames; navi must strip PADDED padding, or HPACK / the body
+    # break. Runs concurrently to exercise the mux's h2 connection path.
+    proc run(): Future[seq[Response]] {.async.} =
+      var cfg = newNaviConfig()
+      cfg.tls.caFile = cert
+      let api = newNavi(cfg)
+      result = await all(@[
+        api.get(padded & "/small.txt"),
+        api.get(padded & "/large.bin")])
+
+    let res = waitFor run()
+    check res[0].status == 200
+    check res[0].body == "hello from nghttpd\n"    # exact: HEADERS + DATA padding stripped
+    check res[1].status == 200
+    check res[1].body.len == 262144                # multi-frame padded body intact
+
   test "concurrent GETs multiplex over a single connection":
     proc run(): Future[seq[Response]] {.async.} =
       var cfg = newNaviConfig()
