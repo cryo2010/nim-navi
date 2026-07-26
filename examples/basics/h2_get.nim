@@ -1,7 +1,7 @@
 ## Manual smoke test: a real HTTP/2 request (sync backend, ALPN-negotiated).
 ## Not in the deterministic suite because it depends on the network.
 ##
-##   nim c -r examples/h2_get.nim
+##   nim c -r examples/basics/h2_get.nim
 
 import navi
 

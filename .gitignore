@@ -31,6 +31,11 @@ tests/test_ws_chronos
 tests/interop/jsws_server
 tests/interop/jsws_client.js
 navi_js.js
+# Compiled example binaries (sources are .nim)
+examples/basics/https_get
+examples/basics/h2_get
+examples/concurrency/async_multiplex
+examples/concurrency/parallel
 # Compiled WebSocket example binaries (sources are .nim)
 examples/websocket/echo_server
 examples/websocket/sync
