@@ -26,12 +26,13 @@ type
     clientp: ptr Navi        ## the owning client (see `client`); valid for the call
     sink: BodySink           ## non-nil for a streaming request
     idx: int                 ## index of the next middleware to run
-  NaviMiddleware* = proc(ctx: NaviContext): Future[void] {.async: (raises: [CatchableError]).}
+  NaviMiddleware* = proc(ctx: NaviContext): Future[void] {.closure, gcsafe.}
     ## A middleware step; may be async. A closure, so it can capture: read/modify
     ## `ctx.req`, `await ctx.next()` to proceed -- or skip it to short-circuit --
-    ## then read/modify `ctx.res`. The `async: (raises: [CatchableError])` type is
-    ## how chronos's strict effect tracking types a raises-aware async callback;
-    ## write a factory `proc bearer(token): NaviMiddleware` to close over config.
+    ## then read/modify `ctx.res`. Write it as a plain `{.async.}` proc (identical
+    ## spelling on every backend); a factory `proc bearer(token): NaviMiddleware`
+    ## closes over config. chronos's strict-raises obligation is discharged
+    ## internally by `next` (see the cast there), not in this public type.
 
   NaviConfig* {.requiresInit.} = object of NaviConfigBase
     ## `requiresInit`: build it with `newNaviConfig()`, not a bare `NaviConfig(...)`.
@@ -123,7 +124,12 @@ proc next*(ctx: NaviContext): Future[void] {.async.} =
   else:
     let m = mws[ctx.idx]
     inc ctx.idx
-    await m(ctx)
+    # The public NaviMiddleware type is a plain closure (portable to js), so it
+    # carries no chronos raises annotation. Middleware raise at most CatchableError
+    # (navi's error contract; CancelledError is one, so cancellation still flows),
+    # which we assert here to satisfy chronos's strict effect tracking.
+    {.cast(raises: [CatchableError]).}:
+      await m(ctx)
 
 proc runChain(ctx: NaviContext): Future[Response] {.async.} =
   await ctx.next()

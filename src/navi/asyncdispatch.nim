@@ -27,8 +27,10 @@ type
   NaviMiddleware* = proc(ctx: NaviContext): Future[void] {.closure.}
     ## A middleware step; may be async. A closure, so it can capture: read/modify
     ## `ctx.req`, `await ctx.next()` to proceed -- or skip it to short-circuit --
-    ## then read/modify `ctx.res`. Write a factory `proc bearer(token): NaviMiddleware`
-    ## to close over per-instance config.
+    ## then read/modify `ctx.res`. Write it as a plain `{.async.}` proc (identical
+    ## spelling on every backend); a factory `proc bearer(token): NaviMiddleware`
+    ## closes over per-instance config. (No `gcsafe`: asyncdispatch does not
+    ## require it -- only chronos does, at its call site.)
 
   NaviConfig* {.requiresInit.} = object of NaviConfigBase
     ## `requiresInit`: build it with `newNaviConfig()`, not a bare `NaviConfig(...)`.

@@ -39,7 +39,7 @@ suite "chronos entry end to end":
     startBodyEcho(th, port)  # echoes each request header back as x-echo-<name>
 
     proc bearerMw(token: string): NaviMiddleware =
-      result = proc(ctx: NaviContext) {.async: (raises: [CatchableError]).} =
+      result = proc(ctx: NaviContext) {.async.} =        # plain {.async.}, no raises spec
         ctx.req.headers["authorization"] = "Bearer " & token  # captures token
         await ctx.next()
 

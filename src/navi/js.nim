@@ -45,8 +45,10 @@ type
   NaviMiddleware* = proc(ctx: NaviContext): Future[void] {.closure.}
     ## A middleware step; may be async. A closure, so it can capture: read/modify
     ## `ctx.req`, `await ctx.next()` to proceed -- or skip it to short-circuit --
-    ## then read/modify `ctx.res`. Write a factory `proc bearer(token): NaviMiddleware`
-    ## to close over per-instance config.
+    ## then read/modify `ctx.res`. Write it as a plain `{.async.}` proc; a factory
+    ## `proc bearer(token): NaviMiddleware` closes over per-instance config. (No
+    ## `gcsafe` here: JS is single-threaded, and requiring it would reject an
+    ## awaiting middleware; the native backends add it where it means something.)
 
   NaviConfig* {.requiresInit.} = object of NaviConfigBase
     ## `requiresInit`: build it with `newNaviConfig()`, not a bare `NaviConfig(...)`.
