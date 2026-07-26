@@ -396,11 +396,11 @@ so it runs once per call; to act on each retry, implement the retry loop in a
 middleware. It does not apply to `websocket()`.
 
 Per-instance config is captured by a middleware factory (or kept on the
-`NaviContext`). On `navi/chronos` the middleware type is
-`proc(ctx: NaviContext): Future[void] {.async: (raises: [CatchableError]).}` --
-that pragma is how chronos types a raises-aware async callback, so write your
-closure with the same `{.async: (raises: [CatchableError]).}`; the other backends
-infer it from a plain `{.async.}`.
+`NaviContext`). The middleware spelling is the same on every async backend
+(`navi/asyncdispatch`, `navi/chronos`, `navi/js`): a plain `{.async.}` closure,
+`proc(ctx: NaviContext): Future[void] {.closure, gcsafe.}`. chronos's strict
+raises tracking is handled inside navi rather than stamped into the public type,
+so the same middleware source compiles on all of them.
 
 ### Decompression
 

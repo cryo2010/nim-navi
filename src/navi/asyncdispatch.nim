@@ -24,11 +24,12 @@ type
     clientp: ptr Navi        ## the owning client (see `client`); valid for the call
     sink: BodySink           ## non-nil for a streaming request
     idx: int                 ## index of the next middleware to run
-  NaviMiddleware* = proc(ctx: NaviContext): Future[void] {.closure.}
+  NaviMiddleware* = proc(ctx: NaviContext): Future[void] {.closure, gcsafe.}
     ## A middleware step; may be async. A closure, so it can capture: read/modify
     ## `ctx.req`, `await ctx.next()` to proceed -- or skip it to short-circuit --
-    ## then read/modify `ctx.res`. Write a factory `proc bearer(token): NaviMiddleware`
-    ## to close over per-instance config.
+    ## then read/modify `ctx.res`. Write it as a plain `{.async.}` proc (identical
+    ## spelling on every backend); a factory `proc bearer(token): NaviMiddleware`
+    ## closes over per-instance config.
 
   NaviConfig* {.requiresInit.} = object of NaviConfigBase
     ## `requiresInit`: build it with `newNaviConfig()`, not a bare `NaviConfig(...)`.
