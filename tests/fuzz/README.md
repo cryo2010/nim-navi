@@ -3,17 +3,29 @@
 The protocol cores are pure byte-in / event-out state machines, which makes them
 ideal fuzz targets: feed arbitrary bytes, assert nothing crashes. Targets:
 
-| target    | decoder under test                          |
+| target    | code under test                             |
 | --------- | ------------------------------------------- |
 | `hpack`   | HPACK header-block decoder                  |
 | `h1`      | HTTP/1.1 response parser                    |
 | `frame`   | HTTP/2 frame decoder                        |
 | `huffman` | HPACK Huffman string decoder                |
+| `h2conn`  | HTTP/2 connection state machine (`H2Conn`)  |
 
-Each target feeds the input into its decoder. Malformed input must raise a
+The first four feed the input into a decoder. Malformed input must raise a
 `CatchableError` (the target swallows it); a `Defect`, out-of-bounds read, hang,
 or ASan/UBSan report is a real bug. The build enables Nim's runtime checks
 (`--panics:on`) plus ASan/UBSan.
+
+`h2conn` is different: **structure-aware and differential.** The frame decoder
+already survives arbitrary bytes, but the padding / interim-1xx / trailers /
+flow-control bugs lived in `H2Conn`'s *semantics* -- it parsed frames fine, then
+mishandled them. So this target reads the input as a script to build a *valid*
+server response on one stream -- randomizing DATA/HEADERS padding, a HEADERS
+priority prefix, interim 1xx blocks, trailers, how the body is chunked, and how
+the wire is split across `feed()` calls -- then asserts `H2Conn` reassembles the
+exact status, headers, and body. Any mismatch (padding leaking in, an interim
+block polluting the final headers, a trailer surfacing) crashes the target and
+is a finding.
 
 ## Run
 

@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [hpack, h1, frame, huffman]
+        target: [hpack, h1, frame, huffman, h2conn]
     name: replay ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v4
@@ -31,7 +31,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [hpack, h1, frame, huffman]
+        target: [hpack, h1, frame, huffman, h2conn]
     name: fuzz ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v4
