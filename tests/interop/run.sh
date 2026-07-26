@@ -54,7 +54,10 @@ srv=$!
 # -b 255: pad HEADERS and DATA frames with up to 255 bytes, so navi must strip
 # the PADDED pad-length byte and trailing padding (RFC 9113 6.1/6.2). Without
 # that, the stray bytes corrupt HPACK / the response body.
-nghttpd -b 255 -d "$work/htdocs" --echo-upload "$padded_port" "$work/key.pem" "$work/cert.pem" \
+# --trailer: send a trailing HEADERS block after DATA; navi must not surface it
+# as a response header (RFC 9113 8.1). Exercises the same edge server both ways.
+nghttpd -b 255 --trailer 'x-navi-trailer: seen' \
+  -d "$work/htdocs" --echo-upload "$padded_port" "$work/key.pem" "$work/cert.pem" \
   >"$work/nghttpd-padded.log" 2>&1 &
 srv_padded=$!
 disown -a 2>/dev/null || true   # don't let the shell print a "Terminated" job notice
