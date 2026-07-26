@@ -41,6 +41,21 @@ libFuzzer writes discovered inputs to `tests/fuzz/corpus/<target>/` (gitignored)
 and any crash to `crash-*` in the working directory. `tests/fuzz/seeds/<target>/`
 holds the small committed starting corpus.
 
+### From any host (Docker)
+
+libFuzzer's runtime ships with clang on Linux but not with macOS's clang, so on
+macOS use the Docker image via `nimble fuzz`:
+
+```
+nimble fuzz                                  # 60s libFuzzer run of h2conn
+NAVI_FUZZ_TARGET=frame NAVI_FUZZ_TIME=120 nimble fuzz
+NAVI_FUZZ_TIME=replay nimble fuzz            # portable ASan seed replay
+```
+
+`NAVI_FUZZ_TARGET` (default `h2conn`) and `NAVI_FUZZ_TIME` (seconds, or `replay`;
+default `60`) select the target and mode. The corpus is bind-mounted, so coverage
+and any crash reproducer persist on the host under `tests/fuzz/corpus/<target>/`.
+
 ## CI
 
 `.github/workflows/fuzz.yml` replays the seed corpus on every PR (portable, fast)
