@@ -48,6 +48,28 @@ task valgrind, "Valgrind leak check of the TLS client path (Docker; Linux valgri
   exec "docker build -f tests/valgrind/Dockerfile -t navi-valgrind ."
   exec "docker run --rm -e NAVI_MM=" & mm & " navi-valgrind"
 
+task fuzz, "Coverage-guided libFuzzer run of a sans-io fuzz target (Docker; Linux libFuzzer)":
+  # libFuzzer's runtime ships with clang on Linux but not macOS, so the Docker
+  # image gives a reproducible run from any host. NAVI_FUZZ_TARGET picks the
+  # target (hpack|h1|frame|huffman|h2conn, default h2conn); NAVI_FUZZ_TIME is a
+  # duration in seconds or "replay" for the portable ASan seed replay (default
+  # 60). The corpus is mounted, so coverage and any crash reproducer persist on
+  # the host under tests/fuzz/corpus/<target>/.
+  let target = getEnv("NAVI_FUZZ_TARGET", "h2conn")
+  let mode = getEnv("NAVI_FUZZ_TIME", "60")
+  mkDir "tests/fuzz/corpus/" & target
+  # NB: nimble does not propagate a task's exit code (nim-lang/nimble#1802) -- not
+  # even an explicit quit -- so `nimble fuzz` exits 0 even on a crash. To tell a
+  # run apart programmatically, check for a written crash artifact (a finding):
+  #   ls tests/fuzz/corpus/<target>/crash-*
+  # or run the docker command directly (its exit code IS reliable). See the fuzz
+  # README. Interactively, a crash prints a stack trace + "SUMMARY: libFuzzer".
+  exec "docker build -f tests/fuzz/Dockerfile -t navi-fuzz ."
+  exec "docker run --rm " &
+       "-v \"$(pwd)/tests/fuzz/corpus:/navi/tests/fuzz/corpus\" " &
+       "-w /navi/tests/fuzz/corpus/" & target & " " &
+       "navi-fuzz " & target & " " & mode
+
 task badssl, "TLS client conformance against badssl.com (network; nightly)":
   exec "nim c -r --hints:off tests/interop/badssl.nim"
 

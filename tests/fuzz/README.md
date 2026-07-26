@@ -3,17 +3,29 @@
 The protocol cores are pure byte-in / event-out state machines, which makes them
 ideal fuzz targets: feed arbitrary bytes, assert nothing crashes. Targets:
 
-| target    | decoder under test                          |
+| target    | code under test                             |
 | --------- | ------------------------------------------- |
 | `hpack`   | HPACK header-block decoder                  |
 | `h1`      | HTTP/1.1 response parser                    |
 | `frame`   | HTTP/2 frame decoder                        |
 | `huffman` | HPACK Huffman string decoder                |
+| `h2conn`  | HTTP/2 connection state machine (`H2Conn`)  |
 
-Each target feeds the input into its decoder. Malformed input must raise a
+The first four feed the input into a decoder. Malformed input must raise a
 `CatchableError` (the target swallows it); a `Defect`, out-of-bounds read, hang,
 or ASan/UBSan report is a real bug. The build enables Nim's runtime checks
 (`--panics:on`) plus ASan/UBSan.
+
+`h2conn` is different: **structure-aware and differential.** The frame decoder
+already survives arbitrary bytes, but the padding / interim-1xx / trailers /
+flow-control bugs lived in `H2Conn`'s *semantics* -- it parsed frames fine, then
+mishandled them. So this target reads the input as a script to build a *valid*
+server response on one stream -- randomizing DATA/HEADERS padding, a HEADERS
+priority prefix, interim 1xx blocks, trailers, how the body is chunked, and how
+the wire is split across `feed()` calls -- then asserts `H2Conn` reassembles the
+exact status, headers, and body. Any mismatch (padding leaking in, an interim
+block polluting the final headers, a trailer surfacing) crashes the target and
+is a finding.
 
 ## Run
 
@@ -28,6 +40,42 @@ tests/fuzz/run.sh hpack replay
 libFuzzer writes discovered inputs to `tests/fuzz/corpus/<target>/` (gitignored)
 and any crash to `crash-*` in the working directory. `tests/fuzz/seeds/<target>/`
 holds the small committed starting corpus.
+
+### From any host (Docker)
+
+libFuzzer's runtime ships with clang on Linux but not with macOS's clang, so on
+macOS use the Docker image via `nimble fuzz`:
+
+```
+nimble fuzz                                  # 60s libFuzzer run of h2conn
+NAVI_FUZZ_TARGET=frame NAVI_FUZZ_TIME=120 nimble fuzz
+NAVI_FUZZ_TIME=replay nimble fuzz            # portable ASan seed replay
+```
+
+`NAVI_FUZZ_TARGET` (default `h2conn`) and `NAVI_FUZZ_TIME` (seconds, or `replay`;
+default `60`) select the target and mode. The corpus is bind-mounted, so coverage
+and any crash reproducer persist on the host under `tests/fuzz/corpus/<target>/`.
+
+### Telling a run apart
+
+`nimble` does not propagate a task's exit code (nim-lang/nimble#1802), so
+**`nimble fuzz` exits 0 even on a crash** -- do not trust `$?` from it. To decide
+pass/fail programmatically, either:
+
+- Check for a crash artifact (the reproducer libFuzzer writes on a finding):
+  ```
+  ls tests/fuzz/corpus/<target>/crash-* 2>/dev/null && echo "FUZZ FOUND A CRASH"
+  ```
+- Or run the container directly -- its exit code *is* reliable (0 clean, non-zero
+  on a crash):
+  ```
+  docker run --rm -v "$PWD/tests/fuzz/corpus:/navi/tests/fuzz/corpus" \
+    -w /navi/tests/fuzz/corpus/<target> navi-fuzz <target> 60
+  ```
+
+Interactively: a clean run ends with `Done <N> runs in <T> second(s)` (or
+`replay ok: <target>`); a crash ends with a Nim stack trace and
+`SUMMARY: libFuzzer: fuzz target exited`, naming the written `crash-*` file.
 
 ## CI
 

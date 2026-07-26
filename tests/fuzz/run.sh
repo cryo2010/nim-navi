@@ -6,10 +6,10 @@
 #   run.sh <target> replay      portable standalone replay of tests/fuzz/seeds/
 #                               <target> under ASan/UBSan (PR CI, any compiler)
 #
-# <target> is one of: hpack h1 frame huffman
+# <target> is one of: hpack h1 frame huffman h2conn
 set -euo pipefail
 
-target="${1:?usage: run.sh <hpack|h1|frame|huffman> [seconds|replay]}"
+target="${1:?usage: run.sh <hpack|h1|frame|huffman|h2conn> [seconds|replay]}"
 mode="${2:-30}"
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 src="$root/tests/fuzz/fuzz_${target}.nim"
