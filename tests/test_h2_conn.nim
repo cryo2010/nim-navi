@@ -291,3 +291,51 @@ suite "h2 connection errors":
     let toSend = c.feed(encodeFrame(ftPushPromise, 0, 1'u32, "\x00\x00\x00\x02hdr"))
     check c.connError.len > 0
     check firstFrameOfType(toSend, ftGoAway)
+
+proc paddedData(id: uint32, data: string, padLen: int, endStream: bool): string =
+  ## A DATA frame with `padLen` bytes of padding: [pad length][data][zero padding].
+  let flags = flagPadded or (if endStream: flagEndStream else: 0'u8)
+  encodeFrame(ftData, flags, id, char(padLen) & data & repeat('\0', padLen))
+
+suite "h2 frame padding":
+  test "strips DATA frame padding from the body":
+    let c = newServerConn()
+    let id = c.openStream()
+    var server = headForStream(id)
+    server.add paddedData(id, "hello", padLen = 7, endStream = true)
+    discard c.feed(server)
+    check c.streamDone(id)
+    check c.takeResponse(id).body == "hello"     # pad byte + 7 padding bytes gone
+
+  test "strips HEADERS frame padding before HPACK decode":
+    let c = newServerConn()
+    let id = c.openStream()
+    let block0 = (HpackEncoder()).encode(@[(":status", "200"), ("x-k", "v")])
+    let payload = char(4) & block0 & repeat('\0', 4)
+    var server = encodeFrame(ftHeaders, flagPadded or flagEndHeaders, id, payload)
+    server.add encodeData(id, "body", endStream = true)
+    discard c.feed(server)
+    check c.streamDone(id)
+    let resp = c.takeResponse(id)
+    check resp.status == 200
+    check resp.headers == @[("x-k", "v")]        # padding did not corrupt HPACK
+    check resp.body == "body"
+
+  test "delivers a zero-data padded DATA frame as empty":
+    let c = newServerConn()
+    let id = c.openStream()
+    var server = headForStream(id)
+    server.add paddedData(id, "", padLen = 5, endStream = true)
+    discard c.feed(server)
+    check c.streamDone(id)
+    check c.takeResponse(id).body == ""
+
+  test "rejects DATA padding that meets or exceeds the payload (PROTOCOL_ERROR)":
+    let c = newServerConn()
+    let id = c.openStream()
+    var server = headForStream(id)
+    # Pad length 10, but only 5 bytes follow the pad-length byte.
+    server.add encodeFrame(ftData, flagPadded or flagEndStream, id, char(10) & "short")
+    let toSend = c.feed(server)
+    check c.connError.len > 0
+    check firstFrameOfType(toSend, ftGoAway)
