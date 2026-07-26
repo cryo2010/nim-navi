@@ -126,6 +126,8 @@ were imported. Choose one of navi (sync), navi/asyncdispatch, navi/chronos,
 or navi/js.
 ```
 
+**Cross-target:** under `nim js`, `import navi/asyncdispatch` and `import navi/chronos` transparently fall back to `navi/js` (neither `std/asyncdispatch` nor `chronos` has a JavaScript backend). So a **library** written on either -- request code, plus middleware as a plain `{.async.}` closure -- compiles for native *and* the browser/Node from one source. The one target-specific line is at the **application** entry point: `waitFor main()` natively vs `discard main()` under js (JS cannot block). js capability limits still apply (no streaming upload, `res.httpVersion` empty, TLS/proxy are the runtime's; see the matrix below).
+
 ### Capability matrix
 
 Every backend shares the same request surface: HTTP/1.1, WebSocket (`ws`/`wss`),

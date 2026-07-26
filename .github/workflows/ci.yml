@@ -99,6 +99,15 @@ jobs:
           node-version: "22"
       - name: Install checksums
         run: nimble install -y checksums   # the native echo server pulls in proto/ws
+
+      # navi/asyncdispatch and navi/chronos fall back to navi/js under `nim js`,
+      # so a library written on either must compile for the browser/Node too
+      # (no chronos package needed on this target).
+      - name: Compile the js fallback (asyncdispatch/chronos -> navi/js)
+        run: |
+          nim js --path:src --hints:off -o:js_fallback_async.js  tests/js_fallback_async.nim
+          nim js --path:src --hints:off -o:js_fallback_chronos.js tests/js_fallback_chronos.nim
+
       # Run the script directly (not `nimble wsjs`): nimble does not propagate a
       # task's exit code (nim-lang/nimble#1802). jsws.sh uses `set -e`.
       - name: navi/js WebSocket runtime test
