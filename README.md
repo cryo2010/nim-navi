@@ -14,7 +14,7 @@ echo res.status, " ", res.body
 ```
 
 ```nim
-import navi/chronos   # or navi/asyncdispatch
+import navi/asyncdispatch  # or navi/chronos
 
 proc main() {.async.} =
   let api = newNavi()
@@ -52,9 +52,7 @@ requires "https://github.com/cryo2010/nim-navi >= 0.1.0"
 You still `import navi` (and `navi/asyncdispatch`, `navi/chronos`, `navi/js`)
 regardless of how it was installed.
 
-## Status
-
-navi is under active development. What works today:
+## Features
 
 - **HTTP/1.1 and HTTP/2** over http and https, IPv4 and IPv6. h2 is native (own
   frames + HPACK + Huffman), ALPN-negotiated with automatic h1 fallback.
@@ -82,8 +80,7 @@ HTTP/2 currently runs on the sync and asyncdispatch backends; chronos stays
 http/1.1 (its bundled TLS exposes no client ALPN). The `navi/js` backend defers
 the protocol to the browser/runtime. WebSocket runs on all four backends; the
 `navi/js` one wraps the runtime's native `WebSocket` (so it ignores custom
-handshake headers and the runtime handles ping/pong). Not built yet: **HTTP/3**.
-See [Roadmap](#roadmap).
+handshake headers and the runtime handles ping/pong).
 
 WebSocket in brief (sync; on `navi/asyncdispatch` the same calls are `await`ed):
 
@@ -336,7 +333,7 @@ cfg.maxResponseBytes = 10 * 1024 * 1024   # 10 MiB; 0 (default) is unlimited
 let api = newNavi(cfg)
 ```
 
-### Auth, cookies, and proxy
+### Auth and proxy
 
 ```nim
 var cfg = newNaviConfig()
@@ -345,7 +342,9 @@ cfg.proxy = "http://proxy:8080"     # else HTTP(S)_PROXY / NO_PROXY env
 let api = newNavi(cfg)
 ```
 
-Each client keeps a cookie jar: cookies from `Set-Cookie` are stored and replayed on later requests to the same client (matched by domain, path, and Secure).
+### Cookies
+
+Each client keeps a cookie jar automatically: cookies from `Set-Cookie` are stored and replayed on later requests to the same client (matched by domain, path, and Secure). There is nothing to configure.
 
 ### Middleware
 
@@ -592,8 +591,6 @@ response as `.response`. Other request errors: `TimeoutError` (exceeded
 HTTP/1.1 and HTTP/2 with the full policy layer (retries, redirects, middleware,
 cookies, auth, proxy, decompression, body helpers, throw-on-non-2xx) are done.
 
-- **HTTP/3**: reserved for when a usable QUIC stack lands on the chronos backend.
-
 Known follow-ups on the chronos backend: HTTP/2 and client certificates (mTLS).
 Its bundled BearSSL exposes no client ALPN (so no h2 negotiation) and no
 client-certificate hook. Custom-CA verification via `caFile` works there today.
@@ -615,9 +612,8 @@ requests and concurrent multiplexing.
 ## Thanks
 
 - [ky](https://github.com/sindresorhus/ky) by Sindre Sorhus, whose minimalist API shaped navi's request surface.
-- The [nghttp2](https://nghttp2.org/) project: the reference server navi's HTTP/2 is tested against, and the source of the [HPACK test corpus](https://github.com/http2jp/hpack-test-case) (via [http2jp](https://github.com/http2jp)).
+- [nghttp2](https://nghttp2.org/): the reference HTTP/2 server navi is tested against, and the source of the [HPACK test corpus](https://github.com/http2jp/hpack-test-case) (via [http2jp](https://github.com/http2jp)).
 - [dart-archive/http2](https://github.com/dart-archive/http2) for the RFC 7541 Huffman decoding table (BSD-licensed).
-- [chronos](https://github.com/status-im/nim-chronos) for the async backend of the same name.
 
 ## License
 
