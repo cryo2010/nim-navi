@@ -58,6 +58,12 @@ task fuzz, "Coverage-guided libFuzzer run of a sans-io fuzz target (Docker; Linu
   let target = getEnv("NAVI_FUZZ_TARGET", "h2conn")
   let mode = getEnv("NAVI_FUZZ_TIME", "60")
   mkDir "tests/fuzz/corpus/" & target
+  # NB: nimble does not propagate a task's exit code (nim-lang/nimble#1802) -- not
+  # even an explicit quit -- so `nimble fuzz` exits 0 even on a crash. To tell a
+  # run apart programmatically, check for a written crash artifact (a finding):
+  #   ls tests/fuzz/corpus/<target>/crash-*
+  # or run the docker command directly (its exit code IS reliable). See the fuzz
+  # README. Interactively, a crash prints a stack trace + "SUMMARY: libFuzzer".
   exec "docker build -f tests/fuzz/Dockerfile -t navi-fuzz ."
   exec "docker run --rm " &
        "-v \"$(pwd)/tests/fuzz/corpus:/navi/tests/fuzz/corpus\" " &

@@ -102,17 +102,23 @@ fuzzMain:
     wire.add encodeFrame(ftHeaders, flagEndHeaders or flagEndStream, id,
                          enc.encode(@[("x-trailer", "t")]))
 
-  # Deliver the wire in input-driven slices, exercising split-across-feeds.
-  var i = 0
-  while i < wire.len:
-    let n = min(wire.len - i, 1 + (cur.nextByte * 5) mod 4096)
-    discard c.feed(wire[i ..< i + n])
-    i += n
-
-  doAssert c.streamDone(id), "stream did not complete"
-  let resp = c.takeResponse(id)
-  doAssert resp.status == parseInt(status),
-    "status " & $resp.status & " != " & status
-  doAssert resp.body == body,
-    "body mismatch: got " & $resp.body.len & " bytes, want " & $body.len
-  doAssert resp.headers == finalHeaders, "final headers mismatch"
+  # The sequence above is valid, so feeding must not raise and the reassembly must
+  # match. Any CatchableError here is a finding -- but under libFuzzer an escaping
+  # CatchableError does NOT abort the process (it unwinds silently across the C
+  # callback), so convert it to a fatal assertion. A failed reassembly doAssert
+  # raises a Defect, which aborts on its own and is not caught here.
+  try:
+    var i = 0
+    while i < wire.len:
+      let n = min(wire.len - i, 1 + (cur.nextByte * 5) mod 4096)
+      discard c.feed(wire[i ..< i + n])   # input-driven slices: split-across-feeds
+      i += n
+    doAssert c.streamDone(id), "stream did not complete"
+    let resp = c.takeResponse(id)
+    doAssert resp.status == parseInt(status),
+      "status " & $resp.status & " != " & status
+    doAssert resp.body == body,
+      "body mismatch: got " & $resp.body.len & " bytes, want " & $body.len
+    doAssert resp.headers == finalHeaders, "final headers mismatch"
+  except CatchableError as e:
+    doAssert false, "valid frames raised " & $e.name & ": " & e.msg

@@ -56,6 +56,27 @@ NAVI_FUZZ_TIME=replay nimble fuzz            # portable ASan seed replay
 default `60`) select the target and mode. The corpus is bind-mounted, so coverage
 and any crash reproducer persist on the host under `tests/fuzz/corpus/<target>/`.
 
+### Telling a run apart
+
+`nimble` does not propagate a task's exit code (nim-lang/nimble#1802), so
+**`nimble fuzz` exits 0 even on a crash** -- do not trust `$?` from it. To decide
+pass/fail programmatically, either:
+
+- Check for a crash artifact (the reproducer libFuzzer writes on a finding):
+  ```
+  ls tests/fuzz/corpus/<target>/crash-* 2>/dev/null && echo "FUZZ FOUND A CRASH"
+  ```
+- Or run the container directly -- its exit code *is* reliable (0 clean, non-zero
+  on a crash):
+  ```
+  docker run --rm -v "$PWD/tests/fuzz/corpus:/navi/tests/fuzz/corpus" \
+    -w /navi/tests/fuzz/corpus/<target> navi-fuzz <target> 60
+  ```
+
+Interactively: a clean run ends with `Done <N> runs in <T> second(s)` (or
+`replay ok: <target>`); a crash ends with a Nim stack trace and
+`SUMMARY: libFuzzer: fuzz target exited`, naming the written `crash-*` file.
+
 ## CI
 
 `.github/workflows/fuzz.yml` replays the seed corpus on every PR (portable, fast)
