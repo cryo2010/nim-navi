@@ -30,6 +30,7 @@ type
     tooLarge: bool        ## response body exceeded maxBodyBytes (we RST'd it)
     hdrBuf: string
     hdrEndStream: bool
+    sawFinal: bool        ## the final (non-1xx) response HEADERS block has arrived
     recvPending: int      ## received bytes not yet acked with a WINDOW_UPDATE
     sendBuf: string       ## request body not yet on the wire (flow-control bound)
     sendOff: int          ## bytes of sendBuf already sent
@@ -132,27 +133,51 @@ proc encodeRequest*(c: H2Conn, streamId: uint32, headers: openArray[HeaderPair],
     s.sendBuf = body
     c.flushSend(streamId, s, result)
 
-proc replenishRecv(c: H2Conn, sid: uint32, s: Stream, n: int, outbuf: var string) =
-  ## Give back receive-window credit for `n` consumed bytes, batched: emit a
-  ## WINDOW_UPDATE only once the unacked total crosses the threshold, so a large
-  ## download costs a handful of control frames instead of one per DATA frame.
-  s.recvPending += n
-  if s.recvPending >= streamReplenish:
-    outbuf.add encodeWindowUpdate(sid, uint32(s.recvPending))
-    s.recvPending = 0
+proc replenishConn(c: H2Conn, n: int, outbuf: var string) =
+  ## Give back connection-level receive-window credit for `n` consumed DATA bytes,
+  ## batched. Every DATA frame's payload counts against the connection window,
+  ## regardless of stream state (RFC 9113 6.9.1) -- see the DATA handler.
   c.connRecvPending += n
   if c.connRecvPending >= connReplenish:
     outbuf.add encodeWindowUpdate(0, uint32(c.connRecvPending))
     c.connRecvPending = 0
 
+proc replenishRecv(c: H2Conn, sid: uint32, s: Stream, n: int, outbuf: var string) =
+  ## Give back stream- and connection-level receive-window credit for `n` consumed
+  ## bytes on an active stream, batched: emit a WINDOW_UPDATE only once the unacked
+  ## total crosses the threshold, so a large download costs a handful of control
+  ## frames instead of one per DATA frame.
+  s.recvPending += n
+  if s.recvPending >= streamReplenish:
+    outbuf.add encodeWindowUpdate(sid, uint32(s.recvPending))
+    s.recvPending = 0
+  c.replenishConn(n, outbuf)
+
 proc applyHeaders(c: H2Conn, s: Stream) =
+  # HPACK is stateful, so every block must be decoded even when its fields are
+  # dropped -- otherwise the dynamic table desyncs and later blocks corrupt.
+  var status = 0
+  var headers: seq[(string, string)]
   for (name, value) in c.dec.decode(s.hdrBuf):
     if name == ":status":
-      try: s.resp.status = parseInt(value)
+      try: status = parseInt(value)
       except ValueError: discard
     elif not name.startsWith(":"):
-      s.resp.headers.add((name, value))
+      headers.add((name, value))
   s.hdrBuf.setLen(0)
+  if s.sawFinal:
+    # A header block after the final response is trailers (RFC 9113 8.1). navi
+    # does not surface trailers; they were decoded above (HPACK sync) and dropped.
+    if s.hdrEndStream: s.ended = true
+    return
+  if status in 100 .. 199:
+    # Interim response (100 Continue, 103 Early Hints, ...): its headers do not
+    # belong to the final response, and it never carries END_STREAM. Discard it;
+    # the final response follows in a later HEADERS block.
+    return
+  s.sawFinal = true
+  s.resp.status = status
+  for h in headers: s.resp.headers.add(h)
   if s.hdrEndStream: s.ended = true
 
 proc connFail(c: H2Conn, code: uint32, reason: string, outbuf: var string) =
@@ -230,6 +255,10 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
           s.hdrEndStream = (f.flags and flagEndStream) != 0
         if (f.flags and flagEndHeaders) != 0: c.applyHeaders(s)
   of uint8(ftData):
+    # Every DATA payload -- pad length byte and padding included (RFC 9113 6.9.1)
+    # -- counts against the connection flow-control window, even on a stream we
+    # have reset or never opened. Skipping that leaks the window and eventually
+    # stalls a long-lived pooled/mux connection.
     let s = c.streams.getOrDefault(f.streamId)
     if s != nil and not s.reset:
       var data = f.payload
@@ -238,12 +267,13 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
       if c.maxBodyBytes > 0 and s.resp.body.len > c.maxBodyBytes:  # over the size cap: RST
         outbuf.add encodeRstStream(f.streamId, errCancel)
         s.reset = true; s.ended = true; s.tooLarge = true
+        c.replenishConn(f.payload.len, outbuf)   # still owe the connection window
       else:
-        # Flow control counts the whole DATA payload -- pad length byte and
-        # padding included (RFC 9113 6.9.1) -- though only `data` reaches the body.
         if f.payload.len > 0:
           c.replenishRecv(f.streamId, s, f.payload.len, outbuf)
         if (f.flags and flagEndStream) != 0: s.ended = true
+    elif f.payload.len > 0:
+      c.replenishConn(f.payload.len, outbuf)     # reset/unknown stream: keep the conn window in sync
   of uint8(ftRstStream):
     let s = c.streams.getOrDefault(f.streamId)
     if s != nil:

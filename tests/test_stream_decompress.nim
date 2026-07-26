@@ -72,3 +72,21 @@ suite "stream() decompresses the response body":
     check res.status == 200
     check collected == gz                      # raw compressed bytes
     joinThread(th)
+
+suite "stacked content-encoding":
+  test "a buffered get decodes a doubly-encoded body (gzip, gzip)":
+    const port = 8968
+    # {"ok":true} gzipped twice; Content-Encoding lists them in applied order.
+    let body = hexToBytes(
+      "1f8b08000000000002ff93efe6600001a6ffabc34e9d0fdba4a5a9e5bb9" &
+      "6956142fc95e5dc406100aa34a89a1f000000")
+    let payload = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip, gzip\r\n" &
+                  "Content-Length: " & $body.len & "\r\nConnection: close\r\n\r\n" & body
+    var th: Thread[ServerCtx]
+    startRaw(th, port, payload)
+
+    let res = newNavi().get("http://127.0.0.1:" & $port & "/")
+    check res.status == 200
+    check res.body == """{"ok":true}"""         # both gzip layers undone, in reverse
+    check not res.headers.contains("content-encoding")
+    joinThread(th)

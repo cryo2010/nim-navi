@@ -64,6 +64,27 @@ suite "h1 parse":
     let r = parseAll("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 0\r\n\r\n")
     check r.headers.get("CONTENT-TYPE") == "text/html"
 
+  test "skips a 103 Early Hints interim response before the final one":
+    let r = parseAll(
+      "HTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\n" &
+      "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+    check r.status == 200
+    check r.body == "hello"
+    check not r.headers.contains("link")          # interim header did not leak
+
+  test "skips 100 Continue then reads the final response":
+    let r = parseAll(
+      "HTTP/1.1 100 Continue\r\n\r\n" &
+      "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+    check r.status == 204
+    check r.body == ""
+
+  test "skips an interim response split across feeds":
+    let r = parseAll("HTTP/1.1 100 Cont", "inue\r\n\r\nHTTP/1.1 200 OK\r\n",
+                     "Content-Length: 2\r\n\r\nhi")
+    check r.status == 200
+    check r.body == "hi"
+
   test "rejects a negative Content-Length without crashing":
     # A peer-controlled negative length must raise (caught upstream), not slice
     # out of bounds into a RangeDefect crash (found by tests/fuzz).

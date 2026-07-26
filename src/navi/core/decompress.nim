@@ -325,22 +325,36 @@ proc decodingSink*(encoding: string, inner: BodySink): BodySink =
     if plain.len > 0: inner(plain.toOpenArrayByte(0, plain.high))
 
 proc decodeBody*(resp: var Response, opts: NaviConfigBase) =
-  ## Decompress the body in place per Content-Encoding, then drop the headers
-  ## that described the encoded form. No-op when decompression is disabled or
-  ## the encoding is identity/unknown.
+  ## Decompress the body in place per Content-Encoding, then drop the headers that
+  ## described the encoded form. Handles a stacked encoding (e.g. `gzip, br`) by
+  ## decoding in reverse of the applied order (RFC 9110 8.4). No-op when
+  ## decompression is disabled, the encoding is identity, or any layer is one we
+  ## cannot decode (the body is then left untouched, header intact).
   if not opts.wantsDecompress: return
-  case resp.headers.get("content-encoding").strip.toLowerAscii
-  of "gzip", "x-gzip":
-    resp.body = inflateBytes(resp.body, wbAuto)
-  of "deflate":
-    # "deflate" is officially zlib-wrapped, but some servers send raw deflate.
-    try: resp.body = inflateBytes(resp.body, wbAuto)
-    except ValueError: resp.body = inflateBytes(resp.body, wbRaw)
-  of "br":
-    resp.body = decodeBrotli(resp.body)
-  of "zstd":
-    resp.body = decodeZstd(resp.body)
-  else:
-    return
+  let ce = resp.headers.get("content-encoding")
+  if ce.len == 0: return
+  var encodings: seq[string]
+  for part in ce.split(','):
+    let e = part.strip.toLowerAscii
+    if e.len == 0 or e == "identity": continue
+    if e notin ["gzip", "x-gzip", "deflate", "br", "zstd"]:
+      return   # an encoding we cannot decode: hand back the body as received
+    encodings.add e
+  if encodings.len == 0: return
+  # The header lists encodings in the order they were applied, so undo them from
+  # the last one back to the first.
+  for i in countdown(encodings.high, 0):
+    case encodings[i]
+    of "gzip", "x-gzip":
+      resp.body = inflateBytes(resp.body, wbAuto)
+    of "deflate":
+      # "deflate" is officially zlib-wrapped, but some servers send raw deflate.
+      try: resp.body = inflateBytes(resp.body, wbAuto)
+      except ValueError: resp.body = inflateBytes(resp.body, wbRaw)
+    of "br":
+      resp.body = decodeBrotli(resp.body)
+    of "zstd":
+      resp.body = decodeZstd(resp.body)
+    else: discard
   resp.headers.del("content-encoding")
   resp.headers["content-length"] = $resp.body.len
