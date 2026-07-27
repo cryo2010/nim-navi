@@ -18,7 +18,10 @@ for a configurable duration:
   plain: its codec is the runtime's.)
 - a **persistent WebSocket** round trip (text + binary echo) per client;
 - **several navi clients**, run concurrently on the async backends
-  (asyncdispatch, chronos, js) and sequentially on sync;
+  (asyncdispatch, chronos, js) and sequentially on sync. On the async backends
+  each client also fires its whole verb batch **concurrently** (verbs.len
+  requests in flight at once), so the connection pool / h2 multiplexer is
+  exercised under real contention, not one request at a time;
 - all over **TLS**, with certificate verification on (the client trusts the
   server's self-signed cert), through **a middleware** that stamps `x-stress: 1`.
 

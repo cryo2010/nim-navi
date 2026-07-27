@@ -5,17 +5,24 @@
 ## stamping x-stress, until a deadline. A failed assert rejects the promise and
 ## exits Node non-zero. Config comes from process.env (std/os is thin under js).
 ##
-## Note: the per-client loop is one closure that *closes over* its Navi rather
-## than taking it as a parameter. Under `nim js`, a value-object (`Navi`) passed
-## as a parameter into an `{.async.}` proc is lost across an `await`; a captured
-## upvalue survives. (Not an issue on the native backends.)
+## Note: each client is held behind a `ref` (`Client`) rather than passing the
+## `Navi` value object around; a ref survives `await` cleanly under `nim js`.
 import std/strutils
 import navi/js
 
 proc envJs(name, dflt: cstring): cstring {.importjs: "(process.env[#] ?? #)".}
 proc nowMs(): float {.importjs: "Date.now()".}
+proc delayMs(ms: int): Future[void] {.importjs: "(new Promise(function(r){ setTimeout(r,#); }))".}
 
 const verbs = [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS]
+
+proc openWs(api: Navi, url: string): Future[WebSocket] {.async.} =
+  # Retry a transient WS-open failure (see the async client for why).
+  for attempt in 1 .. 10:
+    try: return await api.websocket(url)
+    except CatchableError:
+      if attempt == 10: raise
+      await delayMs(20)
 
 proc stampMw(): NaviMiddleware =
   result = proc(ctx: NaviContext) {.async.} =
@@ -33,41 +40,55 @@ proc main() {.async.} =
   let base = $envJs("NAVI_STRESS_URL", "https://127.0.0.1:9443")
   let clients = parseInt($envJs("NAVI_STRESS_CLIENTS", "3"))
   let wsUrl = "wss://" & base["https://".len .. ^1] & "/ws"
-  let deadline = nowMs() + secs * 1000.0
+  type Client = ref object
+    api: Navi
+    ws: WebSocket
 
-  proc oneClient(): Future[int] {.async.} =
-    let api = mkClient(base)              # captured upvalue (survives awaits under js)
-    let ws = await api.websocket(wsUrl)   # one persistent WS per client
+  proc oneClient(c: Client, deadline: float): Future[int] {.async.} =
     var ops = 0
     while nowMs() < deadline:
+      # Fire every verb concurrently, then await each -- verbs.len fetches in
+      # flight at once (undici pools the connections) rather than one at a time.
+      var futs: seq[Future[Response]]
+      var specs: seq[tuple[v: HttpVerb, body, ct: string]]
       for v in verbs:
         let sentBody = if v in {POST, PUT, PATCH}: "payload-" & $v else: ""
         let sentCt = if sentBody.len > 0: "text/plain" else: ""
         var hh = initHeaders()
         if sentCt.len > 0: hh["content-type"] = sentCt
-        let res = await api.request(v, "/echo", headers = hh, body = sentBody)
-        doAssert res.status == 200, $v & " -> " & $res.status
-        doAssert res.headers.get("x-echo-method") == $v, "method echo: " & res.headers.get("x-echo-method")
+        futs.add c.api.request(v, "/echo", headers = hh, body = sentBody)   # started now
+        specs.add (v: v, body: sentBody, ct: sentCt)
+      for i in 0 ..< futs.len:
+        let res = await futs[i]
+        let s = specs[i]
+        doAssert res.status == 200, $s.v & " -> " & $res.status
+        doAssert res.headers.get("x-echo-method") == $s.v, "method echo: " & res.headers.get("x-echo-method")
         doAssert res.headers.get("x-echo-stress") == "1", "middleware header not seen by server"
-        if v != HEAD:                             # HEAD carries no body
-          doAssert res.body == sentBody, "body echo mismatch: " & res.body
-          doAssert res.headers.get("content-length") == $sentBody.len,
+        if s.v != HEAD:                           # HEAD carries no body
+          doAssert res.body == s.body, "body echo mismatch: " & res.body
+          doAssert res.headers.get("content-length") == $s.body.len,
             "content-length: " & res.headers.get("content-length")
-          doAssert res.headers.get("content-type") == sentCt,
+          doAssert res.headers.get("content-type") == s.ct,
             "content-type: " & res.headers.get("content-type")
-      await ws.send("ping")
-      let t = await ws.receive()
+      await c.ws.send("ping")
+      let t = await c.ws.receive()
       doAssert t.kind == wmText and t.data == "ping", "ws text echo"
-      await ws.send("bytes", binary = true)
-      let b = await ws.receive()
+      await c.ws.send("bytes", binary = true)
+      let b = await c.ws.receive()
       doAssert b.kind == wmBinary and b.data == "bytes", "ws binary echo"
       inc ops
-    await ws.close()
+    await c.ws.close()
     return ops
 
-  # Start every client, then await each: they run concurrently on the event loop.
+  # Open every client's WebSocket first, then run the concurrent HTTP soak, so a
+  # WS handshake never competes with the fetch burst for connection setup.
+  var pool: seq[Client]
+  for _ in 0 ..< clients:
+    let api = mkClient(base)
+    pool.add Client(api: api, ws: await openWs(api, wsUrl))
+  let deadline = nowMs() + secs * 1000.0
   var loops: seq[Future[int]]
-  for _ in 0 ..< clients: loops.add oneClient()
+  for c in pool: loops.add oneClient(c, deadline)
   var total = 0
   for f in loops: total += await f
   let rps = int(float(total * verbs.len) / secs)   # HTTP requests/s (WS excluded)

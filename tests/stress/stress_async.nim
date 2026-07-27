@@ -31,6 +31,11 @@ proc mkClient(base, cert: string): Navi =
   newNavi(cfg)
 
 proc httpRound(api: Navi) {.async.} =
+  # Fire every verb concurrently on one client, then await each and check it, so
+  # verbs.len requests are in flight at once -- stressing the connection pool and
+  # (on an h2 origin) the stream multiplexer, which a serial await-each would not.
+  var futs: seq[Future[Response]]
+  var specs: seq[tuple[v: HttpVerb, body, ct, enc: string]]
   for v in verbs:
     let sentBody = if v in {POST, PUT, PATCH}: "payload-" & $v else: ""
     let sentCt = if sentBody.len > 0: "text/plain" else: ""
@@ -45,18 +50,22 @@ proc httpRound(api: Navi) {.async.} =
       wireBody = zcompress(sentBody, enc)
       h["content-encoding"] = enc
       h["x-want-encoding"] = enc
-    let res = await api.request(v, "/echo", headers = h, body = wireBody)
-    doAssert res.status == 200, $v & " -> " & $res.status
-    doAssert res.headers.get("x-echo-method") == $v, "method echo: " & res.headers.get("x-echo-method")
+    futs.add api.request(v, "/echo", headers = h, body = wireBody)   # started now
+    specs.add (v: v, body: sentBody, ct: sentCt, enc: enc)
+  for i in 0 ..< futs.len:
+    let res = await futs[i]
+    let s = specs[i]
+    doAssert res.status == 200, $s.v & " -> " & $res.status
+    doAssert res.headers.get("x-echo-method") == $s.v, "method echo: " & res.headers.get("x-echo-method")
     doAssert res.headers.get("x-echo-stress") == "1", "middleware header not seen by server"
-    if v != HEAD:                               # HEAD carries no body
-      doAssert res.body == sentBody, "body echo mismatch: " & res.body   # navi decoded it
-      doAssert res.headers.get("content-length") == $sentBody.len,       # rewritten to decoded len
+    if s.v != HEAD:                             # HEAD carries no body
+      doAssert res.body == s.body, "body echo mismatch: " & res.body   # navi decoded it
+      doAssert res.headers.get("content-length") == $s.body.len,       # rewritten to decoded len
         "content-length: " & res.headers.get("content-length")
-      doAssert res.headers.get("content-type") == sentCt,
+      doAssert res.headers.get("content-type") == s.ct,
         "content-type: " & res.headers.get("content-type")
-      if enc.len > 0:
-        doAssert res.headers.get("content-encoding") == "",              # navi consumed it
+      if s.enc.len > 0:
+        doAssert res.headers.get("content-encoding") == "",            # navi consumed it
           "content-encoding not consumed: " & res.headers.get("content-encoding")
 
 proc wsRound(ws: WebSocket) {.async.} =
@@ -67,14 +76,26 @@ proc wsRound(ws: WebSocket) {.async.} =
   let b = await ws.receive()
   doAssert b.kind == wmBinary and b.data == "bytes", "ws binary echo"
 
-proc clientLoop(api: Navi, wsUrl: string, deadline: float): Future[int] {.async.} =
-  let ws = await api.websocket(wsUrl)          # one persistent WS per client
+type Client = ref object                       # ref wrapper: Navi has no valid default
+  api: Navi
+  ws: WebSocket
+
+proc openWs(api: Navi, url: string): Future[WebSocket] {.async.} =
+  # Retry a transient WS-open failure: the simple threaded test server can drop a
+  # connection under churn. A genuine setup error still surfaces after the tries.
+  for attempt in 1 .. 10:
+    try: return await api.websocket(url)
+    except CatchableError:
+      if attempt == 10: raise
+      await sleepAsync(20)   # ms; int form works on both asyncdispatch and chronos
+
+proc clientLoop(c: Client, deadline: float): Future[int] {.async.} =
   var ops = 0
   while epochTime() < deadline:
-    await httpRound(api)
-    await wsRound(ws)
+    await httpRound(c.api)
+    await wsRound(c.ws)
     inc ops
-  await ws.close()
+  await c.ws.close()
   return ops
 
 proc main() {.async.} =
@@ -83,12 +104,17 @@ proc main() {.async.} =
   let cert = getEnv("NAVI_STRESS_CERT", "")
   let clients = parseInt(getEnv("NAVI_STRESS_CLIENTS", "3"))
   let wsUrl = "wss://" & base["https://".len .. ^1] & "/ws"
-  let deadline = epochTime() + secs
 
-  # Start every client, then await each: they run concurrently on the event loop.
-  var loops: seq[Future[int]]
+  # Open every client's WebSocket first (sequentially), so the concurrent HTTP
+  # soak that follows never competes with a WS TLS handshake for CPU/accepts.
+  var pool: seq[Client]
   for _ in 0 ..< clients:
-    loops.add clientLoop(mkClient(base, cert), wsUrl, deadline)
+    let api = mkClient(base, cert)
+    pool.add Client(api: api, ws: await openWs(api, wsUrl))
+
+  let deadline = epochTime() + secs
+  var loops: seq[Future[int]]                  # start all, then await: concurrent
+  for c in pool: loops.add clientLoop(c, deadline)
   var total = 0
   for f in loops: total += await f
   let rps = int(float(total * verbs.len) / secs)   # HTTP requests/s (WS excluded)
