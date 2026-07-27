@@ -1,0 +1,31 @@
+name: live
+
+# Live interop against real public servers and CDNs (Google, Cloudflare, Fastly,
+# Go net/http2, nghttp2, Akamai, Apache Traffic Server). This touches the open
+# internet, so it runs nightly and on demand, never as a PR gate. The test
+# (tests/interop/live.nim) tolerates network noise and server-side rejections,
+# failing only on a genuine navi protocol/parse bug.
+on:
+  schedule:
+    - cron: "0 6 * * *"     # 06:00 UTC nightly
+  workflow_dispatch:
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    name: live server/CDN interop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # navi's only required Nim dep (MD5 for Digest auth); this job builds with
+      # raw `nim`, so it isn't resolved automatically.
+      - name: Install checksums
+        run: nimble install -y checksums
+
+      - name: Run the live interop test
+        run: nim c -r --path:src -d:ssl --hints:off tests/interop/live.nim

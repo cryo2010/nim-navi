@@ -93,6 +93,14 @@ task interop, "Run the nghttpd HTTP/2 interop suite (needs nghttpd + openssl)":
   # Starts the nghttp2 reference server over TLS+h2 and runs navi against it.
   exec "bash tests/interop/run.sh"
 
+task servers, "Multi-server HTTP/2 interop: nginx, Caddy, h2o (needs Docker + openssl)":
+  # Runs navi's h2 client (and chronos h1) against three unrelated server stacks.
+  exec "bash tests/interop/servers.sh"
+
+task live, "Live interop against real public servers/CDNs (network; nightly)":
+  # Tolerates network noise/server rejections; fails only on a navi protocol bug.
+  exec "nim c -r --path:src -d:ssl --hints:off tests/interop/live.nim"
+
 task wsjs, "navi/js WebSocket runtime test (Node client vs a native server)":
   # Runs the navi/js WebSocket client under Node against a native echo server.
   exec "bash tests/interop/jsws.sh"

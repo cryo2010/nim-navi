@@ -185,6 +185,31 @@ jobs:
       - name: Run the mTLS interop test
         run: bash tests/interop/mtls.sh
 
+  multiserver:
+    runs-on: ubuntu-latest
+    name: multi-server interop (nginx/caddy/h2o)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install checksums
+        run: nimble install -y checksums
+
+      # Only needed for the navi/chronos entry (the h1+TLS leg of the suite).
+      - name: Install chronos
+        run: nimble install -y "chronos@>= 4.0.0"
+
+      # nghttpd covers the nghttp2 reference; this runs navi's h2 client against
+      # three unrelated stacks (nginx, Caddy/Go net/http2, h2o) plus the h1+TLS
+      # path via chronos. All in containers, so it is offline and reproducible.
+      # Docker Compose ships on the ubuntu-latest runner.
+      - name: Run the multi-server interop suite
+        run: bash tests/interop/servers.sh
+
   leak:
     runs-on: ubuntu-latest
     strategy:

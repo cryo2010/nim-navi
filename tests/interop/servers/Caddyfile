@@ -1,0 +1,9 @@
+{
+	auto_https off
+	admin off
+}
+:8445 {
+	tls /certs/cert.pem /certs/key.pem
+	root * /htdocs
+	file_server
+}
