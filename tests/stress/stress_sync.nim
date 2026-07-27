@@ -46,20 +46,23 @@ proc main() =
   let wsUrl = "wss://" & base["https://".len .. ^1] & "/ws"
   let deadline = epochTime() + secs
 
-  var apis: seq[Navi]
-  var sockets: seq[WebSocket]
+  # A ref wrapper so the seq element has a valid default: `Navi` has none (its
+  # `config` is {.requiresInit.}), which would make `seq[Navi]` growth warn.
+  type Client = ref object
+    api: Navi
+    ws: WebSocket
+  var pool: seq[Client]
   for _ in 0 ..< clients:
     let api = mkClient(base, cert)
-    apis.add api
-    sockets.add api.websocket(wsUrl)          # one persistent WS per client
+    pool.add Client(api: api, ws: api.websocket(wsUrl))   # one persistent WS per client
 
   var total = 0
   while epochTime() < deadline:
-    for i in 0 ..< clients:
-      httpRound(apis[i])
-      wsRound(sockets[i])
+    for c in pool:
+      httpRound(c.api)
+      wsRound(c.ws)
       inc total
-  for ws in sockets: ws.close()
+  for c in pool: c.ws.close()
   echo "[sync] ", clients, " clients, ", total, " batches over ", secs, "s: OK"
 
 main()
