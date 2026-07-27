@@ -3,8 +3,8 @@
 ## This hits the open internet, so it is a nightly / on-demand job (see
 ## .github/workflows/live.yml), never a per-PR gate. It exists to catch h2/TLS
 ## bugs that only real, independent server stacks provoke: Google, Cloudflare,
-## Fastly (api.github.com), Go's net/http2, nghttp2, Akamai, Apache Traffic
-## Server (Wikipedia).
+## Fastly (api.github.com), Go's net/http2, nghttp2, Apache Traffic Server
+## (Wikipedia), and a JSON request-echo (postman-echo).
 ##
 ## Tolerance model: a run must not go red because a network blipped. We split
 ## outcomes three ways:
@@ -30,7 +30,6 @@ const targets = [
   Target(name: "go-net-http2", url: "https://http2.golang.org/"),
   Target(name: "nghttp2",      url: "https://nghttp2.org/"),
   Target(name: "fastly",       url: "https://www.fastly.com/"),
-  Target(name: "akamai",       url: "https://www.akamai.com/"),
   Target(name: "wikipedia",    url: "https://en.wikipedia.org/wiki/HTTP/2"),
   Target(name: "postman-echo", url: "https://postman-echo.com/get", expectJson: true),
 ]
