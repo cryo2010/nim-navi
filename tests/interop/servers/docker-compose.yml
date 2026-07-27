@@ -1,0 +1,33 @@
+# Independent HTTP/2 server stacks for navi's interop suite. nghttpd (the nghttp2
+# reference) is covered by run.sh; this adds nginx (its own h2), Caddy (Go's
+# net/http2), and h2o (its own C h2), so navi's client is exercised against
+# several unrelated implementations. Each serves the same TLS cert + htdocs, on
+# its own port. Cert and htdocs come from the host via NAVI_CERTDIR / NAVI_HTDOCS
+# (set by servers.sh).
+services:
+  nginx:
+    image: nginx:1.27
+    command: ["nginx", "-c", "/nginx.conf", "-g", "daemon off;"]
+    volumes:
+      - ./nginx.conf:/nginx.conf:ro
+      - ${NAVI_CERTDIR}:/certs:ro
+      - ${NAVI_HTDOCS}:/htdocs:ro
+    ports: ["127.0.0.1:8443:8443"]
+
+  caddy:
+    image: caddy:2
+    command: ["caddy", "run", "--config", "/Caddyfile", "--adapter", "caddyfile"]
+    volumes:
+      - ./Caddyfile:/Caddyfile:ro
+      - ${NAVI_CERTDIR}:/certs:ro
+      - ${NAVI_HTDOCS}:/htdocs:ro
+    ports: ["127.0.0.1:8445:8445"]
+
+  h2o:
+    image: lkwg82/h2o-http2-server
+    command: ["h2o", "-c", "/h2o.conf"]
+    volumes:
+      - ./h2o.conf:/h2o.conf:ro
+      - ${NAVI_CERTDIR}:/certs:ro
+      - ${NAVI_HTDOCS}:/htdocs:ro
+    ports: ["127.0.0.1:8444:8444"]
