@@ -51,14 +51,6 @@ proc httpRound(api: Navi) =
         doAssert res.headers.get("content-encoding") == "",              # navi consumed it
           "content-encoding not consumed: " & res.headers.get("content-encoding")
 
-proc openWs(api: Navi, url: string): WebSocket =
-  # Retry a transient WS-open failure (see the async client for why).
-  for attempt in 1 .. 10:
-    try: return api.websocket(url)
-    except CatchableError:
-      if attempt == 10: raise
-      sleep(20)
-
 proc wsRound(ws: WebSocket) =
   ws.send("ping")
   let t = ws.receive()
@@ -83,7 +75,7 @@ proc main() =
   var pool: seq[Client]
   for _ in 0 ..< clients:
     let api = mkClient(base, cert)
-    pool.add Client(api: api, ws: openWs(api, wsUrl))     # one persistent WS per client
+    pool.add Client(api: api, ws: api.websocket(wsUrl))     # one persistent WS per client
 
   var total = 0
   while epochTime() < deadline:

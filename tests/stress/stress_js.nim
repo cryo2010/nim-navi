@@ -12,17 +12,8 @@ import navi/js
 
 proc envJs(name, dflt: cstring): cstring {.importjs: "(process.env[#] ?? #)".}
 proc nowMs(): float {.importjs: "Date.now()".}
-proc delayMs(ms: int): Future[void] {.importjs: "(new Promise(function(r){ setTimeout(r,#); }))".}
 
 const verbs = [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS]
-
-proc openWs(api: Navi, url: string): Future[WebSocket] {.async.} =
-  # Retry a transient WS-open failure (see the async client for why).
-  for attempt in 1 .. 10:
-    try: return await api.websocket(url)
-    except CatchableError:
-      if attempt == 10: raise
-      await delayMs(20)
 
 proc stampMw(): NaviMiddleware =
   result = proc(ctx: NaviContext) {.async.} =
@@ -85,7 +76,7 @@ proc main() {.async.} =
   var pool: seq[Client]
   for _ in 0 ..< clients:
     let api = mkClient(base)
-    pool.add Client(api: api, ws: await openWs(api, wsUrl))
+    pool.add Client(api: api, ws: await api.websocket(wsUrl))
   let deadline = nowMs() + secs * 1000.0
   var loops: seq[Future[int]]
   for c in pool: loops.add oneClient(c, deadline)

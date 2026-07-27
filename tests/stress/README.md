@@ -53,16 +53,20 @@ docker run --rm -e NAVI_STRESS_SECONDS=60 navi-stress
 
 | file | role |
 | --- | --- |
-| `server.nim` | TLS HTTP/1.1 server: echoes any method on `/echo`, WebSocket echo on `/ws`, keep-alive |
+| `server.mjs` | Node.js TLS server: echoes any method on `/echo`, WebSocket echo on `/ws`, keep-alive, gzip/deflate |
 | `stress_sync.nim` | sync client (`import navi`) |
 | `stress_async.nim` | async client; built twice (`-d:useChronos` -> `navi/chronos`, else `navi/asyncdispatch`) |
 | `stress_js.nim` | `navi/js` client, run under Node |
-| `zlibcodec.nim` | zlib gzip/deflate encode+decode for the server and native clients (navi only decodes) |
-| `run.sh` | generate cert, build all, run each backend, tear down |
+| `zlibcodec.nim` | zlib gzip/deflate encode+decode for the native clients (navi only decodes) |
+| `run.sh` | generate cert, start the server, build+run each backend, tear down |
 | `Dockerfile` | Nim + Node 22 + chronos; `ENTRYPOINT` is `run.sh` |
 
 ## Notes
 
+- **The server is Node.js**, not Nim. A robust concurrent TLS+WebSocket server is
+  what's needed here, and Node's stacks are production-grade; the earlier Nim
+  servers hit ARC refcount races across threads (thread-per-connection) and
+  asyncnet SSL write bugs (async). The thing under test is the navi *clients*.
 - The server is HTTP/1.1 over TLS; navi offers ALPN h2 and falls back to h1. h2
   multiplexing is covered by the nghttpd interop suite, not here.
 - Compression uses gzip and zlib-wrapped deflate (navi's common decode path).

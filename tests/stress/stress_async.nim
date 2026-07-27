@@ -80,15 +80,6 @@ type Client = ref object                       # ref wrapper: Navi has no valid 
   api: Navi
   ws: WebSocket
 
-proc openWs(api: Navi, url: string): Future[WebSocket] {.async.} =
-  # Retry a transient WS-open failure: the simple threaded test server can drop a
-  # connection under churn. A genuine setup error still surfaces after the tries.
-  for attempt in 1 .. 10:
-    try: return await api.websocket(url)
-    except CatchableError:
-      if attempt == 10: raise
-      await sleepAsync(20)   # ms; int form works on both asyncdispatch and chronos
-
 proc clientLoop(c: Client, deadline: float): Future[int] {.async.} =
   var ops = 0
   while epochTime() < deadline:
@@ -110,7 +101,7 @@ proc main() {.async.} =
   var pool: seq[Client]
   for _ in 0 ..< clients:
     let api = mkClient(base, cert)
-    pool.add Client(api: api, ws: await openWs(api, wsUrl))
+    pool.add Client(api: api, ws: await api.websocket(wsUrl))
 
   let deadline = epochTime() + secs
   var loops: seq[Future[int]]                  # start all, then await: concurrent
