@@ -70,6 +70,22 @@ task fuzz, "Coverage-guided libFuzzer run of a sans-io fuzz target (Docker; Linu
        "-w /navi/tests/fuzz/corpus/" & target & " " &
        "navi-fuzz " & target & " " & mode
 
+task stress, "Dockerized backend stress test (all backends, TLS, WS, middleware, multi-client)":
+  # Runs every backend (sync, asyncdispatch, chronos, js) against a TLS test
+  # server for NAVI_STRESS_SECONDS (default 20), each with NAVI_STRESS_CLIENTS
+  # navi clients (default 3; concurrent on the async backends), all HTTP verbs,
+  # and a persistent WebSocket, through a middleware. Dockerized so chronos and
+  # Node (for navi/js) are available anywhere.
+  # NB: nimble does not propagate a task's exit code (nim-lang/nimble#1802), so
+  # this exits 0 even on failure; for a reliable pass/fail, run the docker
+  # command directly (its exit code is honest) or read the final "all backends
+  # passed" line.
+  let secs = getEnv("NAVI_STRESS_SECONDS", "20")
+  let clients = getEnv("NAVI_STRESS_CLIENTS", "3")
+  exec "docker build -f tests/stress/Dockerfile -t navi-stress ."
+  exec "docker run --rm -e NAVI_STRESS_SECONDS=" & secs &
+       " -e NAVI_STRESS_CLIENTS=" & clients & " navi-stress"
+
 task badssl, "TLS client conformance against badssl.com (network; nightly)":
   exec "nim c -r --hints:off tests/interop/badssl.nim"
 
