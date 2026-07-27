@@ -18,6 +18,7 @@ when not defined(ssl):
 
 import std/[net, strutils, os, osproc, sequtils, openssl]
 import navi/proto/ws
+import ./zlibcodec
 
 proc setSessionIdContext(ctx: SslCtx, sid: cstring, len: cuint): cint
   {.cdecl, dynlib: DLLSSLName, importc: "SSL_CTX_set_session_id_context".}
@@ -77,20 +78,26 @@ proc serveHttp(c: Socket, firstHead: string) =
   ## Keep-alive HTTP loop: reply to each request until the peer closes. The reply
   ## echoes the request method and `x-stress` header (as x-echo-* response
   ## headers, proof the verb and middleware reached us) and the request body
-  ## verbatim, reflecting its Content-Type and Content-Length.
+  ## verbatim, reflecting its Content-Type and Content-Length. A request body with
+  ## Content-Encoding is decompressed first; if the client set `x-want-encoding`
+  ## the echoed body is (re)compressed with it, so the wire is compressed both
+  ## ways and the client's navi must decode the response.
   var head = firstHead
   while head.len > 0:
     let meth = head.splitLines[0].split(' ')[0]
     let stress = headerValue(head, "x-stress")
     let ct = headerValue(head, "content-type")
+    let reqEnc = headerValue(head, "content-encoding")   # request body encoding
+    let wantEnc = headerValue(head, "x-want-encoding")   # asked response encoding
     var body = ""
     let cl = headerValue(head, "content-length")
     if cl.len > 0:
       let n = parseInt(cl)
-      while body.len < n:                        # read the request body to echo it
+      while body.len < n:
         let chunk = c.recv(n - body.len)
         if chunk.len == 0: return
         body.add chunk
+    let payload = if reqEnc.len > 0: zdecompress(body) else: body   # the original body
     var resp = "HTTP/1.1 200 OK\r\nx-echo-method: " & meth &
                "\r\nx-echo-stress: " & stress & "\r\nConnection: keep-alive\r\n"
     if meth == "HEAD":
@@ -99,8 +106,12 @@ proc serveHttp(c: Socket, firstHead: string) =
       resp.add "Content-Type: application/octet-stream\r\nContent-Length: 24\r\n\r\n"
       c.send(resp)
     else:
+      var echo = payload
+      if wantEnc.len > 0 and payload.len > 0:      # compress the echoed body
+        echo = zcompress(payload, wantEnc)
+        resp.add "Content-Encoding: " & wantEnc & "\r\n"
       if ct.len > 0: resp.add "Content-Type: " & ct & "\r\n"
-      resp.add "Content-Length: " & $body.len & "\r\n\r\n" & body
+      resp.add "Content-Length: " & $echo.len & "\r\n\r\n" & echo
       c.send(resp)
     head = recvHead(c)
 

@@ -10,6 +10,12 @@ for a configurable duration:
   verbatim; the client asserts the method, that the middleware ran, and that the
   echoed **body**, **Content-Type**, and **Content-Length** are exactly what it
   sent;
+- **compression both ways** on the native backends: the client gzip/deflate-
+  encodes the request body (alternating), the server decodes it, re-encodes the
+  echoed response, and navi transparently **decompresses** it -- so the round
+  trip is compressed on the wire and navi's decode path runs under load. The
+  client also asserts navi consumed the `Content-Encoding` header. (js stays
+  plain: its codec is the runtime's.)
 - a **persistent WebSocket** round trip (text + binary echo) per client;
 - **several navi clients**, run concurrently on the async backends
   (asyncdispatch, chronos, js) and sequentially on sync;
@@ -48,6 +54,7 @@ docker run --rm -e NAVI_STRESS_SECONDS=60 navi-stress
 | `stress_sync.nim` | sync client (`import navi`) |
 | `stress_async.nim` | async client; built twice (`-d:useChronos` -> `navi/chronos`, else `navi/asyncdispatch`) |
 | `stress_js.nim` | `navi/js` client, run under Node |
+| `zlibcodec.nim` | zlib gzip/deflate encode+decode for the server and native clients (navi only decodes) |
 | `run.sh` | generate cert, build all, run each backend, tear down |
 | `Dockerfile` | Nim + Node 22 + chronos; `ENTRYPOINT` is `run.sh` |
 
@@ -55,6 +62,9 @@ docker run --rm -e NAVI_STRESS_SECONDS=60 navi-stress
 
 - The server is HTTP/1.1 over TLS; navi offers ALPN h2 and falls back to h1. h2
   multiplexing is covered by the nghttpd interop suite, not here.
+- Compression uses gzip and zlib-wrapped deflate (navi's common decode path).
+  brotli/zstd decoding is covered by `tests/test_stream_decompress.nim`; adding
+  them here would need server-side br/zstd *encoders* (extra libs).
 - `HEAD` replies headers only, with the `Content-Length` a GET would have sent,
   so it exercises the client's HEAD handling (the h1 parser is told the request
   verb and must not wait for a body). Regression coverage: `tests/test_h1.nim`.
