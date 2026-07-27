@@ -3,9 +3,11 @@
 ## `await` is an identity template here so the shared engine's `await`-shaped
 ## body compiles to straight-line blocking code.
 
-import std/[net, os, strutils]
+import std/[net, os, strutils, nativesockets]
 import ./api, ./openssl_alpn
 import ../core/response  # for navi's TimeoutError
+when defined(ssl):
+  import std/openssl  # SSL_pending
 
 export api
 
@@ -77,18 +79,29 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
 proc sendAll*(c: Conn, data: string) =
   c.socket.send(data)
 
+proc waitReadable(c: Conn): bool =
+  ## True when the socket has data ready within `c.timeout` ms. Checks OpenSSL's
+  ## decrypted buffer first: `select` sees the raw fd, so bytes SSL already
+  ## drained off it and buffered would otherwise be missed.
+  when defined(ssl):
+    let ssl = c.socket.sslHandle
+    if not ssl.isNil and SSL_pending(ssl) > 0:
+      return true
+  var fds = @[c.socket.getFd()]
+  selectRead(fds, c.timeout) > 0
+
 proc recvSome*(c: Conn): string =
   ## One chunk of up to 4096 bytes; "" means the peer closed. With a timeout set,
-  ## a stalled read raises navi's TimeoutError (per-recv, not a total deadline).
+  ## wait up to `timeout` ms for data (raising navi's TimeoutError on a stall),
+  ## then read what is available. We deliberately avoid std/net's timeout `recv`:
+  ## it loops until it has filled the whole buffer, so a response that ends
+  ## mid-buffer on a kept-alive connection stalls it until the timeout even
+  ## though the response is complete. A single plain `recv` returns immediately
+  ## with whatever is ready (the same reason `connect` uses an unbuffered socket).
   result = newString(4096)
-  var n: int
-  if c.timeout > 0:
-    try:
-      n = c.socket.recv(addr result[0], result.len, c.timeout)
-    except net.TimeoutError:
-      raise newException(response.TimeoutError, "navi: read timed out")
-  else:
-    n = c.socket.recv(addr result[0], result.len)
+  if c.timeout > 0 and not c.waitReadable():
+    raise newException(response.TimeoutError, "navi: read timed out")
+  let n = c.socket.recv(addr result[0], result.len)
   if n <= 0:
     result.setLen(0)
   else:
