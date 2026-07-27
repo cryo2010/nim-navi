@@ -113,6 +113,11 @@ jobs:
       - name: navi/js WebSocket runtime test
         run: bash tests/interop/jsws.sh
 
+      # Cookie jar + middleware under Node. Guards the runtime navi/js middleware
+      # path (a value-object client miscompiled via unsafeAddr under nim js).
+      - name: navi/js cookie jar + middleware runtime test
+        run: bash tests/interop/js_cookiejar.sh
+
   sanitize:
     runs-on: ubuntu-latest
     name: sanitizers (asan + ubsan)

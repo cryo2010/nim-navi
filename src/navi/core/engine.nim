@@ -42,12 +42,13 @@ template h1Exchange*(transport, req, sink, keep, decompress: typed): Response =
   ## `decompress` is on, body chunks are decompressed as they arrive.
   block:
     sendRequest(transport, req)
+    let noBody = req.verb == HEAD          # a HEAD response never carries a body
     var parser =
       if not sink.isNil and decompress:
         initH1Parser(sinkFactory = proc(h: Headers): BodySink =
-          decodingSink(h.get("content-encoding"), sink))
+          decodingSink(h.get("content-encoding"), sink), headRequest = noBody)
       else:
-        initH1Parser(sink)
+        initH1Parser(sink, headRequest = noBody)
     while not parser.finished:
       let chunk = await recvSome(transport)
       if chunk.len == 0:

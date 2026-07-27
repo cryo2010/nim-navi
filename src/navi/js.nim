@@ -38,7 +38,11 @@ type
     ## then `await ctx.next()` runs the rest of the chain (which fills `res`).
     req*: Request            ## the outgoing request; modify it before `next`
     res*: Response           ## the response; set by `next`, adjust it after
-    clientp: ptr Navi        ## the owning client (see `client`); valid for the call
+    clientv: Navi            ## the owning client (see `client`)
+      ## Held by value, not `ptr Navi`: taking the address of a by-value param
+      ## (`unsafeAddr client` in `request`/`stream`) miscompiles under `nim js`
+      ## (the callee boxes the param, the caller does not), which broke the whole
+      ## middleware path. `Navi`'s cookie jar is a `ref`, so a copy is equivalent.
     sink: BodySink           ## non-nil for a streaming request
     cancel: CancelToken      ## caller's cancellation token, or nil
     idx: int                 ## index of the next middleware to run
@@ -144,18 +148,18 @@ proc runCoreStream(client: Navi, req: Request, sink: BodySink,
   client.maybeThrow(rq, resp)
   result = resp
 
-proc client*(ctx: NaviContext): Navi = ctx.clientp[]
+proc client*(ctx: NaviContext): Navi = ctx.clientv
   ## The client handling this request (e.g. to read `ctx.client.config`).
 
 proc next*(ctx: NaviContext): Future[void] {.async.} =
   ## Run the rest of the chain: the next middleware, or -- once they are
   ## exhausted -- the request itself. The outcome lands in `ctx.res`.
-  let mws = ctx.clientp[].config.middleware
+  let mws = ctx.clientv.config.middleware
   if ctx.idx >= mws.len:
     if ctx.sink.isNil:
-      ctx.res = await runCore(ctx.clientp[], ctx.req, ctx.cancel)
+      ctx.res = await runCore(ctx.clientv, ctx.req, ctx.cancel)
     else:
-      ctx.res = await runCoreStream(ctx.clientp[], ctx.req, ctx.sink, ctx.cancel)
+      ctx.res = await runCoreStream(ctx.clientv, ctx.req, ctx.sink, ctx.cancel)
   else:
     let m = mws[ctx.idx]
     inc ctx.idx
@@ -175,7 +179,7 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
   let req = buildRequest(client.config, verb, target, headers, body, json, form,
                          multipart, nil, params)
   if client.config.middleware.len == 0: return await runCore(client, req, cancel)
-  let ctx = NaviContext(req: req, clientp: unsafeAddr client, cancel: cancel)
+  let ctx = NaviContext(req: req, clientv: client, cancel: cancel)
   return await runChain(ctx)
 
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
@@ -185,7 +189,7 @@ proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
   ## empty. Not retried (the stream is consumed as it is read).
   let req = buildRequest(client.config, verb, target, headers, params = params)
   if client.config.middleware.len == 0: return await runCoreStream(client, req, sink, cancel)
-  let ctx = NaviContext(req: req, clientp: unsafeAddr client, sink: sink, cancel: cancel)
+  let ctx = NaviContext(req: req, clientv: client, sink: sink, cancel: cancel)
   return await runChain(ctx)
 
 proc websocket*(client: Navi, url: string,

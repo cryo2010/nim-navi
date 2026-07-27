@@ -18,6 +18,7 @@ cat > "$work/server.mjs" <<'EOF'
 import http from 'node:http';
 const server = http.createServer((req, res) => {
   res.setHeader('Set-Cookie', 'sid=abc123; Path=/');
+  res.setHeader('x-echo-stress', req.headers['x-stress'] ?? 'none');  // for the middleware check
   res.end('cookie:' + (req.headers.cookie ?? 'none'));
 });
 server.listen(9521, '127.0.0.1', () => console.log('ready'));

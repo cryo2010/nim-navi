@@ -85,6 +85,29 @@ suite "h1 parse":
     check r.status == 200
     check r.body == "hi"
 
+  test "a HEAD response has no body despite Content-Length":
+    # headRequest = true: the parser must complete on the headers alone, not block
+    # waiting for the Content-Length bytes a HEAD reply never sends.
+    var p = initH1Parser(headRequest = true)
+    p.feed("HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n")
+    check p.finished
+    let r = p.toResponse()
+    check r.status == 200
+    check r.body == ""
+    check r.headers.get("content-length") == "42"   # header preserved
+
+  test "a HEAD response with keep-alive stays reusable":
+    var p = initH1Parser(headRequest = true)
+    p.feed("HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: keep-alive\r\n\r\n")
+    check p.finished
+    check p.keepAliveAfter()
+
+  test "204 and 304 have no body despite Content-Length":
+    let a = parseAll("HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\n")
+    check a.status == 204 and a.body == ""
+    let b = parseAll("HTTP/1.1 304 Not Modified\r\nContent-Length: 99\r\n\r\n")
+    check b.status == 304 and b.body == ""
+
   test "rejects a negative Content-Length without crashing":
     # A peer-controlled negative length must raise (caught upstream), not slice
     # out of bounds into a RangeDefect crash (found by tests/fuzz).
