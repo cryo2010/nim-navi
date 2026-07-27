@@ -3,9 +3,10 @@
 [![CI](https://github.com/cryo2010/nim-navi/actions/workflows/ci.yml/badge.svg)](https://github.com/cryo2010/nim-navi/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-An HTTP client for Nim, with a minimalist [ky](https://github.com/sindresorhus/ky)-inspired API. One request surface, four interchangeable backends: synchronous, `std/asyncdispatch`, `chronos`, or a JavaScript/`fetch` backend for the browser and Node. You pick one by which module you import.
+An HTTP client for Nim, inspired by [ky](https://github.com/sindresorhus/ky). One API with four interchangeable backends for sync, async and JavaScript targets. You select a backend via import.
 
 ```nim
+# Imports the synchronous client
 import navi
 
 let api = newNavi()
@@ -14,6 +15,7 @@ echo res.status, " ", res.body
 ```
 
 ```nim
+# Imports the async client
 import navi/asyncdispatch  # or navi/chronos
 
 proc main() {.async.} =
@@ -25,6 +27,7 @@ waitFor main()
 ```
 
 ```nim
+# Imports the javascript client
 import navi/js   # compiles with `nim js`, runs over the runtime's fetch
 
 proc main() {.async.} =
@@ -35,30 +38,48 @@ proc main() {.async.} =
 discard main()
 ```
 
-## Install
+## Contents
 
-navi is not yet in the Nimble registry. Install it from the repository:
-
-```
-nimble install https://github.com/cryo2010/nim-navi
-```
-
-Or pin it in your project's `.nimble`:
-
-```nim
-requires "https://github.com/cryo2010/nim-navi >= 0.1.0"
-```
-
-You still `import navi` (and `navi/asyncdispatch`, `navi/chronos`, `navi/js`)
-regardless of how it was installed.
+- [Features](#features)
+- [Install](#install)
+- [Requirements](#requirements)
+- [Choosing a backend](#choosing-a-backend)
+  - [Capability matrix](#capability-matrix)
+  - [The browser backend (`navi/js`)](#the-browser-backend-navijs)
+- [Usage](#usage)
+  - [Clients and options](#clients-and-options)
+  - [Requests](#requests)
+  - [Responses](#responses)
+  - [Headers](#headers)
+  - [TLS](#tls)
+  - [Errors](#errors)
+  - [Retries, redirects, and timeouts](#retries-redirects-and-timeouts)
+  - [Query parameters](#query-parameters)
+  - [Cancellation](#cancellation)
+  - [Response size limits](#response-size-limits)
+  - [Auth and proxy](#auth-and-proxy)
+  - [Cookies](#cookies)
+  - [Middleware](#middleware)
+  - [Decompression](#decompression)
+  - [HTTP/2](#http2)
+  - [Keep-alive](#keep-alive)
+  - [Streaming](#streaming)
+  - [WebSocket](#websocket)
+- [API](#api)
+  - [NaviConfig](#naviconfig)
+  - [Response](#response)
+  - [HttpError](#httperror)
+- [Thanks](#thanks)
+- [License](#license)
 
 ## Features
 
 - **HTTP/1.1 and HTTP/2** over http and https, IPv4 and IPv6. h2 is native (own
   frames + HPACK + Huffman), ALPN-negotiated with automatic h1 fallback.
 - **HTTP/2 multiplexing**: concurrent async requests to one origin share a
-  single connection (transparent on asyncdispatch); a `parallel` batch API does
-  the same on the sync backend.
+  single HTTP/2 connection (automatic on the h2 async backend, asyncdispatch;
+  chronos is HTTP/1.1 so it uses separate pooled connections). A `parallel` batch
+  API does the same on the sync backend.
 - **Sync and async** from one API, via mutually exclusive entry modules
 - **Browser and Node** via a JavaScript backend (`import navi/js`) that runs on the runtime's `fetch`
 - **TLS** on all three backends (OpenSSL for sync/asyncdispatch, BearSSL for chronos), with certificate verification on by default
@@ -71,25 +92,12 @@ regardless of how it was installed.
 - **Request timeouts** via the `timeout` option (`TimeoutError`)
 - **Middleware**: onion-style `proc(ctx)` steps that modify, observe, or short-circuit a request
 - **Cookie jar**, **basic/bearer/digest auth** (Digest: MD5 and SHA-256, RFC 7616), **proxy** (http absolute-URI and https CONNECT)
-- **Body helpers**: `json=`, `form=`, and `multipart=`
-- **WebSocket** (RFC 6455) on all four backends (sync, asyncdispatch, chronos, and js): `websocket()` with `send`/`receive`/`close`, text and binary messages, fragmentation reassembly, and automatic ping/pong
-- **Response helpers**: `.status`, `.headers`, `.body`, `.data`, `.ok`
-- **Reusable clients** with default options and `.extend()`
+- **WebSockets** (RFC 6455) on all four backends, text and binary messages, fragmentation reassembly, and automatic ping/pong
 
-HTTP/2 currently runs on the sync and asyncdispatch backends; chronos stays
-http/1.1 (its bundled TLS exposes no client ALPN). The `navi/js` backend defers
-the protocol to the browser/runtime. WebSocket runs on all four backends; the
-`navi/js` one wraps the runtime's native `WebSocket` (so it ignores custom
-handshake headers and the runtime handles ping/pong).
+## Install
 
-WebSocket in brief (sync; on `navi/asyncdispatch` the same calls are `await`ed):
-
-```nim
-let ws = api.websocket("wss://example.com/socket")
-ws.send("hello")                       # text; use binary = true for bytes
-let msg = ws.receive()                 # blocks; auto-answers pings, reassembles fragments
-if msg.kind == wmText: echo msg.data
-ws.close()
+```shell
+nimble install navi
 ```
 
 ## Requirements
@@ -482,6 +490,42 @@ discard api.request(POST, "https://example.com/upload", bodyStream = proc(): str
     inc i)
 ```
 
+### WebSocket
+
+Open a WebSocket with `websocket()`, then `send`, `receive`, and `close`. It works
+on all four backends and accepts `ws://` / `wss://` (or `http` / `https`, which are
+mapped). The calls block on the sync backend and are `await`ed on the async ones.
+
+```nim
+let ws = api.websocket("wss://example.com/socket")   # sync
+
+ws.send("hello")                       # text; use binary = true to send bytes
+let msg = ws.receive()                 # blocks until a whole message arrives
+case msg.kind
+of wmText, wmBinary: echo msg.data     # the payload
+of wmClose:          echo "closed: ", msg.closeCode
+
+ws.close()                             # sends a close frame (default code 1000)
+```
+
+On `navi/asyncdispatch`, `navi/chronos`, and `navi/js` the same calls are `await`ed:
+
+```nim
+let ws = await api.websocket("wss://example.com/socket")
+await ws.send("hello")
+let msg = await ws.receive()
+await ws.close()
+```
+
+`receive` returns a `WsMessage`: `kind` is `wmText`, `wmBinary`, or `wmClose`; `data`
+is the payload (or the reason on a close); `closeCode` is set on `wmClose`. navi
+answers pings automatically and reassembles fragmented messages, so `receive` always
+yields a whole message. Middleware does not apply to `websocket()`.
+
+On `navi/js` the WebSocket wraps the runtime's native one, so custom handshake
+`headers` are ignored and the runtime handles ping/pong; the send/receive/close
+surface is otherwise the same.
+
 ## API
 
 ### newNavi(config = newNaviConfig())
@@ -511,6 +555,15 @@ transfer-encoding (return `""` to end). Not available on `navi/js`.
 
 Deliver the response body to `sink: proc(data: openArray[byte])` as it arrives;
 the returned `Response.body` stays empty.
+
+### client.websocket(url, headers = initHeaders())
+
+Open a WebSocket (RFC 6455). Accepts `ws://` / `wss://` (or `http` / `https`, mapped);
+`wss` uses TLS. Returns a `WebSocket` on the sync backend, or a `Future[WebSocket]` on
+the async ones. Then use `ws.send(data, binary = false)`, `ws.receive(): WsMessage`,
+`ws.close(code = closeNormal, reason = "")`, and `ws.ping(data = "")` (native backends;
+`navi/js` leaves ping/pong to the runtime). On `navi/js` it wraps the runtime's native
+`WebSocket`, so `headers` are ignored.
 
 ### client.parallel(targets) (sync backend)
 
@@ -579,35 +632,6 @@ Raised for a non-2xx response when `throwHttpErrors` is on. Carries the full
 response as `.response`. Other request errors: `TimeoutError` (exceeded
 `timeout`), `RequestCancelledError` (a `CancelToken` was cancelled), and
 `ResponseTooLargeError` (body exceeded `maxResponseBytes`).
-
-### Helpers
-
-- **initHeaders(pairs)**: build a case-insensitive, order-preserving `Headers`.
-- **basicAuth(user, pass)** / **bearerAuth(token)** / **digestAuth(user, pass)**: construct an `Auth`.
-- **newCancelToken()**: a `CancelToken`; pass it as `cancel` and call `.cancel()` to abort.
-
-## Roadmap
-
-HTTP/1.1 and HTTP/2 with the full policy layer (retries, redirects, middleware,
-cookies, auth, proxy, decompression, body helpers, throw-on-non-2xx) are done.
-
-Known follow-ups on the chronos backend: HTTP/2 and client certificates (mTLS).
-Its bundled BearSSL exposes no client ALPN (so no h2 negotiation) and no
-client-certificate hook. Custom-CA verification via `caFile` works there today.
-
-## Testing
-
-```
-nimble test
-```
-
-The suite runs the sans-io protocol cores deterministically (HTTP/1.1 parser;
-HTTP/2 frames, HPACK, and Huffman against RFC 7541 vectors; the h2 connection
-against simulated server frames) and exercises all three backends end to end
-against in-process servers (keep-alive reuse, streaming, IPv6, redirects,
-retries, cookies, auth, parallel). Tests do not touch the network. The
-`examples/` directory holds manual smoke tests that do, including real HTTP/2
-requests and concurrent multiplexing.
 
 ## Thanks
 
