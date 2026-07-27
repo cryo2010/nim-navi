@@ -3,7 +3,8 @@
 ##
 ##   - any HTTP method on /echo: replies 200 with a small JSON body echoing the
 ##     request method, the `x-stress` header (proof a middleware ran), and the
-##     received body length. HEAD replies with Content-Length: 0 (see note).
+##     received body length. HEAD replies headers only, with the Content-Length a
+##     GET would have carried, so it exercises the client's HEAD handling.
 ##   - a WebSocket upgrade on /ws: RFC 6455 handshake, then echoes every frame
 ##     until the peer closes.
 ##
@@ -11,11 +12,6 @@
 ## requests. Self-signed cert for localhost is generated on first run.
 ##
 ##   NAVI_STRESS_HOST=0.0.0.0 NAVI_STRESS_PORT=9443 nim c -r -d:ssl tests/stress/server.nim
-##
-## Note: HEAD replies Content-Length: 0 on purpose. navi's h1 response parser is
-## not told the request verb, so a HEAD reply with a non-zero Content-Length and
-## no body would make the client block waiting for a body (a real client bug worth
-## its own fix); this server sidesteps it so the stress run does not deadlock.
 
 when not defined(ssl):
   {.error: "compile the stress server with -d:ssl (OpenSSL)".}
@@ -97,8 +93,11 @@ proc serveHttp(c: Socket, firstHead: string) =
         if chunk.len == 0: return
         got += chunk.len
     if meth == "HEAD":
-      c.send("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" &
-             "Content-Length: 0\r\nConnection: keep-alive\r\n\r\n")
+      # A realistic HEAD: the Content-Length a GET would return, but no body.
+      # Exercises navi's HEAD handling (it must not wait for that body).
+      let body = jsonBody(meth, stress, bodyLen)
+      c.send("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " &
+             $body.len & "\r\nConnection: keep-alive\r\n\r\n")   # headers only
     else:
       let body = jsonBody(meth, stress, bodyLen)
       c.send("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " &

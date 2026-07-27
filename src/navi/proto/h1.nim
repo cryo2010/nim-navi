@@ -63,12 +63,15 @@ type
     body: string
     sink: BodySink          ## when set, body bytes go here instead of `body`
     sinkFactory: SinkFactory ## when set, builds `sink` from the parsed headers
+    headRequest: bool       ## response is to a HEAD request -> never has a body
 
-proc initH1Parser*(sink: BodySink = nil, sinkFactory: SinkFactory = nil): H1Parser =
+proc initH1Parser*(sink: BodySink = nil, sinkFactory: SinkFactory = nil,
+                   headRequest = false): H1Parser =
   result.state = stStatusLine
   result.bodyMode = bmUntilClose
   result.sink = sink
   result.sinkFactory = sinkFactory
+  result.headRequest = headRequest
 
 proc emitBody(p: var H1Parser, chunk: string) =
   if p.sink != nil:
@@ -113,6 +116,14 @@ proc finishHeaders(p: var H1Parser) =
     p.reason = ""
     p.headers = initHeaders()
     p.state = stStatusLine
+    return
+  if p.headRequest or p.status == 204 or p.status == 304:
+    # No message body regardless of Content-Length / Transfer-Encoding: a
+    # response to HEAD (RFC 9110 9.3.2), or a 204/304 (RFC 9110 15.3.5/15.4.5).
+    # Without this the parser would block waiting for a body the server, being
+    # correct, never sends -- which for HEAD on a keep-alive connection hangs.
+    p.bodyMode = bmLength     # self-delimited (zero length): stays keep-alive reusable
+    p.state = stDone
     return
   if p.sinkFactory != nil:      # now that headers are known, choose the sink
     # single-threaded client; the factory need not be gcsafe (see emitBody).

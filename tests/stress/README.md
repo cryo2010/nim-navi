@@ -51,8 +51,6 @@ docker run --rm -e NAVI_STRESS_SECONDS=60 navi-stress
 
 - The server is HTTP/1.1 over TLS; navi offers ALPN h2 and falls back to h1. h2
   multiplexing is covered by the nghttpd interop suite, not here.
-- `HEAD` replies with `Content-Length: 0`. navi's h1 response parser is not told
-  the request verb, so a `HEAD` reply with a non-zero `Content-Length` and no body
-  would make the client wait for a body it never gets. That is a real client bug
-  (its own fix, separate from this harness); the server avoids it so the run does
-  not deadlock.
+- `HEAD` replies headers only, with the `Content-Length` a GET would have sent,
+  so it exercises the client's HEAD handling (the h1 parser is told the request
+  verb and must not wait for a body). Regression coverage: `tests/test_h1.nim`.
