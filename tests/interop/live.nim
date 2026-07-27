@@ -32,7 +32,7 @@ const targets = [
   Target(name: "fastly",       url: "https://www.fastly.com/"),
   Target(name: "akamai",       url: "https://www.akamai.com/"),
   Target(name: "wikipedia",    url: "https://en.wikipedia.org/wiki/HTTP/2"),
-  Target(name: "httpbin",      url: "https://httpbin.org/get", expectJson: true),
+  Target(name: "postman-echo", url: "https://postman-echo.com/get", expectJson: true),
 ]
 
 # Clean network / server-side conditions we tolerate as SKIP. A navi protocol
