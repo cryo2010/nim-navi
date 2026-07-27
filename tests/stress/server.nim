@@ -56,10 +56,6 @@ proc headerValue(head, name: string): string =
     if i > 0 and cmpIgnoreCase(line[0 ..< i].strip, name) == 0:
       return line[i + 1 .. ^1].strip
 
-proc jsonBody(meth, stress: string, bodyLen: int): string =
-  """{"method":"""" & meth & """","stress":"""" & stress &
-    """","len":""" & $bodyLen & "}"
-
 proc serveWs(c: Socket, head: string) =
   let key = headerValue(head, "sec-websocket-key")
   c.send("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n" &
@@ -78,30 +74,34 @@ proc serveWs(c: Socket, head: string) =
     else: discard
 
 proc serveHttp(c: Socket, firstHead: string) =
-  ## Keep-alive HTTP loop: reply to each request until the peer closes.
+  ## Keep-alive HTTP loop: reply to each request until the peer closes. The reply
+  ## echoes the request method and `x-stress` header (as x-echo-* response
+  ## headers, proof the verb and middleware reached us) and the request body
+  ## verbatim, reflecting its Content-Type and Content-Length.
   var head = firstHead
   while head.len > 0:
     let meth = head.splitLines[0].split(' ')[0]
     let stress = headerValue(head, "x-stress")
-    var bodyLen = 0
+    let ct = headerValue(head, "content-type")
+    var body = ""
     let cl = headerValue(head, "content-length")
     if cl.len > 0:
-      bodyLen = parseInt(cl)
-      var got = 0
-      while got < bodyLen:                       # drain the request body
-        let chunk = c.recv(bodyLen - got)
+      let n = parseInt(cl)
+      while body.len < n:                        # read the request body to echo it
+        let chunk = c.recv(n - body.len)
         if chunk.len == 0: return
-        got += chunk.len
+        body.add chunk
+    var resp = "HTTP/1.1 200 OK\r\nx-echo-method: " & meth &
+               "\r\nx-echo-stress: " & stress & "\r\nConnection: keep-alive\r\n"
     if meth == "HEAD":
-      # A realistic HEAD: the Content-Length a GET would return, but no body.
-      # Exercises navi's HEAD handling (it must not wait for that body).
-      let body = jsonBody(meth, stress, bodyLen)
-      c.send("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " &
-             $body.len & "\r\nConnection: keep-alive\r\n\r\n")   # headers only
+      # Headers only, with a non-zero Content-Length: exercises the client's HEAD
+      # handling (it must not wait for a body). No body follows.
+      resp.add "Content-Type: application/octet-stream\r\nContent-Length: 24\r\n\r\n"
+      c.send(resp)
     else:
-      let body = jsonBody(meth, stress, bodyLen)
-      c.send("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " &
-             $body.len & "\r\nConnection: keep-alive\r\n\r\n" & body)
+      if ct.len > 0: resp.add "Content-Type: " & ct & "\r\n"
+      resp.add "Content-Length: " & $body.len & "\r\n\r\n" & body
+      c.send(resp)
     head = recvHead(c)
 
 proc handle(a: tuple[c: Socket, ctx: SslContext]) {.thread.} =

@@ -7,7 +7,7 @@
 ## A middleware stamps `x-stress: 1`, which the server echoes back so we can assert
 ## the chain ran. Any bad status, wrong echo, or exception aborts (non-zero exit).
 
-import std/[times, os, json, strutils]
+import std/[times, os, strutils]
 when defined(useChronos):
   import navi/chronos
   const backend = "chronos"
@@ -31,12 +31,20 @@ proc mkClient(base, cert: string): Navi =
 
 proc httpRound(api: Navi) {.async.} =
   for v in verbs:
-    let body = if v in {POST, PUT, PATCH}: "payload" else: ""
-    let res = await api.request(v, "/echo", body = body)
+    let sentBody = if v in {POST, PUT, PATCH}: "payload-" & $v else: ""
+    let sentCt = if sentBody.len > 0: "text/plain" else: ""
+    var h = initHeaders()
+    if sentCt.len > 0: h["content-type"] = sentCt
+    let res = await api.request(v, "/echo", headers = h, body = sentBody)
     doAssert res.status == 200, $v & " -> " & $res.status
-    if v != HEAD:
-      doAssert res.data["method"].getStr == $v, "method echo: " & res.data["method"].getStr
-      doAssert res.data["stress"].getStr == "1", "middleware header not seen by server"
+    doAssert res.headers.get("x-echo-method") == $v, "method echo: " & res.headers.get("x-echo-method")
+    doAssert res.headers.get("x-echo-stress") == "1", "middleware header not seen by server"
+    if v != HEAD:                               # HEAD carries no body
+      doAssert res.body == sentBody, "body echo mismatch: " & res.body
+      doAssert res.headers.get("content-length") == $sentBody.len,
+        "content-length: " & res.headers.get("content-length")
+      doAssert res.headers.get("content-type") == sentCt,
+        "content-type: " & res.headers.get("content-type")
 
 proc wsRound(ws: WebSocket) {.async.} =
   await ws.send("ping")

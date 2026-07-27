@@ -5,7 +5,11 @@ throughout. For each backend (`sync`, `asyncdispatch`, `chronos`, `js`) it runs,
 for a configurable duration:
 
 - **every HTTP verb** (GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS) against a
-  TLS server, asserting the echoed method and a middleware-stamped header;
+  TLS server. The server echoes the request method and the middleware-stamped
+  `x-stress` header (as `x-echo-*` response headers) and the request body
+  verbatim; the client asserts the method, that the middleware ran, and that the
+  echoed **body**, **Content-Type**, and **Content-Length** are exactly what it
+  sent;
 - a **persistent WebSocket** round trip (text + binary echo) per client;
 - **several navi clients**, run concurrently on the async backends
   (asyncdispatch, chronos, js) and sequentially on sync;
