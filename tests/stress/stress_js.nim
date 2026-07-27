@@ -70,6 +70,8 @@ proc main() {.async.} =
   for _ in 0 ..< clients: loops.add oneClient()
   var total = 0
   for f in loops: total += await f
-  echo "[js] ", clients, " clients, ", total, " batches over ", secs, "s: OK"
+  let rps = int(float(total * verbs.len) / secs)   # HTTP requests/s (WS excluded)
+  echo "[js] ", clients, " clients, ", total, " batches, ", rps,
+       " req/s over ", secs, "s: OK"
 
 discard main()

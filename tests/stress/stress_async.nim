@@ -91,6 +91,8 @@ proc main() {.async.} =
     loops.add clientLoop(mkClient(base, cert), wsUrl, deadline)
   var total = 0
   for f in loops: total += await f
-  echo "[", backend, "] ", clients, " clients, ", total, " batches over ", secs, "s: OK"
+  let rps = int(float(total * verbs.len) / secs)   # HTTP requests/s (WS excluded)
+  echo "[", backend, "] ", clients, " clients, ", total, " batches, ", rps,
+       " req/s over ", secs, "s: OK"
 
 waitFor main()

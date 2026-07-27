@@ -84,6 +84,8 @@ proc main() =
       wsRound(c.ws)
       inc total
   for c in pool: c.ws.close()
-  echo "[sync] ", clients, " clients, ", total, " batches over ", secs, "s: OK"
+  let rps = int(float(total * verbs.len) / secs)   # HTTP requests/s (WS excluded)
+  echo "[sync] ", clients, " clients, ", total, " batches, ", rps,
+       " req/s over ", secs, "s: OK"
 
 main()
