@@ -97,6 +97,11 @@ task servers, "Multi-server HTTP/2 interop: nginx, Caddy, h2o (needs Docker + op
   # Runs navi's h2 client (and chronos h1) against three unrelated server stacks.
   exec "bash tests/interop/servers.sh"
 
+task httpbin, "httpbin functionality interop behind Caddy TLS+h2 (needs Docker + openssl)":
+  # Local httpbin (never the public service): methods, bodies, auth, redirects,
+  # decompression, cookies, streaming, exercised through navi.
+  exec "bash tests/interop/httpbin.sh"
+
 task live, "Live interop against real public servers/CDNs (network; nightly)":
   # Tolerates network noise/server rejections; fails only on a navi protocol bug.
   exec "nim c -r --path:src -d:ssl --hints:off tests/interop/live.nim"

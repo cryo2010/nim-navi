@@ -1,0 +1,11 @@
+# TLS + HTTP/2 front for the httpbin container. Caddy speaks h2 to navi over the
+# supplied test cert and proxies to httpbin over plain HTTP/1.1. auto_https is off
+# because we bring our own cert (no ACME); admin is off (no API needed).
+{
+	auto_https off
+	admin off
+}
+:8447 {
+	tls /certs/cert.pem /certs/key.pem
+	reverse_proxy httpbin:80
+}

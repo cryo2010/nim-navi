@@ -1,0 +1,20 @@
+# Local httpbin behind Caddy, for exercising navi's client against httpbin's full
+# request/response surface without touching the flaky public httpbin.org (which
+# also sits behind AWS anti-bot filtering). httpbin speaks plain HTTP/1.1 on :80
+# only, so Caddy fronts it as a TLS + HTTP/2 terminator. httpbin is NOT published
+# to the host: the only way in is through Caddy, so tests can never accidentally
+# reach a remote service. The cert comes from the host via NAVI_CERTDIR (set by
+# httpbin.sh).
+services:
+  httpbin:
+    image: kennethreitz/httpbin
+    expose: ["80"]          # reachable only on the compose network, via caddy
+
+  caddy:
+    image: caddy:2
+    command: ["caddy", "run", "--config", "/Caddyfile", "--adapter", "caddyfile"]
+    volumes:
+      - ./Caddyfile:/Caddyfile:ro
+      - ${NAVI_CERTDIR}:/certs:ro
+    ports: ["127.0.0.1:8447:8447"]
+    depends_on: [httpbin]
