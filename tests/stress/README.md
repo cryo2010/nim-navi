@@ -57,6 +57,7 @@ docker run --rm -e NAVI_STRESS_SECONDS=60 navi-stress
 | `stress_sync.nim` | sync client (`import navi`) |
 | `stress_async.nim` | async client; built twice (`-d:useChronos` -> `navi/chronos`, else `navi/asyncdispatch`) |
 | `stress_js.nim` | `navi/js` client, run under Node |
+| `reference.mjs` | raw Node `fetch`/`WebSocket` baseline (no navi), for a `[node-ref]` req/s comparison |
 | `zlibcodec.nim` | zlib gzip/deflate encode+decode for the native clients (navi only decodes) |
 | `run.sh` | generate cert, start the server, build+run each backend, tear down |
 | `Dockerfile` | Nim + Node 22 + chronos; `ENTRYPOINT` is `run.sh` |
@@ -67,6 +68,9 @@ docker run --rm -e NAVI_STRESS_SECONDS=60 navi-stress
   what's needed here, and Node's stacks are production-grade; the earlier Nim
   servers hit ARC refcount races across threads (thread-per-connection) and
   asyncnet SSL write bugs (async). The thing under test is the navi *clients*.
+- A final `[node-ref]` line runs the same workload on raw Node `fetch`/`WebSocket`
+  (no navi) as a baseline. Compare it especially to `navi/js` -- both are `fetch`
+  underneath, so the gap is navi's JS layer (~20% in a quick local run).
 - The server is HTTP/1.1 over TLS; navi offers ALPN h2 and falls back to h1. h2
   multiplexing is covered by the nghttpd interop suite, not here.
 - Compression uses gzip and zlib-wrapped deflate (navi's common decode path).

@@ -60,4 +60,6 @@ echo "== stress: ${secs}s per backend, ${clients} clients each, over TLS =="
 "$work/ad"
 "$work/ch"
 NODE_EXTRA_CA_CERTS="$cert" node "$work/js.js"
+# Raw fetch/WebSocket baseline (no navi) for comparison.
+NODE_EXTRA_CA_CERTS="$cert" node "$root/tests/stress/reference.mjs"
 echo "== all backends passed =="
