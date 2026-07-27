@@ -25,6 +25,10 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -keyout "$NAVI_CERTDIR/key.pem" -out "$NAVI_CERTDIR/cert.pem" \
   -subj "/CN=localhost" \
   -addext "subjectAltName=DNS:localhost,DNS:127.0.0.1,IP:127.0.0.1" >/dev/null 2>&1
+# openssl writes the key 0600. Over a Linux bind mount that preserves host perms,
+# h2o (which runs as an unprivileged container user) then can't read it. This is a
+# throwaway 1-day self-signed key, so make it world-readable.
+chmod 644 "$NAVI_CERTDIR"/*.pem
 printf 'navi interop\n' > "$NAVI_HTDOCS/hello.txt"
 head -c 262144 /dev/urandom > "$NAVI_HTDOCS/large.bin"
 
