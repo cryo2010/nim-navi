@@ -1,39 +1,103 @@
-## Mutual-TLS (client certificate) interop against `openssl s_server -Verify`.
-##
-## Driven by tests/interop/mtls.sh, which generates a CA plus server and client
-## certs, starts an OpenSSL server that *requires* a client certificate, and
-## exports NAVI_MTLS_URL / NAVI_MTLS_CA / NAVI_MTLS_CERT / NAVI_MTLS_KEY.
-## Validates that navi presents its client cert (handshake succeeds) and that
-## omitting it is rejected by the server.
+## Mutual-TLS client-certificate interop across every credential format navi
+## accepts, on the OpenSSL backends. Driven by mtls.sh, which stands up an
+## `openssl s_server -Verify 1` that *requires* a client certificate and exports
+## the same credential as PEM files, an encrypted PEM key, a PKCS#12 bundle, DER
+## files, and (read here) in-memory PEM. Built two ways:
+##   nim c ...              -> navi (sync)
+##   nim c -d:useAsync ...  -> navi/asyncdispatch
+## chronos (BearSSL) and js do not present client certificates, so they are out
+## of scope here.
 
-import unittest
-import std/os
-import navi
+import std/[os, strutils]
+when defined(useAsync):
+  import navi/asyncdispatch
+  const backend = "asyncdispatch"
+else:
+  import navi
+  template await(x: untyped): untyped = x
+  const backend = "sync"
 
-let
-  base = getEnv("NAVI_MTLS_URL")
-  ca = getEnv("NAVI_MTLS_CA")
-  cert = getEnv("NAVI_MTLS_CERT")
-  key = getEnv("NAVI_MTLS_KEY")
+proc mtlsCfg(): NaviConfig =
+  ## A config that trusts the test CA but presents no client cert yet.
+  result = newNaviConfig()
+  result.tls.caFile = getEnv("NAVI_MTLS_CA")
+  result.throwHttpErrors = false
 
-suite "mTLS interop (sync, client certificate)":
-  test "presents a client certificate and completes the handshake":
-    var cfg = newNaviConfig()
-    cfg.tls.caFile = ca
-    cfg.tls.certFile = cert
-    cfg.tls.keyFile = key
-    cfg.throwHttpErrors = false
-    let api = newNavi(cfg)
-    let res = api.get(base & "/")
-    check res.status == 200        # openssl s_server -www answers 200
+template runAll() =
+  var passed = 0
+  var failures: seq[string]
+  let base = getEnv("NAVI_MTLS_URL")
 
-  test "a client without a certificate is rejected at the handshake":
-    var cfg = newNaviConfig()
-    cfg.tls.caFile = ca
-    let api = newNavi(cfg)
-    var rejected = false
+  template check(name: string, cond: untyped) =
+    block:
+      try:
+        if cond: inc passed
+        else: (failures.add name; echo "FAIL ", name)
+      except CatchableError as e:
+        failures.add name & " [" & e.msg & "]"
+        echo "FAIL ", name, "  (", e.msg, ")"
+
+  # -www answers 200; reaching it at all means the client cert was accepted.
+  check "PEM cert and key files":
+    var cfg = mtlsCfg()
+    cfg.tls.certFile = getEnv("NAVI_MTLS_CERT")
+    cfg.tls.keyFile = getEnv("NAVI_MTLS_KEY")
+    (await newNavi(cfg).get(base & "/")).status == 200
+
+  check "encrypted PEM key with a passphrase":
+    var cfg = mtlsCfg()
+    cfg.tls.certFile = getEnv("NAVI_MTLS_CERT")
+    cfg.tls.keyFile = getEnv("NAVI_MTLS_ENCKEY")
+    cfg.tls.password = getEnv("NAVI_MTLS_PASS")
+    (await newNavi(cfg).get(base & "/")).status == 200
+
+  check "wrong key passphrase is rejected":
+    var cfg = mtlsCfg()
+    cfg.tls.certFile = getEnv("NAVI_MTLS_CERT")
+    cfg.tls.keyFile = getEnv("NAVI_MTLS_ENCKEY")
+    cfg.tls.password = "not-the-password"
+    var raised = false
+    try: discard await newNavi(cfg).get(base & "/")
+    except CatchableError: raised = true
+    raised
+
+  check "PKCS#12 / PFX bundle":
+    var cfg = mtlsCfg()
+    cfg.tls.pkcs12File = getEnv("NAVI_MTLS_P12")
+    cfg.tls.password = getEnv("NAVI_MTLS_PASS")
+    (await newNavi(cfg).get(base & "/")).status == 200
+
+  check "DER-encoded cert and key (auto-detected)":
+    var cfg = mtlsCfg()
+    cfg.tls.certFile = getEnv("NAVI_MTLS_DERCERT")
+    cfg.tls.keyFile = getEnv("NAVI_MTLS_DERKEY")
+    (await newNavi(cfg).get(base & "/")).status == 200
+
+  check "in-memory PEM cert and key strings":
+    var cfg = mtlsCfg()
+    cfg.tls.certPem = readFile(getEnv("NAVI_MTLS_CERT"))
+    cfg.tls.keyPem = readFile(getEnv("NAVI_MTLS_KEY"))
+    (await newNavi(cfg).get(base & "/")).status == 200
+
+  check "a client with no certificate is not served":
+    # The server (-Verify 1) refuses without a client cert. Sync surfaces that as
+    # a handshake exception; asyncdispatch may instead yield an empty, non-200
+    # response -- either way the page is not served.
+    var ok = false
     try:
-      discard api.get(base & "/")
+      ok = (await newNavi(mtlsCfg()).get(base & "/")).status != 200
     except CatchableError:
-      rejected = true              # server aborts the TLS handshake (no client cert)
-    check rejected
+      ok = true
+    ok
+
+  echo "mTLS interop [", backend, "]: ", passed, " passed, ", failures.len, " failed"
+  if failures.len > 0:
+    for f in failures: echo "  - ", f
+    quit(1)
+
+when defined(useAsync):
+  proc main() {.async.} = runAll()
+  waitFor main()
+else:
+  proc main() = runAll()
+  main()

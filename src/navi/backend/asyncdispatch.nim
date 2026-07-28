@@ -1,7 +1,7 @@
 ## Asynchronous transport backend built on std/asyncnet.
 
 import std/[asyncdispatch, asyncnet, net, nativesockets, strutils]
-import ./api, ./openssl_alpn
+import ./api, ./openssl_alpn, ./openssl_creds
 
 export api, asyncdispatch
 
@@ -47,11 +47,14 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     if tls and not proxy.isSet:
       # Direct TLS: connect a wrapped socket so the handshake completes here and
       # the ALPN result (h2 vs http/1.1) is available before any request.
+      let custom = hasClientCert(cfg)
       let ctx = newContext(
         verifyMode = if cfg.wantsVerify: CVerifyPeer else: CVerifyNone,
-        certFile = cfg.certFile, keyFile = cfg.clientKeyFile,
+        certFile = if custom: "" else: cfg.certFile,
+        keyFile = if custom: "" else: cfg.clientKeyFile,
         caFile = cfg.caFile)
       result.ctx = ctx           # store before the handshake so cleanup frees it
+      if custom: loadClientCert(ctx.context, cfg)
       setAlpn(ctx.context, alpn)
       let socket = newAsyncSocket(pickDomain(host, port), SOCK_STREAM,
                                   IPPROTO_TCP, buffered = false)
@@ -71,11 +74,14 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     when defined(ssl):
       # TLS over the proxy tunnel; the handshake (and any ALPN) completes lazily
       # on first I/O, so this path stays http/1.1.
+      let custom = hasClientCert(cfg)
       let ctx = newContext(
         verifyMode = if cfg.wantsVerify: CVerifyPeer else: CVerifyNone,
-        certFile = cfg.certFile, keyFile = cfg.clientKeyFile,
+        certFile = if custom: "" else: cfg.certFile,
+        keyFile = if custom: "" else: cfg.clientKeyFile,
         caFile = cfg.caFile)
       result.ctx = ctx           # store before the handshake so cleanup frees it
+      if custom: loadClientCert(ctx.context, cfg)
       ctx.wrapConnectedSocket(socket, handshakeAsClient, host)
   established = true
 

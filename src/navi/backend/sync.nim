@@ -4,7 +4,7 @@
 ## body compiles to straight-line blocking code.
 
 import std/[net, os, strutils, nativesockets]
-import ./api, ./openssl_alpn
+import ./api, ./openssl_alpn, ./openssl_creds
 import ../core/response  # for navi's TimeoutError
 when defined(ssl):
   import std/openssl  # SSL_pending
@@ -63,11 +63,16 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     result.socket = dial(host, Port(port), buffered = false)
   if tls:
     when defined(ssl):
+      # Any configured client certificate (PEM/DER/PKCS#12/in-memory) is installed
+      # by loadClientCert; newContext then only handles verification and the CA.
+      let custom = hasClientCert(cfg)
       let ctx = newContext(
         verifyMode = if cfg.wantsVerify: CVerifyPeer else: CVerifyNone,
-        certFile = cfg.certFile, keyFile = cfg.clientKeyFile,
+        certFile = if custom: "" else: cfg.certFile,
+        keyFile = if custom: "" else: cfg.clientKeyFile,
         caFile = cfg.caFile)
       result.ctx = ctx     # store before the handshake so cleanup can free it
+      if custom: loadClientCert(ctx.context, cfg)
       setAlpn(ctx.context, alpn)
       ctx.wrapConnectedSocket(result.socket, handshakeAsClient, host)
       result.protocol = negotiatedProtocol(result.socket.sslHandle)

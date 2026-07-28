@@ -15,10 +15,20 @@
 
 type
   TlsConfig* = object
+    ## TLS options, including the client certificate for mTLS. The client
+    ## credential can come from several sources; precedence is `pkcs12File`, then
+    ## in-memory (`certPem`/`keyPem`), then the `certFile`/`keyFile` pair. Files
+    ## may be PEM or DER (detected by content). All are honored only on the
+    ## OpenSSL backends (sync, asyncdispatch); chronos (BearSSL) and js do not
+    ## present client certificates.
     verify*: bool          ## verify the cert chain and hostname (default on)
     caFile*: string        ## custom CA bundle path; "" uses the system trust store
-    certFile*: string      ## client certificate (PEM) for mTLS; "" presents none
-    keyFile*: string       ## private key (PEM) for `certFile`; "" reuses certFile
+    certFile*: string      ## client certificate file (PEM or DER) for mTLS
+    keyFile*: string       ## private key file for `certFile`; "" reuses certFile
+    password*: string      ## passphrase for an encrypted key, or the PKCS#12 bundle password
+    pkcs12File*: string    ## a PKCS#12/PFX bundle (cert + key + chain); highest precedence
+    certPem*: string       ## client certificate as an in-memory PEM string (may hold a chain)
+    keyPem*: string        ## private key as an in-memory PEM string ("" reuses `certPem`)
 
   ProxyTarget* = object
     ## The HTTP proxy to dial through. An empty `host` means a direct
