@@ -210,6 +210,40 @@ jobs:
       - name: Run the multi-server interop suite
         run: bash tests/interop/servers.sh
 
+  httpbin:
+    runs-on: ubuntu-latest
+    name: httpbin interop (behind Caddy)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # checksums provides the MD5 used by digest auth (exercised by this suite).
+      - name: Install checksums
+        run: nimble install -y checksums
+
+      # Only needed for the navi/chronos leg (the h1+TLS backend).
+      - name: Install chronos
+        run: nimble install -y "chronos@>= 4.0.0"
+
+      # Node runs the navi/js leg (global fetch); libbrotlidec lets the native
+      # brotli-decompression check run for real (it skips cleanly without it).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install brotli runtime
+        run: sudo apt-get update && sudo apt-get install -y libbrotli1
+
+      # A local httpbin (kennethreitz/httpbin) fronted by Caddy for TLS+h2, run
+      # across all four navi backends (sync, asyncdispatch, chronos, js). Covers
+      # every request method plus bodies, auth, redirects, decompression, cookies,
+      # and streaming. Offline: httpbin is never published to the host.
+      - name: Run the httpbin interop suite
+        run: bash tests/interop/httpbin.sh
+
   leak:
     runs-on: ubuntu-latest
     strategy:

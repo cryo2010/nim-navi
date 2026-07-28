@@ -26,6 +26,7 @@ tests/leak_sanitize
 # nimble
 nimblecache/
 tests/interop/badssl
+tests/interop/httpbin_test
 tests/interop/live
 tests/interop/servers_sync
 tests/interop/servers_async
