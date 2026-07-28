@@ -14,24 +14,18 @@
 ## stays transport- and scheme-agnostic.
 
 type
-  TlsFormat* = enum
-    ## Encoding of `certFile`/`keyFile`. In-memory and PKCS#12 credentials are
-    ## always PEM/DER-agnostic (parsed by content), so this only applies to files.
-    tlsPem = "pem"         ## PEM (default)
-    tlsDer = "der"         ## DER / ASN.1
-
   TlsConfig* = object
     ## TLS options, including the client certificate for mTLS. The client
     ## credential can come from several sources; precedence is `pkcs12File`, then
-    ## in-memory (`certPem`/`keyPem`), then the `certFile`/`keyFile` pair. All are
-    ## honored only on the OpenSSL backends (sync, asyncdispatch); chronos
-    ## (BearSSL) and js do not present client certificates.
+    ## in-memory (`certPem`/`keyPem`), then the `certFile`/`keyFile` pair. Files
+    ## may be PEM or DER (detected by content). All are honored only on the
+    ## OpenSSL backends (sync, asyncdispatch); chronos (BearSSL) and js do not
+    ## present client certificates.
     verify*: bool          ## verify the cert chain and hostname (default on)
     caFile*: string        ## custom CA bundle path; "" uses the system trust store
-    certFile*: string      ## client certificate file (PEM, or DER when `format` is tlsDer)
+    certFile*: string      ## client certificate file (PEM or DER) for mTLS
     keyFile*: string       ## private key file for `certFile`; "" reuses certFile
     keyPassword*: string   ## passphrase for an encrypted key (also the PKCS#12 password)
-    format*: TlsFormat     ## encoding of `certFile`/`keyFile` (PEM default, or DER)
     pkcs12File*: string    ## a PKCS#12/PFX bundle (cert + key + chain); highest precedence
     certPem*: string       ## client certificate as an in-memory PEM string (may hold a chain)
     keyPem*: string        ## private key as an in-memory PEM string ("" reuses `certPem`)

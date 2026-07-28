@@ -282,9 +282,8 @@ cfg.tls.certFile    = "client.pem"
 cfg.tls.keyFile     = "client.enc.key"
 cfg.tls.keyPassword = "secret"
 
-# DER-encoded cert and key
+# DER-encoded cert and key (encoding auto-detected from content)
 cfg.tls.certFile = "client.crt"; cfg.tls.keyFile = "client.key"
-cfg.tls.format   = tlsDer
 
 # PKCS#12 / PFX bundle (keyPassword is the bundle password)
 cfg.tls.pkcs12File  = "client.p12"

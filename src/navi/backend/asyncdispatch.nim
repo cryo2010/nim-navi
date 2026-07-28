@@ -47,7 +47,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     if tls and not proxy.isSet:
       # Direct TLS: connect a wrapped socket so the handshake completes here and
       # the ALPN result (h2 vs http/1.1) is available before any request.
-      let custom = usesCustomCert(cfg)
+      let custom = hasClientCert(cfg)
       let ctx = newContext(
         verifyMode = if cfg.wantsVerify: CVerifyPeer else: CVerifyNone,
         certFile = if custom: "" else: cfg.certFile,
@@ -74,7 +74,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     when defined(ssl):
       # TLS over the proxy tunnel; the handshake (and any ALPN) completes lazily
       # on first I/O, so this path stays http/1.1.
-      let custom = usesCustomCert(cfg)
+      let custom = hasClientCert(cfg)
       let ctx = newContext(
         verifyMode = if cfg.wantsVerify: CVerifyPeer else: CVerifyNone,
         certFile = if custom: "" else: cfg.certFile,

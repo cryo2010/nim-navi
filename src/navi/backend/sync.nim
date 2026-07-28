@@ -63,9 +63,9 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     result.socket = dial(host, Port(port), buffered = false)
   if tls:
     when defined(ssl):
-      # A plain PEM cert/key pair goes through newContext; richer client
-      # credentials (encrypted PEM, DER, PKCS#12, in-memory) are loaded after.
-      let custom = usesCustomCert(cfg)
+      # Any configured client certificate (PEM/DER/PKCS#12/in-memory) is installed
+      # by loadClientCert; newContext then only handles verification and the CA.
+      let custom = hasClientCert(cfg)
       let ctx = newContext(
         verifyMode = if cfg.wantsVerify: CVerifyPeer else: CVerifyNone,
         certFile = if custom: "" else: cfg.certFile,

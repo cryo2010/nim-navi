@@ -67,11 +67,10 @@ template runAll() =
     cfg.tls.keyPassword = getEnv("NAVI_MTLS_PASS")
     (await newNavi(cfg).get(base & "/")).status == 200
 
-  check "DER-encoded cert and key":
+  check "DER-encoded cert and key (auto-detected)":
     var cfg = mtlsCfg()
     cfg.tls.certFile = getEnv("NAVI_MTLS_DERCERT")
     cfg.tls.keyFile = getEnv("NAVI_MTLS_DERKEY")
-    cfg.tls.format = tlsDer
     (await newNavi(cfg).get(base & "/")).status == 200
 
   check "in-memory PEM cert and key strings":

@@ -91,33 +91,44 @@ when defined(ssl):
       EVP_PKEY_free(pkey); fail("the PKCS#12 key does not match the certificate")
     EVP_PKEY_free(pkey)
 
-  proc useDerFiles(ctx: SslCtx, certFile, keyFile: string) =
-    if SSL_CTX_use_certificate_file(ctx, certFile.cstring, SSL_FILETYPE_ASN1) != 1:
-      fail("could not load the DER certificate: " & certFile)
-    if SSL_CTX_use_PrivateKey_file(ctx, keyFile.cstring, SSL_FILETYPE_ASN1) != 1:
-      fail("could not load the DER private key: " & keyFile)
+  proc isDer(data: string): bool =
+    ## DER starts with the ASN.1 SEQUENCE tag (0x30); PEM starts with '-'.
+    data.len > 0 and data[0] == '\x30'
+
+  proc useCertFile(ctx: SslCtx, path: string) =
+    let data = readFile(path)
+    if isDer(data):                           # single DER cert (no chain)
+      if SSL_CTX_use_certificate_file(ctx, path.cstring, SSL_FILETYPE_ASN1) != 1:
+        fail("could not load the DER certificate: " & path)
+    else:
+      useCertChainPem(ctx, data)              # PEM leaf + any following chain
+
+  proc useKeyFile(ctx: SslCtx, path, password: string) =
+    let data = readFile(path)
+    if isDer(data):
+      if SSL_CTX_use_PrivateKey_file(ctx, path.cstring, SSL_FILETYPE_ASN1) != 1:
+        fail("could not load the DER private key: " & path)
+    else:
+      useKeyPem(ctx, data, password)          # PEM, possibly encrypted
 
   proc loadClientCert*(ctx: SslCtx, tls: TlsConfig) =
     ## Install the client credential described by `tls`. Precedence: PKCS#12,
-    ## then in-memory PEM, then the cert/key files (DER or encrypted PEM). Raises
-    ## `ValueError` if the material is missing, malformed, or mismatched.
+    ## then in-memory PEM, then the cert/key files. File encoding (PEM vs DER) is
+    ## detected from the content. Raises `ValueError` if the material is missing,
+    ## malformed, or mismatched.
     if tls.pkcs12File.len > 0:
       usePkcs12(ctx, readFile(tls.pkcs12File), tls.keyPassword)
     elif tls.certPem.len > 0:
       useCertChainPem(ctx, tls.certPem)
       useKeyPem(ctx, (if tls.keyPem.len > 0: tls.keyPem else: tls.certPem),
                 tls.keyPassword)
-    elif tls.format == tlsDer:
-      useDerFiles(ctx, tls.certFile, clientKeyFile(tls))
-    else:                                     # PEM files, key possibly encrypted
-      if SSL_CTX_use_certificate_chain_file(ctx, tls.certFile.cstring) != 1:
-        fail("could not load the certificate: " & tls.certFile)
-      useKeyPem(ctx, readFile(clientKeyFile(tls)), tls.keyPassword)
+    else:
+      useCertFile(ctx, tls.certFile)
+      useKeyFile(ctx, clientKeyFile(tls), tls.keyPassword)
     if SSL_CTX_check_private_key(ctx) != 1:
       fail("the client certificate and private key do not match")
 
-proc usesCustomCert*(tls: TlsConfig): bool =
-  ## Whether the client credential needs `loadClientCert` rather than the plain
-  ## PEM-file path that `newContext` already handles.
-  tls.pkcs12File.len > 0 or tls.certPem.len > 0 or tls.format == tlsDer or
-    (tls.certFile.len > 0 and tls.keyPassword.len > 0)
+proc hasClientCert*(tls: TlsConfig): bool =
+  ## Whether a client certificate is configured (so the backend routes through
+  ## `loadClientCert` and hands `newContext` an empty cert/key).
+  tls.pkcs12File.len > 0 or tls.certPem.len > 0 or tls.certFile.len > 0
