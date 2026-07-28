@@ -3,7 +3,7 @@
 [![CI](https://github.com/cryo2010/nim-navi/actions/workflows/ci.yml/badge.svg)](https://github.com/cryo2010/nim-navi/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-An HTTP client for Nim, inspired by [ky](https://github.com/sindresorhus/ky). One API with four interchangeable backends for sync, async and JavaScript targets. You select a backend via import.
+An HTTP client with HTTP/1.1, HTTP/2, TLS, and WebSocket support, inspired by [ky](https://github.com/sindresorhus/ky). One API with four interchangeable backends for sync, async and JavaScript targets. You select a backend via import.
 
 ```nim
 # Imports the synchronous client
