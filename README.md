@@ -278,16 +278,16 @@ cfg.tls.certFile = "client.pem"
 cfg.tls.keyFile  = "client.key"
 
 # Encrypted PEM key
-cfg.tls.certFile    = "client.pem"
-cfg.tls.keyFile     = "client.enc.key"
+cfg.tls.certFile = "client.pem"
+cfg.tls.keyFile  = "client.enc.key"
 cfg.tls.password = "secret"
 
 # DER-encoded cert and key (encoding auto-detected from content)
 cfg.tls.certFile = "client.crt"; cfg.tls.keyFile = "client.key"
 
 # PKCS#12 / PFX bundle (password is the bundle password)
-cfg.tls.pkcs12File  = "client.p12"
-cfg.tls.password = "secret"
+cfg.tls.pkcs12File = "client.p12"
+cfg.tls.password   = "secret"
 
 # In-memory PEM (e.g. from a secrets manager; no files touched)
 cfg.tls.certPem = certString
