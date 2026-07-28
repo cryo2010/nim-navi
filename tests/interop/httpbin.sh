@@ -43,6 +43,24 @@ done
 
 export NAVI_INTEROP_CERT="$NAVI_CERTDIR/cert.pem"
 export NAVI_HTTPBIN_URL="$url"
+common="--path:$root/src -d:ssl --hints:off"
+test="$root/tests/interop/httpbin_test.nim"
 echo "== httpbin functionality: methods, bodies, auth, redirects, decompression, cookies, streaming =="
-nim c -r --path:"$root/src" -d:ssl --hints:off "$root/tests/interop/httpbin_test.nim"
-echo "== httpbin interop passed =="
+
+# Native backends: one shared test compiled three ways (chronos is h1 -- BearSSL
+# has no client ALPN -- the others negotiate h2 with Caddy).
+nim c -r $common               "$test"
+nim c -r $common -d:useAsync   "$test"
+nim c -r $common -d:useChronos "$test"
+
+# js backend under Node: fetch ignores cfg.tls.caFile, so Node trusts the cert via
+# NODE_EXTRA_CA_CERTS. Skipped (not failed) when node is unavailable.
+if command -v node >/dev/null; then
+  nim js -d:nodejs --path:"$root/src" --hints:off -o:"$work/httpbin_js.js" \
+    "$root/tests/interop/httpbin_js.nim"
+  NODE_EXTRA_CA_CERTS="$NAVI_INTEROP_CERT" node "$work/httpbin_js.js"
+else
+  echo "node not found; skipping the js backend"
+fi
+
+echo "== httpbin interop passed (all backends) =="

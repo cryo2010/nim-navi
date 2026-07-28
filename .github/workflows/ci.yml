@@ -225,14 +225,22 @@ jobs:
       - name: Install checksums
         run: nimble install -y checksums
 
-      # libbrotlidec lets the brotli-decompression check actually run (it skips
-      # cleanly without it, but here we want the real assertion).
+      # Only needed for the navi/chronos leg (the h1+TLS backend).
+      - name: Install chronos
+        run: nimble install -y "chronos@>= 4.0.0"
+
+      # Node runs the navi/js leg (global fetch); libbrotlidec lets the native
+      # brotli-decompression check run for real (it skips cleanly without it).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - name: Install brotli runtime
         run: sudo apt-get update && sudo apt-get install -y libbrotli1
 
-      # A local httpbin (kennethreitz/httpbin) fronted by Caddy for TLS+h2. Covers
+      # A local httpbin (kennethreitz/httpbin) fronted by Caddy for TLS+h2, run
+      # across all four navi backends (sync, asyncdispatch, chronos, js). Covers
       # every request method plus bodies, auth, redirects, decompression, cookies,
-      # and streaming through navi. Offline: httpbin is never published to the host.
+      # and streaming. Offline: httpbin is never published to the host.
       - name: Run the httpbin interop suite
         run: bash tests/interop/httpbin.sh
 
