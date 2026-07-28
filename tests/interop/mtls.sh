@@ -33,6 +33,16 @@ openssl req -newkey rsa:2048 -nodes -keyout client.key -out client.csr \
 openssl x509 -req -in client.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 1 \
   -out client.pem >/dev/null 2>&1
 
+# The same client credential re-encoded into every format navi accepts, so one
+# server can validate them all: an encrypted PEM key, a PKCS#12 bundle, and a
+# DER cert + key. (The PEM and in-memory paths reuse client.pem/client.key.)
+pass="navi-secret"
+openssl rsa -in client.key -out client.enc.key -aes256 -passout "pass:$pass" >/dev/null 2>&1
+openssl pkcs12 -export -inkey client.key -in client.pem -certfile ca.pem \
+  -passout "pass:$pass" -out client.p12 >/dev/null 2>&1
+openssl x509 -in client.pem -outform DER -out client.der.crt >/dev/null 2>&1
+openssl rsa -in client.key -outform DER -out client.der.key >/dev/null 2>&1
+
 # -Verify 1 makes a client certificate mandatory; -www answers a 200 HTML page.
 openssl s_server -accept "$port" -cert server.pem -key server.key \
   -CAfile ca.pem -Verify 1 -www -quiet >"$work/s_server.log" 2>&1 &
@@ -53,5 +63,12 @@ export NAVI_MTLS_URL="https://localhost:$port"
 export NAVI_MTLS_CA="$work/ca.pem"
 export NAVI_MTLS_CERT="$work/client.pem"
 export NAVI_MTLS_KEY="$work/client.key"
+export NAVI_MTLS_ENCKEY="$work/client.enc.key"
+export NAVI_MTLS_P12="$work/client.p12"
+export NAVI_MTLS_DERCERT="$work/client.der.crt"
+export NAVI_MTLS_DERKEY="$work/client.der.key"
+export NAVI_MTLS_PASS="$pass"
 
-nim c -r --hints:off -d:ssl -o:"$work/mtls" "$root/tests/interop/mtls.nim"
+# Same test on both OpenSSL backends (chronos/js do not present client certs).
+nim c -r --hints:off -d:ssl -o:"$work/mtls_sync"  "$root/tests/interop/mtls.nim"
+nim c -r --hints:off -d:ssl -d:useAsync -o:"$work/mtls_async" "$root/tests/interop/mtls.nim"

@@ -268,6 +268,35 @@ let api = newNavi(cfg)
 
 `verify` defaults to on. `caFile` is honored by all three backends: sync and asyncdispatch through OpenSSL, and chronos through BearSSL (which otherwise verifies against its bundled Mozilla trust anchors). The chronos backend negotiates up to TLS 1.2 and does not support client certificates (mTLS).
 
+#### Client certificates (mTLS)
+
+On the OpenSSL backends (sync, asyncdispatch) navi can present a client certificate for mutual TLS, from several sources. Precedence is `pkcs12File`, then in-memory (`certPem`/`keyPem`), then the `certFile`/`keyFile` pair.
+
+```nim
+# PEM cert + key files (a single PEM may hold both; leave keyFile empty)
+cfg.tls.certFile = "client.pem"
+cfg.tls.keyFile  = "client.key"
+
+# Encrypted PEM key
+cfg.tls.certFile    = "client.pem"
+cfg.tls.keyFile     = "client.enc.key"
+cfg.tls.keyPassword = "secret"
+
+# DER-encoded cert and key
+cfg.tls.certFile = "client.crt"; cfg.tls.keyFile = "client.key"
+cfg.tls.format   = tlsDer
+
+# PKCS#12 / PFX bundle (keyPassword is the bundle password)
+cfg.tls.pkcs12File  = "client.p12"
+cfg.tls.keyPassword = "secret"
+
+# In-memory PEM (e.g. from a secrets manager; no files touched)
+cfg.tls.certPem = certString
+cfg.tls.keyPem  = keyString
+```
+
+Key algorithms (RSA, ECDSA, Ed25519) work in any of these as long as OpenSSL supports them. In-memory PEM may carry an intermediate chain; a PKCS#12 bundle's extra chain certs are not installed (only its leaf and key), which is all a client needs to present. chronos (BearSSL) and js do not present client certificates.
+
 ### Errors
 
 By default a non-2xx response raises `HttpError`, which carries the full response:
