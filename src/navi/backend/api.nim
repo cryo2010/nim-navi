@@ -25,7 +25,7 @@ type
     caFile*: string        ## custom CA bundle path; "" uses the system trust store
     certFile*: string      ## client certificate file (PEM or DER) for mTLS
     keyFile*: string       ## private key file for `certFile`; "" reuses certFile
-    keyPassword*: string   ## passphrase for an encrypted key (also the PKCS#12 password)
+    password*: string      ## passphrase for an encrypted key, or the PKCS#12 bundle password
     pkcs12File*: string    ## a PKCS#12/PFX bundle (cert + key + chain); highest precedence
     certPem*: string       ## client certificate as an in-memory PEM string (may hold a chain)
     keyPem*: string        ## private key as an in-memory PEM string ("" reuses `certPem`)

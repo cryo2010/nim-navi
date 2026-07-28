@@ -48,14 +48,14 @@ template runAll() =
     var cfg = mtlsCfg()
     cfg.tls.certFile = getEnv("NAVI_MTLS_CERT")
     cfg.tls.keyFile = getEnv("NAVI_MTLS_ENCKEY")
-    cfg.tls.keyPassword = getEnv("NAVI_MTLS_PASS")
+    cfg.tls.password = getEnv("NAVI_MTLS_PASS")
     (await newNavi(cfg).get(base & "/")).status == 200
 
   check "wrong key passphrase is rejected":
     var cfg = mtlsCfg()
     cfg.tls.certFile = getEnv("NAVI_MTLS_CERT")
     cfg.tls.keyFile = getEnv("NAVI_MTLS_ENCKEY")
-    cfg.tls.keyPassword = "not-the-password"
+    cfg.tls.password = "not-the-password"
     var raised = false
     try: discard await newNavi(cfg).get(base & "/")
     except CatchableError: raised = true
@@ -64,7 +64,7 @@ template runAll() =
   check "PKCS#12 / PFX bundle":
     var cfg = mtlsCfg()
     cfg.tls.pkcs12File = getEnv("NAVI_MTLS_P12")
-    cfg.tls.keyPassword = getEnv("NAVI_MTLS_PASS")
+    cfg.tls.password = getEnv("NAVI_MTLS_PASS")
     (await newNavi(cfg).get(base & "/")).status == 200
 
   check "DER-encoded cert and key (auto-detected)":

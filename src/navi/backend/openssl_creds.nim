@@ -3,9 +3,9 @@
 ## a PKCS#12 (`.p12`/`.pfx`) bundle, or in-memory PEM strings. Shared by the
 ## OpenSSL backends (sync, asyncdispatch). Empty unless compiled with `-d:ssl`.
 ##
-## Plain unencrypted PEM *files* still go through `newContext`; `usesCustomCert`
-## reports when a request needs this richer path instead, so the backend can pass
-## empty cert/key files to `newContext` and call `loadClientCert` afterward.
+## When `hasClientCert` reports a credential is configured, the backend hands
+## `newContext` an empty cert/key and calls `loadClientCert` to install it, so
+## every client-cert case (including plain PEM files) takes one uniform path.
 
 import ./api
 
@@ -117,14 +117,14 @@ when defined(ssl):
     ## detected from the content. Raises `ValueError` if the material is missing,
     ## malformed, or mismatched.
     if tls.pkcs12File.len > 0:
-      usePkcs12(ctx, readFile(tls.pkcs12File), tls.keyPassword)
+      usePkcs12(ctx, readFile(tls.pkcs12File), tls.password)
     elif tls.certPem.len > 0:
       useCertChainPem(ctx, tls.certPem)
       useKeyPem(ctx, (if tls.keyPem.len > 0: tls.keyPem else: tls.certPem),
-                tls.keyPassword)
+                tls.password)
     else:
       useCertFile(ctx, tls.certFile)
-      useKeyFile(ctx, clientKeyFile(tls), tls.keyPassword)
+      useKeyFile(ctx, clientKeyFile(tls), tls.password)
     if SSL_CTX_check_private_key(ctx) != 1:
       fail("the client certificate and private key do not match")
 
