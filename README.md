@@ -3,7 +3,7 @@
 [![CI](https://github.com/cryo2010/nim-navi/actions/workflows/ci.yml/badge.svg)](https://github.com/cryo2010/nim-navi/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-An HTTP client for Nim, inspired by [ky](https://github.com/sindresorhus/ky). One API with four interchangeable backends for sync, async and JavaScript targets. You select a backend via import.
+An HTTP client with HTTP/1.1, HTTP/2, TLS, and WebSocket support, inspired by [ky](https://github.com/sindresorhus/ky). One API with four interchangeable backends for sync, async and JavaScript targets. You select a backend via import.
 
 ```nim
 # Imports the synchronous client
@@ -332,7 +332,7 @@ var cfg = newNaviConfig()
 cfg.retry.limit = 5
 cfg.retry.methods = {GET, HEAD}            # verbs eligible for retry
 cfg.retry.statuses = @[429, 503]           # response statuses that trigger one
-cfg.retry.backoffCap = 30_000              # cap the wait between attempts (ms)
+cfg.retry.maxDelay = 30_000                # cap the wait between attempts (ms)
 ```
 
 `timeout` is per socket read on the sync backend and bounds the whole request (including retries) on the async backends.
@@ -623,7 +623,7 @@ fields you want. `NaviConfig` has `{.requiresInit.}`, so a bare or partial
 - **maxRedirects** `int`: redirects to follow. Default 20; 0 disables.
 - **retry** `RetryPolicy`: `limit` (attempts, default 2, 0 disables), `methods`
   (verbs eligible, default the idempotent ones), `statuses` (response codes that
-  trigger a retry), and `backoffCap` (ms ceiling on the wait between attempts).
+  trigger a retry), and `maxDelay` (ms ceiling on the wait between attempts).
 - **maxResponseBytes** `int`: cap on the response body size. A larger response
   raises `ResponseTooLargeError`. 0 (default) is unlimited. Enforced incrementally
   when streaming; counts decompressed bytes on the native backends.

@@ -28,8 +28,8 @@ proc retryAfterMs(resp: Response): int =
 proc backoffMs*(attempt: int, resp: Response, policy: RetryPolicy): int =
   ## Wait before retry `attempt`: a `Retry-After` value takes precedence,
   ## otherwise capped exponential backoff. Either way it is bounded by
-  ## `policy.backoffCap` so a hostile `Retry-After` cannot stall the client.
+  ## `policy.maxDelay` so a hostile `Retry-After` cannot stall the client.
   let ra = retryAfterMs(resp)
-  let cap = if policy.backoffCap > 0: policy.backoffCap else: high(int)
+  let cap = if policy.maxDelay > 0: policy.maxDelay else: high(int)
   if ra >= 0: return min(cap, ra)
   min(cap, 100 * (1 shl min(attempt - 1, 6)))
