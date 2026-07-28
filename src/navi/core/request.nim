@@ -55,7 +55,7 @@ type
     limit*: int                     ## retry attempts, 0 disables (default 2)
     methods*: set[HttpVerb]         ## verbs eligible for retry (idempotent by default)
     statuses*: seq[int]             ## response statuses that trigger a retry
-    backoffCap*: int                ## upper bound on the wait between attempts, ms
+    maxDelay*: int                  ## upper bound on the wait between attempts, ms
 
   NaviConfigBase* = object of RootObj
     ## Backend-agnostic client defaults, applied to every request and inheritable
@@ -92,12 +92,12 @@ type
 proc defaultRetryPolicy*(): RetryPolicy =
   ## Retry idempotent methods up to twice on transient statuses, backing off
   ## exponentially up to 10s. `newNaviConfig` uses this; override `config.retry`
-  ## (or its fields) to change the count, methods, statuses, or backoff cap.
+  ## (or its fields) to change the count, methods, statuses, or max delay.
   RetryPolicy(
     limit: 2,
     methods: {GET, HEAD, PUT, DELETE, OPTIONS},
     statuses: @[408, 413, 429, 500, 502, 503, 504],
-    backoffCap: 10_000)
+    maxDelay: 10_000)
 
 proc limitedSink*(inner: BodySink, limit: int): BodySink =
   ## Wrap `inner` so the cumulative bytes delivered are capped at `limit`, raising
