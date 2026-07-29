@@ -11,7 +11,7 @@ suite "asyncdispatch entry end to end":
     var th: Thread[ServerCtx]
     startServer(th, port)
 
-    let api = initNavi()
+    let api = newNavi()
     let res = waitFor api.get("http://127.0.0.1:" & $port & "/")
     check res.status == 200
     check res.ok
@@ -23,7 +23,7 @@ suite "asyncdispatch entry end to end":
     var th: Thread[ServerCtx]
     startRetry(th, port, failures = 1)
 
-    let api = initNavi()
+    let api = newNavi()
     let res = waitFor api.get("http://127.0.0.1:" & $port & "/")
     check res.status == 200
     check res.body == "recovered"
@@ -34,7 +34,7 @@ suite "asyncdispatch entry end to end":
     var th: Thread[ServerCtx]
     startHang(th, port)  # accepts, reads the request, never replies
 
-    let api = initNavi()
+    let api = newNavi()
     proc run(): Future[void] {.async.} =
       let tok = newCancelToken()
       let f = api.get("http://127.0.0.1:" & $port & "/", cancel = tok)
@@ -57,7 +57,7 @@ suite "asyncdispatch entry end to end":
 
     var cfg = initNaviConfig()
     cfg.middleware = @[bearerMw("captured-42")]
-    let api = initNavi(cfg)
+    let api = newNavi(cfg)
     let res = waitFor api.post("http://127.0.0.1:" & $port & "/", body = "x")
     check res.headers.get("x-echo-authorization") == "Bearer captured-42"
     joinThread(th)

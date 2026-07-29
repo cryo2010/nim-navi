@@ -24,7 +24,7 @@ proc exercise(): int =
   ## Returns the number of requests that completed with 200.
   var cfg = initNaviConfig()
   cfg.tls.caFile = cert
-  let api = initNavi(cfg)
+  let api = newNavi(cfg)
   for _ in 0 ..< iters:
     let r = api.get(url)
     doAssert r.status == 200, "unexpected status " & $r.status
@@ -37,7 +37,7 @@ proc exerciseFailedHandshake(): int =
   ## freed on that path too -- a regression guard for the connect-cleanup defer.
   var cfg = initNaviConfig()
   cfg.retry.limit = 0   # verify on (default), no caFile -> cert untrusted; one attempt
-  let api = initNavi(cfg)
+  let api = newNavi(cfg)
   for _ in 0 ..< iters:
     var raised = false
     try: discard api.get(url)

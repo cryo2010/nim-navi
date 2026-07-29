@@ -16,7 +16,7 @@ let cert = getEnv("NAVI_INTEROP_CERT")
 proc client(): Navi =
   var cfg = initNaviConfig()
   cfg.tls.caFile = cert
-  initNavi(cfg)
+  newNavi(cfg)
 
 suite "nghttpd interop (sync, http/2)":
   test "negotiates h2 over ALPN and GETs a file":

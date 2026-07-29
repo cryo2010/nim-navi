@@ -67,7 +67,7 @@ suite "async websocket client end to end":
     while not wsReady: os.sleep(5)
 
     proc run() {.async.} =
-      let api = initNavi()
+      let api = newNavi()
       let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
 
       await ws.send("hello")
