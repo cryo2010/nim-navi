@@ -185,6 +185,12 @@ jobs:
       - name: Run the mTLS interop test
         run: bash tests/interop/mtls.sh
 
+      # Handshake-aware address fallback: a dead endpoint plus a good TLS server
+      # on one port; navi must fall through to the good address. python3 (present
+      # on the runner) stands up the two servers.
+      - name: Run the TLS address-fallback test
+        run: bash tests/interop/tls_fallback.sh
+
   multiserver:
     runs-on: ubuntu-latest
     name: multi-server interop (nginx/caddy/h2o)

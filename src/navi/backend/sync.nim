@@ -33,6 +33,44 @@ proc proxyConnect(socket: Socket, host: string, port: int) =
   if not resp.startsWith("HTTP/1.1 200") and not resp.startsWith("HTTP/1.0 200"):
     raise newException(ValueError, "navi: proxy CONNECT failed: " & resp.splitLines()[0])
 
+when defined(ssl):
+  proc resolveAddrs(host: string, port: int): seq[string] =
+    ## Numeric addresses for `host`, in the resolver's order (RFC 6724). We
+    ## resolve ourselves so the connect loop can iterate them; std/net's `dial`
+    ## hides the list and stops at the first that TCP-connects.
+    var ai = getAddrInfo(host, Port(port), AF_UNSPEC, SOCK_STREAM, IPPROTO_TCP)
+    var it = ai
+    while it != nil:
+      result.add getAddrString(it.ai_addr)
+      it = it.ai_next
+    freeAddrInfo(ai)
+
+  proc connectAcross*(ctx: SslContext, ips: openArray[string], sni: string,
+                      port: int): Socket =
+    ## TCP-connect + TLS-handshake across `ips` in order, returning the first
+    ## socket that completes the handshake; the connection uses each IP while
+    ## SNI and certificate verification use `sni`. Falls through to the next
+    ## address on a connect *or handshake* failure -- unlike std/net's `dial`,
+    ## which stops at the first address that merely TCP-connects, so a dead
+    ## endpoint on a multi-homed host (a partially-broken CDN pool) no longer
+    ## fails the whole request. Exported for the fallback test; navi reaches it
+    ## through `connect`.
+    if ips.len == 0:
+      raise newException(IOError, "navi: could not resolve " & sni)
+    var lastErr: ref CatchableError
+    for ip in ips:
+      var sock: Socket = nil
+      try:
+        sock = dial(ip, Port(port), buffered = false)
+        ctx.wrapConnectedSocket(sock, handshakeAsClient, sni)
+        return sock
+      except CatchableError as e:
+        if not sock.isNil:
+          try: sock.close()
+          except CatchableError: discard
+        lastErr = e
+    raise lastErr
+
 proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
               proxy: ProxyTarget, alpn: seq[string] = @[], timeout = 0): Conn =
   ## Dial `host:port` (IPv4 or IPv6, resolved by std/net), upgrading to TLS for
@@ -59,17 +97,26 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     result.socket = dial(proxy.host, Port(proxy.port), buffered = false)
     if tls:
       proxyConnect(result.socket, host, port)
-  else:
-    result.socket = dial(host, Port(port), buffered = false)
-  if tls:
+      when defined(ssl):
+        let ctx = newTlsContext(cfg, alpn)   # verify/CA + ALPN + any client cert
+        result.ctx = ctx   # store before the handshake so cleanup can free it
+        ctx.wrapConnectedSocket(result.socket, handshakeAsClient, host)
+        result.protocol = negotiatedProtocol(result.socket.sslHandle)
+      else:
+        raise newException(ValueError, "navi: https requires compiling with -d:ssl")
+  elif tls:
     when defined(ssl):
       let ctx = newTlsContext(cfg, alpn)   # verify/CA + ALPN + any client cert
       result.ctx = ctx     # store before the handshake so cleanup can free it
-      ctx.wrapConnectedSocket(result.socket, handshakeAsClient, host)
+      # Handshake-aware fallback: try each resolved address until the TLS
+      # handshake succeeds (see connectAcross), not just the first that
+      # TCP-connects the way std/net's dial does.
+      result.socket = connectAcross(ctx, resolveAddrs(host, port), host, port)
       result.protocol = negotiatedProtocol(result.socket.sslHandle)
     else:
-      raise newException(ValueError,
-        "navi: https requires compiling with -d:ssl")
+      raise newException(ValueError, "navi: https requires compiling with -d:ssl")
+  else:
+    result.socket = dial(host, Port(port), buffered = false)
   established = true
 
 proc sendAll*(c: Conn, data: string) =
