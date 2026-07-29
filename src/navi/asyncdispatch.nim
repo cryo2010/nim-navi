@@ -1,7 +1,7 @@
 ## navi — asyncdispatch entry point.
 ##
 ##   import navi/asyncdispatch
-##   let api = initNavi()
+##   let api = newNavi()
 ##   let res = await api.get("http://example.com")
 ##
 ## Under `nim js` this transparently falls back to navi/js (fetch), since

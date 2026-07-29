@@ -76,7 +76,7 @@ suite "memory growth":
     while not serverReady: sleep(5)
 
     let iters = parseInt(getEnv("NAVI_LEAK_ITERS", "100000"))
-    let api = initNavi()
+    let api = newNavi()
 
     for _ in 0 ..< 1000: exerciseAll(api)   # let pool/jar reach steady state
     GC_fullCollect()

@@ -11,5 +11,5 @@ proc bearer(token: string): NaviMiddleware =
 proc fetchThing*(url: string): Future[Response] {.async.} =
   var cfg = initNaviConfig()
   cfg.middleware = @[bearer("secret")]
-  let api = initNavi(cfg)
+  let api = newNavi(cfg)
   return await api.get(url, params = @{"q": "x"})

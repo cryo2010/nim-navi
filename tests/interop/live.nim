@@ -66,7 +66,7 @@ proc client(): Navi =
   # targets would answer 403 (a SKIP) instead of exercising navi's h2 read path.
   cfg.headers["user-agent"] =
     "Mozilla/5.0 (compatible; navi-interop/1.0; +https://github.com/)"
-  initNavi(cfg)
+  newNavi(cfg)
 
 proc say(line: string) =
   # Flush per line: Nim block-buffers stdout to a pipe, so without this the CI

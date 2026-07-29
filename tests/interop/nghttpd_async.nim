@@ -19,7 +19,7 @@ suite "nghttpd interop (asyncdispatch, http/2 mux)":
     proc run(): Future[seq[Response]] {.async.} =
       var cfg = initNaviConfig()
       cfg.tls.caFile = cert
-      let api = initNavi(cfg)
+      let api = newNavi(cfg)
       result = await all(@[
         api.get(padded & "/small.txt"),
         api.get(padded & "/large.bin")])
@@ -34,7 +34,7 @@ suite "nghttpd interop (asyncdispatch, http/2 mux)":
     proc run(): Future[seq[Response]] {.async.} =
       var cfg = initNaviConfig()
       cfg.tls.caFile = cert
-      let api = initNavi(cfg)
+      let api = newNavi(cfg)
       result = await all(@[
         api.get(base & "/small.txt"),
         api.get(base & "/small.txt"),
@@ -53,7 +53,7 @@ suite "nghttpd interop (asyncdispatch, http/2 mux)":
     proc run(): Future[seq[Response]] {.async.} =
       var cfg = initNaviConfig()
       cfg.tls.caFile = cert
-      let api = initNavi(cfg)
+      let api = newNavi(cfg)
       var futs: seq[Future[Response]]
       for _ in 0 ..< 8: futs.add api.get(base & "/small.txt")
       result = await all(futs)
@@ -70,7 +70,7 @@ suite "nghttpd interop (asyncdispatch, http/2 mux)":
     proc run(): Future[int] {.async.} =
       var cfg = initNaviConfig()
       cfg.tls.caFile = cert
-      let api = initNavi(cfg)
+      let api = newNavi(cfg)
       proc batch(): Future[void] {.async.} =
         var futs: seq[Future[Response]]
         for _ in 0 ..< 10: futs.add api.get(base & "/small.txt")

@@ -20,7 +20,7 @@ proc mkClient(base, cert: string): Navi =
   cfg.prefixUrl = base
   cfg.tls.caFile = cert
   cfg.middleware = @[stampMw()]
-  initNavi(cfg)
+  newNavi(cfg)
 
 proc httpRound(api: Navi) =
   for v in verbs:

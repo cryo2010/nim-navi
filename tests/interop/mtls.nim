@@ -42,14 +42,14 @@ template runAll() =
     var cfg = mtlsCfg()
     cfg.tls.certFile = getEnv("NAVI_MTLS_CERT")
     cfg.tls.keyFile = getEnv("NAVI_MTLS_KEY")
-    (await initNavi(cfg).get(base & "/")).status == 200
+    (await newNavi(cfg).get(base & "/")).status == 200
 
   check "encrypted PEM key with a passphrase":
     var cfg = mtlsCfg()
     cfg.tls.certFile = getEnv("NAVI_MTLS_CERT")
     cfg.tls.keyFile = getEnv("NAVI_MTLS_ENCKEY")
     cfg.tls.password = getEnv("NAVI_MTLS_PASS")
-    (await initNavi(cfg).get(base & "/")).status == 200
+    (await newNavi(cfg).get(base & "/")).status == 200
 
   check "wrong key passphrase is rejected":
     var cfg = mtlsCfg()
@@ -57,7 +57,7 @@ template runAll() =
     cfg.tls.keyFile = getEnv("NAVI_MTLS_ENCKEY")
     cfg.tls.password = "not-the-password"
     var raised = false
-    try: discard await initNavi(cfg).get(base & "/")
+    try: discard await newNavi(cfg).get(base & "/")
     except CatchableError: raised = true
     raised
 
@@ -65,19 +65,19 @@ template runAll() =
     var cfg = mtlsCfg()
     cfg.tls.pkcs12File = getEnv("NAVI_MTLS_P12")
     cfg.tls.password = getEnv("NAVI_MTLS_PASS")
-    (await initNavi(cfg).get(base & "/")).status == 200
+    (await newNavi(cfg).get(base & "/")).status == 200
 
   check "DER-encoded cert and key (auto-detected)":
     var cfg = mtlsCfg()
     cfg.tls.certFile = getEnv("NAVI_MTLS_DERCERT")
     cfg.tls.keyFile = getEnv("NAVI_MTLS_DERKEY")
-    (await initNavi(cfg).get(base & "/")).status == 200
+    (await newNavi(cfg).get(base & "/")).status == 200
 
   check "in-memory PEM cert and key strings":
     var cfg = mtlsCfg()
     cfg.tls.certPem = readFile(getEnv("NAVI_MTLS_CERT"))
     cfg.tls.keyPem = readFile(getEnv("NAVI_MTLS_KEY"))
-    (await initNavi(cfg).get(base & "/")).status == 200
+    (await newNavi(cfg).get(base & "/")).status == 200
 
   check "a client with no certificate is not served":
     # The server (-Verify 1) refuses without a client cert. Sync surfaces that as
@@ -85,7 +85,7 @@ template runAll() =
     # response -- either way the page is not served.
     var ok = false
     try:
-      ok = (await initNavi(mtlsCfg()).get(base & "/")).status != 200
+      ok = (await newNavi(mtlsCfg()).get(base & "/")).status != 200
     except CatchableError:
       ok = true
     ok

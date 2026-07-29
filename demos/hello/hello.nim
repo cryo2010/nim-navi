@@ -25,7 +25,7 @@ proc main() {.async.} =
   let url = $getEnv("HELLO_URL", "http://localhost:8080/hello")
   var cfg = initNaviConfig()
   cfg.middleware = @[NaviMiddleware(echoUrl)]   # top-level proc; convert to the closure type
-  let api = initNavi(cfg)
+  let api = newNavi(cfg)
 
   try:
     let res = await api.get(url)

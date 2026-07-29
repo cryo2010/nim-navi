@@ -20,7 +20,7 @@ proc client(): Navi =
   # under chronos's async macro.
   var cfg = initNaviConfig()
   cfg.tls.caFile = getEnv("NAVI_INTEROP_CERT")
-  initNavi(cfg)
+  newNavi(cfg)
 
 proc main() {.async.} =
   for entry in getEnv("NAVI_SERVERS").splitWhitespace():

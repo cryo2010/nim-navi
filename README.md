@@ -9,7 +9,7 @@ An HTTP client with HTTP/1.1, HTTP/2, TLS, and WebSocket support, inspired by [k
 # Imports the synchronous client
 import navi
 
-let api = initNavi()
+let api = newNavi()
 let res = api.get("https://example.com")
 echo res.status, " ", res.body
 ```
@@ -19,7 +19,7 @@ echo res.status, " ", res.body
 import navi/asyncdispatch  # or navi/chronos
 
 proc main() {.async.} =
-  let api = initNavi()
+  let api = newNavi()
   let res = await api.get("https://example.com")
   echo res.status, " ", res.data
 
@@ -31,7 +31,7 @@ waitFor main()
 import navi/js   # compiles with `nim js`, runs over the runtime's fetch
 
 proc main() {.async.} =
-  let api = initNavi()
+  let api = newNavi()
   let res = await api.get("https://example.com")
   echo res.status, " ", res.body
 
@@ -114,7 +114,7 @@ nimble install navi
 
 ## Choosing a backend
 
-Import exactly one entry module. Each exports the same `initNavi`/`get`/`post`/... surface; only the return type differs.
+Import exactly one entry module. Each exports the same `newNavi`/`get`/`post`/... surface; only the return type differs.
 
 | Import | Style | Call site | Engine |
 | --- | --- | --- | --- |
@@ -180,7 +180,7 @@ import navi/js
 proc main() {.async.} =
   var cfg = initNaviConfig()
   cfg.prefixUrl = "https://api.example.com"
-  let api = initNavi(cfg)
+  let api = newNavi(cfg)
   let user = await api.get("users/42")
   echo user.data["name"].getStr
 
@@ -193,7 +193,7 @@ discard main()   # a browser or Node runs the returned Promise
 
 Build a config with `initNaviConfig()`, which sets the safe defaults (verification
 on, decompression on, 2 retries, 20 redirects); then set the fields you want and
-pass it to `initNavi`. `NaviConfig` has `{.requiresInit.}`, so a bare or partial
+pass it to `newNavi`. `NaviConfig` has `{.requiresInit.}`, so a bare or partial
 `NaviConfig(...)` literal is a compile error; `initNaviConfig()` is the only way
 to build one, which keeps the defaults from being silently zeroed.
 
@@ -201,7 +201,7 @@ to build one, which keeps the defaults from being silently zeroed.
 var cfg = initNaviConfig()
 cfg.prefixUrl = "https://api.example.com"
 cfg.headers = initHeaders({"authorization": "Bearer ..."})
-let api = initNavi(cfg)
+let api = newNavi(cfg)
 
 # Relative targets resolve against prefixUrl.
 let user = api.get("users/42").data
@@ -263,7 +263,7 @@ for (name, value) in h.pairs: discard
 ```nim
 var cfg = initNaviConfig()
 cfg.tls.caFile = "/path/to/ca-bundle.pem"   # verify is already on
-let api = initNavi(cfg)
+let api = newNavi(cfg)
 ```
 
 `verify` defaults to on. `caFile` is honored by all three backends: sync and asyncdispatch through OpenSSL, and chronos through BearSSL (which otherwise verifies against its bundled Mozilla trust anchors). The chronos backend negotiates up to TLS 1.2 and does not support client certificates (mTLS).
@@ -310,7 +310,7 @@ except HttpError as e:
 # Opt out to handle status codes yourself:
 var cfg = initNaviConfig()
 cfg.throwHttpErrors = false
-let api = initNavi(cfg)
+let api = newNavi(cfg)
 ```
 
 ### Retries, redirects, and timeouts
@@ -322,7 +322,7 @@ var cfg = initNaviConfig()
 cfg.retry.limit = 3        # default 2; 0 disables retries
 cfg.maxRedirects = 5       # default 20; 0 disables
 cfg.timeout = 5000         # 5s; 0 (default) disables. Raises TimeoutError.
-let api = initNavi(cfg)
+let api = newNavi(cfg)
 ```
 
 The whole retry policy is configurable via `cfg.retry` (a `RetryPolicy`):
@@ -366,7 +366,7 @@ tok.cancel()
 ```nim
 var cfg = initNaviConfig()
 cfg.maxResponseBytes = 10 * 1024 * 1024   # 10 MiB; 0 (default) is unlimited
-let api = initNavi(cfg)
+let api = newNavi(cfg)
 ```
 
 ### Auth and proxy
@@ -375,7 +375,7 @@ let api = initNavi(cfg)
 var cfg = initNaviConfig()
 cfg.auth = bearerAuth("token")      # or basicAuth("user", "pass")
 cfg.proxy = "http://proxy:8080"     # else HTTP(S)_PROXY / NO_PROXY env
-let api = initNavi(cfg)
+let api = newNavi(cfg)
 ```
 
 ### Cookies
@@ -405,7 +405,7 @@ proc trace(prefix: string): NaviMiddleware =       # sync (import navi)
 
 var cfg = initNaviConfig()
 cfg.middleware = @[trace("api")]
-let api = initNavi(cfg)
+let api = newNavi(cfg)
 ```
 
 Short-circuit by setting `ctx.res` and *not* calling `next` (a cache hit or
@@ -461,7 +461,7 @@ Just start them and await together (like `Promise.all`):
 import navi/asyncdispatch
 
 proc main() {.async.} =
-  let api = initNavi()
+  let api = newNavi()
   let results = await all(@[
     api.get("https://nghttp2.org/httpbin/get"),
     api.get("https://nghttp2.org/httpbin/ip"),
@@ -478,7 +478,7 @@ multiplexing is available through a batch call:
 ```nim
 import navi
 
-let api = initNavi()
+let api = newNavi()
 let results = api.parallel(@[
   "https://nghttp2.org/httpbin/get",
   "https://nghttp2.org/httpbin/ip",
@@ -556,7 +556,7 @@ surface is otherwise the same.
 
 ## API
 
-### initNavi(config = initNaviConfig())
+### newNavi(config = initNaviConfig())
 
 Create a client. `config` supplies the defaults applied to every request and
 inherited via `extend`. Returns a `Navi`. Read it back (read-only) via

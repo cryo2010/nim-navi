@@ -3,7 +3,7 @@
 ##   import navi/js
 ##
 ##   proc main() {.async.} =
-##     let api = initNavi()
+##     let api = newNavi()
 ##     let res = await api.get("https://example.com")
 ##     echo res.status, " ", res.data
 ##   discard main()
@@ -58,7 +58,7 @@ type
     ## `requiresInit`: build it with `initNaviConfig()`, not a bare `NaviConfig(...)`.
     middleware*: seq[NaviMiddleware]
 
-  Navi* = object
+  Navi* = ref object
     config: NaviConfig   ## the runtime owns connections
     jar: CookieJar          ## kept off-browser; nil in a browser (its store owns cookies)
 
@@ -78,7 +78,7 @@ proc initNaviConfig*(): NaviConfig =
 # a browser document context.
 proc inBrowser(): bool {.importjs: "(typeof document !== 'undefined')".}
 
-proc initNavi*(config = initNaviConfig()): Navi =
+proc newNavi*(config = initNaviConfig()): Navi =
   result = Navi(config: config)
   if not inBrowser(): result.jar = newCookieJar()
 

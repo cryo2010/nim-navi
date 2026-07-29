@@ -165,7 +165,7 @@ suite "digest auth end to end":
 
     var cfg = initNaviConfig()
     cfg.auth = digestAuth("user", "pass")
-    let api = initNavi(cfg)
+    let api = newNavi(cfg)
     let res = api.get("http://127.0.0.1:" & $port & "/secret")
     check res.status == 200
     check res.body == "welcome"
@@ -179,7 +179,7 @@ suite "digest auth end to end":
 
     var cfg = initNaviConfig()
     cfg.auth = digestAuth("user", "pass")
-    let api = initNavi(cfg)
+    let api = newNavi(cfg)
     let res = api.get("http://127.0.0.1:" & $port & "/secret")
     check res.status == 200
     check res.body == "welcome"

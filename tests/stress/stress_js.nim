@@ -24,7 +24,7 @@ proc mkClient(base: string): Navi =
   var cfg = initNaviConfig()
   cfg.prefixUrl = base
   cfg.middleware = @[stampMw()]
-  initNavi(cfg)
+  newNavi(cfg)
 
 proc main() {.async.} =
   let secs = parseFloat($envJs("NAVI_STRESS_SECONDS", "20"))

@@ -17,7 +17,7 @@ proc client(): Navi =
   # the exact shape that made the sync backend's timeout path stall until the
   # deadline; keeping a timeout here guards against that regression.
   cfg.timeout = 15_000
-  initNavi(cfg)
+  newNavi(cfg)
 
 for entry in getEnv("NAVI_SERVERS").splitWhitespace():
   let p = entry.split('=', 1)

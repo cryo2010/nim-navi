@@ -1,7 +1,7 @@
 ## navi — synchronous entry point.
 ##
 ##   import navi
-##   let api = initNavi()
+##   let api = newNavi()
 ##   let res = api.get("http://example.com")
 ##   echo res.status, " ", res.body
 ##
@@ -44,7 +44,7 @@ type
     ## `initNaviConfig()`.
     middleware*: seq[NaviMiddleware]
 
-  Navi* = object
+  Navi* = ref object
     config: NaviConfig
     pool*: Pool[PooledConn[Conn]]
     jar*: CookieJar
@@ -52,14 +52,14 @@ type
 proc initNaviConfig*(): NaviConfig =
   ## The only way to build a config: `NaviConfig` requires every field. Sets the
   ## safe defaults (verify on, decompress on, 2 retries, 20 redirects); override
-  ## the fields you want, then pass it to `initNavi`.
+  ## the fields you want, then pass it to `newNavi`.
   NaviConfig(
     prefixUrl: "", headers: initHeaders(), http: {H1, H2}, tls: defaultTls(),
     decompress: true, throwHttpErrors: true, maxRedirects: 20,
     retry: defaultRetryPolicy(), maxResponseBytes: 0,
     auth: Auth(), proxy: "", timeout: 0, middleware: @[])
 
-proc initNavi*(config = initNaviConfig()): Navi =
+proc newNavi*(config = initNaviConfig()): Navi =
   ## Create a client. `config` supplies defaults (prefixUrl, headers, TLS,
   ## middleware, …).
   Navi(config: config, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())

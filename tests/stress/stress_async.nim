@@ -28,7 +28,7 @@ proc mkClient(base, cert: string): Navi =
   cfg.prefixUrl = base
   cfg.tls.caFile = cert                       # trust the server's self-signed cert
   cfg.middleware = @[stampMw()]
-  initNavi(cfg)
+  newNavi(cfg)
 
 proc httpRound(api: Navi) {.async.} =
   # Fire every verb concurrently on one client, then await each and check it, so
