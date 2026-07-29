@@ -1,23 +1,51 @@
-## Load a client certificate + key into an OpenSSL `SslCtx` from sources that
-## std/net's `newContext` cannot handle: an encrypted PEM key, a DER cert/key,
-## a PKCS#12 (`.p12`/`.pfx`) bundle, or in-memory PEM strings. Shared by the
-## OpenSSL backends (sync, asyncdispatch). Empty unless compiled with `-d:ssl`.
+## First-party OpenSSL TLS context builder for the sync and asyncdispatch
+## backends. This is the single place navi configures an `SSL_CTX`:
 ##
-## When `hasClientCert` reports a credential is configured, the backend hands
-## `newContext` an empty cert/key and calls `loadClientCert` to install it, so
-## every client-cert case (including plain PEM files) takes one uniform path.
+##   * certificate verification and CA trust come from std/net's `newContext`,
+##     which owns the security-critical chain and hostname checks;
+##   * ALPN (h2 / http/1.1) is set here;
+##   * the client certificate -- encrypted PEM, DER, PKCS#12, or in-memory PEM --
+##     is installed here, covering everything `newContext` cannot.
+##
+## Backends call `newTlsContext` and, after the handshake, `negotiatedProtocol`;
+## they no longer touch `newContext`, ALPN, or the credential loader directly.
+## Empty unless compiled with `-d:ssl`.
 
 import ./api
 
 when defined(ssl):
-  import std/openssl
+  import std/[net, openssl]
 
-  const SSL_CTRL_EXTRA_CHAIN_CERT = 14
+  # --- ALPN --------------------------------------------------------------
 
+  proc setAlpn(ctx: SslCtx, protos: openArray[string]) =
+    ## Offer `protos` (e.g. @["h2", "http/1.1"]) on the context before the
+    ## handshake; SSL handles created from it inherit the list.
+    if protos.len == 0: return
+    var wire: string
+    for p in protos:
+      wire.add char(p.len)
+      wire.add p
+    discard SSL_CTX_set_alpn_protos(ctx, wire.cstring, cuint(wire.len))
+
+  proc negotiatedProtocol*(ssl: SslPtr): string =
+    ## The ALPN protocol the peer selected, read after the handshake.
+    var data: cstring
+    var length: cuint
+    SSL_get0_alpn_selected(ssl, addr data, addr length)
+    if length > 0:
+      result = newString(int(length))
+      copyMem(addr result[0], data, int(length))
+
+  # --- client certificate (mTLS) -----------------------------------------
+  #
   # libssl / libcrypto entry points not exposed by std/openssl (mirrors the
   # importc style of the wrapper). SSL_CTX_use_certificate/PrivateKey both bump
   # the object's refcount, so we free our reference after handing it over;
   # add_extra_chain_cert (via SSL_CTX_ctrl) transfers ownership, so we do not.
+
+  const SSL_CTRL_EXTRA_CHAIN_CERT = 14
+
   proc SSL_CTX_use_certificate(ctx: SslCtx, x: PX509): cint
     {.cdecl, dynlib: DLLSSLName, importc.}
   proc SSL_CTX_use_PrivateKey(ctx: SslCtx, pkey: EVP_PKEY): cint
@@ -111,7 +139,10 @@ when defined(ssl):
     else:
       useKeyPem(ctx, data, password)          # PEM, possibly encrypted
 
-  proc loadClientCert*(ctx: SslCtx, tls: TlsConfig) =
+  proc hasClientCert(tls: TlsConfig): bool =
+    tls.pkcs12File.len > 0 or tls.certPem.len > 0 or tls.certFile.len > 0
+
+  proc loadClientCert(ctx: SslCtx, tls: TlsConfig) =
     ## Install the client credential described by `tls`. Precedence: PKCS#12,
     ## then in-memory PEM, then the cert/key files. File encoding (PEM vs DER) is
     ## detected from the content. Raises `ValueError` if the material is missing,
@@ -128,7 +159,20 @@ when defined(ssl):
     if SSL_CTX_check_private_key(ctx) != 1:
       fail("the client certificate and private key do not match")
 
-proc hasClientCert*(tls: TlsConfig): bool =
-  ## Whether a client certificate is configured (so the backend routes through
-  ## `loadClientCert` and hands `newContext` an empty cert/key).
-  tls.pkcs12File.len > 0 or tls.certPem.len > 0 or tls.certFile.len > 0
+  # --- the builder -------------------------------------------------------
+
+  proc newTlsContext*(cfg: TlsConfig, alpn: openArray[string] = @[]): SslContext =
+    ## Build a client TLS context. Verification and CA trust come from
+    ## `newContext` (the security-critical path); then ALPN and any configured
+    ## client certificate are applied. When a client cert is present it is
+    ## installed by `loadClientCert`, so `newContext` is handed an empty cert/key
+    ## and every credential form (plain PEM included) takes one path. Raises
+    ## `ValueError` on malformed or mismatched TLS material.
+    let custom = hasClientCert(cfg)
+    result = newContext(
+      verifyMode = if cfg.wantsVerify: CVerifyPeer else: CVerifyNone,
+      certFile = if custom: "" else: cfg.certFile,
+      keyFile = if custom: "" else: cfg.clientKeyFile,
+      caFile = cfg.caFile)
+    if custom: loadClientCert(result.context, cfg)
+    setAlpn(result.context, alpn)
