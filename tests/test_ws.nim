@@ -169,7 +169,7 @@ suite "websocket client end to end":
     createThread(th, wsEcho, port)
     while not wsReady: sleep(5)
 
-    let api = newNavi()
+    let api = initNavi()
     let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
 
     ws.send("hello")

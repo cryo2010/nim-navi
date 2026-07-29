@@ -1,7 +1,7 @@
 ## navi — chronos entry point.
 ##
 ##   import navi/chronos
-##   let api = newNavi()
+##   let api = initNavi()
 ##   let res = await api.get("http://example.com")
 ##
 ## Requires the `chronos` package on native targets. Under `nim js` this

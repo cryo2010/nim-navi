@@ -44,7 +44,7 @@ suite "sync entry end to end":
     createThread(th, serve, port)
     while not serverReady: sleep(5)
 
-    let api = newNavi()
+    let api = initNavi()
     let res = api.get("http://127.0.0.1:" & $port & "/")
     check res.status == 200
     check res.ok
@@ -58,7 +58,7 @@ suite "sync entry end to end":
     var th: Thread[KeepAliveCtx]
     startKeepAlive(th, port, requests = 2, accepts = addr accepts)
 
-    let api = newNavi()
+    let api = initNavi()
     let key = "http://127.0.0.1:" & $port
     let first = api.get(key & "/")
     check first.status == 200
@@ -77,7 +77,7 @@ suite "sync entry end to end":
     var th: Thread[KeepAliveCtx]
     startKeepAlive(th, port, requests = 2, accepts = addr accepts)
 
-    let api = newNavi()
+    let api = initNavi()
     let key = "http://127.0.0.1:" & $port
     discard api.get(key & "/")
     check api.pool.idleCount(key) == 1     # pooled after the request
@@ -90,7 +90,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startServer(th, port)  # responds with {"ok":true}, content-length 11
 
-    let api = newNavi()
+    let api = initNavi()
     var collected = ""
     let res = api.stream(GET, "http://127.0.0.1:" & $port & "/",
       sink = proc(data: openArray[byte]) =
@@ -105,7 +105,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startUploadEcho(th, port)
 
-    let api = newNavi()
+    let api = initNavi()
     let parts = @["hello ", "streaming ", "world"]
     var i = 0
     let res = api.request(POST, "http://127.0.0.1:" & $port & "/",
@@ -122,7 +122,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startServer(th, port, ipv6 = true)
 
-    let api = newNavi()
+    let api = initNavi()
     let res = api.get("http://[::1]:" & $port & "/")
     check res.status == 200
     check res.data["ok"].getBool()
@@ -139,7 +139,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startRaw(th, port, payload)
 
-    let api = newNavi()
+    let api = initNavi()
     let res = api.get("http://127.0.0.1:" & $port & "/")
     check res.status == 200
     check res.body == """{"ok":true}"""       # decoded
@@ -155,7 +155,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startRaw(th, port, payload)
 
-    let api = newNavi()
+    let api = initNavi()
     let res = api.get("http://127.0.0.1:" & $port & "/")
     check res.body == """{"ok":true}"""
     joinThread(th)
@@ -168,7 +168,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startRaw(th, port, payload)
 
-    let api = newNavi()
+    let api = initNavi()
     let res = api.get("http://127.0.0.1:" & $port & "/")
     check res.body == """{"ok":true}"""
     joinThread(th)
@@ -179,7 +179,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startRaw(th, port, payload)
 
-    let api = newNavi()
+    let api = initNavi()
     var raised = false
     try:
       discard api.get("http://127.0.0.1:" & $port & "/")
@@ -196,9 +196,9 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startRaw(th, port, payload)
 
-    var cfg = newNaviConfig()
+    var cfg = initNaviConfig()
     cfg.throwHttpErrors = false
-    let api = newNavi(cfg)
+    let api = initNavi(cfg)
     let res = api.get("http://127.0.0.1:" & $port & "/")
     check res.status == 404
     check res.body == "no!"
@@ -209,7 +209,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startRedirect(th, port)
 
-    let api = newNavi()
+    let api = initNavi()
     let res = api.get("http://127.0.0.1:" & $port & "/start")
     check res.status == 200
     check res.body == "arrived"
@@ -222,10 +222,10 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startRaw(th, port, payload)
 
-    var cfg = newNaviConfig()
+    var cfg = initNaviConfig()
     cfg.maxRedirects = 0
     cfg.throwHttpErrors = false
-    let api = newNavi(cfg)
+    let api = initNavi(cfg)
     let res = api.get("http://127.0.0.1:" & $port & "/start")
     check res.status == 302
     check res.headers.get("location") == "/final"
@@ -236,7 +236,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)
 
-    let api = newNavi()
+    let api = initNavi()
     let res = api.post("http://127.0.0.1:" & $port & "/", json = %*{"a": 1})
     check res.body == """{"a":1}"""
     check res.headers.get("x-echo-content-type") == "application/json"
@@ -247,7 +247,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)
 
-    let api = newNavi()
+    let api = initNavi()
     let res = api.post("http://127.0.0.1:" & $port & "/",
                        form = @[("a", "1"), ("b", "two words")])
     check res.body == "a=1&b=two+words"
@@ -259,7 +259,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)
 
-    let api = newNavi()
+    let api = initNavi()
     let res = api.post("http://127.0.0.1:" & $port & "/", multipart = @[
       field("title", "hello"),
       filePart("file", "a.txt", "file body", "text/plain")])
@@ -281,9 +281,9 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)
 
-    var cfg = newNaviConfig()
+    var cfg = initNaviConfig()
     cfg.auth = bearerAuth("secret-token")
-    let api = newNavi(cfg)
+    let api = initNavi(cfg)
     let res = api.post("http://127.0.0.1:" & $port & "/", body = "x")
     check res.headers.get("x-echo-authorization") == "Bearer secret-token"
     joinThread(th)
@@ -293,9 +293,9 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)
 
-    var cfg = newNaviConfig()
+    var cfg = initNaviConfig()
     cfg.auth = basicAuth("user", "pass")
-    let api = newNavi(cfg)
+    let api = initNavi(cfg)
     let res = api.post("http://127.0.0.1:" & $port & "/", body = "x")
     check res.headers.get("x-echo-authorization") == "Basic dXNlcjpwYXNz"
     joinThread(th)
@@ -305,7 +305,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startRetry(th, port, failures = 1)
 
-    let api = newNavi()
+    let api = initNavi()
     let res = api.get("http://127.0.0.1:" & $port & "/")
     check res.status == 200
     check res.body == "recovered"
@@ -318,10 +318,10 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startRaw(th, port, payload)
 
-    var cfg = newNaviConfig()
+    var cfg = initNaviConfig()
     cfg.retry.limit = 0
     cfg.throwHttpErrors = false
-    let api = newNavi(cfg)
+    let api = initNavi(cfg)
     let res = api.get("http://127.0.0.1:" & $port & "/")
     check res.status == 503
     joinThread(th)
@@ -331,10 +331,10 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startHang(th, port)  # accepts, reads the request, never replies
 
-    var cfg = newNaviConfig()
+    var cfg = initNaviConfig()
     cfg.timeout = 200
     cfg.retry.limit = 0
-    let api = newNavi(cfg)
+    let api = initNavi(cfg)
     var raised = false
     try:
       discard api.get("http://127.0.0.1:" & $port & "/")
@@ -348,9 +348,9 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startHang(th, port)
 
-    var cfg = newNaviConfig()
+    var cfg = initNaviConfig()
     cfg.timeout = 200
-    let api = newNavi(cfg)
+    let api = initNavi(cfg)
     var raised = false
     try:
       discard api.parallel(@["http://127.0.0.1:" & $port & "/"])
@@ -365,9 +365,9 @@ suite "sync entry end to end":
     startBodyEcho(th, port)
 
     let observed = new(int)
-    var cfg = newNaviConfig()
+    var cfg = initNaviConfig()
     cfg.middleware = @[authMw("Wrapped", observed)]   # captured header + observer cell
-    let api = newNavi(cfg)
+    let api = initNavi(cfg)
     let res = api.post("http://127.0.0.1:" & $port & "/", body = "x")
     check res.headers.get("x-echo-authorization") == "Wrapped"
     check observed[] == 200
@@ -376,9 +376,9 @@ suite "sync entry end to end":
   test "middleware can short-circuit without sending a request":
     # No server here: if the request were dialed it would fail to connect, so a
     # 299 proves `ctx.next()` was never called.
-    var cfg = newNaviConfig()
+    var cfg = initNaviConfig()
     cfg.middleware = @[cannedMw(299, "from middleware")]
-    let api = newNavi(cfg)
+    let api = initNavi(cfg)
     let res = api.get("http://127.0.0.1:1/")
     check res.status == 299
     check res.body == "from middleware"
@@ -388,7 +388,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startCookies(th, port)
 
-    let api = newNavi()
+    let api = initNavi()
     discard api.get("http://127.0.0.1:" & $port & "/")       # receives Set-Cookie
     let res = api.get("http://127.0.0.1:" & $port & "/page")  # should send Cookie
     check res.body == "sid=abc123"
@@ -399,9 +399,9 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startProxy(th, port)
 
-    var cfg = newNaviConfig()
+    var cfg = initNaviConfig()
     cfg.proxy = "http://127.0.0.1:" & $port
-    let api = newNavi(cfg)
+    let api = initNavi(cfg)
     let res = api.get("http://example.test/path?q=1")
     check res.status == 200
     check res.body == "http://example.test/path?q=1"  # proxy saw the absolute URI
@@ -413,7 +413,7 @@ suite "sync entry end to end":
     var th: Thread[KeepAliveCtx]
     startKeepAlive(th, port, requests = 3, accepts = addr accepts)
 
-    let api = newNavi()
+    let api = initNavi()
     let base = "http://127.0.0.1:" & $port
     let res = api.parallel(@[base & "/a", base & "/b", base & "/c"])
     check res.len == 3
@@ -429,17 +429,17 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)
 
-    let api = newNavi()
+    let api = initNavi()
     let res = api.options("http://127.0.0.1:" & $port & "/")
     check res.status == 200
     check res.headers.get("x-echo-method") == "OPTIONS"
     joinThread(th)
 
   test "extend layers headers and prefixUrl":
-    var bcfg = newNaviConfig()
+    var bcfg = initNaviConfig()
     bcfg.headers = initHeaders({"x-base": "1"})
-    let base = newNavi(bcfg)
-    var ovr = newNaviConfig()
+    let base = initNavi(bcfg)
+    var ovr = initNaviConfig()
     ovr.prefixUrl = "http://api.test"
     let child = base.extend(ovr)
     check child.config.prefixUrl == "http://api.test"
@@ -450,7 +450,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startEchoLine(th, port)
 
-    let api = newNavi()
+    let api = initNavi()
     let res = api.get("http://127.0.0.1:" & $port & "/search",
                       params = @{"q": "test", "n": "2"})
     check res.status == 200
@@ -462,7 +462,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startEchoLine(th, port)
 
-    let api = newNavi()
+    let api = initNavi()
     let res = api.get("http://127.0.0.1:" & $port & "/search",
                       params = {"q": "test", "n": "2"}.toOrderedTable)
     check res.status == 200
@@ -476,9 +476,9 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startRaw(th, port, payload)
 
-    var cfg = newNaviConfig()
+    var cfg = initNaviConfig()
     cfg.maxResponseBytes = 10
-    let api = newNavi(cfg)
+    let api = initNavi(cfg)
     expect ResponseTooLargeError:
       discard api.get("http://127.0.0.1:" & $port & "/")
     joinThread(th)
@@ -490,9 +490,9 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startRaw(th, port, payload)
 
-    var cfg = newNaviConfig()
+    var cfg = initNaviConfig()
     cfg.maxResponseBytes = 100
-    let api = newNavi(cfg)
+    let api = initNavi(cfg)
     let res = api.get("http://127.0.0.1:" & $port & "/")
     check res.body.len == 50
     joinThread(th)
@@ -504,9 +504,9 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startRaw(th, port, payload)
 
-    var cfg = newNaviConfig()
+    var cfg = initNaviConfig()
     cfg.maxResponseBytes = 10
-    let api = newNavi(cfg)
+    let api = initNavi(cfg)
     expect ResponseTooLargeError:
       discard api.stream(GET, "http://127.0.0.1:" & $port & "/",
         sink = proc(data: openArray[byte]) = discard)
@@ -519,16 +519,16 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startRaw(th, port, payload)
 
-    var cfg = newNaviConfig()
+    var cfg = initNaviConfig()
     cfg.retry.statuses = @[500]     # 503 no longer eligible, so no retry
     cfg.throwHttpErrors = false
-    let api = newNavi(cfg)
+    let api = initNavi(cfg)
     let res = api.get("http://127.0.0.1:" & $port & "/")
     check res.status == 503
     joinThread(th)
 
   test "a cancelled token aborts before dispatch":
-    let api = newNavi()
+    let api = initNavi()
     let tok = newCancelToken()
     tok.cancel()
     expect RequestCancelledError:
@@ -539,7 +539,7 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startServer(th, port)
 
-    let api = newNavi()
+    let api = initNavi()
     let res = api.get("http://127.0.0.1:" & $port & "/", cancel = newCancelToken())
     check res.status == 200
     joinThread(th)

@@ -16,11 +16,11 @@ import navi/js
 const base = "https://127.0.0.1:8447"
 
 proc baseCfg(): NaviConfig =
-  result = newNaviConfig()
+  result = initNaviConfig()
   result.timeout = 20_000
   result.headers["user-agent"] = "navi-httpbin/1.0"
 
-proc api(): Navi = newNavi(baseCfg())
+proc api(): Navi = initNavi(baseCfg())
 
 proc main() {.async.} =
   var passed = 0
@@ -75,7 +75,7 @@ proc main() {.async.} =
   # --- request data --------------------------------------------------------
   check "a custom request header is delivered":
     var c = baseCfg(); c.headers["x-navi-test"] = "42"
-    (await newNavi(c).get(base & "/headers")).data["headers"]["X-Navi-Test"].getStr == "42"
+    (await initNavi(c).get(base & "/headers")).data["headers"]["X-Navi-Test"].getStr == "42"
 
   # --- status codes --------------------------------------------------------
   check "/status/200 is 200":
@@ -83,7 +83,7 @@ proc main() {.async.} =
 
   check "throwHttpErrors=false returns the 404":
     var c = baseCfg(); c.throwHttpErrors = false
-    (await newNavi(c).get(base & "/status/404")).status == 404
+    (await initNavi(c).get(base & "/status/404")).status == 404
 
   check "throwHttpErrors=true raises HttpError on 500":
     var raised = false
@@ -101,16 +101,16 @@ proc main() {.async.} =
   # --- auth ----------------------------------------------------------------
   check "basic auth succeeds":
     var c = baseCfg(); c.auth = basicAuth("user", "pass")
-    let r = await newNavi(c).get(base & "/basic-auth/user/pass")
+    let r = await initNavi(c).get(base & "/basic-auth/user/pass")
     r.status == 200 and r.data["authenticated"].getBool
 
   check "basic auth with a wrong password is rejected (401)":
     var c = baseCfg(); c.auth = basicAuth("user", "wrong"); c.throwHttpErrors = false
-    (await newNavi(c).get(base & "/basic-auth/user/pass")).status == 401
+    (await initNavi(c).get(base & "/basic-auth/user/pass")).status == 401
 
   check "bearer auth succeeds and echoes the token":
     var c = baseCfg(); c.auth = bearerAuth("tok123")
-    (await newNavi(c).get(base & "/bearer")).data["token"].getStr == "tok123"
+    (await initNavi(c).get(base & "/bearer")).data["token"].getStr == "tok123"
 
   # --- redirects (runtime-followed) ----------------------------------------
   check "follows a redirect to completion":

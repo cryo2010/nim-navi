@@ -17,9 +17,9 @@ suite "nghttpd interop (asyncdispatch, http/2 mux)":
     # nghttpd -b pads frames; navi must strip PADDED padding, or HPACK / the body
     # break. Runs concurrently to exercise the mux's h2 connection path.
     proc run(): Future[seq[Response]] {.async.} =
-      var cfg = newNaviConfig()
+      var cfg = initNaviConfig()
       cfg.tls.caFile = cert
-      let api = newNavi(cfg)
+      let api = initNavi(cfg)
       result = await all(@[
         api.get(padded & "/small.txt"),
         api.get(padded & "/large.bin")])
@@ -32,9 +32,9 @@ suite "nghttpd interop (asyncdispatch, http/2 mux)":
 
   test "concurrent GETs multiplex over a single connection":
     proc run(): Future[seq[Response]] {.async.} =
-      var cfg = newNaviConfig()
+      var cfg = initNaviConfig()
       cfg.tls.caFile = cert
-      let api = newNavi(cfg)
+      let api = initNavi(cfg)
       result = await all(@[
         api.get(base & "/small.txt"),
         api.get(base & "/small.txt"),
@@ -51,9 +51,9 @@ suite "nghttpd interop (asyncdispatch, http/2 mux)":
     # Server caps concurrency at 2 (run.sh -m 2). Firing 8 at once must be
     # admitted in waves by the mux rather than opening streams that get reset.
     proc run(): Future[seq[Response]] {.async.} =
-      var cfg = newNaviConfig()
+      var cfg = initNaviConfig()
       cfg.tls.caFile = cert
-      let api = newNavi(cfg)
+      let api = initNavi(cfg)
       var futs: seq[Future[Response]]
       for _ in 0 ..< 8: futs.add api.get(base & "/small.txt")
       result = await all(futs)
@@ -68,9 +68,9 @@ suite "nghttpd interop (asyncdispatch, http/2 mux)":
     # Batches of 10 (past the server's cap of 2) churn the mux's waiter table and
     # slot queue; assert the Nim heap does not grow across 5000 requests.
     proc run(): Future[int] {.async.} =
-      var cfg = newNaviConfig()
+      var cfg = initNaviConfig()
       cfg.tls.caFile = cert
-      let api = newNavi(cfg)
+      let api = initNavi(cfg)
       proc batch(): Future[void] {.async.} =
         var futs: seq[Future[Response]]
         for _ in 0 ..< 10: futs.add api.get(base & "/small.txt")

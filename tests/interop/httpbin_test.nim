@@ -28,12 +28,12 @@ else:
 proc baseCfg(): NaviConfig =
   # Read the cert path here rather than from a global so the config helper stays
   # GC-safe under chronos's async macro.
-  result = newNaviConfig()
+  result = initNaviConfig()
   result.tls.caFile = getEnv("NAVI_INTEROP_CERT")
   result.timeout = 20_000
   result.headers["user-agent"] = "navi-httpbin/1.0"
 
-proc api(): Navi = newNavi(baseCfg())
+proc api(): Navi = initNavi(baseCfg())
 
 template runAll() =
   # State and env reads live here (locals of `main`), so the chronos async proc
@@ -95,7 +95,7 @@ template runAll() =
   # --- request data --------------------------------------------------------
   check "a custom request header is delivered":
     var c = baseCfg(); c.headers["x-navi-test"] = "42"
-    (await newNavi(c).get(base & "/headers")).data["headers"]["X-Navi-Test"].getStr == "42"
+    (await initNavi(c).get(base & "/headers")).data["headers"]["X-Navi-Test"].getStr == "42"
 
   check "/user-agent reflects our User-Agent":
     (await api().get(base & "/user-agent")).data["user-agent"].getStr == "navi-httpbin/1.0"
@@ -106,7 +106,7 @@ template runAll() =
 
   check "throwHttpErrors=false returns the 404":
     var c = baseCfg(); c.throwHttpErrors = false
-    (await newNavi(c).get(base & "/status/404")).status == 404
+    (await initNavi(c).get(base & "/status/404")).status == 404
 
   check "throwHttpErrors=true raises HttpError on 500":
     var raised = false
@@ -116,7 +116,7 @@ template runAll() =
 
   check "/status/418 teapot":
     var c = baseCfg(); c.throwHttpErrors = false
-    (await newNavi(c).get(base & "/status/418")).status == 418
+    (await initNavi(c).get(base & "/status/418")).status == 418
 
   # --- response inspection -------------------------------------------------
   check "/json parses via res.data":
@@ -134,20 +134,20 @@ template runAll() =
   # --- auth ----------------------------------------------------------------
   check "basic auth succeeds":
     var c = baseCfg(); c.auth = basicAuth("user", "pass")
-    let r = await newNavi(c).get(base & "/basic-auth/user/pass")
+    let r = await initNavi(c).get(base & "/basic-auth/user/pass")
     r.status == 200 and r.data["authenticated"].getBool
 
   check "basic auth with a wrong password is rejected (401)":
     var c = baseCfg(); c.auth = basicAuth("user", "wrong"); c.throwHttpErrors = false
-    (await newNavi(c).get(base & "/basic-auth/user/pass")).status == 401
+    (await initNavi(c).get(base & "/basic-auth/user/pass")).status == 401
 
   check "bearer auth succeeds and echoes the token":
     var c = baseCfg(); c.auth = bearerAuth("tok123")
-    (await newNavi(c).get(base & "/bearer")).data["token"].getStr == "tok123"
+    (await initNavi(c).get(base & "/bearer")).data["token"].getStr == "tok123"
 
   check "digest auth completes the 401 challenge and retries":
     var c = baseCfg(); c.auth = digestAuth("duser", "dpass")
-    let r = await newNavi(c).get(base & "/digest-auth/auth/duser/dpass")
+    let r = await initNavi(c).get(base & "/digest-auth/auth/duser/dpass")
     r.status == 200 and r.data["authenticated"].getBool
 
   # --- redirects -----------------------------------------------------------
@@ -161,7 +161,7 @@ template runAll() =
 
   check "maxRedirects=0 returns the 302 unfollowed":
     var c = baseCfg(); c.maxRedirects = 0; c.throwHttpErrors = false
-    let r = await newNavi(c).get(base & "/relative-redirect/1")
+    let r = await initNavi(c).get(base & "/relative-redirect/1")
     r.status == 302 and "location" in r.headers
 
   # --- decompression -------------------------------------------------------
@@ -175,7 +175,7 @@ template runAll() =
     # Ask for gzip explicitly (httpbin only compresses when Accept-Encoding invites
     # it) but disable navi's decompression, so the body must come back encoded.
     var c = baseCfg(); c.decompress = false; c.headers["accept-encoding"] = "gzip"
-    let r = await newNavi(c).get(base & "/gzip")
+    let r = await initNavi(c).get(base & "/gzip")
     r.headers.get("content-encoding").contains("gzip") and
       r.body.len >= 2 and r.body[0] == '\x1f' and r.body[1] == '\x8b'
 

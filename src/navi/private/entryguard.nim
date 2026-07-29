@@ -4,7 +4,7 @@
 ## `claimEntry` at import time. The claim runs at compile time and records the
 ## chosen backend in a compile-time global; a conflicting second claim aborts
 ## compilation with a clear message instead of failing later on an ambiguous
-## `newNavi` overload.
+## `initNavi` overload.
 
 import std/macros
 

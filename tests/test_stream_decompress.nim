@@ -44,7 +44,7 @@ suite "stream() decompresses the response body":
     var th: Thread[ServerCtx]
     startRaw(th, port, payload)
 
-    let api = newNavi()
+    let api = initNavi()
     var collected = ""
     let res = api.stream(GET, "http://127.0.0.1:" & $port & "/",
       sink = proc(data: openArray[byte]) =
@@ -62,9 +62,9 @@ suite "stream() decompresses the response body":
     var th: Thread[ServerCtx]
     startRaw(th, port, payload)
 
-    var cfg = newNaviConfig()
+    var cfg = initNaviConfig()
     cfg.decompress = false
-    let api = newNavi(cfg)
+    let api = initNavi(cfg)
     var collected = ""
     let res = api.stream(GET, "http://127.0.0.1:" & $port & "/",
       sink = proc(data: openArray[byte]) =
@@ -85,7 +85,7 @@ suite "stacked content-encoding":
     var th: Thread[ServerCtx]
     startRaw(th, port, payload)
 
-    let res = newNavi().get("http://127.0.0.1:" & $port & "/")
+    let res = initNavi().get("http://127.0.0.1:" & $port & "/")
     check res.status == 200
     check res.body == """{"ok":true}"""         # both gzip layers undone, in reverse
     check not res.headers.contains("content-encoding")

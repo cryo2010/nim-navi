@@ -24,11 +24,11 @@ proc stampMw(): NaviMiddleware =
     await ctx.next()
 
 proc mkClient(base, cert: string): Navi =
-  var cfg = newNaviConfig()
+  var cfg = initNaviConfig()
   cfg.prefixUrl = base
   cfg.tls.caFile = cert                       # trust the server's self-signed cert
   cfg.middleware = @[stampMw()]
-  newNavi(cfg)
+  initNavi(cfg)
 
 proc httpRound(api: Navi) {.async.} =
   # Fire every verb concurrently on one client, then await each and check it, so

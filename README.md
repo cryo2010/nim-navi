@@ -9,7 +9,7 @@ An HTTP client with HTTP/1.1, HTTP/2, TLS, and WebSocket support, inspired by [k
 # Imports the synchronous client
 import navi
 
-let api = newNavi()
+let api = initNavi()
 let res = api.get("https://example.com")
 echo res.status, " ", res.body
 ```
@@ -19,7 +19,7 @@ echo res.status, " ", res.body
 import navi/asyncdispatch  # or navi/chronos
 
 proc main() {.async.} =
-  let api = newNavi()
+  let api = initNavi()
   let res = await api.get("https://example.com")
   echo res.status, " ", res.data
 
@@ -31,7 +31,7 @@ waitFor main()
 import navi/js   # compiles with `nim js`, runs over the runtime's fetch
 
 proc main() {.async.} =
-  let api = newNavi()
+  let api = initNavi()
   let res = await api.get("https://example.com")
   echo res.status, " ", res.body
 
@@ -114,7 +114,7 @@ nimble install navi
 
 ## Choosing a backend
 
-Import exactly one entry module. Each exports the same `newNavi`/`get`/`post`/... surface; only the return type differs.
+Import exactly one entry module. Each exports the same `initNavi`/`get`/`post`/... surface; only the return type differs.
 
 | Import | Style | Call site | Engine |
 | --- | --- | --- | --- |
@@ -178,9 +178,9 @@ Two backends carry caveats:
 import navi/js
 
 proc main() {.async.} =
-  var cfg = newNaviConfig()
+  var cfg = initNaviConfig()
   cfg.prefixUrl = "https://api.example.com"
-  let api = newNavi(cfg)
+  let api = initNavi(cfg)
   let user = await api.get("users/42")
   echo user.data["name"].getStr
 
@@ -191,28 +191,28 @@ discard main()   # a browser or Node runs the returned Promise
 
 ### Clients and options
 
-Build a config with `newNaviConfig()`, which sets the safe defaults (verification
+Build a config with `initNaviConfig()`, which sets the safe defaults (verification
 on, decompression on, 2 retries, 20 redirects); then set the fields you want and
-pass it to `newNavi`. `NaviConfig` has `{.requiresInit.}`, so a bare or partial
-`NaviConfig(...)` literal is a compile error; `newNaviConfig()` is the only way
+pass it to `initNavi`. `NaviConfig` has `{.requiresInit.}`, so a bare or partial
+`NaviConfig(...)` literal is a compile error; `initNaviConfig()` is the only way
 to build one, which keeps the defaults from being silently zeroed.
 
 ```nim
-var cfg = newNaviConfig()
+var cfg = initNaviConfig()
 cfg.prefixUrl = "https://api.example.com"
 cfg.headers = initHeaders({"authorization": "Bearer ..."})
-let api = newNavi(cfg)
+let api = initNavi(cfg)
 
 # Relative targets resolve against prefixUrl.
 let user = api.get("users/42").data
 ```
 
 Derive a client that layers new defaults over an existing one. Build the override
-with `newNaviConfig()` too; `extend` layers its identity fields (prefixUrl,
+with `initNaviConfig()` too; `extend` layers its identity fields (prefixUrl,
 headers, http, auth, proxy) over the parent and inherits the rest:
 
 ```nim
-var ovr = newNaviConfig()
+var ovr = initNaviConfig()
 ovr.headers = initHeaders({"x-api-key": "..."})
 let authed = api.extend(ovr)
 ```
@@ -261,9 +261,9 @@ for (name, value) in h.pairs: discard
 ### TLS
 
 ```nim
-var cfg = newNaviConfig()
+var cfg = initNaviConfig()
 cfg.tls.caFile = "/path/to/ca-bundle.pem"   # verify is already on
-let api = newNavi(cfg)
+let api = initNavi(cfg)
 ```
 
 `verify` defaults to on. `caFile` is honored by all three backends: sync and asyncdispatch through OpenSSL, and chronos through BearSSL (which otherwise verifies against its bundled Mozilla trust anchors). The chronos backend negotiates up to TLS 1.2 and does not support client certificates (mTLS).
@@ -308,9 +308,9 @@ except HttpError as e:
   echo e.response.body
 
 # Opt out to handle status codes yourself:
-var cfg = newNaviConfig()
+var cfg = initNaviConfig()
 cfg.throwHttpErrors = false
-let api = newNavi(cfg)
+let api = initNavi(cfg)
 ```
 
 ### Retries, redirects, and timeouts
@@ -318,17 +318,17 @@ let api = newNavi(cfg)
 Idempotent requests that hit a transient failure (network error or 408/413/429/500/502/503/504) are retried with capped exponential backoff, honoring `Retry-After` (both the seconds and HTTP-date forms). Redirects are followed by default.
 
 ```nim
-var cfg = newNaviConfig()
+var cfg = initNaviConfig()
 cfg.retry.limit = 3        # default 2; 0 disables retries
 cfg.maxRedirects = 5       # default 20; 0 disables
 cfg.timeout = 5000         # 5s; 0 (default) disables. Raises TimeoutError.
-let api = newNavi(cfg)
+let api = initNavi(cfg)
 ```
 
 The whole retry policy is configurable via `cfg.retry` (a `RetryPolicy`):
 
 ```nim
-var cfg = newNaviConfig()
+var cfg = initNaviConfig()
 cfg.retry.limit = 5
 cfg.retry.methods = {GET, HEAD}            # verbs eligible for retry
 cfg.retry.statuses = @[429, 503]           # response statuses that trigger one
@@ -364,18 +364,18 @@ tok.cancel()
 `maxResponseBytes` caps the response body; a larger response raises `ResponseTooLargeError`. Streaming enforces the cap incrementally (per chunk); buffered requests enforce it on the assembled body. On the native backends the cap counts decompressed bytes, so it also guards against decompression bombs.
 
 ```nim
-var cfg = newNaviConfig()
+var cfg = initNaviConfig()
 cfg.maxResponseBytes = 10 * 1024 * 1024   # 10 MiB; 0 (default) is unlimited
-let api = newNavi(cfg)
+let api = initNavi(cfg)
 ```
 
 ### Auth and proxy
 
 ```nim
-var cfg = newNaviConfig()
+var cfg = initNaviConfig()
 cfg.auth = bearerAuth("token")      # or basicAuth("user", "pass")
 cfg.proxy = "http://proxy:8080"     # else HTTP(S)_PROXY / NO_PROXY env
-let api = newNavi(cfg)
+let api = initNavi(cfg)
 ```
 
 ### Cookies
@@ -403,9 +403,9 @@ proc trace(prefix: string): NaviMiddleware =       # sync (import navi)
     ctx.next()
     log(prefix, ctx.req.verb, ctx.res.status, epochTime() - t0)  # after
 
-var cfg = newNaviConfig()
+var cfg = initNaviConfig()
 cfg.middleware = @[trace("api")]
-let api = newNavi(cfg)
+let api = initNavi(cfg)
 ```
 
 Short-circuit by setting `ctx.res` and *not* calling `next` (a cache hit or
@@ -461,7 +461,7 @@ Just start them and await together (like `Promise.all`):
 import navi/asyncdispatch
 
 proc main() {.async.} =
-  let api = newNavi()
+  let api = initNavi()
   let results = await all(@[
     api.get("https://nghttp2.org/httpbin/get"),
     api.get("https://nghttp2.org/httpbin/ip"),
@@ -478,7 +478,7 @@ multiplexing is available through a batch call:
 ```nim
 import navi
 
-let api = newNavi()
+let api = initNavi()
 let results = api.parallel(@[
   "https://nghttp2.org/httpbin/get",
   "https://nghttp2.org/httpbin/ip",
@@ -556,7 +556,7 @@ surface is otherwise the same.
 
 ## API
 
-### newNavi(config = newNaviConfig())
+### initNavi(config = initNaviConfig())
 
 Create a client. `config` supplies the defaults applied to every request and
 inherited via `extend`. Returns a `Navi`. Read it back (read-only) via
@@ -608,9 +608,9 @@ connection pool and cookie jar.
 
 ### NaviConfig
 
-Build one with `newNaviConfig()`, which sets the defaults below, then assign the
+Build one with `initNaviConfig()`, which sets the defaults below, then assign the
 fields you want. `NaviConfig` has `{.requiresInit.}`, so a bare or partial
-`NaviConfig(...)` is a compile error; `newNaviConfig()` is the only builder.
+`NaviConfig(...)` is a compile error; `initNaviConfig()` is the only builder.
 
 - **prefixUrl** `string`: prepended to relative request targets.
 - **headers** `Headers`: sent on every request (merged with per-call headers).

@@ -89,7 +89,7 @@ suite "chronos websocket client end to end":
     # Checks live in the sync body: chronos's strict exception tracking rejects
     # unittest's `check` (which can raise) inside an {.async.} proc.
     proc run(): Future[seq[WsMessage]] {.async.} =
-      let api = newNavi()
+      let api = initNavi()
       let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
       await ws.send("hello")
       result.add await ws.receive()
@@ -116,9 +116,9 @@ suite "chronos websocket client end to end":
     while not stallReady: os.sleep(5)
 
     proc run(): Future[string] {.async.} =
-      var cfg = newNaviConfig()
+      var cfg = initNaviConfig()
       cfg.timeout = 600
-      let api = newNavi(cfg)
+      let api = initNavi(cfg)
       try:
         discard await api.websocket("ws://127.0.0.1:" & $port & "/")
         return "opened"
