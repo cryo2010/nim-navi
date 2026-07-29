@@ -51,7 +51,7 @@ type
     # would otherwise silently fall back to HTTP/1.1 (no ALPN h2 offered).
 
   RetryPolicy* = object
-    ## When and how a request is retried. `newNaviConfig` seeds `defaultRetryPolicy`.
+    ## When and how a request is retried. `initNaviConfig` seeds `defaultRetryPolicy`.
     limit*: int                     ## retry attempts, 0 disables (default 2)
     methods*: set[HttpVerb]         ## verbs eligible for retry (idempotent by default)
     statuses*: seq[int]             ## response statuses that trigger a retry
@@ -61,7 +61,7 @@ type
     ## Backend-agnostic client defaults, applied to every request and inheritable
     ## via `.extend`. Each entry module derives its own `NaviConfig` from this,
     ## adding a backend-specific `middleware` field. The derived `NaviConfig` has
-    ## `{.requiresInit.}`, so it can only be built with `newNaviConfig` (a bare or
+    ## `{.requiresInit.}`, so it can only be built with `initNaviConfig` (a bare or
     ## partial `NaviConfig(...)` is a compile error), keeping the defaults intact.
     prefixUrl*: string
     headers*: Headers
@@ -91,7 +91,7 @@ type
 
 proc defaultRetryPolicy*(): RetryPolicy =
   ## Retry idempotent methods up to twice on transient statuses, backing off
-  ## exponentially up to 10s. `newNaviConfig` uses this; override `config.retry`
+  ## exponentially up to 10s. `initNaviConfig` uses this; override `config.retry`
   ## (or its fields) to change the count, methods, statuses, or max delay.
   RetryPolicy(
     limit: 2,
@@ -129,7 +129,7 @@ proc wantsH2*(opts: NaviConfigBase): bool =
 proc mergeBase*[T: NaviConfigBase](base, overrides: T): T =
   ## Layer `overrides`' addressing/identity fields over `base` for `.extend`,
   ## preserving `base`'s policy knobs and derived fields (e.g. middleware). The
-  ## override is a full `newNaviConfig`; only fields with a natural "unset" value
+  ## override is a full `initNaviConfig`; only fields with a natural "unset" value
   ## (prefixUrl, headers, http, auth, proxy) take effect, so its defaults for the
   ## other fields do not clobber `base`.
   result = base

@@ -163,9 +163,9 @@ suite "digest auth end to end":
     createThread(th, serveDigest, port)
     while not chReady: sleep(5)
 
-    var cfg = newNaviConfig()
+    var cfg = initNaviConfig()
     cfg.auth = digestAuth("user", "pass")
-    let api = newNavi(cfg)
+    let api = initNavi(cfg)
     let res = api.get("http://127.0.0.1:" & $port & "/secret")
     check res.status == 200
     check res.body == "welcome"
@@ -177,9 +177,9 @@ suite "digest auth end to end":
     createThread(th, serveDigestMulti, port)
     while not multiReady: sleep(5)
 
-    var cfg = newNaviConfig()
+    var cfg = initNaviConfig()
     cfg.auth = digestAuth("user", "pass")
-    let api = newNavi(cfg)
+    let api = initNavi(cfg)
     let res = api.get("http://127.0.0.1:" & $port & "/secret")
     check res.status == 200
     check res.body == "welcome"

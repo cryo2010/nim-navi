@@ -4,7 +4,7 @@
 import navi/js
 
 proc main() {.async.} =
-  let api = newNavi()
+  let api = initNavi()
   let ws = await api.websocket("ws://127.0.0.1:9500/chat")
 
   await ws.send("hello from navi/js")

@@ -57,7 +57,7 @@ var failures: seq[string]
 var skips: seq[string]
 
 proc client(): Navi =
-  var cfg = newNaviConfig()
+  var cfg = initNaviConfig()
   cfg.timeout = 20_000            # bound hangs so a stuck target can't wedge CI
   cfg.retry.limit = 0            # one attempt/target; flakes become SKIP, not
                                  # three stacked 20s timeouts
@@ -66,7 +66,7 @@ proc client(): Navi =
   # targets would answer 403 (a SKIP) instead of exercising navi's h2 read path.
   cfg.headers["user-agent"] =
     "Mozilla/5.0 (compatible; navi-interop/1.0; +https://github.com/)"
-  newNavi(cfg)
+  initNavi(cfg)
 
 proc say(line: string) =
   # Flush per line: Nim block-buffers stdout to a pipe, so without this the CI

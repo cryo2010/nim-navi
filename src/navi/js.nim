@@ -3,7 +3,7 @@
 ##   import navi/js
 ##
 ##   proc main() {.async.} =
-##     let api = newNavi()
+##     let api = initNavi()
 ##     let res = await api.get("https://example.com")
 ##     echo res.status, " ", res.data
 ##   discard main()
@@ -55,14 +55,14 @@ type
     ## awaiting middleware; the native backends add it where it means something.)
 
   NaviConfig* {.requiresInit.} = object of NaviConfigBase
-    ## `requiresInit`: build it with `newNaviConfig()`, not a bare `NaviConfig(...)`.
+    ## `requiresInit`: build it with `initNaviConfig()`, not a bare `NaviConfig(...)`.
     middleware*: seq[NaviMiddleware]
 
   Navi* = object
     config: NaviConfig   ## the runtime owns connections
     jar: CookieJar          ## kept off-browser; nil in a browser (its store owns cookies)
 
-proc newNaviConfig*(): NaviConfig =
+proc initNaviConfig*(): NaviConfig =
   ## The only way to build a config (`NaviConfig` requires every field). Safe
   ## defaults, minus decompression: the browser decodes bodies and forbids the
   ## Accept-Encoding request header, so navi does not add it. TLS and HTTP version
@@ -78,7 +78,7 @@ proc newNaviConfig*(): NaviConfig =
 # a browser document context.
 proc inBrowser(): bool {.importjs: "(typeof document !== 'undefined')".}
 
-proc newNavi*(config = newNaviConfig()): Navi =
+proc initNavi*(config = initNaviConfig()): Navi =
   result = Navi(config: config)
   if not inBrowser(): result.jar = newCookieJar()
 

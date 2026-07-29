@@ -21,10 +21,10 @@ proc stampMw(): NaviMiddleware =
     await ctx.next()
 
 proc mkClient(base: string): Navi =
-  var cfg = newNaviConfig()
+  var cfg = initNaviConfig()
   cfg.prefixUrl = base
   cfg.middleware = @[stampMw()]
-  newNavi(cfg)
+  initNavi(cfg)
 
 proc main() {.async.} =
   let secs = parseFloat($envJs("NAVI_STRESS_SECONDS", "20"))

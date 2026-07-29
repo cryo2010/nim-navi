@@ -14,9 +14,9 @@ let padded = getEnv("NAVI_INTEROP_PADDED_URL")   # nghttpd started with -b (fram
 let cert = getEnv("NAVI_INTEROP_CERT")
 
 proc client(): Navi =
-  var cfg = newNaviConfig()
+  var cfg = initNaviConfig()
   cfg.tls.caFile = cert
-  newNavi(cfg)
+  initNavi(cfg)
 
 suite "nghttpd interop (sync, http/2)":
   test "negotiates h2 over ALPN and GETs a file":

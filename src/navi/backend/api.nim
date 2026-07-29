@@ -38,7 +38,7 @@ type
 
 proc wantsVerify*(tls: TlsConfig): bool = tls.verify
   ## Whether to verify the cert chain and hostname. `defaultTls()` /
-  ## `newNaviConfig()` turn it on; a bare `TlsConfig()` leaves it off, so build
+  ## `initNaviConfig()` turn it on; a bare `TlsConfig()` leaves it off, so build
   ## configs through those to stay secure by default.
 
 proc clientKeyFile*(tls: TlsConfig): string =

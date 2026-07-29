@@ -12,7 +12,7 @@ import navi/js
 const url = "http://127.0.0.1:9521/"
 
 proc twoRequests(): Future[(string, string)] {.async.} =
-  let api = newNavi()                       # no config: jar is kept off-browser
+  let api = initNavi()                       # no config: jar is kept off-browser
   let r1 = await api.get(url)               # nothing stored yet
   let r2 = await api.get(url)               # Set-Cookie from r1 is replayed
   return (r1.body, r2.body)
@@ -24,9 +24,9 @@ proc middlewareRuns(): Future[bool] {.async.} =
       ctx.req.headers["x-stress"] = "1"
       inc ran
       await ctx.next()
-  var cfg = newNaviConfig()
+  var cfg = initNaviConfig()
   cfg.middleware = @[stamp()]
-  let api = newNavi(cfg)
+  let api = initNavi(cfg)
   let r = await api.get(url)                 # pre-fix this threw: client was undefined
   doAssert ran == 1, "middleware did not run"
   doAssert r.headers.get("x-echo-stress") == "1",

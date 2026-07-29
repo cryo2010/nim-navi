@@ -10,14 +10,14 @@ import navi
 let cert = getEnv("NAVI_INTEROP_CERT")
 
 proc client(): Navi =
-  var cfg = newNaviConfig()
+  var cfg = initNaviConfig()
   cfg.tls.caFile = cert
   # A read timeout on purpose: these servers keep the connection alive, and the
   # responses (hello.txt is 13 bytes) end well inside one recv buffer. That is
   # the exact shape that made the sync backend's timeout path stall until the
   # deadline; keeping a timeout here guards against that regression.
   cfg.timeout = 15_000
-  newNavi(cfg)
+  initNavi(cfg)
 
 for entry in getEnv("NAVI_SERVERS").splitWhitespace():
   let p = entry.split('=', 1)

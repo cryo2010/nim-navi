@@ -18,9 +18,9 @@ else:
 proc client(): Navi =
   # Read the cert path here (not from a global) so the closure stays GC-safe
   # under chronos's async macro.
-  var cfg = newNaviConfig()
+  var cfg = initNaviConfig()
   cfg.tls.caFile = getEnv("NAVI_INTEROP_CERT")
-  newNavi(cfg)
+  initNavi(cfg)
 
 proc main() {.async.} =
   for entry in getEnv("NAVI_SERVERS").splitWhitespace():

@@ -31,7 +31,7 @@ type
     ## require it -- only chronos does, at its call site.)
 
   NaviConfig* {.requiresInit.} = object of NaviConfigBase
-    ## `requiresInit`: build it with `newNaviConfig()`, not a bare `NaviConfig(...)`.
+    ## `requiresInit`: build it with `initNaviConfig()`, not a bare `NaviConfig(...)`.
     middleware*: seq[NaviMiddleware]
 
   Navi* = object
@@ -41,16 +41,16 @@ type
     muxes: TableRef[string, H2Mux]              ## live shared h2 connections
     pendingMux: TableRef[string, Future[H2Mux]] ## in-flight connects (coalescing)
 
-proc newNaviConfig*(): NaviConfig =
+proc initNaviConfig*(): NaviConfig =
   ## The only way to build a config (`NaviConfig` requires every field). Sets the
-  ## safe defaults; override the fields you want, then pass it to `newNavi`.
+  ## safe defaults; override the fields you want, then pass it to `initNavi`.
   NaviConfig(
     prefixUrl: "", headers: initHeaders(), http: {H1, H2}, tls: defaultTls(),
     decompress: true, throwHttpErrors: true, maxRedirects: 20,
     retry: defaultRetryPolicy(), maxResponseBytes: 0,
     auth: Auth(), proxy: "", timeout: 0, middleware: @[])
 
-proc newNavi*(config = newNaviConfig()): Navi =
+proc initNavi*(config = initNaviConfig()): Navi =
   Navi(config: config,
        pool: newPool[PooledConn[Conn]](), jar: newCookieJar(),
        muxes: newTable[string, H2Mux](),
