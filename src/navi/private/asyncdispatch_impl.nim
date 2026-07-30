@@ -19,7 +19,7 @@ type
     ## then `await ctx.next()` runs the rest of the chain (which fills `res`).
     req*: Request            ## the outgoing request; modify it before `next`
     res*: Response           ## the response; set by `next`, adjust it after
-    clientp: ptr Navi        ## the owning client (see `client`); valid for the call
+    clientv: Navi            ## the owning client (see `client`)
     sink: BodySink           ## non-nil for a streaming request
     idx: int                 ## index of the next middleware to run
   NaviMiddleware* = proc(ctx: NaviContext): Future[void] {.closure.}
@@ -191,18 +191,18 @@ proc guard(client: Navi, fut: Future[Response],
     if cancel != nil: cancel.disarmHook()
     if not cancelFut.finished: cancelFut.complete()
 
-proc client*(ctx: NaviContext): Navi = ctx.clientp[]
+proc client*(ctx: NaviContext): Navi = ctx.clientv
   ## The client handling this request (e.g. to read `ctx.client.config`).
 
 proc next*(ctx: NaviContext): Future[void] {.async.} =
   ## Run the rest of the chain: the next middleware, or -- once they are
   ## exhausted -- the request itself. The outcome lands in `ctx.res`.
-  let mws = ctx.clientp[].config.middleware
+  let mws = ctx.clientv.config.middleware
   if ctx.idx >= mws.len:
     if ctx.sink.isNil:
-      ctx.res = await doRequest(ctx.clientp[], ctx.req)
+      ctx.res = await doRequest(ctx.clientv, ctx.req)
     else:
-      ctx.res = await doStream(ctx.clientp[], ctx.req, ctx.sink)
+      ctx.res = await doStream(ctx.clientv, ctx.req, ctx.sink)
   else:
     let m = mws[ctx.idx]
     inc ctx.idx
@@ -224,7 +224,7 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
                          form, multipart, bodyStream, params)
   if client.config.middleware.len == 0:
     return await client.guard(doRequest(client, req), cancel)
-  let ctx = NaviContext(req: req, clientp: unsafeAddr client)
+  let ctx = NaviContext(req: req, clientv: client)
   return await client.guard(runChain(ctx), cancel)
 
 proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
@@ -234,7 +234,7 @@ proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
   let req = buildRequest(client.config, verb, target, headers, params = params)
   if client.config.middleware.len == 0:
     return await client.guard(doStream(client, req, sink), cancel)
-  let ctx = NaviContext(req: req, clientp: unsafeAddr client, sink: sink)
+  let ctx = NaviContext(req: req, clientv: client, sink: sink)
   return await client.guard(runChain(ctx), cancel)
 
 include navi/private/verbs

@@ -38,11 +38,7 @@ type
     ## then `await ctx.next()` runs the rest of the chain (which fills `res`).
     req*: Request            ## the outgoing request; modify it before `next`
     res*: Response           ## the response; set by `next`, adjust it after
-    clientv: Navi            ## the owning client (see `client`)
-      ## Held by value, not `ptr Navi`: taking the address of a by-value param
-      ## (`unsafeAddr client` in `request`/`stream`) miscompiles under `nim js`
-      ## (the callee boxes the param, the caller does not), which broke the whole
-      ## middleware path. `Navi`'s cookie jar is a `ref`, so a copy is equivalent.
+    clientv: Navi            ## the owning client (see `client`); a shared ref
     sink: BodySink           ## non-nil for a streaming request
     cancel: CancelToken      ## caller's cancellation token, or nil
     idx: int                 ## index of the next middleware to run
