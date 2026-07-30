@@ -543,3 +543,25 @@ suite "sync entry end to end":
     let res = api.get("http://127.0.0.1:" & $port & "/", cancel = newCancelToken())
     check res.status == 200
     joinThread(th)
+
+suite "TLS session resumption config":
+  test "resumption is on by default and allocates a per-client session cache":
+    check initNaviConfig().tls.resumeSessions
+    let api = newNavi()
+    when defined(ssl):
+      check not api.config.tls.sessionCache.isNil
+    else:
+      check api.config.tls.sessionCache.isNil   # no OpenSSL, no cache
+
+  test "resumeSessions = false leaves no session cache":
+    var cfg = initNaviConfig()
+    cfg.tls.resumeSessions = false
+    let api = newNavi(cfg)
+    check api.config.tls.sessionCache.isNil
+
+  test "extend gives the derived client its own cache":
+    let parent = newNavi()
+    let child = parent.extend(initNaviConfig())
+    when defined(ssl):
+      check not child.config.tls.sessionCache.isNil
+      check not (child.config.tls.sessionCache == parent.config.tls.sessionCache)

@@ -24,8 +24,18 @@ type
     protocol*: string   ## ALPN-negotiated protocol ("h2" or "", meaning http/1.1)
     when defined(ssl):
       ctx: SslContext   ## kept so `close` can free the SSL_CTX (destroyContext)
+      slot: SessionSlot ## keeps the resumption link alive for the SSL's lifetime
 
 var openedConnections*: int  ## diagnostic: TCP connections opened by this backend
+
+when defined(ssl):
+  proc resumeSlot(cfg: TlsConfig, ctx: SslContext, origin: string): SessionSlot =
+    ## When resumption is on and the client has a session cache, arm `ctx` to feed
+    ## it and return a slot keyed by `origin`; otherwise nil (no resumption).
+    if cfg.wantsResume and not cfg.sessionCache.isNil:
+      let cache = cast[TlsSessionCache](cfg.sessionCache)
+      enableResumption(ctx, cache)
+      result = newSlot(cache, origin)
 
 proc proxyConnect(socket: AsyncSocket, host: string, port: int) {.async.} =
   let target = host & ":" & $port
@@ -66,11 +76,13 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
       # handshake -- a later increment.
       let ctx = newTlsContext(cfg, alpn)   # verify/CA + ALPN + any client cert
       result.ctx = ctx           # store before the handshake so cleanup frees it
+      result.slot = resumeSlot(cfg, ctx, host & ":" & $port)  # arm ctx before SSL_new
       let socket = newAsyncSocket(pickDomain(host, port), SOCK_STREAM,
                                   IPPROTO_TCP, buffered = false)
       result.socket = socket
       setNoDelay(socket.getFd())
       wrapSocket(ctx, socket)
+      applySession(socket.sslHandle, result.slot)  # present cached session pre-handshake
       await socket.connect(host, Port(port))
       result.protocol = negotiatedProtocol(socket.sslHandle)
       established = true
@@ -108,3 +120,18 @@ proc close*(c: Conn): Future[void] {.async.} =
     if not c.ctx.isNil: c.ctx.destroyContext()
 
 proc sleep*(ms: int): Future[void] = sleepAsync(ms)
+
+proc newTlsStore*(cfg: TlsConfig): RootRef =
+  ## The per-client TLS session cache, or nil when resumption is off or
+  ## unavailable (non-`-d:ssl` build). The entry puts it on `config.tls.sessionCache`.
+  when defined(ssl):
+    if cfg.wantsResume: result = newTlsSessionCache()
+  else:
+    discard cfg
+
+proc closeTlsStore*(store: RootRef) =
+  ## Free the sessions held by a `newTlsStore` cache. The entry calls this in `close`.
+  when defined(ssl):
+    if not store.isNil: close(cast[TlsSessionCache](store))
+  else:
+    discard store

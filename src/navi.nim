@@ -62,7 +62,9 @@ proc initNaviConfig*(): NaviConfig =
 proc newNavi*(config = initNaviConfig()): Navi =
   ## Create a client. `config` supplies defaults (prefixUrl, headers, TLS,
   ## middleware, …).
-  Navi(config: config, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
+  var cfg = config
+  if cfg.tls.sessionCache.isNil: cfg.tls.sessionCache = newTlsStore(cfg.tls)
+  Navi(config: cfg, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
 proc config*(client: Navi): lent NaviConfig = client.config
   ## Read-only view of the client's config. Config is fixed at construction;
@@ -74,15 +76,17 @@ proc extend*(client: Navi, config: NaviConfig): Navi =
   ## appended). The derived client gets its own connection pool and cookie jar.
   var merged = mergeBase(client.config, config)
   merged.middleware = client.config.middleware & config.middleware
+  merged.tls.sessionCache = newTlsStore(merged.tls)  # its own cache, not the parent's
   Navi(config: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
 proc close*(client: Navi) =
-  ## Close all idle pooled connections, freeing their TLS contexts. Optional but
-  ## recommended when done with a client: a later request just opens fresh
-  ## connections. Without it, pooled connections are reclaimed only at process
-  ## exit (and their OpenSSL contexts leak until then).
+  ## Close all idle pooled connections, freeing their TLS contexts and cached
+  ## sessions. Optional but recommended when done with a client: a later request
+  ## just opens fresh connections. Without it, pooled connections are reclaimed
+  ## only at process exit (and their OpenSSL contexts leak until then).
   for pc in client.pool.drain():
     pc.transport.close()
+  closeTlsStore(client.config.tls.sessionCache)
 
 proc transport(client: Navi, req: Request, sink: BodySink): Response =
   ## Pool-based transport (one request per connection at a time).

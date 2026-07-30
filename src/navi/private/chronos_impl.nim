@@ -48,7 +48,9 @@ proc initNaviConfig*(): NaviConfig =
     auth: Auth(), proxy: "", timeout: 0, middleware: @[])
 
 proc newNavi*(config = initNaviConfig()): Navi =
-  Navi(config: config, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
+  var cfg = config
+  if cfg.tls.sessionCache.isNil: cfg.tls.sessionCache = newTlsStore(cfg.tls)
+  Navi(config: cfg, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
 proc config*(client: Navi): lent NaviConfig = client.config
   ## Read-only view of the client's config. Config is fixed at construction;
@@ -58,6 +60,7 @@ proc config*(client: Navi): lent NaviConfig = client.config
 proc extend*(client: Navi, config: NaviConfig): Navi =
   var merged = mergeBase(client.config, config)
   merged.middleware = client.config.middleware & config.middleware
+  merged.tls.sessionCache = newTlsStore(merged.tls)  # its own cache, not the parent's
   Navi(config: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
 
 proc close*(client: Navi): Future[void] {.async.} =
@@ -65,6 +68,7 @@ proc close*(client: Navi): Future[void] {.async.} =
   ## the client (a later request opens fresh connections).
   for pc in client.pool.drain():
     await close(pc.transport)
+  closeTlsStore(client.config.tls.sessionCache)
 
 proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
   ## Pool-based transport (http/1.1; chronos has no h2).
