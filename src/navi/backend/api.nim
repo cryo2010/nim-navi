@@ -29,6 +29,10 @@ type
     pkcs12File*: string    ## a PKCS#12/PFX bundle (cert + key + chain); highest precedence
     certPem*: string       ## client certificate as an in-memory PEM string (may hold a chain)
     keyPem*: string        ## private key as an in-memory PEM string ("" reuses `certPem`)
+    resumeSessions*: bool  ## reuse TLS sessions across connections to the same origin
+                           ## (abbreviated handshake); on by default via `defaultTls()`
+    sessionCache*: RootRef ## per-client session store, set by `newNavi`; the TLS
+                           ## backend owns the concrete type. Not user-configurable.
 
   ProxyTarget* = object
     ## The HTTP proxy to dial through. An empty `host` means a direct
@@ -41,13 +45,18 @@ proc wantsVerify*(tls: TlsConfig): bool = tls.verify
   ## `initNaviConfig()` turn it on; a bare `TlsConfig()` leaves it off, so build
   ## configs through those to stay secure by default.
 
+proc wantsResume*(tls: TlsConfig): bool = tls.resumeSessions
+  ## Whether to reuse TLS sessions across connections to the same origin (a
+  ## resumed handshake skips the certificate exchange and the server's signature).
+  ## `defaultTls()` / `initNaviConfig()` turn it on.
+
 proc clientKeyFile*(tls: TlsConfig): string =
   ## Path to the client private key: `keyFile` when set, otherwise `certFile`
   ## (a single PEM commonly holds both the certificate and its key).
   if tls.keyFile.len > 0: tls.keyFile else: tls.certFile
 
 proc defaultTls*(): TlsConfig =
-  TlsConfig(verify: true)  # secure by default
+  TlsConfig(verify: true, resumeSessions: true)  # secure + fast by default
 
 proc direct*(): ProxyTarget = ProxyTarget()
 proc isSet*(p: ProxyTarget): bool = p.host.len > 0

@@ -21,6 +21,17 @@ type
     caStore: CaTrustStore  ## keeps custom-CA anchors alive; BearSSL holds raw pointers into it
     protocol*: string    ## ALPN protocol; always "" here (this backend is http/1.1)
 
+proc newTlsStore*(cfg: TlsConfig): RootRef =
+  ## No-op for chronos: BearSSL client-side session resumption is not available in
+  ## the chronos versions navi targets (the session-cache API is server-only, and
+  ## `TLSSessionCache.init` does not compile on some releases). Kept for a uniform
+  ## client interface across backends; TLS resumption applies to the OpenSSL
+  ## backends (sync, asyncdispatch). Always nil.
+  discard cfg
+
+proc closeTlsStore*(store: RootRef) =
+  discard store
+
 proc proxyConnect(transport: StreamTransport, host: string, port: int) {.async.} =
   let target = host & ":" & $port
   discard await transport.write(
@@ -61,7 +72,11 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
         result.caStore = loadCaTrustStore(readFile(cfg.caFile))
       let rdr = newAsyncStreamReader(transport)
       let wtr = newAsyncStreamWriter(transport)
-      # This chronos/BearSSL build negotiates up to TLS 1.2 only.
+      # This chronos/BearSSL build negotiates up to TLS 1.2 only. Session
+      # resumption is not wired here: chronos's client stream exposes no session
+      # cache (the cache API is server-only in current chronos), so this backend
+      # always does a full handshake. Resumption is available on the OpenSSL
+      # backends (sync, asyncdispatch).
       let stream =
         if result.caStore != nil:
           newTLSClientAsyncStream(rdr, wtr, host, flags = flags,

@@ -51,7 +51,9 @@ proc initNaviConfig*(): NaviConfig =
     auth: Auth(), proxy: "", timeout: 0, middleware: @[])
 
 proc newNavi*(config = initNaviConfig()): Navi =
-  Navi(config: config,
+  var cfg = config
+  if cfg.tls.sessionCache.isNil: cfg.tls.sessionCache = newTlsStore(cfg.tls)
+  Navi(config: cfg,
        pool: newPool[PooledConn[Conn]](), jar: newCookieJar(),
        muxes: newTable[string, H2Mux](),
        pendingMux: newTable[string, Future[H2Mux]]())
@@ -64,6 +66,7 @@ proc config*(client: Navi): lent NaviConfig = client.config
 proc extend*(client: Navi, config: NaviConfig): Navi =
   var merged = mergeBase(client.config, config)
   merged.middleware = client.config.middleware & config.middleware
+  merged.tls.sessionCache = newTlsStore(merged.tls)  # its own cache, not the parent's
   Navi(config: merged,
        pool: newPool[PooledConn[Conn]](), jar: newCookieJar(),
        muxes: newTable[string, H2Mux](),
@@ -78,6 +81,7 @@ proc close*(client: Navi): Future[void] {.async.} =
   for mux in client.muxes.values:
     await mux.close()
   client.muxes.clear()
+  closeTlsStore(client.config.tls.sessionCache)
 
 proc muxRequest(client: Navi, mux: H2Mux, req: Request,
                 sink: BodySink): Future[Response] {.async.} =

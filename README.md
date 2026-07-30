@@ -268,6 +268,22 @@ let api = newNavi(cfg)
 
 `verify` defaults to on. `caFile` is honored by all three backends: sync and asyncdispatch through OpenSSL, and chronos through BearSSL (which otherwise verifies against its bundled Mozilla trust anchors). The chronos backend negotiates up to TLS 1.2 and does not support client certificates (mTLS).
 
+#### Session resumption
+
+navi caches TLS sessions per client and resumes them on later connections to the
+same origin, so a reconnect skips the certificate exchange and the server's
+signature (an abbreviated handshake). This is on by default and matters most for
+workloads that open many short-lived connections (`Connection: close`, no pooling);
+a pooled, kept-alive connection already amortizes the handshake. Disable it with:
+
+```nim
+cfg.tls.resumeSessions = false
+```
+
+Supported on the OpenSSL backends (sync, asyncdispatch); the sync backend sees the
+largest gain. Not available on chronos (BearSSL exposes no client session cache in
+the chronos versions navi targets), which always does a full handshake.
+
 #### Client certificates (mTLS)
 
 On the OpenSSL backends (sync, asyncdispatch) navi can present a client certificate for mutual TLS, from several sources. Precedence is `pkcs12File`, then in-memory (`certPem`/`keyPem`), then the `certFile`/`keyFile` pair.

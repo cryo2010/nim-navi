@@ -14,7 +14,7 @@
 import ./api
 
 when defined(ssl):
-  import std/[net, openssl, nativesockets]
+  import std/[net, openssl, nativesockets, tables]
   # Re-export the context type + destructor so backends can own the socket and
   # handshake while still building the (verified) context through newContext.
   export net.SslContext, net.destroyContext
@@ -180,6 +180,92 @@ when defined(ssl):
     if custom: loadClientCert(result.context, cfg)
     setAlpn(result.context, alpn)
 
+  # --- TLS session resumption --------------------------------------------
+  #
+  # A resumed handshake skips the certificate exchange and the server's
+  # signature, so repeat connections to the same origin are much cheaper. We keep
+  # a per-client cache of SSL_SESSIONs keyed by origin: OpenSSL hands us a session
+  # through the new-session callback (in TLS 1.3 the ticket arrives after the
+  # handshake, during the first reads), and we present it on the next connection.
+
+  type
+    TlsSessionCache* = ref object of RootObj
+      ## Per-client store of resumable TLS sessions, keyed by "host:port". Held by
+      ## the client through `TlsConfig.sessionCache`; freed with `close`.
+      sessions: Table[string, pointer]   # origin -> SSL_SESSION*
+    SessionSlot* = ref object
+      ## Per-connection link from an SSL back to its cache and origin. Kept alive
+      ## by the connection (its address lives in the SSL's ex_data), so the
+      ## new-session callback can reach the cache while the connection is open.
+      cache: TlsSessionCache
+      origin: string
+
+  proc CRYPTO_get_ex_new_index(classIndex: cint, argl: clong, argp: pointer,
+    newf, dupf, freef: pointer): cint {.cdecl, dynlib: DLLUtilName, importc.}
+  proc SSL_set_ex_data(ssl: SslPtr, idx: cint, arg: pointer): cint
+    {.cdecl, dynlib: DLLSSLName, importc.}
+  proc SSL_get_ex_data(ssl: SslPtr, idx: cint): pointer
+    {.cdecl, dynlib: DLLSSLName, importc.}
+  proc SSL_set_session(ssl: SslPtr, session: pointer): cint
+    {.cdecl, dynlib: DLLSSLName, importc.}
+  proc SSL_SESSION_free(session: pointer) {.cdecl, dynlib: DLLSSLName, importc.}
+  proc SSL_get_SSL_CTX(ssl: SslPtr): SslCtx {.cdecl, dynlib: DLLSSLName, importc.}
+  proc SSL_CTX_sess_set_new_cb(ctx: SslCtx,
+    cb: proc(ssl: SslPtr, session: pointer): cint {.cdecl.})
+    {.cdecl, dynlib: DLLSSLName, importc.}
+
+  const
+    CRYPTO_EX_INDEX_SSL = 0
+    SSL_CTRL_SET_SESS_CACHE_MODE = 44
+    SSL_SESS_CACHE_CLIENT = 0x0001
+    SSL_SESS_CACHE_NO_INTERNAL_STORE = 0x0200
+
+  var slotExIdx {.global.}: cint = -1
+  proc ensureExIdx() =
+    if slotExIdx < 0:
+      slotExIdx = CRYPTO_get_ex_new_index(CRYPTO_EX_INDEX_SSL, 0, nil, nil, nil, nil)
+
+  proc onNewSession(ssl: SslPtr, session: pointer): cint {.cdecl.} =
+    ## Called by OpenSSL when a resumable session becomes available; we take
+    ## ownership (return 1) and cache it under the connection's origin.
+    {.cast(gcsafe).}:
+      let p = SSL_get_ex_data(ssl, slotExIdx)
+      if p.isNil: return 0
+      let slot = cast[SessionSlot](p)
+      let prev = slot.cache.sessions.getOrDefault(slot.origin, nil)
+      if not prev.isNil: SSL_SESSION_free(prev)
+      slot.cache.sessions[slot.origin] = session
+      return 1
+
+  proc newTlsSessionCache*(): TlsSessionCache =
+    TlsSessionCache(sessions: initTable[string, pointer]())
+
+  proc close*(cache: TlsSessionCache) =
+    ## Free every cached session. Call when the client is closed.
+    if cache.isNil: return
+    for s in cache.sessions.values: SSL_SESSION_free(s)
+    cache.sessions.clear()
+
+  proc enableResumption*(ctx: SslContext, cache: TlsSessionCache) =
+    ## Arm `ctx` to hand new sessions to `cache`. Call before creating the SSL.
+    if cache.isNil: return
+    ensureExIdx()
+    discard SSL_CTX_ctrl(ctx.context, SSL_CTRL_SET_SESS_CACHE_MODE.cint,
+      (SSL_SESS_CACHE_CLIENT or SSL_SESS_CACHE_NO_INTERNAL_STORE).clong, nil)
+    SSL_CTX_sess_set_new_cb(ctx.context, onNewSession)
+
+  proc newSlot*(cache: TlsSessionCache, origin: string): SessionSlot =
+    SessionSlot(cache: cache, origin: origin)
+
+  proc applySession*(ssl: SslPtr, slot: SessionSlot) =
+    ## Link `ssl` to its cache/origin and, if a session is cached for that origin,
+    ## present it so the handshake resumes. Call after SSL_new, before SSL_connect.
+    if slot.isNil: return
+    ensureExIdx()
+    discard SSL_set_ex_data(ssl, slotExIdx, cast[pointer](slot))
+    let s = slot.cache.sessions.getOrDefault(slot.origin, nil)
+    if not s.isNil: discard SSL_set_session(ssl, s)
+
   # --- per-connection handshake ------------------------------------------
 
   proc checkCertName(ssl: SslPtr, host: string) =
@@ -195,20 +281,22 @@ when defined(ssl):
     if match != 1: fail("certificate does not match host " & host)
 
   proc startClientTls*(ctx: SslContext, fd: SocketHandle, host: string,
-                       verify: bool): SslPtr =
+                       verify: bool, slot: SessionSlot = nil): SslPtr =
     ## Attach a client SSL to the already-connected socket `fd`, set SNI, drive
     ## the handshake, and -- when `verify` -- confirm the chain and the peer's
     ## identity against `host`. Replaces std/net's `wrapConnectedSocket` so SNI
     ## and the verified hostname stay under navi's control; the context from
     ## `newTlsContext` carries the CA/chain trust and ALPN. Mirrors std/net: SNI
-    ## and the hostname check apply to DNS-name hosts, not IP literals. Raises
-    ## `ValueError` on any failure; `negotiatedProtocol(result)` reads the ALPN.
+    ## and the hostname check apply to DNS-name hosts, not IP literals. `slot`, if
+    ## given, resumes a cached session for the origin. Raises `ValueError` on any
+    ## failure; `negotiatedProtocol(result)` reads the ALPN.
     result = SSL_new(ctx.context)
     if result.isNil: fail("SSL_new failed")
     var ok = false
     defer:
       if not ok: SSL_free(result)
     discard SSL_set_fd(result, fd)
+    applySession(result, slot)   # present a cached session before the handshake
     let nameHost = host.len > 0 and not isIpAddress(host)
     if nameHost:
       discard SSL_set_tlsext_host_name(result, host.cstring)   # SNI

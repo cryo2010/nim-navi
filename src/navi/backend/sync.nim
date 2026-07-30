@@ -44,6 +44,7 @@ type
     when defined(ssl):
       ssl: SslPtr       ## the TLS connection; nil for plain http
       ctx: SslContext   ## kept so `close` can free the SSL_CTX (destroyContext)
+      slot: SessionSlot ## keeps the resumption link alive for the SSL's lifetime
 
 template await*(x: untyped): untyped = x
 
@@ -101,14 +102,22 @@ when defined(ssl):
       it = it.ai_next
     freeAddrInfo(ai)
 
+  proc resumeSlot(cfg: TlsConfig, ctx: SslContext, origin: string): SessionSlot =
+    ## When resumption is on and the client has a session cache, arm `ctx` to feed
+    ## it and return a slot keyed by `origin`; otherwise nil (no resumption).
+    if cfg.wantsResume and not cfg.sessionCache.isNil:
+      let cache = cast[TlsSessionCache](cfg.sessionCache)
+      enableResumption(ctx, cache)
+      result = newSlot(cache, origin)
+
   proc connectAcross*(ctx: SslContext, ips: openArray[string], sni: string,
-                      port: int, verify: bool): Conn =
+                      port: int, verify: bool, slot: SessionSlot = nil): Conn =
     ## TCP-connect + TLS-handshake across `ips` in order, returning the first that
     ## completes the handshake; the connection uses each IP while SNI and
     ## verification use `sni`. Falls through on a connect *or handshake* failure,
     ## so a dead endpoint on a multi-homed host (a partially-broken CDN pool) no
-    ## longer fails the whole request. `ctx` is set on the returned Conn by the
-    ## caller. Exported for the fallback test; navi reaches it through `connect`.
+    ## longer fails the whole request. `ctx`/`slot` are set on the returned Conn by
+    ## the caller. Exported for the fallback test; navi reaches it through `connect`.
     result.fd = osInvalidSocket
     if ips.len == 0:
       raise newException(IOError, "navi: could not resolve " & sni)
@@ -117,8 +126,9 @@ when defined(ssl):
       var fd = osInvalidSocket
       try:
         fd = tcpConnect(ip, port)
-        result.ssl = startClientTls(ctx, fd, sni, verify)
+        result.ssl = startClientTls(ctx, fd, sni, verify, slot)
         result.fd = fd
+        result.slot = slot
         result.protocol = negotiatedProtocol(result.ssl)
         return
       except CatchableError as e:
@@ -150,19 +160,23 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
       proxyConnect(result.fd, host, port)
       when defined(ssl):
         result.ctx = newTlsContext(cfg, alpn)   # verify/CA + ALPN + any client cert
-        result.ssl = startClientTls(result.ctx, result.fd, host, cfg.wantsVerify)
+        result.slot = resumeSlot(cfg, result.ctx, host & ":" & $port)
+        result.ssl = startClientTls(result.ctx, result.fd, host, cfg.wantsVerify,
+                                    result.slot)
         result.protocol = negotiatedProtocol(result.ssl)
       else:
         raise newException(ValueError, "navi: https requires compiling with -d:ssl")
   elif tls:
     when defined(ssl):
       let ctx = newTlsContext(cfg, alpn)   # verify/CA + ALPN + any client cert
+      let slot = resumeSlot(cfg, ctx, host & ":" & $port)
       # Handshake-aware fallback across the resolved addresses (see connectAcross).
       # connectAcross returns a fresh Conn, so `result.ctx` is nil until we set it
       # below; free `ctx` here if the handshake fails, before `result` is assigned
       # (the connect-cleanup defer cannot see it yet).
       try:
-        result = connectAcross(ctx, resolveAddrs(host, port), host, port, cfg.wantsVerify)
+        result = connectAcross(ctx, resolveAddrs(host, port), host, port,
+                               cfg.wantsVerify, slot)
       except CatchableError:
         ctx.destroyContext()
         raise
@@ -227,3 +241,19 @@ proc close*(c: Conn) =
     # newContext leaves the SSL_CTX without a destructor; free it so a long-lived
     # client does not leak one context (~85 KB) per connection.
     if not c.ctx.isNil: c.ctx.destroyContext()
+
+proc newTlsStore*(cfg: TlsConfig): RootRef =
+  ## The per-client TLS session cache for this backend, or nil when resumption is
+  ## off or unavailable (a non-`-d:ssl` build). Entries put it on
+  ## `config.tls.sessionCache` in `newNavi`.
+  when defined(ssl):
+    if cfg.wantsResume: result = newTlsSessionCache()
+  else:
+    discard cfg
+
+proc closeTlsStore*(store: RootRef) =
+  ## Free the sessions held by a `newTlsStore` cache. Entries call this in `close`.
+  when defined(ssl):
+    if not store.isNil: close(cast[TlsSessionCache](store))
+  else:
+    discard store
