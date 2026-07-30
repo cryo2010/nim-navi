@@ -4,8 +4,12 @@ A Dockerized, apples-to-apples benchmark of navi against Nim's stdlib and the Go
 and Rust clients, over **TLS + gzip**, exercising **every HTTP method**.
 
 ```
+nimble bench                                    # build the image + run (default load)
+NAVI_BENCH_ITERS=5000 nimble bench              # heavier load
+
+# or directly:
 docker build -f bench/Dockerfile -t navi-bench .
-docker run --rm navi-bench                      # 3000 iterations (default)
+docker run --rm navi-bench
 docker run --rm -e NAVI_BENCH_ITERS=8000 navi-bench
 ```
 
