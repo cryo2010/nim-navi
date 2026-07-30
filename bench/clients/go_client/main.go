@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -26,6 +27,10 @@ func main() {
 	url := env("NAVI_BENCH_URL", "https://127.0.0.1:8443")
 	iters, _ := strconv.Atoi(env("NAVI_BENCH_ITERS", "3000"))
 	cold := env("NAVI_BENCH_COLD", "0") == "1"
+	conc, _ := strconv.Atoi(env("NAVI_BENCH_CONC", "1"))
+	if conc < 1 {
+		conc = 1
+	}
 	warmup := iters / 10
 	if cold {
 		warmup = 20
@@ -37,10 +42,14 @@ func main() {
 	}
 	body := strings.Repeat("x", 256)
 
+	maxConns := 8
+	if conc > maxConns {
+		maxConns = conc // enough pooled connections for the goroutines
+	}
 	client := &http.Client{Transport: &http.Transport{
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 		ForceAttemptHTTP2:   false, // stay on HTTP/1.1 like the others
-		MaxIdleConnsPerHost: 8,
+		MaxIdleConnsPerHost: maxConns,
 	}}
 
 	do := func(method, path, reqBody string) {
@@ -70,11 +79,35 @@ func main() {
 	for i := 0; i < warmup; i++ {
 		oneIter()
 	}
-	t0 := time.Now()
-	for i := 0; i < iters; i++ {
-		oneIter()
+
+	var reqs int
+	var secs float64
+	if conc > 1 {
+		per := iters / conc
+		if per < 1 {
+			per = 1
+		}
+		t0 := time.Now()
+		var wg sync.WaitGroup
+		for w := 0; w < conc; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := 0; i < per; i++ {
+					oneIter()
+				}
+			}()
+		}
+		wg.Wait()
+		secs = time.Since(t0).Seconds()
+		reqs = per * conc * 7
+	} else {
+		t0 := time.Now()
+		for i := 0; i < iters; i++ {
+			oneIter()
+		}
+		secs = time.Since(t0).Seconds()
+		reqs = iters * 7
 	}
-	secs := time.Since(t0).Seconds()
-	reqs := iters * 7
 	fmt.Printf("RESULT\tgo-nethttp\t%d\t%.3f\t%.0f\n", reqs, secs, float64(reqs)/secs)
 }

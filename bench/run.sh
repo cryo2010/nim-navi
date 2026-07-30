@@ -14,6 +14,11 @@ export NAVI_BENCH_ITERS="${NAVI_BENCH_ITERS:-500}"
 # Cold phase (fresh connection per request) is far slower per request -- a full
 # TCP+TLS handshake every time -- so it runs fewer iterations by default.
 NAVI_BENCH_COLD_ITERS="${NAVI_BENCH_COLD_ITERS:-200}"
+# Concurrent phase: this many requests in flight (pooled). Measures sustained
+# throughput under concurrency. Held in local vars because run_phase exports (and
+# thus overwrites) NAVI_BENCH_CONC for the child clients.
+conc_level="${NAVI_BENCH_CONC:-64}"
+conc_iters="${NAVI_BENCH_CONC_ITERS:-3000}"
 # Per-client wall-clock cap so one slow/stuck client can't wedge the run.
 NAVI_BENCH_TIMEOUT="${NAVI_BENCH_TIMEOUT:-180}"
 export NAVI_BENCH_CERT="$work/cert.pem" NAVI_BENCH_KEY="$work/key.pem"
@@ -47,11 +52,11 @@ done
 [ -n "$ready" ] || { echo "server did not come up"; exit 1; }
 
 # Run the whole client matrix once and print a ranked table. Args: results file,
-# cold flag (0/1), iterations. The clients read NAVI_BENCH_COLD / NAVI_BENCH_ITERS
-# from the environment, so export them here for the child processes.
+# cold flag (0/1), iterations, concurrency. The clients read NAVI_BENCH_COLD /
+# NAVI_BENCH_ITERS / NAVI_BENCH_CONC from the environment, so export them here.
 run_phase() {
   local tmp="$1"
-  export NAVI_BENCH_COLD="$2" NAVI_BENCH_ITERS="$3"
+  export NAVI_BENCH_COLD="$2" NAVI_BENCH_ITERS="$3" NAVI_BENCH_CONC="${4:-1}"
   : > "$tmp"
   run() { # name binary
     local out
@@ -64,8 +69,12 @@ run_phase() {
   }
   run navi-sync   "$work/navi_sync"
   run navi-async  "$work/navi_async"
-  run std-sync    "$work/std_sync"
-  run std-async   "$work/std_async"
+  # std/httpclient does not pool, so the concurrent phase (which measures pooled
+  # throughput under load) would just multiply its handshake storm -- skip it there.
+  if [ "${4:-1}" -le 1 ]; then
+    run std-sync    "$work/std_sync"
+    run std-async   "$work/std_async"
+  fi
   run go          "$work/go_client"
   run rust        "$rust_bin"
   run node        "$work/node_client"
@@ -86,13 +95,19 @@ run_phase() {
 echo ""
 echo "=== HTTP client benchmark: TLS (HTTP/1.1) + gzip + all methods ==="
 echo ""
-echo "-- pooled: one kept-alive connection reused across requests --"
+echo "-- pooled: one kept-alive connection reused, one request at a time --"
 echo "   $NAVI_BENCH_ITERS iterations x 7 methods = $((NAVI_BENCH_ITERS * 7)) requests/client"
 echo ""
-run_phase "$work/pooled" 0 "$NAVI_BENCH_ITERS"
+run_phase "$work/pooled" 0 "$NAVI_BENCH_ITERS" 1
 
 echo ""
 echo "-- cold: a fresh TCP+TLS connection per request (connection setup) --"
 echo "   $NAVI_BENCH_COLD_ITERS iterations x 7 methods = $((NAVI_BENCH_COLD_ITERS * 7)) requests/client"
 echo ""
-run_phase "$work/cold" 1 "$NAVI_BENCH_COLD_ITERS"
+run_phase "$work/cold" 1 "$NAVI_BENCH_COLD_ITERS" 1
+
+echo ""
+echo "-- concurrent: $conc_level requests in flight, pooled (sustained throughput) --"
+echo "   $conc_iters iterations x 7 methods = $((conc_iters * 7)) requests/client (std excluded: no pooling)"
+echo ""
+run_phase "$work/conc" 0 "$conc_iters" "$conc_level"

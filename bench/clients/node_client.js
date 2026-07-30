@@ -4,19 +4,22 @@
 // decompression work matches the other clients. NAVI_BENCH_COLD=1 turns keep-alive
 // off and sends `Connection: close`, so every request opens a fresh connection
 // (the Agent still resumes the TLS session, as Node does by default).
+// NAVI_BENCH_CONC>1 runs that many concurrent workers -- Node's event loop keeps
+// them all in flight over the Agent's socket pool.
 const https = require('https');
 const zlib = require('zlib');
 
 const url = new URL(process.env.NAVI_BENCH_URL || 'https://127.0.0.1:8443');
 const iters = parseInt(process.env.NAVI_BENCH_ITERS || '3000', 10);
 const cold = process.env.NAVI_BENCH_COLD === '1';
+const conc = Math.max(1, parseInt(process.env.NAVI_BENCH_CONC || '1', 10));
 const warmup = cold ? Math.min(20, iters) : Math.max(100, Math.floor(iters / 10));
 const body = 'x'.repeat(256);
 
 const agent = new https.Agent({
   keepAlive: !cold,
   rejectUnauthorized: false, // self-signed target; TLS still exercised
-  maxSockets: 8,
+  maxSockets: Math.max(8, conc), // enough sockets for the concurrent workers
 });
 
 function req(method, path, data) {
@@ -52,10 +55,22 @@ async function one() {
 
 (async () => {
   for (let i = 0; i < warmup; i++) await one();
-  const t0 = process.hrtime.bigint();
-  for (let i = 0; i < iters; i++) await one();
-  const secs = Number(process.hrtime.bigint() - t0) / 1e9;
-  const reqs = iters * 7;
+  let reqs, secs;
+  if (conc > 1) {
+    const per = Math.max(1, Math.floor(iters / conc));
+    const worker = async () => {
+      for (let i = 0; i < per; i++) await one();
+    };
+    const t0 = process.hrtime.bigint();
+    await Promise.all(Array.from({ length: conc }, () => worker()));
+    secs = Number(process.hrtime.bigint() - t0) / 1e9;
+    reqs = per * conc * 7;
+  } else {
+    const t0 = process.hrtime.bigint();
+    for (let i = 0; i < iters; i++) await one();
+    secs = Number(process.hrtime.bigint() - t0) / 1e9;
+    reqs = iters * 7;
+  }
   process.stdout.write(`RESULT\tnode-https\t${reqs}\t${secs.toFixed(3)}\t${(reqs / secs).toFixed(0)}\n`);
 })().catch((e) => {
   console.error(e);
