@@ -29,6 +29,10 @@ for c in navi_sync navi_async std_sync std_async; do
   nim c -d:release -d:ssl --hints:off --path:"$root/src" -o:"$work/$c" \
     "$bench/clients/$c.nim" >/dev/null 2>&1
 done
+# Interpreted clients: tiny launchers so the run() helper can exec them uniformly.
+printf '#!/usr/bin/env bash\nexec node "%s"\n' "$bench/clients/node_client.js" > "$work/node_client"
+printf '#!/usr/bin/env bash\nexec python3 "%s"\n' "$bench/clients/python_client.py" > "$work/python_client"
+chmod +x "$work/node_client" "$work/python_client"
 rust_bin="$bench/clients/rust_client/target/release/rust_client"
 
 "$work/server" & srv=$!
@@ -64,6 +68,8 @@ run_phase() {
   run std-async   "$work/std_async"
   run go          "$work/go_client"
   run rust        "$rust_bin"
+  run node        "$work/node_client"
+  run python      "$work/python_client"
 
   echo ""
   local max

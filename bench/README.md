@@ -38,15 +38,21 @@ and decoding the response — in **two phases**, each printing a table of wall-c
 | `std-async` | Nim `AsyncHttpClient` + `zippy` to gunzip |
 | `go` | Go `net/http` |
 | `rust` | Rust `reqwest` (blocking) |
+| `node` | Node.js built-in `https` + `Agent` (gunzip via `zlib`) |
+| `python` | Python `requests` (`Session`) |
 
 ## Fairness notes
 
-- **HTTP/1.1 for everyone.** The server disables h2, so all six are compared on
-  the same protocol (`std/httpclient` is h1-only). navi/Go/reqwest also support
+- **HTTP/1.1 for everyone.** The server disables h2, so all clients are compared
+  on the same protocol (`std/httpclient` is h1-only). navi/Go/reqwest also support
   h2; that is a separate comparison.
+- **Sequential, one request at a time.** This measures per-request cost, not
+  concurrent throughput. The interpreted async clients (Node, Python) are built
+  for concurrency, which a sequential loop does not exercise -- with many in-flight
+  requests (undici, `aiohttp`) they would fare better than they do here.
 - **Compression is equalized.** The server gzips when the client asks. navi, Go,
-  and reqwest decode transparently; `std/httpclient` doesn't decompress at all,
-  so those two clients gunzip with `zippy` to do the same work.
+  reqwest, and Python `requests` decode transparently; `std/httpclient` and Node's
+  `https` don't, so they gunzip with `zippy` / `zlib` to do the same work.
 - **Verification is off** (self-signed target) purely to avoid per-client CA
   plumbing. The TLS handshake and per-byte symmetric crypto are still exercised;
   verification is a one-time per-connection cost that a pooled run amortizes to
@@ -61,21 +67,32 @@ and decoding the response — in **two phases**, each printing a table of wall-c
 
 ## What you'll see
 
-- **Pooled: navi, Go, and Rust are the same order of magnitude** — a few thousand
-  req/s, because they all pool the TLS connection and amortize the handshake.
-  Run-to-run ordering among these three is within noise; navi is competitive,
-  sometimes fastest.
-- **Cold: throughput drops to hundreds of req/s** for the pooling clients — that
-  gap *is* the connection-setup cost (a full TCP + TLS handshake per request).
-  navi lands alongside Go here; Rust's `reqwest`/rustls has the fastest cold
-  setup. This phase is where navi's owned transport (connect, handshake) actually
-  runs, and it is invisible in the pooled phase.
-- **`std/httpclient` is ~50-90x slower even pooled** (tens of req/s): it does not
-  reuse the TLS connection here, so it pays a fresh handshake on nearly every
-  request — effectively always cold. That is why the default iteration counts are
-  modest, and why the std clients typically time out of the cold phase entirely.
+Indicative figures from one `docker run` (sequential, localhost, HTTP/1.1 + gzip),
+relative to the fastest client in each phase:
 
-Numbers are indicative, not authoritative: they depend on the host and its load
-(this is a `docker run` on your machine), and Nim binaries are `-d:release`, Rust
-`--release`, Go default (already optimized). Increase `NAVI_BENCH_ITERS` for
-steadier numbers on the fast clients.
+| client | pooled | cold |
+| --- | --- | --- |
+| navi (sync / async) | **100%** | 86% |
+| Go `net/http` | 90% | 41% |
+| Rust `reqwest` | 80% | **100%** |
+| Node `https` | 44% | 52% |
+| Python `requests` | 44% | 33% |
+| `std/httpclient` | 1% | times out |
+
+- **Pooled: navi is fastest**, with Go close behind and reqwest a step back; all
+  four compiled/pooling clients are a few thousand req/s. Node and Python land at
+  ~2000 req/s — solid, but carrying VM/interpreter overhead. Run-to-run ordering
+  among navi/Go/reqwest is within noise.
+- **Cold** (fresh connection per request) is where TLS **session resumption**
+  decides it: reqwest and navi resume (abbreviated handshake) and stay on top;
+  Node resumes too (its `Agent` caches sessions), so it beats Go despite a lower
+  pooled number; Go and Python do a full handshake every time and fall to the
+  bottom. This is the phase navi's owned transport + resumption targets, and it is
+  invisible in the pooled phase.
+- **`std/httpclient` is ~90x slower even pooled**: it does not reuse the TLS
+  connection here, so it is effectively always cold, and times out of the cold
+  phase entirely.
+
+Numbers depend on the host and its load; Nim is `-d:release`, Rust `--release`,
+Go default, Node/Python interpreted. Increase `NAVI_BENCH_ITERS` for steadier
+numbers on the fast clients.

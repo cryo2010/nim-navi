@@ -1,6 +1,6 @@
 # Multi-language HTTP client benchmark for navi. A single image carrying Nim, Go,
-# and Rust; it builds each client and runs them against a local TLS server.
-# Large by design (three toolchains), but self-contained and reproducible.
+# Rust, Node.js, and Python; it builds/runs each client against a local TLS server.
+# Large by design (several toolchains), but self-contained and reproducible.
 #
 #   docker build -f bench/Dockerfile -t navi-bench .
 #   docker run --rm navi-bench                     # default 3000 iterations
@@ -32,6 +32,12 @@ RUN curl -fsSL "https://nim-lang.org/download/nim-${NIM_VERSION}.tar.xz" -o /tmp
     ./koch boot -d:release && ./koch tools
 ENV PATH="/opt/nim-2.2.10/bin:/root/.nimble/bin:${PATH}"
 RUN nimble install -y checksums zippy
+
+# Node.js and Python (requests) for the interpreted-client comparison. Added
+# after the toolchains above so their build layers stay cached.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      nodejs python3 python3-requests \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY src ./src
