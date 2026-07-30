@@ -51,3 +51,7 @@ examples/websocket/wss_sync
 examples/websocket/wss_asyncdispatch
 examples/websocket/wss_chronos
 examples/websocket/.certs/
+
+# bench build artifacts
+bench/clients/rust_client/target/
+bench/clients/rust_client/Cargo.lock
