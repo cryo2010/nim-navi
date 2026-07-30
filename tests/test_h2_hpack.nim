@@ -71,3 +71,39 @@ suite "hpack decode rejects malformed input without crashing":
     var dec = initHpackDecoder()
     expect ValueError:
       discard dec.decode("\x3f" & "\xff".repeat(8))  # table-size update, huge int
+
+suite "hpack decode enforces DoS bounds":
+  # Encode an HPACK integer with `prefixBits` and the given top-bit flag, so the
+  # tests can build size-update / indexed-reference instructions precisely.
+  proc hpackInt(value, prefixBits: int, flag: uint8): string =
+    let maxPrefix = (1 shl prefixBits) - 1
+    if value < maxPrefix:
+      result.add char(uint8(value) or flag)
+    else:
+      result.add char(uint8(maxPrefix) or flag)
+      var v = value - maxPrefix
+      while v >= 128:
+        result.add char(uint8((v and 0x7f) or 0x80))
+        v = v shr 7
+      result.add char(uint8(v))
+
+  test "rejects a dynamic table size update above the advertised maximum":
+    var dec = initHpackDecoder(maxSize = 4096)     # advertised table max
+    expect ValueError:                              # RFC 7541 6.3 -> COMPRESSION_ERROR
+      discard dec.decode(hpackInt(100_000, 5, 0x20))
+
+  test "accepts a table size update at or below the maximum":
+    var dec = initHpackDecoder(maxSize = 4096)
+    check dec.decode(hpackInt(2048, 5, 0x20) & "\x82") == @[(":method", "GET")]
+
+  test "rejects an over-budget decoded header list (indexed-reference bomb)":
+    var dec = initHpackDecoder(maxList = 4096)      # small decoded-list budget
+    # Many 1-byte indexed references to static entry 2 (":method", "GET"): each
+    # accounts for ~35 octets, so this blows the 4 KiB budget and must raise
+    # rather than expand the seq without limit.
+    expect ValueError:
+      discard dec.decode(hpackInt(2, 7, 0x80).repeat(1000))
+
+  test "a normal header list stays well under the default budget":
+    var dec = initHpackDecoder()
+    check dec.decode("\x82\x86\x84").len == 3      # :method GET, :scheme http, :path /
