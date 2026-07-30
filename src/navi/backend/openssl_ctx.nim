@@ -280,33 +280,41 @@ when defined(ssl):
     X509_free(cert)
     if match != 1: fail("certificate does not match host " & host)
 
-  proc startClientTls*(ctx: SslContext, fd: SocketHandle, host: string,
-                       verify: bool, slot: SessionSlot = nil): SslPtr =
-    ## Attach a client SSL to the already-connected socket `fd`, set SNI, drive
-    ## the handshake, and -- when `verify` -- confirm the chain and the peer's
-    ## identity against `host`. Replaces std/net's `wrapConnectedSocket` so SNI
-    ## and the verified hostname stay under navi's control; the context from
-    ## `newTlsContext` carries the CA/chain trust and ALPN. Mirrors std/net: SNI
-    ## and the hostname check apply to DNS-name hosts, not IP literals. `slot`, if
-    ## given, resumes a cached session for the origin. Raises `ValueError` on any
-    ## failure; `negotiatedProtocol(result)` reads the ALPN.
+  proc newClientSsl*(ctx: SslContext, fd: SocketHandle, host: string,
+                     slot: SessionSlot = nil): SslPtr =
+    ## Create a client SSL bound to `fd`, set SNI (DNS-name hosts only, as
+    ## std/net does), and present any cached session for resumption. The caller
+    ## drives the handshake (blocking in the sync backend, await-based in the
+    ## async one) and frees the SSL on failure.
     result = SSL_new(ctx.context)
     if result.isNil: fail("SSL_new failed")
+    discard SSL_set_fd(result, fd)
+    applySession(result, slot)   # present a cached session before the handshake
+    if host.len > 0 and not isIpAddress(host):
+      discard SSL_set_tlsext_host_name(result, host.cstring)   # SNI
+
+  proc verifyPeer*(ssl: SslPtr, host: string, verify: bool) =
+    ## After a completed handshake, confirm the chain (SSL_VERIFY_PEER already
+    ## aborts the handshake on a bad chain; this is the belt-and-suspenders check)
+    ## and, for DNS-name hosts, the certificate identity. No-op when `verify` is
+    ## off. Raises `ValueError` on mismatch.
+    if not verify: return
+    if SSL_get_verify_result(ssl) != X509_V_OK:
+      fail("certificate verification failed for " & host)
+    if host.len > 0 and not isIpAddress(host): checkCertName(ssl, host)
+
+  proc startClientTls*(ctx: SslContext, fd: SocketHandle, host: string,
+                       verify: bool, slot: SessionSlot = nil): SslPtr =
+    ## Blocking client handshake (sync backend): bind + SNI + resume, drive the
+    ## handshake, verify. Replaces std/net's `wrapConnectedSocket` so SNI and the
+    ## verified hostname stay under navi's control. Raises `ValueError` on failure;
+    ## `negotiatedProtocol(result)` reads the ALPN. The async backend composes
+    ## `newClientSsl` + an await-based handshake + `verifyPeer` itself.
+    result = newClientSsl(ctx, fd, host, slot)
     var ok = false
     defer:
       if not ok: SSL_free(result)
-    discard SSL_set_fd(result, fd)
-    applySession(result, slot)   # present a cached session before the handshake
-    let nameHost = host.len > 0 and not isIpAddress(host)
-    if nameHost:
-      discard SSL_set_tlsext_host_name(result, host.cstring)   # SNI
     if SSL_connect(result) != 1:
       fail("TLS handshake failed for " & host)
-    if verify:
-      # The context verifies the chain against the CA (SSL_VERIFY_PEER, so a bad
-      # chain already aborts SSL_connect); confirm the result, then match the
-      # certificate identity for DNS-name hosts.
-      if SSL_get_verify_result(result) != X509_V_OK:
-        fail("certificate verification failed for " & host)
-      if nameHost: checkCertName(result, host)
+    verifyPeer(result, host, verify)
     ok = true
