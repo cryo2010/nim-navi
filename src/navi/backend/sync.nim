@@ -23,6 +23,8 @@ when defined(windows):
     winlean.send(fd, cast[cstring](buf), cint(n), 0'i32).int
   proc sysRecv(fd: SocketHandle, buf: pointer, n: int): int =
     winlean.recv(fd, cast[cstring](buf), cint(n), 0'i32).int
+  proc setNoDelay(fd: SocketHandle) =
+    setSockOptInt(fd, winlean.IPPROTO_TCP.int, winlean.TCP_NODELAY.int, 1)
 else:
   import std/posix
   proc sysConnect(fd: SocketHandle, sa: ptr SockAddr, sl: SockLen): cint =
@@ -31,6 +33,8 @@ else:
     posix.send(fd, buf, n, 0'i32)
   proc sysRecv(fd: SocketHandle, buf: pointer, n: int): int =
     posix.recv(fd, buf, n, 0'i32)
+  proc setNoDelay(fd: SocketHandle) =
+    setSockOptInt(fd, posix.IPPROTO_TCP.int, posix.TCP_NODELAY.int, 1)
 
 type
   Conn* = object
@@ -55,6 +59,10 @@ proc tcpConnect(host: string, port: int): SocketHandle =
   while it != nil:
     let fd = createNativeSocket(it.ai_family, it.ai_socktype, it.ai_protocol)
     if fd != osInvalidSocket:
+      # Disable Nagle: HTTP is request/response, and with Nagle on, the TLS
+      # handshake's final flight plus the first request stall ~40ms on the peer's
+      # delayed ACK -- paid on every fresh (unpooled) connection.
+      setNoDelay(fd)
       if sysConnect(fd, it.ai_addr, it.ai_addrlen) == 0'i32:
         result = fd
         break
