@@ -54,6 +54,7 @@ const
   errFrameSizeError* = 0x6'u32
   errRefusedStream* = 0x7'u32
   errCancel* = 0x8'u32
+  errCompressionError* = 0x9'u32
   errEnhanceYourCalm* = 0xb'u32
 
 proc u24(n: int): string =

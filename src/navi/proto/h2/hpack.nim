@@ -15,10 +15,14 @@ type
   DynamicTable = object
     entries: seq[HeaderPair]  ## most-recent first
     size: int                 ## current size in HPACK octets
-    maxSize: int
+    maxSize: int              ## current cap (a size update may lower it)
+    hardMax: int              ## our advertised SETTINGS_HEADER_TABLE_SIZE; a peer
+                              ## size update above this is a COMPRESSION_ERROR
 
   HpackDecoder* = object
     dyn: DynamicTable
+    maxList: int              ## SETTINGS_MAX_HEADER_LIST_SIZE: cap on the decoded
+                              ## header list, bounding HPACK amplification
 
   HpackEncoder* = object
 
@@ -46,8 +50,16 @@ const staticTable: array[1 .. 61, HeaderPair] = [
 
 const entryOverhead = 32  # RFC 7541 section 4.1
 
-proc initHpackDecoder*(maxSize = 4096): HpackDecoder =
+const defaultMaxHeaderList* = 256 * 1024
+  ## Default SETTINGS_MAX_HEADER_LIST_SIZE (matches common browsers). The decoded
+  ## header list -- sum of name + value + 32 per field -- is capped here so a
+  ## small header block of indexed references cannot amplify into a huge
+  ## allocation (HPACK bomb).
+
+proc initHpackDecoder*(maxSize = 4096, maxList = defaultMaxHeaderList): HpackDecoder =
   result.dyn.maxSize = maxSize
+  result.dyn.hardMax = maxSize
+  result.maxList = maxList
 
 # --- Integer and string primitives (RFC 7541 sections 5.1-5.2) ---
 
@@ -121,6 +133,12 @@ proc add(dt: var DynamicTable, name, value: string) =
   dt.evict()
 
 proc resize(dt: var DynamicTable, newMax: int) =
+  # RFC 7541 6.3: a dynamic table size update must not exceed the maximum the
+  # decoder advertised (SETTINGS_HEADER_TABLE_SIZE); otherwise a peer could grow
+  # our table without bound. Reject it as a decoding (COMPRESSION) error.
+  if newMax > dt.hardMax:
+    raise newException(ValueError, "hpack: table size update " & $newMax &
+      " exceeds the advertised maximum " & $dt.hardMax)
   dt.maxSize = newMax
   dt.evict()
 
@@ -142,18 +160,29 @@ proc decodeLiteral(dec: var HpackDecoder, data: string, i: var int,
 
 proc decode*(dec: var HpackDecoder, headerBlock: string): seq[HeaderPair] =
   var i = 0
+  var listSize = 0
   while i < headerBlock.len:
     let b = uint8(headerBlock[i])
+    var pair: HeaderPair
+    var emit = true
     if (b and 0x80) != 0:                      # indexed header field
-      result.add dec.lookup(decodeInteger(headerBlock, i, 7))
+      pair = dec.lookup(decodeInteger(headerBlock, i, 7))
     elif (b and 0x40) != 0:                    # literal, incremental indexing
-      let pair = dec.decodeLiteral(headerBlock, i, 6)
+      pair = dec.decodeLiteral(headerBlock, i, 6)
       dec.dyn.add(pair[0], pair[1])
-      result.add pair
     elif (b and 0x20) != 0:                    # dynamic table size update
       dec.dyn.resize(decodeInteger(headerBlock, i, 5))
+      emit = false
     else:                                       # literal, without/never indexed
-      result.add dec.decodeLiteral(headerBlock, i, 4)
+      pair = dec.decodeLiteral(headerBlock, i, 4)
+    if emit:
+      # Bound the decoded list before appending, so an indexed-reference bomb
+      # raises at ~maxList octets instead of expanding without limit.
+      listSize += pair[0].len + pair[1].len + entryOverhead
+      if listSize > dec.maxList:
+        raise newException(ValueError, "hpack: decoded header list exceeds " &
+          $dec.maxList & " octets")
+      result.add pair
 
 # --- Encoder (RFC 7541 section 6, static-indexed + literals) ---
 

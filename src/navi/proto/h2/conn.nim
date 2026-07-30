@@ -83,7 +83,8 @@ proc preamble*(c: H2Conn): string =
   ## not throttled to the 64 KiB default.
   result = connectionPreface
   result.add encodeSettings({settingsEnablePush: 0'u32,
-                             settingsInitialWindowSize: uint32(recvWindowSize)})
+                             settingsInitialWindowSize: uint32(recvWindowSize),
+                             settingsMaxHeaderListSize: uint32(defaultMaxHeaderList)})
   result.add encodeWindowUpdate(0, 0x3fff0000'u32)
 
 proc openStream*(c: H2Conn): uint32 =
@@ -253,7 +254,14 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
       else:
         if f.typ == uint8(ftHeaders):
           s.hdrEndStream = (f.flags and flagEndStream) != 0
-        if (f.flags and flagEndHeaders) != 0: c.applyHeaders(s)
+        if (f.flags and flagEndHeaders) != 0:
+          # Any HPACK decoding failure (truncated block, integer overflow, a
+          # table-size update over the advertised max, or a header list past
+          # SETTINGS_MAX_HEADER_LIST_SIZE) is a connection-level COMPRESSION_ERROR.
+          try: c.applyHeaders(s)
+          except ValueError as e:
+            c.connFail(errCompressionError, e.msg, outbuf)
+            return
   of uint8(ftData):
     # Every DATA payload -- pad length byte and padding included (RFC 9113 6.9.1)
     # -- counts against the connection flow-control window, even on a stream we
