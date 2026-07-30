@@ -110,6 +110,12 @@ task live, "Live interop against real public servers/CDNs (network; nightly)":
   # Tolerates network noise/server rejections; fails only on a navi protocol bug.
   exec "nim c -r --path:src -d:ssl --hints:off tests/interop/live.nim"
 
+task bench, "Dockerized HTTP client benchmark: navi vs std/httpclient, Go, Rust (needs Docker)":
+  # Builds a Nim+Go+Rust image and runs the TLS+gzip+all-methods comparison.
+  # Set NAVI_BENCH_ITERS to change the load, e.g. `NAVI_BENCH_ITERS=5000 nimble bench`.
+  exec "docker build -f bench/Dockerfile -t navi-bench ."
+  exec "docker run --rm -e NAVI_BENCH_ITERS navi-bench"
+
 task wsjs, "navi/js WebSocket runtime test (Node client vs a native server)":
   # Runs the navi/js WebSocket client under Node against a native echo server.
   exec "bash tests/interop/jsws.sh"
