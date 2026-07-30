@@ -14,7 +14,10 @@
 import ./api
 
 when defined(ssl):
-  import std/[net, openssl]
+  import std/[net, openssl, nativesockets]
+  # Re-export the context type + destructor so backends can own the socket and
+  # handshake while still building the (verified) context through newContext.
+  export net.SslContext, net.destroyContext
 
   # --- ALPN --------------------------------------------------------------
 
@@ -176,3 +179,46 @@ when defined(ssl):
       caFile = cfg.caFile)
     if custom: loadClientCert(result.context, cfg)
     setAlpn(result.context, alpn)
+
+  # --- per-connection handshake ------------------------------------------
+
+  proc checkCertName(ssl: SslPtr, host: string) =
+    ## Match the peer certificate's SAN/CN against `host` with X509_check_host,
+    ## the same identity check std/net's `wrapConnectedSocket` runs. Callers skip
+    ## it for IP literals (as std/net does): X509_check_host matches DNS names.
+    let cert = SSL_get_peer_certificate(ssl)
+    if cert.isNil: fail("server presented no certificate")
+    const X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT = 0x1.cuint
+    let match = X509_check_host(cert, host.cstring, host.len.cint,
+                                X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT, nil)
+    X509_free(cert)
+    if match != 1: fail("certificate does not match host " & host)
+
+  proc startClientTls*(ctx: SslContext, fd: SocketHandle, host: string,
+                       verify: bool): SslPtr =
+    ## Attach a client SSL to the already-connected socket `fd`, set SNI, drive
+    ## the handshake, and -- when `verify` -- confirm the chain and the peer's
+    ## identity against `host`. Replaces std/net's `wrapConnectedSocket` so SNI
+    ## and the verified hostname stay under navi's control; the context from
+    ## `newTlsContext` carries the CA/chain trust and ALPN. Mirrors std/net: SNI
+    ## and the hostname check apply to DNS-name hosts, not IP literals. Raises
+    ## `ValueError` on any failure; `negotiatedProtocol(result)` reads the ALPN.
+    result = SSL_new(ctx.context)
+    if result.isNil: fail("SSL_new failed")
+    var ok = false
+    defer:
+      if not ok: SSL_free(result)
+    discard SSL_set_fd(result, fd)
+    let nameHost = host.len > 0 and not isIpAddress(host)
+    if nameHost:
+      discard SSL_set_tlsext_host_name(result, host.cstring)   # SNI
+    if SSL_connect(result) != 1:
+      fail("TLS handshake failed for " & host)
+    if verify:
+      # The context verifies the chain against the CA (SSL_VERIFY_PEER, so a bad
+      # chain already aborts SSL_connect); confirm the result, then match the
+      # certificate identity for DNS-name hosts.
+      if SSL_get_verify_result(result) != X509_V_OK:
+        fail("certificate verification failed for " & host)
+      if nameHost: checkCertName(result, host)
+    ok = true
