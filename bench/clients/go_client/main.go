@@ -1,6 +1,7 @@
 // Benchmark client: Go net/http. The Transport auto-adds Accept-Encoding: gzip
 // and transparently decompresses, so we leave the header alone. Connection
-// pooling is on by default.
+// pooling is on by default; NAVI_BENCH_COLD=1 sets req.Close so every request
+// uses a fresh TCP+TLS connection, exposing the connection-setup path.
 package main
 
 import (
@@ -24,9 +25,15 @@ func env(k, def string) string {
 func main() {
 	url := env("NAVI_BENCH_URL", "https://127.0.0.1:8443")
 	iters, _ := strconv.Atoi(env("NAVI_BENCH_ITERS", "3000"))
+	cold := env("NAVI_BENCH_COLD", "0") == "1"
 	warmup := iters / 10
-	if warmup < 100 {
+	if cold {
+		warmup = 20
+	} else if warmup < 100 {
 		warmup = 100
+	}
+	if warmup > iters {
+		warmup = iters
 	}
 	body := strings.Repeat("x", 256)
 
@@ -42,6 +49,7 @@ func main() {
 			r = strings.NewReader(reqBody)
 		}
 		req, _ := http.NewRequest(method, url+path, r)
+		req.Close = cold // cold: close after the response so the next request reconnects
 		resp, err := client.Do(req)
 		if err != nil {
 			panic(err)

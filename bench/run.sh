@@ -11,6 +11,9 @@ export NAVI_BENCH_URL="https://127.0.0.1:8443"
 # re-handshakes TLS every request (no connection reuse) and is ~90x slower than
 # the pooling clients. Bump it for steadier numbers on the fast clients.
 export NAVI_BENCH_ITERS="${NAVI_BENCH_ITERS:-500}"
+# Cold phase (fresh connection per request) is far slower per request -- a full
+# TCP+TLS handshake every time -- so it runs fewer iterations by default.
+NAVI_BENCH_COLD_ITERS="${NAVI_BENCH_COLD_ITERS:-200}"
 # Per-client wall-clock cap so one slow/stuck client can't wedge the run.
 NAVI_BENCH_TIMEOUT="${NAVI_BENCH_TIMEOUT:-180}"
 export NAVI_BENCH_CERT="$work/cert.pem" NAVI_BENCH_KEY="$work/key.pem"
@@ -39,33 +42,51 @@ for _ in $(seq 1 60); do
 done
 [ -n "$ready" ] || { echo "server did not come up"; exit 1; }
 
+# Run the whole client matrix once and print a ranked table. Args: results file,
+# cold flag (0/1), iterations. The clients read NAVI_BENCH_COLD / NAVI_BENCH_ITERS
+# from the environment, so export them here for the child processes.
+run_phase() {
+  local tmp="$1"
+  export NAVI_BENCH_COLD="$2" NAVI_BENCH_ITERS="$3"
+  : > "$tmp"
+  run() { # name binary
+    local out
+    if out="$(timeout "$NAVI_BENCH_TIMEOUT" "$2" 2>/dev/null)" && echo "$out" | grep -q '^RESULT'; then
+      echo "$out" | grep '^RESULT' >> "$tmp"
+      echo "  $1: done"
+    else
+      echo "  $1: FAILED or exceeded ${NAVI_BENCH_TIMEOUT}s"
+    fi
+  }
+  run navi-sync   "$work/navi_sync"
+  run navi-async  "$work/navi_async"
+  run std-sync    "$work/std_sync"
+  run std-async   "$work/std_async"
+  run go          "$work/go_client"
+  run rust        "$rust_bin"
+
+  echo ""
+  local max
+  max="$(sort -t$'\t' -k5 -nr "$tmp" | head -1 | cut -f5)"
+  printf "%-14s %10s %9s %12s %8s\n" CLIENT REQUESTS "TIME(s)" "REQ/S" REL
+  printf -- "------------------------------------------------------------\n"
+  sort -t$'\t' -k5 -nr "$tmp" | while IFS=$'\t' read -r _ name req sec rps; do
+    local rel
+    rel="$(awk -v r="$rps" -v m="$max" 'BEGIN{printf "%.0f", r / m * 100}')"
+    printf "%-14s %10s %9s %12s %7s%%\n" "$name" "$req" "$sec" "$rps" "$rel"
+  done
+}
+
 echo ""
 echo "=== HTTP client benchmark: TLS (HTTP/1.1) + gzip + all methods ==="
-echo "    $NAVI_BENCH_ITERS iterations x 7 methods = $((NAVI_BENCH_ITERS * 7)) requests/client, pooled connection"
 echo ""
-
-tmp="$work/results"; : > "$tmp"
-run() { # name binary
-  local out
-  if out="$(timeout "$NAVI_BENCH_TIMEOUT" "$2" 2>/dev/null)" && echo "$out" | grep -q '^RESULT'; then
-    echo "$out" | grep '^RESULT' >> "$tmp"
-    echo "  $1: done"
-  else
-    echo "  $1: FAILED or exceeded ${NAVI_BENCH_TIMEOUT}s"
-  fi
-}
-run navi-sync   "$work/navi_sync"
-run navi-async  "$work/navi_async"
-run std-sync    "$work/std_sync"
-run std-async   "$work/std_async"
-run go          "$work/go_client"
-run rust        "$rust_bin"
+echo "-- pooled: one kept-alive connection reused across requests --"
+echo "   $NAVI_BENCH_ITERS iterations x 7 methods = $((NAVI_BENCH_ITERS * 7)) requests/client"
+echo ""
+run_phase "$work/pooled" 0 "$NAVI_BENCH_ITERS"
 
 echo ""
-max="$(sort -t$'\t' -k5 -nr "$tmp" | head -1 | cut -f5)"
-printf "%-14s %10s %9s %12s %8s\n" CLIENT REQUESTS "TIME(s)" "REQ/S" REL
-printf -- "------------------------------------------------------------\n"
-sort -t$'\t' -k5 -nr "$tmp" | while IFS=$'\t' read -r _ name req sec rps; do
-  rel="$(awk -v r="$rps" -v m="$max" 'BEGIN{printf "%.0f", r / m * 100}')"
-  printf "%-14s %10s %9s %12s %7s%%\n" "$name" "$req" "$sec" "$rps" "$rel"
-done
+echo "-- cold: a fresh TCP+TLS connection per request (connection setup) --"
+echo "   $NAVI_BENCH_COLD_ITERS iterations x 7 methods = $((NAVI_BENCH_COLD_ITERS * 7)) requests/client"
+echo ""
+run_phase "$work/cold" 1 "$NAVI_BENCH_COLD_ITERS"
