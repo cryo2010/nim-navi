@@ -5,6 +5,19 @@ import ./api, ./openssl_ctx
 
 export api, asyncdispatch
 
+# Disable Nagle on the connection socket: without it the TLS handshake's final
+# flight plus the first request stall ~40ms on the peer's delayed ACK, paid on
+# every fresh (unpooled) connection. asyncnet does not set this, so navi does
+# (the sync backend does the same in its own tcpConnect).
+when defined(windows):
+  import std/winlean
+  proc setNoDelay(fd: SocketHandle) =
+    setSockOptInt(fd, winlean.IPPROTO_TCP.int, winlean.TCP_NODELAY.int, 1)
+else:
+  import std/posix
+  proc setNoDelay(fd: SocketHandle) =
+    setSockOptInt(fd, posix.IPPROTO_TCP.int, posix.TCP_NODELAY.int, 1)
+
 type
   Conn* = object
     socket: AsyncSocket
@@ -56,6 +69,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
       let socket = newAsyncSocket(pickDomain(host, port), SOCK_STREAM,
                                   IPPROTO_TCP, buffered = false)
       result.socket = socket
+      setNoDelay(socket.getFd())
       wrapSocket(ctx, socket)
       await socket.connect(host, Port(port))
       result.protocol = negotiatedProtocol(socket.sslHandle)
@@ -66,6 +80,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     if proxy.isSet: await asyncnet.dial(proxy.host, Port(proxy.port), buffered = false)
     else: await asyncnet.dial(host, Port(port), buffered = false)
   result.socket = socket
+  setNoDelay(socket.getFd())
   if proxy.isSet and tls:
     await proxyConnect(socket, host, port)
     when defined(ssl):

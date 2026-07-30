@@ -6,11 +6,16 @@ import zippy
 
 let url = getEnv("NAVI_BENCH_URL", "https://127.0.0.1:8443")
 let iters = parseInt(getEnv("NAVI_BENCH_ITERS", "3000"))
-let warmup = max(100, iters div 10)
+let cold = getEnv("NAVI_BENCH_COLD", "0") == "1"
+let warmup = if cold: min(20, iters) else: max(100, iters div 10)
 const body = "x".repeat(256)
 
 let client = newHttpClient(sslContext = newContext(verifyMode = CVerifyNone))
-client.headers = newHttpHeaders({"Accept-Encoding": "gzip"})
+# NAVI_BENCH_COLD=1: `Connection: close` makes the server drop the socket so each
+# request reconnects (fresh TCP+TLS), exposing the connection-setup path.
+var hdrs = @[("Accept-Encoding", "gzip")]
+if cold: hdrs.add ("Connection", "close")
+client.headers = newHttpHeaders(hdrs)
 
 proc decode(resp: Response): string =
   if resp.headers.getOrDefault("content-encoding") == "gzip":

@@ -1,34 +1,91 @@
-## Synchronous transport backend: blocking std/net sockets.
+## Synchronous transport backend: blocking sockets we own directly.
 ##
-## `await` is an identity template here so the shared engine's `await`-shaped
-## body compiles to straight-line blocking code.
+## This does not use std/net's `Socket`/`dial`/`wrapConnectedSocket`. It owns the
+## raw socket (std/nativesockets + the platform connect/send/recv), drives the
+## TLS handshake and read/write itself (OpenSSL via openssl_ctx), and keeps only
+## std/net's `newContext` (the verified TLS context, reached through
+## openssl_ctx). `await` is an identity template so the shared engine's
+## `await`-shaped body compiles to straight-line blocking code.
 
-import std/[net, os, strutils, nativesockets]
+import std/[os, strutils, nativesockets]
 import ./api, ./openssl_ctx
 import ../core/response  # for navi's TimeoutError
 when defined(ssl):
-  import std/openssl  # SSL_pending
+  import std/openssl
 
 export api
 
+when defined(windows):
+  import std/winlean
+  proc sysConnect(fd: SocketHandle, sa: ptr SockAddr, sl: SockLen): cint =
+    winlean.connect(fd, sa, cint(sl))
+  proc sysSend(fd: SocketHandle, buf: pointer, n: int): int =
+    winlean.send(fd, cast[cstring](buf), cint(n), 0'i32).int
+  proc sysRecv(fd: SocketHandle, buf: pointer, n: int): int =
+    winlean.recv(fd, cast[cstring](buf), cint(n), 0'i32).int
+  proc setNoDelay(fd: SocketHandle) =
+    setSockOptInt(fd, winlean.IPPROTO_TCP.int, winlean.TCP_NODELAY.int, 1)
+else:
+  import std/posix
+  proc sysConnect(fd: SocketHandle, sa: ptr SockAddr, sl: SockLen): cint =
+    posix.connect(fd, sa, sl)
+  proc sysSend(fd: SocketHandle, buf: pointer, n: int): int =
+    posix.send(fd, buf, n, 0'i32)
+  proc sysRecv(fd: SocketHandle, buf: pointer, n: int): int =
+    posix.recv(fd, buf, n, 0'i32)
+  proc setNoDelay(fd: SocketHandle) =
+    setSockOptInt(fd, posix.IPPROTO_TCP.int, posix.TCP_NODELAY.int, 1)
+
 type
   Conn* = object
-    socket: Socket
+    fd: SocketHandle
     protocol*: string   ## ALPN-negotiated protocol ("h2" or "", meaning http/1.1)
     timeout: int        ## per-recv timeout in ms; 0 means block indefinitely
     when defined(ssl):
+      ssl: SslPtr       ## the TLS connection; nil for plain http
       ctx: SslContext   ## kept so `close` can free the SSL_CTX (destroyContext)
 
 template await*(x: untyped): untyped = x
 
 proc sleep*(ms: int) = os.sleep(ms)
 
-proc proxyConnect(socket: Socket, host: string, port: int) =
-  ## Establish a CONNECT tunnel to `host:port` through an already-dialed proxy.
+proc tcpConnect(host: string, port: int): SocketHandle =
+  ## Resolve `host` and connect to the first address that accepts a TCP
+  ## connection (IPv4 or IPv6, in the resolver's order). Raises on failure.
+  var ai = getAddrInfo(host, Port(port), AF_UNSPEC, SOCK_STREAM, IPPROTO_TCP)
+  var it = ai
+  var lastErr = "no address"
+  result = osInvalidSocket
+  while it != nil:
+    let fd = createNativeSocket(it.ai_family, it.ai_socktype, it.ai_protocol)
+    if fd != osInvalidSocket:
+      # Disable Nagle: HTTP is request/response, and with Nagle on, the TLS
+      # handshake's final flight plus the first request stall ~40ms on the peer's
+      # delayed ACK -- paid on every fresh (unpooled) connection.
+      setNoDelay(fd)
+      if sysConnect(fd, it.ai_addr, it.ai_addrlen) == 0'i32:
+        result = fd
+        break
+      lastErr = osErrorMsg(osLastError())
+      close(fd)
+    it = it.ai_next
+  freeAddrInfo(ai)
+  if result == osInvalidSocket:
+    raise newException(IOError, "navi: could not connect to " & host & ": " & lastErr)
+
+proc sendRaw(fd: SocketHandle, data: string) =
+  var off = 0
+  while off < data.len:
+    let n = sysSend(fd, unsafeAddr data[off], data.len - off)
+    if n <= 0: raise newException(IOError, "navi: socket write failed")
+    off += n
+
+proc proxyConnect(fd: SocketHandle, host: string, port: int) =
+  ## Establish a CONNECT tunnel to `host:port` through an already-connected proxy.
   let target = host & ":" & $port
-  socket.send("CONNECT " & target & " HTTP/1.1\r\nHost: " & target & "\r\n\r\n")
+  sendRaw(fd, "CONNECT " & target & " HTTP/1.1\r\nHost: " & target & "\r\n\r\n")
   var resp = newString(1024)
-  let n = socket.recv(addr resp[0], resp.len)
+  let n = sysRecv(fd, addr resp[0], resp.len)
   resp.setLen(max(n, 0))
   if not resp.startsWith("HTTP/1.1 200") and not resp.startsWith("HTTP/1.0 200"):
     raise newException(ValueError, "navi: proxy CONNECT failed: " & resp.splitLines()[0])
@@ -36,8 +93,7 @@ proc proxyConnect(socket: Socket, host: string, port: int) =
 when defined(ssl):
   proc resolveAddrs(host: string, port: int): seq[string] =
     ## Numeric addresses for `host`, in the resolver's order (RFC 6724). We
-    ## resolve ourselves so the connect loop can iterate them; std/net's `dial`
-    ## hides the list and stops at the first that TCP-connects.
+    ## resolve ourselves so the connect loop can iterate them one at a time.
     var ai = getAddrInfo(host, Port(port), AF_UNSPEC, SOCK_STREAM, IPPROTO_TCP)
     var it = ai
     while it != nil:
@@ -46,113 +102,128 @@ when defined(ssl):
     freeAddrInfo(ai)
 
   proc connectAcross*(ctx: SslContext, ips: openArray[string], sni: string,
-                      port: int): Socket =
-    ## TCP-connect + TLS-handshake across `ips` in order, returning the first
-    ## socket that completes the handshake; the connection uses each IP while
-    ## SNI and certificate verification use `sni`. Falls through to the next
-    ## address on a connect *or handshake* failure -- unlike std/net's `dial`,
-    ## which stops at the first address that merely TCP-connects, so a dead
-    ## endpoint on a multi-homed host (a partially-broken CDN pool) no longer
-    ## fails the whole request. Exported for the fallback test; navi reaches it
-    ## through `connect`.
+                      port: int, verify: bool): Conn =
+    ## TCP-connect + TLS-handshake across `ips` in order, returning the first that
+    ## completes the handshake; the connection uses each IP while SNI and
+    ## verification use `sni`. Falls through on a connect *or handshake* failure,
+    ## so a dead endpoint on a multi-homed host (a partially-broken CDN pool) no
+    ## longer fails the whole request. `ctx` is set on the returned Conn by the
+    ## caller. Exported for the fallback test; navi reaches it through `connect`.
+    result.fd = osInvalidSocket
     if ips.len == 0:
       raise newException(IOError, "navi: could not resolve " & sni)
     var lastErr: ref CatchableError
     for ip in ips:
-      var sock: Socket = nil
+      var fd = osInvalidSocket
       try:
-        sock = dial(ip, Port(port), buffered = false)
-        ctx.wrapConnectedSocket(sock, handshakeAsClient, sni)
-        return sock
+        fd = tcpConnect(ip, port)
+        result.ssl = startClientTls(ctx, fd, sni, verify)
+        result.fd = fd
+        result.protocol = negotiatedProtocol(result.ssl)
+        return
       except CatchableError as e:
-        if not sock.isNil:
-          try: sock.close()
-          except CatchableError: discard
+        if fd != osInvalidSocket: close(fd)
         lastErr = e
     raise lastErr
 
 proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
               proxy: ProxyTarget, alpn: seq[string] = @[], timeout = 0): Conn =
-  ## Dial `host:port` (IPv4 or IPv6, resolved by std/net), upgrading to TLS for
-  ## https. Through a proxy, https targets get a CONNECT tunnel and http targets
-  ## are dialed directly to the proxy (the engine sends an absolute-URI).
-  ## TLS requires compiling with `-d:ssl` (OpenSSL).
-  ##
-  ## The socket is unbuffered: std/net's buffered `recv(pointer, size)` blocks
-  ## until it fills the whole buffer, which deadlocks on a kept-alive connection
-  ## where the response is smaller than the buffer.
+  ## Connect to `host:port` (IPv4 or IPv6), upgrading to TLS for https. Through a
+  ## proxy, https targets get a CONNECT tunnel and http targets connect directly
+  ## to the proxy (the engine sends an absolute-URI). TLS requires `-d:ssl`.
   result.timeout = timeout
+  result.fd = osInvalidSocket
   # Release the socket and TLS context if we don't finish connecting -- a failed
-  # proxy CONNECT or TLS handshake (e.g. cert rejection) would otherwise leak
-  # both, the SSL_CTX permanently (it has no destructor).
+  # proxy CONNECT or TLS handshake would otherwise leak the fd and the SSL_CTX
+  # (which has no destructor).
   var established = false
   defer:
     if not established:
-      if not result.socket.isNil:
-        try: result.socket.close()
-        except CatchableError: discard
       when defined(ssl):
+        if not result.ssl.isNil: SSL_free(result.ssl)
         if not result.ctx.isNil: result.ctx.destroyContext()
+      if result.fd != osInvalidSocket:
+        close(result.fd)
   if proxy.isSet:
-    result.socket = dial(proxy.host, Port(proxy.port), buffered = false)
+    result.fd = tcpConnect(proxy.host, proxy.port)
     if tls:
-      proxyConnect(result.socket, host, port)
+      proxyConnect(result.fd, host, port)
       when defined(ssl):
-        let ctx = newTlsContext(cfg, alpn)   # verify/CA + ALPN + any client cert
-        result.ctx = ctx   # store before the handshake so cleanup can free it
-        ctx.wrapConnectedSocket(result.socket, handshakeAsClient, host)
-        result.protocol = negotiatedProtocol(result.socket.sslHandle)
+        result.ctx = newTlsContext(cfg, alpn)   # verify/CA + ALPN + any client cert
+        result.ssl = startClientTls(result.ctx, result.fd, host, cfg.wantsVerify)
+        result.protocol = negotiatedProtocol(result.ssl)
       else:
         raise newException(ValueError, "navi: https requires compiling with -d:ssl")
   elif tls:
     when defined(ssl):
       let ctx = newTlsContext(cfg, alpn)   # verify/CA + ALPN + any client cert
-      result.ctx = ctx     # store before the handshake so cleanup can free it
-      # Handshake-aware fallback: try each resolved address until the TLS
-      # handshake succeeds (see connectAcross), not just the first that
-      # TCP-connects the way std/net's dial does.
-      result.socket = connectAcross(ctx, resolveAddrs(host, port), host, port)
-      result.protocol = negotiatedProtocol(result.socket.sslHandle)
+      # Handshake-aware fallback across the resolved addresses (see connectAcross).
+      # connectAcross returns a fresh Conn, so `result.ctx` is nil until we set it
+      # below; free `ctx` here if the handshake fails, before `result` is assigned
+      # (the connect-cleanup defer cannot see it yet).
+      try:
+        result = connectAcross(ctx, resolveAddrs(host, port), host, port, cfg.wantsVerify)
+      except CatchableError:
+        ctx.destroyContext()
+        raise
+      result.ctx = ctx
+      result.timeout = timeout
     else:
       raise newException(ValueError, "navi: https requires compiling with -d:ssl")
   else:
-    result.socket = dial(host, Port(port), buffered = false)
+    result.fd = tcpConnect(host, port)
   established = true
 
 proc sendAll*(c: Conn, data: string) =
-  c.socket.send(data)
+  if data.len == 0: return
+  when defined(ssl):
+    if not c.ssl.isNil:
+      var off = 0
+      while off < data.len:
+        let n = SSL_write(c.ssl, cast[cstring](unsafeAddr data[off]), data.len - off).int
+        if n <= 0: raise newException(IOError, "navi: SSL_write failed")
+        off += n
+      return
+  sendRaw(c.fd, data)
 
 proc waitReadable(c: Conn): bool =
   ## True when the socket has data ready within `c.timeout` ms. Checks OpenSSL's
   ## decrypted buffer first: `select` sees the raw fd, so bytes SSL already
   ## drained off it and buffered would otherwise be missed.
   when defined(ssl):
-    let ssl = c.socket.sslHandle
-    if not ssl.isNil and SSL_pending(ssl) > 0:
+    if not c.ssl.isNil and SSL_pending(c.ssl) > 0:
       return true
-  var fds = @[c.socket.getFd()]
+  var fds = @[c.fd]
   selectRead(fds, c.timeout) > 0
 
 proc recvSome*(c: Conn): string =
   ## One chunk of up to 4096 bytes; "" means the peer closed. With a timeout set,
   ## wait up to `timeout` ms for data (raising navi's TimeoutError on a stall),
-  ## then read what is available. We deliberately avoid std/net's timeout `recv`:
-  ## it loops until it has filled the whole buffer, so a response that ends
-  ## mid-buffer on a kept-alive connection stalls it until the timeout even
-  ## though the response is complete. A single plain `recv` returns immediately
-  ## with whatever is ready (the same reason `connect` uses an unbuffered socket).
+  ## then read what is available in a single read (no fill-the-buffer loop).
   result = newString(4096)
   if c.timeout > 0 and not c.waitReadable():
     raise newException(response.TimeoutError, "navi: read timed out")
-  let n = c.socket.recv(addr result[0], result.len)
+  var n: int
+  when defined(ssl):
+    if not c.ssl.isNil:
+      n = SSL_read(c.ssl, addr result[0], result.len).int
+    else:
+      n = sysRecv(c.fd, addr result[0], result.len)
+  else:
+    n = sysRecv(c.fd, addr result[0], result.len)
   if n <= 0:
     result.setLen(0)
   else:
     result.setLen(n)
 
 proc close*(c: Conn) =
-  c.socket.close()
   when defined(ssl):
-    # std/net closes the SSL on socket.close but never the SSL_CTX; free it so a
-    # long-lived client does not leak one context (~85 KB) per connection.
+    if not c.ssl.isNil:
+      discard SSL_shutdown(c.ssl)
+      SSL_free(c.ssl)
+  if c.fd != osInvalidSocket:
+    close(c.fd)
+  when defined(ssl):
+    # newContext leaves the SSL_CTX without a destructor; free it so a long-lived
+    # client does not leak one context (~85 KB) per connection.
     if not c.ctx.isNil: c.ctx.destroyContext()

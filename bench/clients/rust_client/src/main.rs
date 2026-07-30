@@ -1,5 +1,7 @@
 // Benchmark client: Rust reqwest (blocking). gzip(true) makes it request and
 // transparently decompress the body; the client pools connections by default.
+// NAVI_BENCH_COLD=1 disables the idle pool (pool_max_idle_per_host(0)) so every
+// request opens a fresh TCP+TLS connection, exposing the connection-setup path.
 use reqwest::blocking::Client;
 use reqwest::Method;
 use std::time::Instant;
@@ -10,14 +12,17 @@ fn main() {
         .unwrap_or_else(|_| "3000".into())
         .parse()
         .unwrap();
-    let warmup = (iters / 10).max(100);
+    let cold = std::env::var("NAVI_BENCH_COLD").map(|v| v == "1").unwrap_or(false);
+    let warmup = if cold { 20.min(iters) } else { (iters / 10).max(100) };
     let body = "x".repeat(256);
 
-    let client = Client::builder()
+    let mut builder = Client::builder()
         .danger_accept_invalid_certs(true) // self-signed target; TLS still exercised
-        .gzip(true)
-        .build()
-        .unwrap();
+        .gzip(true);
+    if cold {
+        builder = builder.pool_max_idle_per_host(0); // no reuse: reconnect per request
+    }
+    let client = builder.build().unwrap();
 
     let one = |c: &Client| {
         let get = |m: Method, path: &str| {
