@@ -150,8 +150,15 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     when defined(ssl):
       let ctx = newTlsContext(cfg, alpn)   # verify/CA + ALPN + any client cert
       # Handshake-aware fallback across the resolved addresses (see connectAcross).
-      result = connectAcross(ctx, resolveAddrs(host, port), host, port, cfg.wantsVerify)
-      result.ctx = ctx     # set after: connectAcross builds a fresh Conn
+      # connectAcross returns a fresh Conn, so `result.ctx` is nil until we set it
+      # below; free `ctx` here if the handshake fails, before `result` is assigned
+      # (the connect-cleanup defer cannot see it yet).
+      try:
+        result = connectAcross(ctx, resolveAddrs(host, port), host, port, cfg.wantsVerify)
+      except CatchableError:
+        ctx.destroyContext()
+        raise
+      result.ctx = ctx
       result.timeout = timeout
     else:
       raise newException(ValueError, "navi: https requires compiling with -d:ssl")
