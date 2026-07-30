@@ -93,6 +93,10 @@ task interop, "Run the nghttpd HTTP/2 interop suite (needs nghttpd + openssl)":
   # Starts the nghttp2 reference server over TLS+h2 and runs navi against it.
   exec "bash tests/interop/run.sh"
 
+task tlsFallback, "Handshake-aware address fallback test (needs openssl + python3)":
+  # A dead endpoint + a good TLS server on the same port; navi must fall through.
+  exec "bash tests/interop/tls_fallback.sh"
+
 task servers, "Multi-server HTTP/2 interop: nginx, Caddy, h2o (needs Docker + openssl)":
   # Runs navi's h2 client (and chronos h1) against three unrelated server stacks.
   exec "bash tests/interop/servers.sh"

@@ -47,6 +47,10 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     if tls and not proxy.isSet:
       # Direct TLS: connect a wrapped socket so the handshake completes here and
       # the ALPN result (h2 vs http/1.1) is available before any request.
+      # NB: no handshake-aware address fallback here (the sync backend has it):
+      # asyncnet's `connect` binds SNI to the connect host and hides the handshake
+      # loop, so falling through to another IP needs navi to own the async TLS
+      # handshake -- a later increment.
       let ctx = newTlsContext(cfg, alpn)   # verify/CA + ALPN + any client cert
       result.ctx = ctx           # store before the handshake so cleanup frees it
       let socket = newAsyncSocket(pickDomain(host, port), SOCK_STREAM,

@@ -30,6 +30,7 @@ tests/interop/httpbin_test
 tests/interop/live
 tests/interop/servers_sync
 tests/interop/servers_async
+tests/interop/tls_fallback
 tests/test_ws_async
 tests/test_ws_chronos
 tests/interop/jsws_server
