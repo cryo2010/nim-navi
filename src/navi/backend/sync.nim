@@ -126,17 +126,104 @@ proc proxyConnect(fd: SocketHandle, host: string, port: int) =
   if not resp.startsWith("HTTP/1.1 200") and not resp.startsWith("HTTP/1.0 200"):
     raise newException(ValueError, "navi: proxy CONNECT failed: " & resp.splitLines()[0])
 
-when defined(ssl):
-  proc resolveAddrs(host: string, port: int): seq[string] =
-    ## Numeric addresses for `host`, in the resolver's order (RFC 6724). We
-    ## resolve ourselves so the connect loop can iterate them one at a time.
-    var ai = getAddrInfo(host, Port(port), AF_UNSPEC, SOCK_STREAM, IPPROTO_TCP)
-    var it = ai
-    while it != nil:
-      result.add getAddrString(it.ai_addr)
-      it = it.ai_next
-    freeAddrInfo(ai)
+# --- Happy Eyeballs (RFC 8305) -----------------------------------------
 
+const heAttemptDelayMs = 250   ## RFC 8305 Connection Attempt Delay
+
+proc interleaveFamilies(ips: seq[string]): seq[string] =
+  ## Alternate address families (RFC 8305 §4) so a down family (e.g. every IPv6
+  ## address) is not exhausted before the other is tried. Leads with the family
+  ## the resolver put first.
+  var v6, v4: seq[string]
+  for ip in ips:
+    if ':' in ip: v6.add ip else: v4.add ip
+  let (a, b) = if ips.len > 0 and ':' in ips[0]: (v6, v4) else: (v4, v6)
+  var i = 0
+  while i < a.len or i < b.len:
+    if i < a.len: result.add a[i]
+    if i < b.len: result.add b[i]
+    inc i
+
+proc resolveAddrs(host: string, port: int): seq[string] =
+  ## Numeric addresses for `host` in the resolver's order (RFC 6724), interleaved
+  ## by family for Happy Eyeballs. We resolve ourselves so the racer can iterate
+  ## them one at a time.
+  var ai = getAddrInfo(host, Port(port), AF_UNSPEC, SOCK_STREAM, IPPROTO_TCP)
+  var it = ai
+  var raw: seq[string]
+  while it != nil:
+    raw.add getAddrString(it.ai_addr)
+    it = it.ai_next
+  freeAddrInfo(ai)
+  interleaveFamilies(raw)
+
+proc happyConnect(ips: seq[string], port: int,
+                  connectMs = 0): (SocketHandle, int) =
+  ## Happy Eyeballs: start non-blocking TCP connects to `ips` in order, staggered
+  ## by ~250ms, and return the (fd, index) of the first to complete -- so a slow or
+  ## blackholed address does not stall the others. Losing attempts are closed.
+  ## `connectMs` > 0 bounds the whole race. Raises `TimeoutError` / `IOError`.
+  var
+    inflight: seq[tuple[fd: SocketHandle, idx: int]]
+    nextIdx = 0
+    lastStart: MonoTime
+    began = false
+    lastErr = "no address"
+    timedOut = false
+  let start = getMonoTime()
+
+  proc begin() =
+    let ip = ips[nextIdx]
+    var ai = getAddrInfo(ip, Port(port), AF_UNSPEC, SOCK_STREAM, IPPROTO_TCP)
+    let fd = createNativeSocket(ai.ai_family, ai.ai_socktype, ai.ai_protocol)
+    if fd != osInvalidSocket:
+      setNoDelay(fd); fd.setBlocking(false)
+      if sysConnect(fd, ai.ai_addr, ai.ai_addrlen) == 0'i32 or connectInProgress():
+        inflight.add (fd, nextIdx)       # completes now or is in progress
+      else:
+        lastErr = osErrorMsg(osLastError()); close(fd)
+    freeAddrInfo(ai)
+    inc nextIdx
+    lastStart = getMonoTime()
+    began = true
+
+  while true:
+    # Start the next attempt: the first at once; the rest when nothing is in flight
+    # or the stagger window has elapsed.
+    if nextIdx < ips.len and
+       (not began or inflight.len == 0 or
+        (getMonoTime() - lastStart).inMilliseconds >= heAttemptDelayMs):
+      begin()
+      continue
+    if inflight.len == 0: break          # nothing pending and nothing left to start
+    var waitMs = heAttemptDelayMs
+    if connectMs > 0:
+      let remaining = connectMs - (getMonoTime() - start).inMilliseconds.int
+      if remaining <= 0: timedOut = true; break
+      waitMs = min(waitMs, remaining)
+    var fds = newSeq[SocketHandle](inflight.len)
+    for i, e in inflight: fds[i] = e.fd
+    if selectWrite(fds, waitMs) > 0:
+      for ready in fds:                  # `fds` now holds only the writable sockets
+        var pos = -1
+        for i, e in inflight:
+          if e.fd == ready: pos = i; break
+        if pos < 0: continue
+        if getSockOptInt(ready, SOL_SOCKET.int, SO_ERROR.int) == 0:
+          ready.setBlocking(true)
+          let idx = inflight[pos].idx
+          for i, e in inflight:
+            if i != pos: close(e.fd)      # cancel the losing attempts
+          return (ready, idx)
+        else:
+          lastErr = "connection refused"; close(ready); inflight.delete(pos)
+  for e in inflight: close(e.fd)
+  if timedOut:
+    raise newException(response.TimeoutError,
+                       "navi: connect timed out after " & $connectMs & " ms")
+  raise newException(IOError, "navi: could not connect: " & lastErr)
+
+when defined(ssl):
   proc resumeSlot(cfg: TlsConfig, ctx: SslContext, origin: string): SessionSlot =
     ## When resumption is on and the client has a session cache, arm `ctx` to feed
     ## it and return a slot keyed by `origin`; otherwise nil (no resumption).
@@ -148,21 +235,21 @@ when defined(ssl):
   proc connectAcross*(ctx: SslContext, ips: openArray[string], sni: string,
                       port: int, verify: bool, slot: SessionSlot = nil,
                       connectMs = 0): Conn =
-    ## TCP-connect + TLS-handshake across `ips` in order, returning the first that
-    ## completes the handshake; the connection uses each IP while SNI and
-    ## verification use `sni`. Falls through on a connect *or handshake* failure,
-    ## so a dead endpoint on a multi-homed host (a partially-broken CDN pool) no
-    ## longer fails the whole request. `connectMs` > 0 bounds each address's TCP
-    ## connect and TLS handshake. `ctx`/`slot` are set on the returned Conn by the
-    ## caller. Exported for the fallback test; navi reaches it through `connect`.
+    ## Happy-Eyeballs TCP connect across `ips` (raced, staggered), then a TLS
+    ## handshake on the winner; the connection uses each IP while SNI and
+    ## verification use `sni`. On a *handshake* failure the winning address is
+    ## dropped and the remaining addresses are re-raced, so a partially-broken CDN
+    ## pool still connects. `connectMs` > 0 bounds each race and handshake.
+    ## `ctx`/`slot` are set on the returned Conn by the caller. Exported for the
+    ## interop tests; navi reaches it through `connect`.
     result.fd = osInvalidSocket
     if ips.len == 0:
       raise newException(IOError, "navi: could not resolve " & sni)
+    var pool = @ips
     var lastErr: ref CatchableError
-    for ip in ips:
-      var fd = osInvalidSocket
+    while pool.len > 0:
+      let (fd, idx) = happyConnect(pool, port, connectMs)   # raise = nothing connected
       try:
-        fd = tcpConnect(ip, port, connectMs)
         if connectMs > 0: setIoTimeout(fd, connectMs)   # bound the blocking handshake
         result.ssl = startClientTls(ctx, fd, sni, verify, slot)
         if connectMs > 0: setIoTimeout(fd, 0)           # clear; reads use selectRead
@@ -171,8 +258,8 @@ when defined(ssl):
         result.protocol = negotiatedProtocol(result.ssl)
         return
       except CatchableError as e:
-        if fd != osInvalidSocket: close(fd)
-        lastErr = e
+        close(fd); lastErr = e
+        pool.delete(idx)   # TLS failed on this address; re-race the rest
     raise lastErr
 
 proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
@@ -238,7 +325,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     else:
       raise newException(ValueError, "navi: https requires compiling with -d:ssl")
   else:
-    result.fd = tcpConnect(host, port, establishMs)
+    result.fd = happyConnect(resolveAddrs(host, port), port, establishMs)[0]
   established = true
 
 proc sendAll*(c: Conn, data: string) =

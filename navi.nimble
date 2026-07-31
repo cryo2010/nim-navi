@@ -101,6 +101,10 @@ task tlsVersion, "TLS min/max version pinning enforcement (needs openssl with TL
   # TLS 1.2-only and TLS 1.3-only servers; navi's min/max version pins must be honored.
   exec "bash tests/interop/tls_version.sh"
 
+task happyEyeballs, "Happy Eyeballs address racing (needs openssl)":
+  # A blackholed first address + a good server; navi must race past the blackhole.
+  exec "bash tests/interop/happy_eyeballs.sh"
+
 task servers, "Multi-server HTTP/2 interop: nginx, Caddy, h2o (needs Docker + openssl)":
   # Runs navi's h2 client (and chronos h1) against three unrelated server stacks.
   exec "bash tests/interop/servers.sh"

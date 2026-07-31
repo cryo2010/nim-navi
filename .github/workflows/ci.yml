@@ -197,6 +197,12 @@ jobs:
       - name: Run the TLS version-pinning test
         run: bash tests/interop/tls_version.sh
 
+      # Happy Eyeballs (RFC 8305): a blackholed first address (192.0.2.1, SYN
+      # dropped) plus a good server; navi must race the addresses and reach the
+      # good one in ~the attempt delay instead of stalling on the blackhole.
+      - name: Run the Happy Eyeballs test
+        run: bash tests/interop/happy_eyeballs.sh
+
   multiserver:
     runs-on: ubuntu-latest
     name: multi-server interop (nginx/caddy/h2o)
