@@ -284,6 +284,24 @@ Supported on the OpenSSL backends (sync, asyncdispatch); the sync backend sees t
 largest gain. Not available on chronos (BearSSL exposes no client session cache in
 the chronos versions navi targets), which always does a full handshake.
 
+#### TLS version pinning
+
+Pin the acceptable TLS protocol range with `minVersion` / `maxVersion` (each a
+`TlsVersion`: `tlsDefault`, `tls10`, `tls11`, `tls12`, `tls13`). `tlsDefault` (the
+default) leaves that bound to the library.
+
+```nim
+cfg.tls.minVersion = tls12    # refuse anything below TLS 1.2
+cfg.tls.maxVersion = tls13
+```
+
+Enforced on the OpenSSL backends (sync, asyncdispatch). chronos (BearSSL) accepts
+`tls10`–`tls12` — requesting `tls13` there raises, since that build tops out at
+TLS 1.2. On `navi/js` the runtime controls the TLS version, so these are ignored.
+A negotiation outside the pinned range fails the handshake (`ValueError`). If the
+loaded OpenSSL/LibreSSL is too old to support version pinning (e.g. the LibreSSL
+some macOS builds link), setting a bound raises rather than silently ignoring it.
+
 #### Client certificates (mTLS)
 
 On the OpenSSL backends (sync, asyncdispatch) navi can present a client certificate for mutual TLS, from several sources. Precedence is `pkcs12File`, then in-memory (`certPem`/`keyPem`), then the `certFile`/`keyFile` pair.
@@ -650,7 +668,9 @@ fields you want. `NaviConfig` has `{.requiresInit.}`, so a bare or partial
 - **http** `set[HttpVersion]`: protocol preference. Default `{H1, H2}` negotiates
   h2 via ALPN with h1 fallback; set `{H1}` to force HTTP/1.1. Ignored by `navi/js`.
 - **tls** `TlsConfig`: `verify` (`bool`, default `true`) and `caFile` (custom CA
-  bundle, honored on all backends), plus `certFile`/`keyFile` for mTLS.
+  bundle, honored on all backends), `certFile`/`keyFile` for mTLS, `resumeSessions`
+  (session resumption, on by default), and `minVersion`/`maxVersion` (`TlsVersion`,
+  TLS version pinning).
 - **decompress** `bool`: decode gzip/deflate response bodies. Default on.
 - **throwHttpErrors** `bool`: raise `HttpError` on a non-2xx response. Default on.
 - **maxRedirects** `int`: redirects to follow. Default 20; 0 disables.

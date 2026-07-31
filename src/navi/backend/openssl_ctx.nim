@@ -164,13 +164,41 @@ when defined(ssl):
 
   # --- the builder -------------------------------------------------------
 
+  const
+    SSL_CTRL_SET_MIN_PROTO_VERSION = 123
+    SSL_CTRL_SET_MAX_PROTO_VERSION = 124
+
+  proc osslTlsVersion(v: TlsVersion): clong =
+    ## The OpenSSL protocol-version constant for a navi `TlsVersion`.
+    case v
+    of tlsDefault: 0
+    of tls10: 0x0301   # TLS1_VERSION
+    of tls11: 0x0302   # TLS1_1_VERSION
+    of tls12: 0x0303   # TLS1_2_VERSION
+    of tls13: 0x0304   # TLS1_3_VERSION
+
+  proc setVersionBounds(ctx: SslCtx, cfg: TlsConfig) =
+    ## Pin the negotiated TLS version range; `tlsDefault` leaves a bound unset.
+    ## SSL_CTX_set_min/max_proto_version is a macro over SSL_CTX_ctrl in OpenSSL;
+    ## we call the ctrl directly so it links against both OpenSSL and LibreSSL. A
+    ## 0 return means the loaded library doesn't support it (e.g. the old LibreSSL
+    ## macOS ships) -- surface that rather than silently ignore the pin.
+    if cfg.minVersion != tlsDefault:
+      if SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION.cint,
+                      osslTlsVersion(cfg.minVersion), nil) != 1:
+        fail("the loaded OpenSSL/LibreSSL does not support setting the minimum TLS version")
+    if cfg.maxVersion != tlsDefault:
+      if SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MAX_PROTO_VERSION.cint,
+                      osslTlsVersion(cfg.maxVersion), nil) != 1:
+        fail("the loaded OpenSSL/LibreSSL does not support setting the maximum TLS version")
+
   proc newTlsContext*(cfg: TlsConfig, alpn: openArray[string] = @[]): SslContext =
     ## Build a client TLS context. Verification and CA trust come from
-    ## `newContext` (the security-critical path); then ALPN and any configured
-    ## client certificate are applied. When a client cert is present it is
-    ## installed by `loadClientCert`, so `newContext` is handed an empty cert/key
-    ## and every credential form (plain PEM included) takes one path. Raises
-    ## `ValueError` on malformed or mismatched TLS material.
+    ## `newContext` (the security-critical path); then ALPN, the TLS version
+    ## bounds, and any configured client certificate are applied. When a client
+    ## cert is present it is installed by `loadClientCert`, so `newContext` is
+    ## handed an empty cert/key and every credential form (plain PEM included)
+    ## takes one path. Raises `ValueError` on malformed or mismatched TLS material.
     let custom = hasClientCert(cfg)
     result = newContext(
       verifyMode = if cfg.wantsVerify: CVerifyPeer else: CVerifyNone,
@@ -179,6 +207,7 @@ when defined(ssl):
       caFile = cfg.caFile)
     if custom: loadClientCert(result.context, cfg)
     setAlpn(result.context, alpn)
+    setVersionBounds(result.context, cfg)
 
   # --- TLS session resumption --------------------------------------------
   #

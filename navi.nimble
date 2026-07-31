@@ -97,6 +97,10 @@ task tlsFallback, "Handshake-aware address fallback test (needs openssl + python
   # A dead endpoint + a good TLS server on the same port; navi must fall through.
   exec "bash tests/interop/tls_fallback.sh"
 
+task tlsVersion, "TLS min/max version pinning enforcement (needs openssl with TLS 1.3)":
+  # TLS 1.2-only and TLS 1.3-only servers; navi's min/max version pins must be honored.
+  exec "bash tests/interop/tls_version.sh"
+
 task servers, "Multi-server HTTP/2 interop: nginx, Caddy, h2o (needs Docker + openssl)":
   # Runs navi's h2 client (and chronos h1) against three unrelated server stacks.
   exec "bash tests/interop/servers.sh"

@@ -191,6 +191,12 @@ jobs:
       - name: Run the TLS address-fallback test
         run: bash tests/interop/tls_fallback.sh
 
+      # TLS version pinning: openssl s_server pinned to TLS 1.2 and to TLS 1.3;
+      # navi's minVersion/maxVersion must reject the excluded version. Needs an
+      # openssl that speaks TLS 1.3 (the runner's OpenSSL 3 does).
+      - name: Run the TLS version-pinning test
+        run: bash tests/interop/tls_version.sh
+
   multiserver:
     runs-on: ubuntu-latest
     name: multi-server interop (nginx/caddy/h2o)

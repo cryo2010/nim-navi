@@ -13,6 +13,19 @@ import ../core/response  # for navi's TimeoutError
 
 export api, chronos
 
+proc chronosVer(v: api.TlsVersion,
+                whenDefault: tlsstream.TLSVersion): tlsstream.TLSVersion =
+  ## Map a navi `TlsVersion` to chronos's (`TLSVersion` collides by name, so both
+  ## are qualified); BearSSL here tops out at TLS 1.2.
+  case v
+  of tlsDefault: whenDefault
+  of tls10: TLS10
+  of tls11: TLS11
+  of tls12: TLS12
+  of tls13:
+    raise newException(ValueError,
+      "navi: the chronos backend (BearSSL) supports up to TLS 1.2; tls13 is unavailable")
+
 type
   Conn* = object
     transport: StreamTransport
@@ -75,13 +88,20 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
           conn.caStore = loadCaTrustStore(readFile(cfg.caFile))
         let rdr = newAsyncStreamReader(transport)
         let wtr = newAsyncStreamWriter(transport)
-        # TLS 1.2 only; no client session resumption (chronos exposes no client cache).
+        # BearSSL tops out at TLS 1.2. Unpinned, keep chronos's 1.2-only default;
+        # when the user pins a bound, widen the other end to the extremes so the
+        # requested range is honored. No client session resumption here.
+        let pinned = cfg.minVersion != tlsDefault or cfg.maxVersion != tlsDefault
+        let vmin = if pinned: chronosVer(cfg.minVersion, TLS10) else: TLS12
+        let vmax = if pinned: chronosVer(cfg.maxVersion, TLS12) else: TLS12
         let stream =
           if conn.caStore != nil:
             newTLSClientAsyncStream(rdr, wtr, host, flags = flags,
+                                    minVersion = vmin, maxVersion = vmax,
                                     trustAnchors = conn.caStore.store)
           else:
-            newTLSClientAsyncStream(rdr, wtr, host, flags = flags)
+            newTLSClientAsyncStream(rdr, wtr, host, flags = flags,
+                                    minVersion = vmin, maxVersion = vmax)
         conn.tls = stream
         conn.reader = stream.reader
         conn.writer = stream.writer
