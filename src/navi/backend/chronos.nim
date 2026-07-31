@@ -64,6 +64,11 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   ## stored for per-read timeouts. `totalMs` is enforced by the chronos entry's
   ## guard (structured cancellation), so it is unused here.
   discard totalMs
+  # BearSSL uses a fixed cipher profile; reject cipher selection up front rather
+  # than after dialing.
+  if tls and (cfg.ciphers.len > 0 or cfg.cipherSuites.len > 0):
+    raise newException(ValueError,
+      "navi: the chronos backend (BearSSL) does not support cipher selection")
   var conn: Conn
   conn.readMs = readMs
 

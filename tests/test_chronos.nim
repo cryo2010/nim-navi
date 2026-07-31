@@ -49,3 +49,20 @@ suite "chronos entry end to end":
     let res = waitFor api.post("http://127.0.0.1:" & $port & "/", body = "x")
     check res.headers.get("x-echo-authorization") == "Bearer captured-42"
     joinThread(th)
+
+suite "chronos TLS config":
+  # BearSSL has a fixed cipher profile, so cipher selection cannot be honored.
+  # The backend rejects it up front (before dialing), so no server is needed.
+  test "cipher selection is rejected rather than silently ignored":
+    var cfg = initNaviConfig()
+    cfg.tls.ciphers = "ECDHE-RSA-AES128-GCM-SHA256"
+    let api = newNavi(cfg)
+    expect ValueError:
+      discard waitFor api.get("https://127.0.0.1:1/")
+
+  test "cipherSuites selection is rejected rather than silently ignored":
+    var cfg = initNaviConfig()
+    cfg.tls.cipherSuites = "TLS_AES_128_GCM_SHA256"
+    let api = newNavi(cfg)
+    expect ValueError:
+      discard waitFor api.get("https://127.0.0.1:1/")

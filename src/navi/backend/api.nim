@@ -40,6 +40,10 @@ type
                            ## backend owns the concrete type. Not user-configurable.
     minVersion*: TlsVersion ## lowest TLS version to negotiate (`tlsDefault` = unset)
     maxVersion*: TlsVersion ## highest TLS version to negotiate (`tlsDefault` = unset)
+    ciphers*: string       ## TLS <=1.2 cipher list, OpenSSL format (colon-separated,
+                           ## e.g. "ECDHE-RSA-AES128-GCM-SHA256"); "" = library default
+    cipherSuites*: string  ## TLS 1.3 ciphersuites (colon-separated, e.g.
+                           ## "TLS_AES_128_GCM_SHA256"); "" = library default
 
   ProxyTarget* = object
     ## The HTTP proxy to dial through. An empty `host` means a direct
