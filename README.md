@@ -63,6 +63,7 @@ discard main()
   - [Decompression](#decompression)
   - [HTTP/2](#http2)
   - [Keep-alive](#keep-alive)
+  - [Happy Eyeballs](#happy-eyeballs)
   - [Streaming](#streaming)
   - [WebSocket](#websocket)
 - [API](#api)
@@ -84,6 +85,7 @@ discard main()
 - **Browser and Node** via a JavaScript backend (`import navi/js`) that runs on the runtime's `fetch`
 - **TLS** on all three backends (OpenSSL for sync/asyncdispatch, BearSSL for chronos), with certificate verification on by default
 - **Connection pooling / keep-alive**, with automatic retry on a stale pooled connection
+- **Happy Eyeballs** (RFC 8305) address racing on the sync backend, so a slow/blackholed address doesn't stall the connect
 - **Streaming** uploads (chunked) and downloads (chunk sink)
 - **Retries** with capped exponential backoff, honoring `Retry-After`
 - **Redirect following** with method rewrites and cross-origin `Authorization` stripping
@@ -546,6 +548,10 @@ HTTP/1.1, set `http: {H1}` in `NaviConfig`.
 ### Keep-alive
 
 Connection reuse is automatic. Each client keeps an idle-connection pool keyed by origin; responses that are self-delimited (content-length or chunked) and not marked `Connection: close` return their connection to the pool. A pooled connection that the server has since closed is transparently retried on a fresh connection.
+
+### Happy Eyeballs
+
+When a host resolves to several addresses (typical of dual-stack IPv4/IPv6 hosts and CDN pools), the sync backend follows [RFC 8305](https://www.rfc-editor.org/rfc/rfc8305): it interleaves the address families and **races** the connection attempts, staggered by ~250ms, using whichever completes first. A slow or blackholed address no longer stalls the whole connect for the full timeout before the next is tried. If the TLS handshake then fails on the winning address, the remaining addresses are re-raced (handshake-aware fallback). This is automatic and needs no configuration.
 
 ### Streaming
 
