@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mm: [orc, arc]
+        mm: [orc, arc, atomicArc]
     name: tests (--mm:${{ matrix.mm }})
     steps:
       - uses: actions/checkout@v4
@@ -47,7 +47,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mm: [orc, arc]
+        mm: [orc, arc, atomicArc]
     name: compile entries (--mm:${{ matrix.mm }}, -d:ssl)
     steps:
       - uses: actions/checkout@v4
@@ -272,7 +272,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mm: [orc, arc]
+        mm: [orc, arc, atomicArc]
     name: leak check (--mm:${{ matrix.mm }})
     steps:
       - uses: actions/checkout@v4
@@ -299,7 +299,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mm: [orc, arc]
+        mm: [orc, arc, atomicArc]
     name: valgrind leak check (TLS client, --mm:${{ matrix.mm }})
     steps:
       - uses: actions/checkout@v4
