@@ -15,7 +15,7 @@ fall into six groups:
 
 The **CI** column says which check runs it on every PR (see
 `.github/workflows/`). "local" means it is not wired into per-PR CI and is run on
-demand; "nightly" runs on a schedule. A green PR is **25 checks**: 14 from
+demand; "nightly" runs on a schedule. A green PR is **29 checks**: 18 from
 `ci.yml`, 10 from `fuzz.yml`, 1 from `badssl.yml` (`live.yml` is nightly only).
 
 ## Running at a glance
@@ -57,7 +57,7 @@ nimble bench              # client benchmark: navi vs std/httpclient, Go, Rust
 Compiles and runs every `tests/test_*.nim`. `nimble test` delegates to
 `tests/run.sh` (nimble does not propagate a task's exit code, nim-lang/nimble#1802,
 so CI runs the script directly under `set -e`). In CI it runs three times: the
-**`test`** job over the memory-manager matrix (`orc` and `arc`) and the
+**`test`** job over the memory-manager matrix (`orc`, `arc`, and `atomicArc`) and the
 **`sanitize`** job under AddressSanitizer + UBSan (`NAVI_SANITIZE=1`, which also
 switches to `-d:useMalloc`). All tests below are covered by those three runs.
 
@@ -110,7 +110,7 @@ way its consumers will build it. These jobs are compile-only unless noted.
 
 | Check | CI | Verifies |
 |------|----|----------|
-| `compile` job (`nim check`, matrix orc/arc) | **yes** (`compile entries`) | `navi`, `navi/asyncdispatch`, and `navi/chronos` each type-check with `-d:ssl` (the OpenSSL/ALPN path the plain-TCP unit suite never builds) under both memory managers |
+| `compile` job (`nim check`, matrix orc/arc/atomicArc) | **yes** (`compile entries`) | `navi`, `navi/asyncdispatch`, and `navi/chronos` each type-check with `-d:ssl` (the OpenSSL/ALPN path the plain-TCP unit suite never builds) under every memory manager |
 | `nim js src/navi/js.nim` | **yes** (`compile navi/js`) | The js entry compiles under the JavaScript backend (the only job that builds it) |
 | `tests/js_fallback_{async,chronos}.nim` | **yes** (`compile navi/js`) | A library written on navi/asyncdispatch or navi/chronos also builds under `nim js`, where the entry falls back to navi/js (portable middleware/config/params) |
 | `tests/interop/jsws.sh` | **yes** (`compile navi/js`) | navi/js WebSocket client runs under Node 22+ (global WebSocket) against a native echo server |
@@ -146,14 +146,14 @@ red (read the job log for the failing step).
 ## Memory-safety checks
 
 navi holds C resources (OpenSSL `SSL_CTX`, zlib/brotli/zstd contexts), so leaks
-need more than a Nim-heap check. Each runs under both memory managers where a
-reference cycle could differ (`arc` does not collect cycles).
+need more than a Nim-heap check. Each runs under every memory manager where a
+reference cycle could differ (`arc` and `atomicArc` do not collect cycles).
 
 | Check | CI | Verifies |
 |------|----|----------|
 | `sanitize` job → `tests/run.sh` | **yes** (`sanitizers`) | The whole default suite rebuilt under AddressSanitizer + UBSan (`-d:useMalloc`): heap overflows, use-after-free, and UB in the sans-io parsers a passing test would hide. Leak detection off (short-lived test processes leak by design) |
-| `leak.nim` (matrix orc/arc) | **yes** (`leak check`) | Every verb + `request` in a 100,000× loop (800k requests) against an in-process keep-alive server; asserts the Nim heap stays flat (an orc/arc gap would mean a reference cycle) |
-| `leak_valgrind.nim` (matrix orc/arc, Docker) | **yes** (`valgrind leak check`) | navi's HTTPS request loop under Valgrind memcheck; fails on any definite/indirect leak (e.g. a per-connection `SSL_CTX` that `getOccupiedMem` and LeakSanitizer miss) |
+| `leak.nim` (matrix orc/arc/atomicArc) | **yes** (`leak check`) | Every verb + `request` in a 100,000× loop (800k requests) against an in-process keep-alive server; asserts the Nim heap stays flat (a gap between managers would mean a reference cycle) |
+| `leak_valgrind.nim` (matrix orc/arc/atomicArc, Docker) | **yes** (`valgrind leak check`) | navi's HTTPS request loop under Valgrind memcheck; fails on any definite/indirect leak (e.g. a per-connection `SSL_CTX` that `getOccupiedMem` and LeakSanitizer miss) |
 | `leak_sanitize.nim` | **yes** (`leak check (codec FFI…)`) | Codec-FFI leaks LeakSanitizer sees but `getOccupiedMem` cannot: zlib / libbrotlidec / libzstd contexts a dropped `=destroy`/defer would leak (`detect_leaks=1`) |
 
 ---
