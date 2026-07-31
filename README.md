@@ -89,7 +89,7 @@ discard main()
 - **Redirect following** with method rewrites and cross-origin `Authorization` stripping
 - **Throw-on-non-2xx** by default (`HttpError`), opt-out available
 - **Automatic decompression**: gzip/deflate (zlib), plus brotli and zstd when `libbrotlidec`/`libzstd` are present
-- **Request timeouts** via the `timeout` option (`TimeoutError`)
+- **Request timeouts**, overall or per-phase (connect / read / total) via `timeout` / `timeouts` (`TimeoutError`)
 - **Middleware**: onion-style `proc(ctx)` steps that modify, observe, or short-circuit a request
 - **Cookie jar**, **basic/bearer/digest auth** (Digest: MD5 and SHA-256, RFC 7616), **proxy** (http absolute-URI and https CONNECT)
 - **WebSockets** (RFC 6455) on all four backends, text and binary messages, fragmentation reassembly, and automatic ping/pong
@@ -351,7 +351,24 @@ cfg.retry.statuses = @[429, 503]           # response statuses that trigger one
 cfg.retry.maxDelay = 30_000                # cap the wait between attempts (ms)
 ```
 
-`timeout` is per socket read on the sync backend and bounds the whole request (including retries) on the async backends.
+`timeout` bounds the whole request (raising `TimeoutError`): on the async backends (asyncdispatch/chronos/js) it covers all retries; on the sync backend it is per attempt.
+
+#### Per-phase timeouts
+
+For finer control, set `cfg.timeouts` (a `Timeouts`) to bound individual phases instead of just the overall request. Each field is milliseconds; 0 (the default) disables that phase's limit.
+
+```nim
+var cfg = initNaviConfig()
+cfg.timeouts.connect = 2_000   # TCP connect + TLS handshake
+cfg.timeouts.read    = 5_000   # stall waiting for a response chunk
+cfg.timeouts.total   = 30_000  # whole request (overrides/supersedes `timeout`)
+```
+
+- **connect** and **read** are enforced on the native backends (sync, asyncdispatch, chronos).
+- **total** is enforced on all four backends; `timeout` is the legacy alias for it.
+- On `navi/js` only **total** applies (via `AbortSignal.timeout` — `fetch` hides the connect/read phases).
+
+All raise `TimeoutError`. A timed-out phase on the async backends abandons the in-flight operation (asyncdispatch drains it in the background; chronos cancels it).
 
 ### Query parameters
 
@@ -643,9 +660,11 @@ fields you want. `NaviConfig` has `{.requiresInit.}`, so a bare or partial
 - **maxResponseBytes** `int`: cap on the response body size. A larger response
   raises `ResponseTooLargeError`. 0 (default) is unlimited. Enforced incrementally
   when streaming; counts decompressed bytes on the native backends.
-- **timeout** `int`: request timeout in milliseconds. 0 (default) disables it. A
-  stalled request raises `TimeoutError`. The sync backend applies it per socket
-  read; the async backends bound the whole request.
+- **timeout** `int`: overall request timeout in milliseconds; 0 (default) disables.
+  A stalled request raises `TimeoutError`. Legacy alias for `timeouts.total`.
+- **timeouts** `Timeouts`: per-phase deadlines (`connect`, `read`, `total`, ms; 0
+  disables each). `connect`/`read` apply to the native backends; `total` to all
+  four. See [Per-phase timeouts](#retries-redirects-and-timeouts).
 - **auth** `Auth`: `basicAuth(user, pass)`, `bearerAuth(token)`, or
   `digestAuth(user, pass)`. Basic/bearer set `Authorization` on every request;
   digest answers the server's 401 challenge (MD5 or SHA-256) on a one-shot retry.

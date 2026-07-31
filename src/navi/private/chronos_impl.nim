@@ -45,7 +45,7 @@ proc initNaviConfig*(): NaviConfig =
     prefixUrl: "", headers: initHeaders(), http: {H1, H2}, tls: defaultTls(),
     decompress: true, throwHttpErrors: true, maxRedirects: 20,
     retry: defaultRetryPolicy(), maxResponseBytes: 0,
-    auth: Auth(), proxy: "", timeout: 0, middleware: @[])
+    auth: Auth(), proxy: "", timeout: 0, timeouts: Timeouts(), middleware: @[])
 
 proc newNavi*(config = initNaviConfig()): Navi =
   var cfg = config
@@ -84,7 +84,7 @@ proc guard[T](client: Navi, fut: Future[T], cancel: CancelToken): Future[T] {.as
   ## Bound the whole operation by `timeout` and `cancel`. On either, the in-flight
   ## request is cancelled via chronos structured cancellation (its cleanup closes
   ## the socket) and TimeoutError / RequestCancelledError is raised.
-  let ms = client.config.timeoutMs
+  let ms = client.config.totalMs
   if ms <= 0 and cancel == nil:
     return await fut
   var cancelFut = newFuture[void]("navi.cancel")
@@ -182,7 +182,7 @@ proc doWebsocket(client: Navi, url: string,
   let u = toWsUrl(url)
   let conn = await connect(u.host, u.port, u.isTls, client.config.tls,
                            resolveProxy(client.config, u), @[],
-                           client.config.timeoutMs)
+                           client.config.connectMs)
   let key = genKey()
   # Close the connection on any handshake failure (its close is async, so this
   # uses try/except rather than defer). A timeout cancels this future, raising
