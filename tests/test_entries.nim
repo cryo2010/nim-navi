@@ -602,3 +602,13 @@ suite "per-phase timeouts":
     except response.TimeoutError: raised = true
     check raised
     joinThread(th)
+
+suite "TLS version pinning config":
+  test "min/max default to tlsDefault and are settable":
+    var cfg = initNaviConfig()
+    check cfg.tls.minVersion == tlsDefault
+    check cfg.tls.maxVersion == tlsDefault
+    cfg.tls.minVersion = tls12
+    cfg.tls.maxVersion = tls13
+    check cfg.tls.minVersion == tls12
+    check cfg.tls.maxVersion == tls13

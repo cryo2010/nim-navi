@@ -14,6 +14,11 @@
 ## stays transport- and scheme-agnostic.
 
 type
+  TlsVersion* = enum
+    ## A TLS protocol version for `TlsConfig.minVersion` / `maxVersion`.
+    ## `tlsDefault` (the zero value) leaves that bound to the backend's default.
+    tlsDefault, tls10, tls11, tls12, tls13
+
   TlsConfig* = object
     ## TLS options, including the client certificate for mTLS. The client
     ## credential can come from several sources; precedence is `pkcs12File`, then
@@ -33,6 +38,8 @@ type
                            ## (abbreviated handshake); on by default via `defaultTls()`
     sessionCache*: RootRef ## per-client session store, set by `newNavi`; the TLS
                            ## backend owns the concrete type. Not user-configurable.
+    minVersion*: TlsVersion ## lowest TLS version to negotiate (`tlsDefault` = unset)
+    maxVersion*: TlsVersion ## highest TLS version to negotiate (`tlsDefault` = unset)
 
   ProxyTarget* = object
     ## The HTTP proxy to dial through. An empty `host` means a direct
