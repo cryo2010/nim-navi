@@ -304,6 +304,23 @@ A negotiation outside the pinned range fails the handshake (`ValueError`). If th
 loaded OpenSSL/LibreSSL is too old to support version pinning (e.g. the LibreSSL
 some macOS builds link), setting a bound raises rather than silently ignoring it.
 
+#### Cipher selection
+
+Restrict the offered ciphers with `ciphers` (TLS ≤1.2) and `cipherSuites` (TLS 1.3)
+— they use OpenSSL's two separate cipher APIs, so set whichever applies to the
+versions you allow. Both are colon-separated OpenSSL names; "" (default) leaves the
+library's selection.
+
+```nim
+cfg.tls.ciphers      = "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256"
+cfg.tls.cipherSuites = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"
+```
+
+Enforced on the OpenSSL backends (sync, asyncdispatch); a value with no cipher the
+peer accepts fails the handshake, and an all-invalid list raises. chronos (BearSSL,
+a fixed cipher profile) raises if either is set; on `navi/js` the runtime controls
+ciphers, so they are ignored.
+
 #### Client certificates (mTLS)
 
 On the OpenSSL backends (sync, asyncdispatch) navi can present a client certificate for mutual TLS, from several sources. Precedence is `pkcs12File`, then in-memory (`certPem`/`keyPem`), then the `certFile`/`keyFile` pair.
@@ -675,8 +692,9 @@ fields you want. `NaviConfig` has `{.requiresInit.}`, so a bare or partial
   h2 via ALPN with h1 fallback; set `{H1}` to force HTTP/1.1. Ignored by `navi/js`.
 - **tls** `TlsConfig`: `verify` (`bool`, default `true`) and `caFile` (custom CA
   bundle, honored on all backends), `certFile`/`keyFile` for mTLS, `resumeSessions`
-  (session resumption, on by default), and `minVersion`/`maxVersion` (`TlsVersion`,
-  TLS version pinning).
+  (session resumption, on by default), `minVersion`/`maxVersion` (`TlsVersion`,
+  version pinning), and `ciphers`/`cipherSuites` (cipher selection for TLS ≤1.2 /
+  TLS 1.3).
 - **decompress** `bool`: decode gzip/deflate response bodies. Default on.
 - **throwHttpErrors** `bool`: raise `HttpError` on a non-2xx response. Default on.
 - **maxRedirects** `int`: redirects to follow. Default 20; 0 disables.

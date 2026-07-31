@@ -192,6 +192,17 @@ when defined(ssl):
                       osslTlsVersion(cfg.maxVersion), nil) != 1:
         fail("the loaded OpenSSL/LibreSSL does not support setting the maximum TLS version")
 
+  proc setCiphers(ctx: SslCtx, cfg: TlsConfig) =
+    ## Restrict the offered ciphers. TLS <=1.2 and TLS 1.3 use separate OpenSSL
+    ## APIs, so `ciphers` and `cipherSuites` are set independently; a non-1 return
+    ## means every name was invalid/unknown, which we surface.
+    if cfg.ciphers.len > 0:
+      if SSL_CTX_set_cipher_list(ctx, cfg.ciphers.cstring) != 1:
+        fail("no usable cipher in TlsConfig.ciphers: " & cfg.ciphers)
+    if cfg.cipherSuites.len > 0:
+      if SSL_CTX_set_ciphersuites(ctx, cfg.cipherSuites.cstring) != 1:
+        fail("no usable ciphersuite in TlsConfig.cipherSuites: " & cfg.cipherSuites)
+
   proc newTlsContext*(cfg: TlsConfig, alpn: openArray[string] = @[]): SslContext =
     ## Build a client TLS context. Verification and CA trust come from
     ## `newContext` (the security-critical path); then ALPN, the TLS version
@@ -208,6 +219,7 @@ when defined(ssl):
     if custom: loadClientCert(result.context, cfg)
     setAlpn(result.context, alpn)
     setVersionBounds(result.context, cfg)
+    setCiphers(result.context, cfg)
 
   # --- TLS session resumption --------------------------------------------
   #

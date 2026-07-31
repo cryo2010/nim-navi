@@ -203,6 +203,11 @@ jobs:
       - name: Run the Happy Eyeballs test
         run: bash tests/interop/happy_eyeballs.sh
 
+      # Cipher-suite selection: servers pinned to a single TLS 1.2 cipher and a
+      # single TLS 1.3 ciphersuite; navi's ciphers/cipherSuites must be honored.
+      - name: Run the cipher-suite selection test
+        run: bash tests/interop/cipher_suite.sh
+
   multiserver:
     runs-on: ubuntu-latest
     name: multi-server interop (nginx/caddy/h2o)

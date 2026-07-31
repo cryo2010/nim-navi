@@ -612,3 +612,12 @@ suite "TLS version pinning config":
     cfg.tls.maxVersion = tls13
     check cfg.tls.minVersion == tls12
     check cfg.tls.maxVersion == tls13
+
+suite "TLS cipher selection config":
+  test "ciphers/cipherSuites default empty and are settable":
+    var cfg = initNaviConfig()
+    check cfg.tls.ciphers == "" and cfg.tls.cipherSuites == ""
+    cfg.tls.ciphers = "ECDHE-RSA-AES128-GCM-SHA256"
+    cfg.tls.cipherSuites = "TLS_AES_128_GCM_SHA256"
+    check cfg.tls.ciphers == "ECDHE-RSA-AES128-GCM-SHA256"
+    check cfg.tls.cipherSuites == "TLS_AES_128_GCM_SHA256"

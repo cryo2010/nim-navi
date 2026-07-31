@@ -105,6 +105,10 @@ task happyEyeballs, "Happy Eyeballs address racing (needs openssl)":
   # A blackholed first address + a good server; navi must race past the blackhole.
   exec "bash tests/interop/happy_eyeballs.sh"
 
+task cipherSuite, "Cipher-suite selection enforcement (needs openssl with TLS 1.3)":
+  # Servers pinned to one TLS 1.2 cipher / one TLS 1.3 ciphersuite; pins must hold.
+  exec "bash tests/interop/cipher_suite.sh"
+
 task servers, "Multi-server HTTP/2 interop: nginx, Caddy, h2o (needs Docker + openssl)":
   # Runs navi's h2 client (and chronos h1) against three unrelated server stacks.
   exec "bash tests/interop/servers.sh"

@@ -79,6 +79,10 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
       if proxy.isSet and tls:
         await proxyConnect(transport, host, port)
       if tls:
+        # BearSSL uses a fixed cipher profile; cipher selection is not available.
+        if cfg.ciphers.len > 0 or cfg.cipherSuites.len > 0:
+          raise newException(ValueError,
+            "navi: the chronos backend (BearSSL) does not support cipher selection")
         # Client certificates are not honored here (BearSSL client presents none).
         let flags =
           if cfg.wantsVerify: {} else: {TLSFlags.NoVerifyHost, TLSFlags.NoVerifyServerName}
