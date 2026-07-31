@@ -9,6 +9,7 @@ import std/[strutils, os]
 import pkg/chronos, pkg/chronos/transports/stream
 import pkg/chronos/streams/[asyncstream, tlsstream]
 import ./api, ./chronos_castore
+import ../core/response  # for navi's TimeoutError
 
 export api, chronos
 
@@ -20,6 +21,7 @@ type
     tls: TLSAsyncStream  ## kept alive for the connection's lifetime; nil if plaintext
     caStore: CaTrustStore  ## keeps custom-CA anchors alive; BearSSL holds raw pointers into it
     protocol*: string    ## ALPN protocol; always "" here (this backend is http/1.1)
+    readMs: int          ## per-read stall timeout in ms; 0 blocks indefinitely
 
 proc newTlsStore*(cfg: TlsConfig): RootRef =
   ## No-op for chronos: BearSSL client-side session resumption is not available in
@@ -44,69 +46,81 @@ proc proxyConnect(transport: StreamTransport, host: string, port: int) {.async.}
 
 proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
               proxy: ProxyTarget, alpn: seq[string] = @[],
-              timeout = 0): Future[Conn] {.async.} =
-  ## `timeout` is enforced by the chronos entry via withTimeout, so it is unused
-  ## in this proc (kept for a uniform transport signature across backends).
-  discard timeout
-  let dialAddr =
-    if proxy.isSet: resolveTAddress(proxy.host, Port(proxy.port))[0]
-    else: resolveTAddress(host, Port(port))[0]
-  let transport = await connect(dialAddr)
-  result.transport = transport
-  # Close the transport if the CONNECT tunnel or TLS setup fails; the transport's
-  # close is async, so this uses try/except rather than defer.
-  try:
-    if proxy.isSet and tls:
-      await proxyConnect(transport, host, port)
-    if tls:
-      # Client certificates (cfg.certFile/keyFile, for mTLS) are not honored
-      # here; this client stream presents no certificate. mTLS is available on
-      # the sync and asyncdispatch (OpenSSL) backends.
-      let flags =
-        if cfg.wantsVerify: {} else: {TLSFlags.NoVerifyHost, TLSFlags.NoVerifyServerName}
-      # A custom CA (cfg.caFile) replaces BearSSL's bundled Mozilla anchors, but
-      # only matters when verifying: NoVerifyHost skips anchor checks entirely.
-      if cfg.wantsVerify and cfg.caFile.len > 0:
-        if not fileExists(cfg.caFile):
-          raise newException(IOError, "navi: CA file not found: " & cfg.caFile)
-        result.caStore = loadCaTrustStore(readFile(cfg.caFile))
-      let rdr = newAsyncStreamReader(transport)
-      let wtr = newAsyncStreamWriter(transport)
-      # This chronos/BearSSL build negotiates up to TLS 1.2 only. Session
-      # resumption is not wired here: chronos's client stream exposes no session
-      # cache (the cache API is server-only in current chronos), so this backend
-      # always does a full handshake. Resumption is available on the OpenSSL
-      # backends (sync, asyncdispatch).
-      let stream =
-        if result.caStore != nil:
-          newTLSClientAsyncStream(rdr, wtr, host, flags = flags,
-                                  trustAnchors = result.caStore.store)
-        else:
-          newTLSClientAsyncStream(rdr, wtr, host, flags = flags)
-      result.tls = stream
-      result.reader = stream.reader
-      result.writer = stream.writer
-      # Drive the handshake now so a verification failure raises here, at connect
-      # time, rather than deadlocking a later read (BearSSL's fatal alert can't be
-      # flushed while we are only awaiting a response) or surfacing mid-request.
-      await stream.handshake()
-    else:
-      result.reader = newAsyncStreamReader(transport)
-      result.writer = newAsyncStreamWriter(transport)
-  except CatchableError:
-    try: await transport.closeWait()
-    except CatchableError: discard
-    raise
+              connectMs = 0, readMs = 0, totalMs = 0): Future[Conn] {.async.} =
+  ## `connectMs` bounds establishment (TCP connect + TLS handshake); `readMs` is
+  ## stored for per-read timeouts. `totalMs` is enforced by the chronos entry's
+  ## guard (structured cancellation), so it is unused here.
+  discard totalMs
+  var conn: Conn
+  conn.readMs = readMs
+
+  proc establish() {.async.} =
+    let dialAddr =
+      if proxy.isSet: resolveTAddress(proxy.host, Port(proxy.port))[0]
+      else: resolveTAddress(host, Port(port))[0]
+    let transport = await connect(dialAddr)
+    conn.transport = transport
+    # Close the transport if the CONNECT tunnel or TLS setup fails (or the connect
+    # times out -- withTimeout cancels this future, raising CancelledError here).
+    try:
+      if proxy.isSet and tls:
+        await proxyConnect(transport, host, port)
+      if tls:
+        # Client certificates are not honored here (BearSSL client presents none).
+        let flags =
+          if cfg.wantsVerify: {} else: {TLSFlags.NoVerifyHost, TLSFlags.NoVerifyServerName}
+        if cfg.wantsVerify and cfg.caFile.len > 0:
+          if not fileExists(cfg.caFile):
+            raise newException(IOError, "navi: CA file not found: " & cfg.caFile)
+          conn.caStore = loadCaTrustStore(readFile(cfg.caFile))
+        let rdr = newAsyncStreamReader(transport)
+        let wtr = newAsyncStreamWriter(transport)
+        # TLS 1.2 only; no client session resumption (chronos exposes no client cache).
+        let stream =
+          if conn.caStore != nil:
+            newTLSClientAsyncStream(rdr, wtr, host, flags = flags,
+                                    trustAnchors = conn.caStore.store)
+          else:
+            newTLSClientAsyncStream(rdr, wtr, host, flags = flags)
+        conn.tls = stream
+        conn.reader = stream.reader
+        conn.writer = stream.writer
+        # Drive the handshake now so a verification failure raises here, not mid-read.
+        await stream.handshake()
+      else:
+        conn.reader = newAsyncStreamReader(transport)
+        conn.writer = newAsyncStreamWriter(transport)
+    except CatchableError:
+      try: await transport.closeWait()
+      except CatchableError: discard
+      raise
+
+  if connectMs > 0:
+    if not await withTimeout(establish(), connectMs):
+      raise newException(response.TimeoutError,
+                         "navi: connect timed out after " & $connectMs & " ms")
+  else:
+    await establish()
+  return conn
 
 proc sendAll*(c: Conn, data: string): Future[void] {.async.} =
   await c.writer.write(data)
 
 proc recvSome*(c: Conn): Future[string] {.async.} =
-  ## One chunk of up to 4096 bytes; "" means the peer closed.
+  ## One chunk of up to 4096 bytes; "" means the peer closed. Bounded by `readMs`
+  ## (the per-read stall timeout) when set; on expiry the read is cancelled and
+  ## TimeoutError is raised.
   var buf = newString(4096)
   var n = 0
   try:
-    n = await c.reader.readOnce(addr buf[0], buf.len)
+    if c.readMs > 0:
+      let fut = c.reader.readOnce(addr buf[0], buf.len)
+      if not await withTimeout(fut, c.readMs):
+        raise newException(response.TimeoutError,
+                           "navi: read timed out after " & $c.readMs & " ms")
+      n = await fut
+    else:
+      n = await c.reader.readOnce(addr buf[0], buf.len)
   except TLSStreamError:
     raise  # a real TLS/handshake failure is not an EOF -- surface it, don't spin
   except AsyncStreamError:

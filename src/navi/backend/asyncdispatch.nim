@@ -11,6 +11,7 @@
 
 import std/[asyncdispatch, nativesockets, strutils]
 import ./api, ./openssl_ctx
+import ../core/response  # for navi's TimeoutError
 when defined(ssl):
   import std/openssl
 
@@ -34,6 +35,7 @@ type
   Conn* = object
     fd: AsyncFD
     protocol*: string   ## ALPN-negotiated protocol ("h2" or "", meaning http/1.1)
+    readMs: int         ## per-read stall timeout in ms; 0 blocks indefinitely
     when defined(ssl):
       ssl: SslPtr       ## the TLS connection; nil for plain http
       ctx: SslContext   ## kept so `close` can free the SSL_CTX (destroyContext)
@@ -116,44 +118,56 @@ proc proxyConnect(fd: AsyncFD, host: string, port: int) {.async.} =
     raise newException(ValueError, "navi: proxy CONNECT failed: " & resp.splitLines()[0])
 
 proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
-              proxy: ProxyTarget, alpn: seq[string] = @[]): Future[Conn] {.async.} =
+              proxy: ProxyTarget, alpn: seq[string] = @[],
+              connectMs = 0, readMs = 0): Future[Conn] {.async.} =
   ## Dial `host:port` (or the proxy), upgrading to TLS for https with a CONNECT
   ## tunnel when proxied. The handshake completes here so the ALPN result (h2 vs
-  ## http/1.1) is known before any request. TLS requires `-d:ssl`.
+  ## http/1.1) is known before any request. `connectMs` bounds establishment (TCP
+  ## + TLS); `readMs` is stored for per-read timeouts. TLS requires `-d:ssl`.
   inc openedConnections
-  result.fd = invalidFd
-  var established = false
-  # Cleanup on a failed connect: all teardown ops are synchronous, so this runs
-  # cleanly from the finally of an async proc (the SSL_CTX has no destructor, so a
-  # failed handshake would otherwise leak it).
-  try:
-    let dialHost = if proxy.isSet: proxy.host else: host
-    let dialPort = if proxy.isSet: proxy.port else: port
-    let fd = await dial(dialHost, Port(dialPort), IPPROTO_TCP)
-    result.fd = fd
-    setNoDelay(fd.SocketHandle)
-    if proxy.isSet and tls:
-      await proxyConnect(fd, host, port)
-    if tls:
+  var conn: Conn
+  conn.fd = invalidFd
+  conn.readMs = readMs
+
+  proc establish() {.async.} =
+    # Self-contained cleanup on failure: the SSL_CTX has no destructor, so a
+    # failed handshake would otherwise leak it.
+    try:
+      let dialHost = if proxy.isSet: proxy.host else: host
+      let dialPort = if proxy.isSet: proxy.port else: port
+      let fd = await dial(dialHost, Port(dialPort), IPPROTO_TCP)
+      conn.fd = fd
+      setNoDelay(fd.SocketHandle)
+      if proxy.isSet and tls:
+        await proxyConnect(fd, host, port)
+      if tls:
+        when defined(ssl):
+          # No ALPN over a proxy tunnel (the old path negotiated it lazily).
+          let ctx = newTlsContext(cfg, if proxy.isSet: @[] else: alpn)
+          conn.ctx = ctx
+          conn.slot = resumeSlot(cfg, ctx, host & ":" & $port)
+          conn.ssl = newClientSsl(ctx, fd.SocketHandle, host, conn.slot)
+          await driveHandshake(conn.ssl, fd, host)
+          verifyPeer(conn.ssl, host, cfg.wantsVerify)
+          conn.protocol = negotiatedProtocol(conn.ssl)
+        else:
+          raise newException(ValueError, "navi: https requires compiling with -d:ssl")
+    except CatchableError:
       when defined(ssl):
-        # No ALPN over a proxy tunnel (the old path negotiated it lazily); this
-        # stays http/1.1, matching the previous behaviour.
-        let ctx = newTlsContext(cfg, if proxy.isSet: @[] else: alpn)
-        result.ctx = ctx
-        result.slot = resumeSlot(cfg, ctx, host & ":" & $port)
-        result.ssl = newClientSsl(ctx, fd.SocketHandle, host, result.slot)
-        await driveHandshake(result.ssl, fd, host)
-        verifyPeer(result.ssl, host, cfg.wantsVerify)
-        result.protocol = negotiatedProtocol(result.ssl)
-      else:
-        raise newException(ValueError, "navi: https requires compiling with -d:ssl")
-    established = true
-  finally:
-    if not established:
-      when defined(ssl):
-        if not result.ssl.isNil: SSL_free(result.ssl)
-        if not result.ctx.isNil: result.ctx.destroyContext()
-      if result.fd != invalidFd: closeSocket(result.fd)
+        if not conn.ssl.isNil: SSL_free(conn.ssl); conn.ssl = nil
+        if not conn.ctx.isNil: conn.ctx.destroyContext(); conn.ctx = nil
+      if conn.fd != invalidFd: closeSocket(conn.fd); conn.fd = invalidFd
+      raise
+
+  # On a connect timeout the establish future is abandoned (asyncdispatch has no
+  # cancellation): it drains in the background and its socket is reclaimed later,
+  # the same contract as the whole-request guard.
+  let estFut = establish()
+  if connectMs > 0 and not await withTimeout(estFut, connectMs):
+    raise newException(response.TimeoutError,
+                       "navi: connect timed out after " & $connectMs & " ms")
+  await estFut
+  return conn
 
 proc sendAll*(c: Conn, data: string): Future[void] {.async.} =
   when defined(ssl):
@@ -161,11 +175,19 @@ proc sendAll*(c: Conn, data: string): Future[void] {.async.} =
       await sslWrite(c, data); return
   await send(c.fd, data)
 
-proc recvSome*(c: Conn): Future[string] =
-  ## One chunk of up to 4096 bytes; "" means the peer closed.
+proc recvSome*(c: Conn): Future[string] {.async.} =
+  ## One chunk of up to 4096 bytes; "" means the peer closed. Bounded by `readMs`
+  ## (the per-read stall timeout) when set; on expiry the pending read is abandoned
+  ## and TimeoutError is raised.
+  var readFut: Future[string]
   when defined(ssl):
-    if not c.ssl.isNil: return sslRead(c)
-  recv(c.fd, 4096)
+    readFut = if not c.ssl.isNil: sslRead(c) else: recv(c.fd, 4096)
+  else:
+    readFut = recv(c.fd, 4096)
+  if c.readMs > 0 and not await withTimeout(readFut, c.readMs):
+    raise newException(response.TimeoutError,
+                       "navi: read timed out after " & $c.readMs & " ms")
+  return await readFut
 
 proc close*(c: Conn): Future[void] {.async.} =
   when defined(ssl):

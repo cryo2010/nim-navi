@@ -565,3 +565,40 @@ suite "TLS session resumption config":
     when defined(ssl):
       check not child.config.tls.sessionCache.isNil
       check not (child.config.tls.sessionCache == parent.config.tls.sessionCache)
+
+suite "per-phase timeouts":
+  test "resolvers read the struct; total falls back to legacy timeout":
+    var cfg = initNaviConfig()
+    check (cfg.connectMs, cfg.readMs, cfg.totalMs) == (0, 0, 0)
+    cfg.timeout = 500
+    check cfg.totalMs == 500                       # legacy timeout feeds total
+    cfg.timeouts = Timeouts(connect: 100, read: 200, total: 300)
+    check (cfg.connectMs, cfg.readMs, cfg.totalMs) == (100, 200, 300)
+
+  test "read timeout fires on a stalled response":
+    const port = 8998
+    var th: Thread[ServerCtx]
+    startHang(th, port)
+    var cfg = initNaviConfig()
+    cfg.timeouts.read = 200
+    cfg.retry.limit = 0
+    let api = newNavi(cfg)
+    var raised = false
+    try: discard api.get("http://127.0.0.1:" & $port & "/")
+    except response.TimeoutError: raised = true
+    check raised
+    joinThread(th)
+
+  test "total timeout fires on a stalled response":
+    const port = 8999
+    var th: Thread[ServerCtx]
+    startHang(th, port)
+    var cfg = initNaviConfig()
+    cfg.timeouts.total = 200
+    cfg.retry.limit = 0
+    let api = newNavi(cfg)
+    var raised = false
+    try: discard api.get("http://127.0.0.1:" & $port & "/")
+    except response.TimeoutError: raised = true
+    check raised
+    joinThread(th)

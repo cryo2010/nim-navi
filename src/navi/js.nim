@@ -67,7 +67,7 @@ proc initNaviConfig*(): NaviConfig =
     prefixUrl: "", headers: initHeaders(), http: {}, tls: defaultTls(),
     decompress: false, throwHttpErrors: true, maxRedirects: 20,
     retry: defaultRetryPolicy(), maxResponseBytes: 0,
-    auth: Auth(), proxy: "", timeout: 0, middleware: @[])
+    auth: Auth(), proxy: "", timeout: 0, timeouts: Timeouts(), middleware: @[])
 
 # A browser owns the cookie store (and hides Set-Cookie from fetch); Node, Deno,
 # Bun, and Workers do not, so navi keeps the jar there. `document` exists only in
@@ -115,7 +115,7 @@ proc runCore(client: Navi, req0: Request, cancel: CancelToken): Future[Response]
     var failed = false
     if not client.jar.isNil: applyCookies(client.jar, req)
     try:
-      resp = await fetchExchange(req, nil, client.config.timeoutMs, cancel)
+      resp = await fetchExchange(req, nil, client.config.totalMs, cancel)
     except CatchableError:
       throwIfCancelled(cancel)   # a cancel is not a retryable failure
       if not (attempt < policy.limit and isRetryableVerb(req.verb, policy)):
@@ -139,7 +139,7 @@ proc runCoreStream(client: Navi, req: Request, sink: BodySink,
   var rq = req
   if not client.jar.isNil: applyCookies(client.jar, rq)
   let limited = limitedSink(sink, client.config.maxResponseBytes)
-  var resp = await fetchExchange(rq, limited, client.config.timeoutMs, cancel)
+  var resp = await fetchExchange(rq, limited, client.config.totalMs, cancel)
   if not client.jar.isNil: storeCookies(client.jar, rq.url, resp)
   client.maybeThrow(rq, resp)
   result = resp

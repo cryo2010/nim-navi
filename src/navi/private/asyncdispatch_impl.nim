@@ -48,7 +48,7 @@ proc initNaviConfig*(): NaviConfig =
     prefixUrl: "", headers: initHeaders(), http: {H1, H2}, tls: defaultTls(),
     decompress: true, throwHttpErrors: true, maxRedirects: 20,
     retry: defaultRetryPolicy(), maxResponseBytes: 0,
-    auth: Auth(), proxy: "", timeout: 0, middleware: @[])
+    auth: Auth(), proxy: "", timeout: 0, timeouts: Timeouts(), middleware: @[])
 
 proc newNavi*(config = initNaviConfig()): Navi =
   var cfg = config
@@ -141,7 +141,8 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
     client.pendingMux[origin] = pending
     try:
       let conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
-                               client.config.tls, proxyTarget, alpn)
+                               client.config.tls, proxyTarget, alpn,
+                               client.config.connectMs, client.config.readMs)
       if conn.protocol == "h2":
         let mux = await newH2Mux(conn, client.config.maxResponseBytes)
         client.muxes[origin] = mux
@@ -158,7 +159,8 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
       raise
 
   let conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
-                           client.config.tls, proxyTarget, alpn)
+                           client.config.tls, proxyTarget, alpn,
+                           client.config.connectMs, client.config.readMs)
   result = await client.h1OnConn(conn, origin, rq, sink)
 
 proc doRequest(client: Navi, req: Request): Future[Response] {.async.} =
@@ -172,7 +174,7 @@ proc guard(client: Navi, fut: Future[Response],
   ## Bound the whole request (all attempts) by `timeout` and `cancel`. On expiry
   ## or cancellation the abandoned future runs to completion in the background
   ## (asyncdispatch has no true cancellation); its socket is later reclaimed.
-  let ms = client.config.timeoutMs
+  let ms = client.config.totalMs
   if ms <= 0 and cancel == nil:
     return await fut
   var cancelFut = newFuture[void]("navi.cancel")
@@ -267,7 +269,8 @@ proc websocket*(client: Navi, url: string,
   ## validates `Sec-WebSocket-Accept`. Use `send`, `receive`, and `close`.
   let u = toWsUrl(url)
   let conn = await connect(u.host, u.port, u.isTls, client.config.tls,
-                           resolveProxy(client.config, u), @[])
+                           resolveProxy(client.config, u), @[],
+                           client.config.connectMs)
   let key = genKey()
   # Close the connection on any handshake failure (its close is async, so this
   # uses try/except rather than defer).

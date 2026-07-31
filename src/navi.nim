@@ -57,7 +57,7 @@ proc initNaviConfig*(): NaviConfig =
     prefixUrl: "", headers: initHeaders(), http: {H1, H2}, tls: defaultTls(),
     decompress: true, throwHttpErrors: true, maxRedirects: 20,
     retry: defaultRetryPolicy(), maxResponseBytes: 0,
-    auth: Auth(), proxy: "", timeout: 0, middleware: @[])
+    auth: Auth(), proxy: "", timeout: 0, timeouts: Timeouts(), middleware: @[])
 
 proc newNavi*(config = initNaviConfig()): Navi =
   ## Create a client. `config` supplies defaults (prefixUrl, headers, TLS,
@@ -171,7 +171,8 @@ proc transportGroup(client: Navi, items: seq[BatchItem],
     h2 = pc.h2
   else:
     transport = connect(url0.host, url0.port, url0.isTls, client.config.tls,
-                        resolveProxy(client.config, url0), alpn, client.config.timeoutMs)
+                        resolveProxy(client.config, url0), alpn,
+                        client.config.connectMs, client.config.readMs, client.config.totalMs)
     pc = PooledConn[Conn](transport: transport)
     if transport.protocol == "h2":
       h2 = initH2Conn(client.config.maxResponseBytes)
@@ -235,7 +236,8 @@ proc transportGroup(client: Navi, items: seq[BatchItem],
       elif not keep:
         transport.close()
         transport = connect(url0.host, url0.port, url0.isTls, client.config.tls,
-                            resolveProxy(client.config, url0), alpn, client.config.timeoutMs)
+                            resolveProxy(client.config, url0), alpn,
+                            client.config.connectMs, client.config.readMs, client.config.totalMs)
         pc = PooledConn[Conn](transport: transport)
 
 proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
@@ -320,7 +322,7 @@ proc websocket*(client: Navi, url: string, headers = initHeaders()): WebSocket =
   ## validates `Sec-WebSocket-Accept`. Use `send`, `receive`, and `close`.
   let u = toWsUrl(url)
   let conn = connect(u.host, u.port, u.isTls, client.config.tls,
-                     resolveProxy(client.config, u), @[], client.config.timeoutMs)
+                     resolveProxy(client.config, u), @[], client.config.connectMs)
   # Close the connection unless the handshake completes -- a send/recv error mid
   # handshake would otherwise leak the socket (and its SSL_CTX for wss).
   var handshakeOk = false

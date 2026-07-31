@@ -7,7 +7,7 @@
 ## openssl_ctx). `await` is an identity template so the shared engine's
 ## `await`-shaped body compiles to straight-line blocking code.
 
-import std/[os, strutils, nativesockets]
+import std/[os, strutils, nativesockets, monotimes, times]
 import ./api, ./openssl_ctx
 import ../core/response  # for navi's TimeoutError
 when defined(ssl):
@@ -25,6 +25,10 @@ when defined(windows):
     winlean.recv(fd, cast[cstring](buf), cint(n), 0'i32).int
   proc setNoDelay(fd: SocketHandle) =
     setSockOptInt(fd, winlean.IPPROTO_TCP.int, winlean.TCP_NODELAY.int, 1)
+  proc connectInProgress(): bool = osLastError().int32 == WSAEWOULDBLOCK
+  proc setIoTimeout(fd: SocketHandle, ms: int) =
+    setSockOptInt(fd, SOL_SOCKET.int, SO_RCVTIMEO.int, ms)  # win: DWORD ms
+    setSockOptInt(fd, SOL_SOCKET.int, SO_SNDTIMEO.int, ms)
 else:
   import std/posix
   proc sysConnect(fd: SocketHandle, sa: ptr SockAddr, sl: SockLen): cint =
@@ -35,12 +39,26 @@ else:
     posix.recv(fd, buf, n, 0'i32)
   proc setNoDelay(fd: SocketHandle) =
     setSockOptInt(fd, posix.IPPROTO_TCP.int, posix.TCP_NODELAY.int, 1)
+  proc connectInProgress(): bool = errno == EINPROGRESS
+  proc setIoTimeout(fd: SocketHandle, ms: int) =
+    var tv = Timeval(tv_sec: posix.Time(ms div 1000),
+                     tv_usec: Suseconds((ms mod 1000) * 1000))
+    discard setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, addr tv, SockLen(sizeof tv))
+    discard setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, addr tv, SockLen(sizeof tv))
+
+proc waitWritable(fd: SocketHandle, ms: int): bool =
+  ## True once the (non-blocking) socket becomes writable within `ms` ms -- i.e.
+  ## the async connect finished. selectWrite mutates its seq, so pass a fresh one.
+  var fds = @[fd]
+  selectWrite(fds, ms) > 0
 
 type
   Conn* = object
     fd: SocketHandle
     protocol*: string   ## ALPN-negotiated protocol ("h2" or "", meaning http/1.1)
-    timeout: int        ## per-recv timeout in ms; 0 means block indefinitely
+    readMs: int         ## per-read stall timeout in ms; 0 blocks indefinitely
+    deadline: MonoTime  ## absolute overall deadline; enforced when `bounded`
+    bounded: bool       ## whether `deadline` is active (total timeout set)
     when defined(ssl):
       ssl: SslPtr       ## the TLS connection; nil for plain http
       ctx: SslContext   ## kept so `close` can free the SSL_CTX (destroyContext)
@@ -50,12 +68,15 @@ template await*(x: untyped): untyped = x
 
 proc sleep*(ms: int) = os.sleep(ms)
 
-proc tcpConnect(host: string, port: int): SocketHandle =
+proc tcpConnect(host: string, port: int, connectMs = 0): SocketHandle =
   ## Resolve `host` and connect to the first address that accepts a TCP
-  ## connection (IPv4 or IPv6, in the resolver's order). Raises on failure.
+  ## connection (IPv4 or IPv6, in the resolver's order). With `connectMs` > 0 the
+  ## connect is bounded (non-blocking connect + select); otherwise it blocks (the
+  ## OS default). Raises `TimeoutError` on a connect timeout, else `IOError`.
   var ai = getAddrInfo(host, Port(port), AF_UNSPEC, SOCK_STREAM, IPPROTO_TCP)
   var it = ai
   var lastErr = "no address"
+  var timedOut = false
   result = osInvalidSocket
   while it != nil:
     let fd = createNativeSocket(it.ai_family, it.ai_socktype, it.ai_protocol)
@@ -64,14 +85,28 @@ proc tcpConnect(host: string, port: int): SocketHandle =
       # handshake's final flight plus the first request stall ~40ms on the peer's
       # delayed ACK -- paid on every fresh (unpooled) connection.
       setNoDelay(fd)
-      if sysConnect(fd, it.ai_addr, it.ai_addrlen) == 0'i32:
-        result = fd
-        break
-      lastErr = osErrorMsg(osLastError())
-      close(fd)
+      if connectMs <= 0:
+        if sysConnect(fd, it.ai_addr, it.ai_addrlen) == 0'i32:
+          result = fd; break
+        lastErr = osErrorMsg(osLastError()); close(fd)
+      else:
+        fd.setBlocking(false)
+        if sysConnect(fd, it.ai_addr, it.ai_addrlen) == 0'i32:
+          fd.setBlocking(true); result = fd; break     # connected immediately
+        elif not connectInProgress():
+          lastErr = osErrorMsg(osLastError()); close(fd)
+        elif not waitWritable(fd, connectMs):
+          timedOut = true
+          lastErr = "connect timed out after " & $connectMs & " ms"; close(fd)
+        elif getSockOptInt(fd, SOL_SOCKET.int, SO_ERROR.int) != 0:
+          lastErr = "connection refused"; close(fd)
+        else:
+          fd.setBlocking(true); result = fd; break     # async connect succeeded
     it = it.ai_next
   freeAddrInfo(ai)
   if result == osInvalidSocket:
+    if timedOut:
+      raise newException(response.TimeoutError, "navi: " & lastErr)
     raise newException(IOError, "navi: could not connect to " & host & ": " & lastErr)
 
 proc sendRaw(fd: SocketHandle, data: string) =
@@ -111,13 +146,15 @@ when defined(ssl):
       result = newSlot(cache, origin)
 
   proc connectAcross*(ctx: SslContext, ips: openArray[string], sni: string,
-                      port: int, verify: bool, slot: SessionSlot = nil): Conn =
+                      port: int, verify: bool, slot: SessionSlot = nil,
+                      connectMs = 0): Conn =
     ## TCP-connect + TLS-handshake across `ips` in order, returning the first that
     ## completes the handshake; the connection uses each IP while SNI and
     ## verification use `sni`. Falls through on a connect *or handshake* failure,
     ## so a dead endpoint on a multi-homed host (a partially-broken CDN pool) no
-    ## longer fails the whole request. `ctx`/`slot` are set on the returned Conn by
-    ## the caller. Exported for the fallback test; navi reaches it through `connect`.
+    ## longer fails the whole request. `connectMs` > 0 bounds each address's TCP
+    ## connect and TLS handshake. `ctx`/`slot` are set on the returned Conn by the
+    ## caller. Exported for the fallback test; navi reaches it through `connect`.
     result.fd = osInvalidSocket
     if ips.len == 0:
       raise newException(IOError, "navi: could not resolve " & sni)
@@ -125,8 +162,10 @@ when defined(ssl):
     for ip in ips:
       var fd = osInvalidSocket
       try:
-        fd = tcpConnect(ip, port)
+        fd = tcpConnect(ip, port, connectMs)
+        if connectMs > 0: setIoTimeout(fd, connectMs)   # bound the blocking handshake
         result.ssl = startClientTls(ctx, fd, sni, verify, slot)
+        if connectMs > 0: setIoTimeout(fd, 0)           # clear; reads use selectRead
         result.fd = fd
         result.slot = slot
         result.protocol = negotiatedProtocol(result.ssl)
@@ -137,12 +176,20 @@ when defined(ssl):
     raise lastErr
 
 proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
-              proxy: ProxyTarget, alpn: seq[string] = @[], timeout = 0): Conn =
+              proxy: ProxyTarget, alpn: seq[string] = @[],
+              connectMs = 0, readMs = 0, totalMs = 0): Conn =
   ## Connect to `host:port` (IPv4 or IPv6), upgrading to TLS for https. Through a
   ## proxy, https targets get a CONNECT tunnel and http targets connect directly
-  ## to the proxy (the engine sends an absolute-URI). TLS requires `-d:ssl`.
-  result.timeout = timeout
+  ## to the proxy (the engine sends an absolute-URI). `connectMs` bounds TCP
+  ## connect + TLS handshake; `readMs` is the per-read stall limit; `totalMs` is
+  ## the overall (per-attempt) deadline. TLS requires `-d:ssl`.
+  # A total deadline also caps establishment when no explicit connect limit is set.
+  let establishMs = if connectMs > 0: connectMs else: totalMs
   result.fd = osInvalidSocket
+  result.readMs = readMs
+  if totalMs > 0:
+    result.deadline = getMonoTime() + initDuration(milliseconds = totalMs)
+    result.bounded = true
   # Release the socket and TLS context if we don't finish connecting -- a failed
   # proxy CONNECT or TLS handshake would otherwise leak the fd and the SSL_CTX
   # (which has no destructor).
@@ -155,14 +202,16 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
       if result.fd != osInvalidSocket:
         close(result.fd)
   if proxy.isSet:
-    result.fd = tcpConnect(proxy.host, proxy.port)
+    result.fd = tcpConnect(proxy.host, proxy.port, establishMs)
     if tls:
+      if establishMs > 0: setIoTimeout(result.fd, establishMs)
       proxyConnect(result.fd, host, port)
       when defined(ssl):
         result.ctx = newTlsContext(cfg, alpn)   # verify/CA + ALPN + any client cert
         result.slot = resumeSlot(cfg, result.ctx, host & ":" & $port)
         result.ssl = startClientTls(result.ctx, result.fd, host, cfg.wantsVerify,
                                     result.slot)
+        if establishMs > 0: setIoTimeout(result.fd, 0)
         result.protocol = negotiatedProtocol(result.ssl)
       else:
         raise newException(ValueError, "navi: https requires compiling with -d:ssl")
@@ -170,22 +219,26 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     when defined(ssl):
       let ctx = newTlsContext(cfg, alpn)   # verify/CA + ALPN + any client cert
       let slot = resumeSlot(cfg, ctx, host & ":" & $port)
+      let dl = result.deadline
+      let bd = result.bounded
       # Handshake-aware fallback across the resolved addresses (see connectAcross).
       # connectAcross returns a fresh Conn, so `result.ctx` is nil until we set it
       # below; free `ctx` here if the handshake fails, before `result` is assigned
       # (the connect-cleanup defer cannot see it yet).
       try:
         result = connectAcross(ctx, resolveAddrs(host, port), host, port,
-                               cfg.wantsVerify, slot)
+                               cfg.wantsVerify, slot, establishMs)
       except CatchableError:
         ctx.destroyContext()
         raise
       result.ctx = ctx
-      result.timeout = timeout
+      result.readMs = readMs
+      result.deadline = dl
+      result.bounded = bd
     else:
       raise newException(ValueError, "navi: https requires compiling with -d:ssl")
   else:
-    result.fd = tcpConnect(host, port)
+    result.fd = tcpConnect(host, port, establishMs)
   established = true
 
 proc sendAll*(c: Conn, data: string) =
@@ -200,22 +253,31 @@ proc sendAll*(c: Conn, data: string) =
       return
   sendRaw(c.fd, data)
 
-proc waitReadable(c: Conn): bool =
-  ## True when the socket has data ready within `c.timeout` ms. Checks OpenSSL's
-  ## decrypted buffer first: `select` sees the raw fd, so bytes SSL already
-  ## drained off it and buffered would otherwise be missed.
+proc waitReadable(c: Conn, ms: int): bool =
+  ## True when the socket has data ready within `ms`. Checks OpenSSL's decrypted
+  ## buffer first: `select` sees the raw fd, so bytes SSL already drained off it
+  ## and buffered would otherwise be missed.
   when defined(ssl):
     if not c.ssl.isNil and SSL_pending(c.ssl) > 0:
       return true
   var fds = @[c.fd]
-  selectRead(fds, c.timeout) > 0
+  selectRead(fds, ms) > 0
 
 proc recvSome*(c: Conn): string =
-  ## One chunk of up to 4096 bytes; "" means the peer closed. With a timeout set,
-  ## wait up to `timeout` ms for data (raising navi's TimeoutError on a stall),
-  ## then read what is available in a single read (no fill-the-buffer loop).
+  ## One chunk of up to 4096 bytes; "" means the peer closed. Waits up to the read
+  ## stall limit -- capped by the time left to the overall deadline -- then reads
+  ## what is available in a single read (no fill-the-buffer loop). Raises navi's
+  ## TimeoutError on a per-read stall or an expired total deadline.
   result = newString(4096)
-  if c.timeout > 0 and not c.waitReadable():
+  var waitMs = c.readMs
+  if c.bounded:
+    let remaining = (c.deadline - getMonoTime()).inMilliseconds.int
+    if remaining <= 0:
+      raise newException(response.TimeoutError, "navi: request timed out")
+    waitMs = if waitMs <= 0: remaining else: min(waitMs, remaining)
+  if waitMs > 0 and not c.waitReadable(waitMs):
+    if c.bounded and (c.deadline - getMonoTime()).inMilliseconds.int <= 0:
+      raise newException(response.TimeoutError, "navi: request timed out")
     raise newException(response.TimeoutError, "navi: read timed out")
   var n: int
   when defined(ssl):
