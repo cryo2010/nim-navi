@@ -200,7 +200,15 @@ when defined(ssl):
       if SSL_CTX_set_cipher_list(ctx, cfg.ciphers.cstring) != 1:
         fail("no usable cipher in TlsConfig.ciphers: " & cfg.ciphers)
     if cfg.cipherSuites.len > 0:
-      if SSL_CTX_set_ciphersuites(ctx, cfg.cipherSuites.cstring) != 1:
+      # SSL_CTX_set_ciphersuites (TLS 1.3) is missing from some old LibreSSL builds
+      # (e.g. macOS system LibreSSL); std/openssl raises LibraryError there. Turn
+      # that into a clear message rather than leaking the FFI error.
+      var applied: cint
+      try:
+        applied = SSL_CTX_set_ciphersuites(ctx, cfg.cipherSuites.cstring)
+      except CatchableError:
+        fail("the loaded OpenSSL/LibreSSL does not support setting TLS 1.3 ciphersuites")
+      if applied != 1:
         fail("no usable ciphersuite in TlsConfig.cipherSuites: " & cfg.cipherSuites)
 
   proc newTlsContext*(cfg: TlsConfig, alpn: openArray[string] = @[]): SslContext =

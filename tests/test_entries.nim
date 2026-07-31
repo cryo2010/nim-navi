@@ -621,3 +621,27 @@ suite "TLS cipher selection config":
     cfg.tls.cipherSuites = "TLS_AES_128_GCM_SHA256"
     check cfg.tls.ciphers == "ECDHE-RSA-AES128-GCM-SHA256"
     check cfg.tls.cipherSuites == "TLS_AES_128_GCM_SHA256"
+
+  # A value with no valid cipher must fail loudly at context build (before any
+  # socket work), never be silently ignored. newTlsContext runs before the dial,
+  # so an unreachable URL never gets connected to.
+  when defined(ssl):
+    test "an unusable ciphers value raises rather than being ignored":
+      var cfg = initNaviConfig()
+      cfg.tls.verify = false
+      cfg.retry.limit = 0
+      cfg.tls.ciphers = "NOT-A-REAL-CIPHER"
+      let api = newNavi(cfg)
+      expect ValueError:
+        discard api.get("https://127.0.0.1:1/")
+      api.close()
+
+    test "an unusable cipherSuites value raises rather than being ignored":
+      var cfg = initNaviConfig()
+      cfg.tls.verify = false
+      cfg.retry.limit = 0
+      cfg.tls.cipherSuites = "NOT-A-REAL-SUITE"
+      let api = newNavi(cfg)
+      expect ValueError:
+        discard api.get("https://127.0.0.1:1/")
+      api.close()
