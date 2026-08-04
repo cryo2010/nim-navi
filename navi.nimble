@@ -1,6 +1,6 @@
 # Package
 
-version       = "0.2.0"
+version       = "0.3.0"
 author        = "Craig Younker"
 description   = "An HTTP client with HTTP/1.1, HTTP/2, TLS and WebSocket support"
 license       = "MIT"
