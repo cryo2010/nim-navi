@@ -123,7 +123,7 @@ way its consumers will build it. These jobs are compile-only unless noted.
 Each stands up a real server (openssl `s_server`, the nghttp2 reference, or
 containers) and runs navi's client against it, exiting non-zero on failure. The
 per-PR ones live in the **`interop`**, **`multiserver`**, and **`httpbin`** CI
-jobs; the `interop` job runs the first six rows below as sequential steps under
+jobs; the `interop` job runs the first seven rows below as sequential steps under
 `set -e`, so any one failing turns the single `nghttpd interop (http/2)` check
 red (read the job log for the failing step).
 
@@ -135,6 +135,7 @@ red (read the job log for the failing step).
 | `tls_version.sh` → `tls_version.nim` | **yes** (`interop`) | TLS version pinning: TLS-1.2-only and TLS-1.3-only servers; a `minVersion`/`maxVersion` pin excluding the server's version fails the handshake |
 | `happy_eyeballs.sh` → `happy_eyeballs.nim` | **yes** (`interop`) | Happy Eyeballs (RFC 8305): a blackholed first address (192.0.2.1, SYN dropped) plus a good server; navi races the addresses and reaches the good one in ~the attempt delay instead of stalling |
 | `cipher_suite.sh` → `cipher_suite.nim` | **yes** (`interop`) | Cipher selection: servers pinned to one TLS 1.2 cipher and one TLS 1.3 ciphersuite; `TlsConfig.ciphers`/`cipherSuites` honored (matching name connects, non-matching fails the handshake) |
+| `ca_verify.sh` → `ca_verify.nim` | **yes** (`interop`) | Private-CA verification (sync): a server cert signed by a throwaway CA; navi trusts it via `TlsConfig.caFile` and rejects the same server without the CA (system trust lacks that root) |
 | `servers.sh` → `servers_{sync,async}.nim` | **yes** (`multiserver`) | h2 client against three unrelated stacks (nginx, Caddy/Go, h2o) over TLS via docker compose, plus the chronos h1+TLS leg; ALPN negotiation and a 256 KiB body (receive flow control) |
 | `httpbin.sh` → `httpbin_test.nim`, `httpbin_js.nim` | **yes** (`httpbin`) | Full httpbin breadth (every method, bodies, auth, redirects, decompression, cookies, streaming) behind Caddy (TLS+h2) across all four backends; offline (never published to the host) |
 | `badssl.nim` (`badssl.yml`) | **yes** (`badssl TLS conformance`) | Certificate-verification conformance: navi rejects invalid server certs with verification on (the default) and accepts a valid one. Hits badssl.com (network) |
