@@ -35,6 +35,8 @@ tests/interop/tls_version
 tests/interop/happy_eyeballs
 tests/interop/cipher_suite
 tests/interop/ca_verify
+tests/interop/streaming_client
+tests/interop/streaming_server
 tests/test_ws_async
 tests/test_ws_chronos
 tests/interop/jsws_server

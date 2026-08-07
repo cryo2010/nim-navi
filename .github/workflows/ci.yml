@@ -214,6 +214,35 @@ jobs:
       - name: Run the private-CA verification test
         run: bash tests/interop/ca_verify.sh
 
+  streaming:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        proto: [http1, http2]
+        dir: [upload, download]
+    name: file streaming (${{ matrix.proto }} ${{ matrix.dir }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install checksums
+        run: nimble install -y checksums
+
+      # http/2 uses nghttpd; http/1.1 uses a local Nim server. Installing nghttpd
+      # for both keeps the step uniform.
+      - name: Install nghttpd
+        run: sudo apt-get update && sudo apt-get install -y nghttp2-server
+
+      # Streams a 3 MiB file over the matrix protocol/direction and asserts the
+      # transfer used that protocol and the bytes hash-match the original.
+      - name: Run the file-streaming check
+        run: bash tests/interop/streaming.sh ${{ matrix.proto }} ${{ matrix.dir }}
+
   multiserver:
     runs-on: ubuntu-latest
     name: multi-server interop (nginx/caddy/h2o)
