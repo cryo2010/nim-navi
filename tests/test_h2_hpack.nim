@@ -59,18 +59,27 @@ suite "hpack decode rejects malformed input without crashing":
   test "the HPACK decoder should raise when a string length runs past the end of the block":
     var dec = initHpackDecoder()
     # literal-with-indexing whose value length runs past the buffer (fuzz-found)
-    expect ValueError:
+    var msg = ""
+    try:
       discard dec.decode(hex("a20f0b0d04c36ed80e71e0fd77"))
+    except ValueError as e: msg = e.msg
+    check "hpack:" in msg
 
   test "the HPACK decoder should raise on a truncated integer continuation":
     var dec = initHpackDecoder()
-    expect ValueError:
+    var msg = ""
+    try:
       discard dec.decode("\xff")  # indexed field, all-ones prefix, no continuation
+    except ValueError as e: msg = e.msg
+    check "hpack:" in msg
 
   test "the HPACK decoder should raise on an oversized integer instead of overflowing":
     var dec = initHpackDecoder()
-    expect ValueError:
+    var msg = ""
+    try:
       discard dec.decode("\x3f" & "\xff".repeat(8))  # table-size update, huge int
+    except ValueError as e: msg = e.msg
+    check "integer too large" in msg
 
 suite "hpack decode enforces DoS bounds":
   # Encode an HPACK integer with `prefixBits` and the given top-bit flag, so the
@@ -89,8 +98,11 @@ suite "hpack decode enforces DoS bounds":
 
   test "the HPACK decoder should reject a dynamic table size update above the advertised maximum (RFC 7541 6.3)":
     var dec = initHpackDecoder(maxSize = 4096)     # advertised table max
-    expect ValueError:                              # RFC 7541 6.3 -> COMPRESSION_ERROR
+    var msg = ""                                    # RFC 7541 6.3 -> COMPRESSION_ERROR
+    try:
       discard dec.decode(hpackInt(100_000, 5, 0x20))
+    except ValueError as e: msg = e.msg
+    check "exceeds the advertised maximum" in msg
 
   test "the HPACK decoder should accept a table size update at or below the maximum":
     var dec = initHpackDecoder(maxSize = 4096)
@@ -101,8 +113,11 @@ suite "hpack decode enforces DoS bounds":
     # Many 1-byte indexed references to static entry 2 (":method", "GET"): each
     # accounts for ~35 octets, so this blows the 4 KiB budget and must raise
     # rather than expand the seq without limit.
-    expect ValueError:
+    var msg = ""
+    try:
       discard dec.decode(hpackInt(2, 7, 0x80).repeat(1000))
+    except ValueError as e: msg = e.msg
+    check "decoded header list" in msg
 
   test "the HPACK decoder should keep a normal header list well under the default budget":
     var dec = initHpackDecoder()

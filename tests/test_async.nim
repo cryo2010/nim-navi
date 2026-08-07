@@ -1,7 +1,7 @@
 ## End-to-end test of the asyncdispatch entry module.
 
 import unittest
-import std/asyncdispatch
+import std/[asyncdispatch, strutils]
 import navi/asyncdispatch
 import ./support
 
@@ -41,8 +41,11 @@ suite "asyncdispatch entry end to end":
       await sleepAsync(50)                # let the request reach the hung server
       tok.cancel()
       discard await f
-    expect RequestCancelledError:
+    var msg = ""
+    try:
       waitFor run()
+    except RequestCancelledError as e: msg = e.msg
+    check "cancelled" in msg
     joinThread(th)
 
   test "closure middleware should capture config and modify the request":

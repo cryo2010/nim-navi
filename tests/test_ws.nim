@@ -69,8 +69,11 @@ suite "websocket frame codec":
     var d: WsDecoder
     d.feed("\x83\x00")            # FIN + opcode 0x3 (reserved), unmasked, len 0
     var f: Frame
-    expect ValueError:
+    var msg = ""
+    try:
       discard d.next(f)
+    except ValueError as e: msg = e.msg
+    check "reserved WebSocket opcode" in msg
 
 suite "websocket close":
   test "the close payload should carry the big-endian code then the reason":

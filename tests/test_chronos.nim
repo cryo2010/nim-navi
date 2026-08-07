@@ -1,6 +1,7 @@
 ## End-to-end test of the chronos entry module.
 
 import unittest
+import std/strutils
 import pkg/chronos
 import navi/chronos
 import ./support
@@ -29,8 +30,11 @@ suite "chronos entry end to end":
       await sleepAsync(50.milliseconds)  # let the request reach the hung server
       tok.cancel()
       discard await f
-    expect RequestCancelledError:
+    var msg = ""
+    try:
       waitFor run(newNavi(), "http://127.0.0.1:" & $port & "/")
+    except RequestCancelledError as e: msg = e.msg
+    check "cancelled" in msg
     joinThread(th)
 
   test "closure middleware should capture config and modify the request":
@@ -57,12 +61,18 @@ suite "chronos TLS config":
     var cfg = initNaviConfig()
     cfg.tls.ciphers = "ECDHE-RSA-AES128-GCM-SHA256"
     let api = newNavi(cfg)
-    expect ValueError:
+    var msg = ""
+    try:
       discard waitFor api.get("https://127.0.0.1:1/")
+    except ValueError as e: msg = e.msg
+    check "cipher selection" in msg
 
   test "the chronos backend should reject cipherSuites selection rather than ignore it":
     var cfg = initNaviConfig()
     cfg.tls.cipherSuites = "TLS_AES_128_GCM_SHA256"
     let api = newNavi(cfg)
-    expect ValueError:
+    var msg = ""
+    try:
       discard waitFor api.get("https://127.0.0.1:1/")
+    except ValueError as e: msg = e.msg
+    check "cipher selection" in msg
