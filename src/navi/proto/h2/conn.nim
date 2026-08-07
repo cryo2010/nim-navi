@@ -32,6 +32,8 @@ type
     hdrEndStream: bool
     sawFinal: bool        ## the final (non-1xx) response HEADERS block has arrived
     recvPending: int      ## received bytes not yet acked with a WINDOW_UPDATE
+    bodyTotal: int        ## total body bytes received (for the size cap; `resp.body`
+                          ## is drained incrementally by `takeBody`)
     sendBuf: string       ## request body not yet on the wire (flow-control bound)
     sendOff: int          ## bytes of sendBuf already sent
     sendWindow: int       ## per-stream send window (peer's INITIAL_WINDOW_SIZE)
@@ -319,7 +321,8 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
       var data = f.payload
       if (f.flags and flagPadded) != 0 and not c.unpad(f, data, outbuf): return
       s.resp.body.add data
-      if c.maxBodyBytes > 0 and s.resp.body.len > c.maxBodyBytes:  # over the size cap: RST
+      s.bodyTotal += data.len
+      if c.maxBodyBytes > 0 and s.bodyTotal > c.maxBodyBytes:  # over the size cap: RST
         outbuf.add encodeRstStream(f.streamId, errCancel)
         s.reset = true; s.ended = true; s.tooLarge = true
         c.replenishConn(f.payload.len, outbuf)   # still owe the connection window
@@ -392,6 +395,24 @@ proc streamUnprocessed*(c: H2Conn, streamId: uint32): bool =
   ## safe to retry even a non-idempotent method.
   let s = c.streams.getOrDefault(streamId)
   (s != nil and s.refused) or (c.goneAway and streamId > c.goAwayLastId)
+
+proc takeBody*(c: H2Conn, streamId: uint32): string =
+  ## Drain and return the response-body bytes buffered for `streamId` so far, for
+  ## incremental delivery to a sink; clears the buffer so a large download stays
+  ## bounded rather than accumulating the whole body. (`respHeader` reads the
+  ## content-encoding to decode as chunks arrive.)
+  let s = c.streams.getOrDefault(streamId)
+  if s != nil and s.resp.body.len > 0:
+    result = move(s.resp.body)
+    s.resp.body = ""
+
+proc respHeader*(c: H2Conn, streamId: uint32, name: string): string =
+  ## A response header value once the HEADERS block has arrived (h2 field names
+  ## are lowercase, so `name` must be lowercase). "" if absent.
+  let s = c.streams.getOrDefault(streamId)
+  if s != nil:
+    for (k, v) in s.resp.headers:
+      if k == name: return v
 
 proc takeResponse*(c: H2Conn, streamId: uint32): H2Response =
   ## Return the stream's response and drop the stream.

@@ -85,11 +85,26 @@ template h2Stream(transport, h2, req, sink, decompress: typed): Response =
           if toSend.len > 0: await sendAll(transport, toSend)
     else:
       await sendAll(transport, h2.encodeRequest(sid, h2HeaderList(req), req.body))
+    # Deliver the body to the sink incrementally as DATA arrives (bounded memory),
+    # or buffer it for a non-streaming request. The decoder-wrapped sink is built
+    # once the response headers are in (so content-encoding is known); the loop
+    # runs once more after the END_STREAM feed, so the final chunk is delivered
+    # too. On the buffered path `takeBody` is never called, so the whole body
+    # accumulates in the connection as before.
+    var streamSink: BodySink = nil
     while not h2.streamDone(sid):
       let chunk = await recvSome(transport)
       if chunk.len == 0: break
       let toSend = h2.feed(chunk)
       if toSend.len > 0: await sendAll(transport, toSend)
+      if not sink.isNil:
+        let body = h2.takeBody(sid)
+        if body.len > 0:
+          if streamSink.isNil:
+            streamSink =
+              if decompress: decodingSink(h2.respHeader(sid, "content-encoding"), sink)
+              else: sink
+          {.cast(gcsafe).}: streamSink(body.toOpenArrayByte(0, body.high))
     let wasReset = h2.streamReset(sid)
     let tooLarge = h2.streamTooLarge(sid)
     let unprocessed = h2.streamUnprocessed(sid)
@@ -104,15 +119,7 @@ template h2Stream(transport, h2, req, sink, decompress: typed): Response =
       raise newException(UnprocessedError, "navi: http/2 request not processed")
     if wasReset or r.status == 0:  # reset, or gone away before a response
       raise newException(IOError, "navi: http/2 request did not complete")
-    if not sink.isNil and r.body.len > 0:
-      # The h2 body arrives buffered in the connection, so decode it in one pass
-      # here (consistent with the incremental h1 streaming path).
-      var payload = r.body
-      if decompress:
-        let dec = newStreamDecoder(r.headers.get("content-encoding"))
-        if dec != nil: payload = dec.update(payload.toOpenArrayByte(0, payload.high))
-      {.cast(gcsafe).}: sink(payload.toOpenArrayByte(0, payload.high))
-      r.body = ""
+    if not sink.isNil: r.body = ""  # delivered incrementally above
     r
 
 template poolTransport*(client, req, sink: typed): Response =

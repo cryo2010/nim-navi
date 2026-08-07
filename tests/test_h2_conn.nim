@@ -459,3 +459,37 @@ suite "h2 streaming request body":
     check dataBytes(out1) + dataBytes(out3) == 100_000  # the whole body, no more
     check c.sendDrained(sid)
     check lastFrameEndsStream(out3)                  # END_STREAM rides the tail
+
+suite "h2 incremental response body":
+  # The engine drains the body per feed via takeBody (bounded memory) instead of
+  # buffering the whole response, decoding content-encoding as chunks arrive.
+  let head = @[(":method", "GET"), (":scheme", "https"),
+               (":path", "/"), (":authority", "x")]
+  proc serverHeaders(sid: uint32, extra: seq[HeaderPair] = @[]): string =
+    let enc = HpackEncoder()
+    encodeHeaders(sid, enc.encode(@[(":status", "200")] & extra),
+                  endStream = false, endHeaders = true)
+
+  test "takeBody drains the body incrementally and respHeader reads a header":
+    let c = newServerConn()
+    let sid = c.openStream()
+    discard c.encodeRequest(sid, head, "")
+    discard c.feed(serverHeaders(sid, @[("content-encoding", "identity")]))
+    check c.respHeader(sid, "content-encoding") == "identity"
+    discard c.feed(encodeData(sid, "hello ", endStream = false))
+    check c.takeBody(sid) == "hello "
+    check c.takeBody(sid) == ""                      # nothing left until more arrives
+    discard c.feed(encodeData(sid, "world", endStream = true))
+    check c.takeBody(sid) == "world"
+    check c.streamEnded(sid)
+    check c.takeResponse(sid).body == ""            # drained, never buffered whole
+
+  test "the size cap counts total body bytes even when drained incrementally":
+    let c = newServerConn(maxBody = 10)
+    let sid = c.openStream()
+    discard c.encodeRequest(sid, head, "")
+    discard c.feed(serverHeaders(sid))
+    discard c.feed(encodeData(sid, repeat("x", 8), endStream = false))
+    check c.takeBody(sid).len == 8                  # drained; resp.body is now empty
+    discard c.feed(encodeData(sid, repeat("x", 8), endStream = false))  # total 16 > 10
+    check c.streamTooLarge(sid)                     # cap tracks the running total, not the buffer
