@@ -114,6 +114,13 @@ task caVerify, "Private-CA (TlsConfig.caFile) verification, sync backend (needs 
   # reject it without the CA (private root is not in the system trust store).
   exec "bash tests/interop/ca_verify.sh"
 
+task streaming, "File-streaming interop: http1/http2 x upload/download (needs nghttpd + openssl)":
+  # Streams a 3 MiB file each way over each protocol and asserts the transfer used
+  # that protocol and hash-matches the original. Mirrors the four CI checks.
+  for proto in ["http1", "http2"]:
+    for dir in ["upload", "download"]:
+      exec "bash tests/interop/streaming.sh " & proto & " " & dir
+
 task servers, "Multi-server HTTP/2 interop: nginx, Caddy, h2o (needs Docker + openssl)":
   # Runs navi's h2 client (and chronos h1) against three unrelated server stacks.
   exec "bash tests/interop/servers.sh"
