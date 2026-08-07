@@ -85,7 +85,7 @@ proc close*(client: Navi): Future[void] {.async.} =
 
 proc muxRequest(client: Navi, mux: H2Mux, req: Request,
                 sink: BodySink): Future[Response] {.async.} =
-  var r = toResponse(await mux.request(h2HeaderList(req), req.body))
+  var r = toResponse(await mux.request(h2HeaderList(req), req.body, req.bodyStream))
   # For a streaming request the h2 body is buffered by the mux; decode it once
   # before handing it to the sink (the buffered path decodes via decodeBody).
   if not sink.isNil and client.config.wantsDecompress and r.body.len > 0:
