@@ -208,6 +208,12 @@ jobs:
       - name: Run the cipher-suite selection test
         run: bash tests/interop/cipher_suite.sh
 
+      # Private-CA verification: a server cert signed by a throwaway CA; navi
+      # must verify it against TlsConfig.caFile and reject the same server when
+      # it falls back to the system trust store (which lacks that CA).
+      - name: Run the private-CA verification test
+        run: bash tests/interop/ca_verify.sh
+
   multiserver:
     runs-on: ubuntu-latest
     name: multi-server interop (nginx/caddy/h2o)
