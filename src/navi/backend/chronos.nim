@@ -121,7 +121,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
       raise
 
   if connectMs > 0:
-    if not await withTimeout(establish(), connectMs):
+    if not await withTimeout(establish(), connectMs.milliseconds):
       raise newException(response.TimeoutError,
                          "navi: connect timed out after " & $connectMs & " ms")
   else:
@@ -140,7 +140,7 @@ proc recvSome*(c: Conn): Future[string] {.async.} =
   try:
     if c.readMs > 0:
       let fut = c.reader.readOnce(addr buf[0], buf.len)
-      if not await withTimeout(fut, c.readMs):
+      if not await withTimeout(fut, c.readMs.milliseconds):
         raise newException(response.TimeoutError,
                            "navi: read timed out after " & $c.readMs & " ms")
       n = await fut
