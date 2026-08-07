@@ -15,7 +15,7 @@ fall into six groups:
 
 The **CI** column says which check runs it on every PR (see
 `.github/workflows/`). "local" means it is not wired into per-PR CI and is run on
-demand; "nightly" runs on a schedule. A green PR is **25 checks**: 14 from
+demand; "nightly" runs on a schedule. A green PR is **29 checks**: 18 from
 `ci.yml`, 10 from `fuzz.yml`, 1 from `badssl.yml` (`live.yml` is nightly only).
 
 ## Running at a glance
@@ -125,22 +125,52 @@ containers) and runs navi's client against it, exiting non-zero on failure. The
 per-PR ones live in the **`interop`**, **`multiserver`**, and **`httpbin`** CI
 jobs; the `interop` job runs the first seven rows below as sequential steps under
 `set -e`, so any one failing turns the single `nghttpd interop (http/2)` check
-red (read the job log for the failing step).
+red (read the job log for the failing step). File streaming additionally has its
+own **`streaming`** matrix job (four separate checks) — see the row below and the
+[File streaming](#file-streaming) coverage summary.
 
 | Suite (script → driver) | CI | Verifies |
 |------|----|----------|
-| `run.sh` → `nghttpd_{sync,async}.nim` | **yes** (`interop`) | HTTP/2 against nghttpd (nghttp2 reference): navi's HPACK **encoder**, ALPN, real h2 wire framing, multiplexing, receive-side flow control, and PADDED-flag handling (a second nghttpd runs with `-b` padding) |
+| `run.sh` → `nghttpd_{sync,async}.nim` | **yes** (`interop`) | HTTP/2 against nghttpd (nghttp2 reference): navi's HPACK **encoder**, ALPN, real h2 wire framing, multiplexing, receive-side flow control, PADDED-flag handling (a second nghttpd runs with `-b` padding), and a streamed `bodyStream` upload over h2 (sync and the async mux) |
 | `mtls.sh` → `mtls.nim` | **yes** (`interop`) | Mutual TLS: an `openssl s_server -Verify 1` rejects clients without a CA-signed cert, exercising `TlsConfig.certFile`/`keyFile` |
 | `tls_fallback.sh` → `tls_fallback.nim` | **yes** (`interop`) | Handshake-aware address fallback (sync): a dead endpoint (accepts TCP then drops the handshake) plus a good TLS server on the same port; navi falls through to the good address |
 | `tls_version.sh` → `tls_version.nim` | **yes** (`interop`) | TLS version pinning: TLS-1.2-only and TLS-1.3-only servers; a `minVersion`/`maxVersion` pin excluding the server's version fails the handshake |
 | `happy_eyeballs.sh` → `happy_eyeballs.nim` | **yes** (`interop`) | Happy Eyeballs (RFC 8305): a blackholed first address (192.0.2.1, SYN dropped) plus a good server; navi races the addresses and reaches the good one in ~the attempt delay instead of stalling |
 | `cipher_suite.sh` → `cipher_suite.nim` | **yes** (`interop`) | Cipher selection: servers pinned to one TLS 1.2 cipher and one TLS 1.3 ciphersuite; `TlsConfig.ciphers`/`cipherSuites` honored (matching name connects, non-matching fails the handshake) |
 | `ca_verify.sh` → `ca_verify.nim` | **yes** (`interop`) | Private-CA verification (sync): a server cert signed by a throwaway CA; navi trusts it via `TlsConfig.caFile` and rejects the same server without the CA (system trust lacks that root) |
+| `streaming.sh` → `streaming_client.nim` (+ `streaming_server.nim` for h1) | **yes** (`file streaming …`, 4 checks) | File streaming (sync) as a matrix of protocol × direction: for http/1.1 (a local Nim server) and http/2 (nghttpd), upload via `bodyStream` and download via a `sink`. Each check asserts the transfer used that protocol (`res.httpVersion`) and the bytes hash-match a 3 MiB original |
 | `servers.sh` → `servers_{sync,async}.nim` | **yes** (`multiserver`) | h2 client against three unrelated stacks (nginx, Caddy/Go, h2o) over TLS via docker compose, plus the chronos h1+TLS leg; ALPN negotiation and a 256 KiB body (receive flow control) |
-| `httpbin.sh` → `httpbin_test.nim`, `httpbin_js.nim` | **yes** (`httpbin`) | Full httpbin breadth (every method, bodies, auth, redirects, decompression, cookies, streaming) behind Caddy (TLS+h2) across all four backends; offline (never published to the host) |
+| `httpbin.sh` → `httpbin_test.nim`, `httpbin_js.nim` | **yes** (`httpbin`) | Full httpbin breadth (every method, bodies, auth, redirects, decompression, cookies) behind Caddy (TLS+h2) across all four backends; also streaming download to a `sink` on all four and `bodyStream` upload on the native backends (buffered on js); offline (never published to the host) |
 | `badssl.nim` (`badssl.yml`) | **yes** (`badssl TLS conformance`) | Certificate-verification conformance: navi rejects invalid server certs with verification on (the default) and accepts a valid one. Hits badssl.com (network) |
 | `chronos_cafile.sh` → `chronos_cafile.nim` | local | Custom-CA verification for chronos/BearSSL (`TlsConfig.caFile`): a server cert signed by a private CA is verified against that CA (uses a dNSName SAN, which BearSSL matches) |
 | `live.nim` (`live.yml`) | nightly | Real public servers/CDNs (Google, Cloudflare, …) to catch h2/TLS bugs only independent stacks provoke. Network; never a per-PR gate |
+
+### File streaming
+
+Streaming is verified per **backend × direction**, always by hashing the transfer
+against the original. Upload uses a pull-based `bodyStream` producer; download
+uses a `sink` that receives chunks as they arrive.
+
+| | `navi` (sync) | `navi/asyncdispatch` | `navi/chronos` | `navi/js` |
+| --- | :---: | :---: | :---: | :---: |
+| Download (`sink`) | ✓ | ✓ | ✓ | ✓ |
+| Upload (`bodyStream`) | ✓ | ✓ | ✓ | ✓ buffered |
+
+Where each is exercised:
+
+- **Dedicated `streaming` job** (4 checks) — sync, both directions, over http/1.1
+  and http/2, asserting the protocol and a 3 MiB hash match (`streaming.sh`).
+- **httpbin job** — download to a `sink` on all four backends; `bodyStream` upload
+  on the three native backends, and buffered on js (`httpbin_test.nim` builds for
+  sync/async/chronos, `httpbin_js.nim` for js).
+- **nghttpd `interop` job** — streamed `bodyStream` upload over real h2 on the
+  sync backend and the async mux.
+- **Unit** — `test_entries` caps a streamed body incrementally and sends a chunked
+  upload; `test_stream_decompress` decodes a streamed body through the `sink`.
+
+`navi/js` **buffers** `bodyStream` (drains the producer, then sends one body):
+`fetch` cannot reliably stream a request body. See the backend matrix in the
+README.
 
 ---
 
