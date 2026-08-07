@@ -6,23 +6,23 @@ import navi/proto/ws
 import ./support   # hexToBytes
 
 suite "websocket handshake":
-  test "accept key matches the RFC 6455 section 1.3 example":
+  test "the handshake should compute the accept key from the client key (RFC 6455 1.3)":
     check acceptFor("dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
 
-  test "genKey is a fresh 16-byte base64 nonce":
+  test "the handshake should generate a fresh 16-byte base64 nonce key":
     check base64.decode(genKey()).len == 16
     check genKey() != genKey()
 
 suite "websocket frame codec":
-  test "encodes the RFC 6455 section 5.7 masked Hello example":
+  test "the frame codec should encode the masked Hello example (RFC 6455 5.7)":
     let wire = encodeFrame(opText, "Hello", masked = true,
                            maskKey = hexToBytes("37fa213d"))
     check wire == hexToBytes("818537fa213d7f9f4d5158")
 
-  test "encodes an unmasked server frame":
+  test "the frame codec should encode an unmasked server frame":
     check encodeFrame(opText, "Hello", masked = false) == hexToBytes("810548656c6c6f")
 
-  test "decodes a masked frame, unmasking the payload":
+  test "the frame codec should decode a masked frame and unmask the payload":
     var d: WsDecoder
     d.feed(hexToBytes("818537fa213d7f9f4d5158"))
     var f: Frame
@@ -31,7 +31,7 @@ suite "websocket frame codec":
     check f.opcode == opText
     check f.payload == "Hello"
 
-  test "round-trips binary data through a random mask":
+  test "the frame codec should round-trip binary data through a random mask":
     let payload = "raw \x00\x01\x02\xff bytes"
     var d: WsDecoder
     d.feed(encodeFrame(opBinary, payload))     # random mask key
@@ -40,7 +40,7 @@ suite "websocket frame codec":
     check f.opcode == opBinary
     check f.payload == payload
 
-  test "handles a 16-bit extended length":
+  test "the frame codec should decode a frame with a 16-bit extended length":
     let big = repeat("x", 1000)
     var d: WsDecoder
     d.feed(encodeFrame(opText, big))
@@ -48,7 +48,7 @@ suite "websocket frame codec":
     check d.next(f)
     check f.payload == big
 
-  test "waits for more bytes on a split frame":
+  test "the frame codec should wait for more bytes when a frame is split":
     let wire = encodeFrame(opText, "hello world")
     var d: WsDecoder
     d.feed(wire[0 ..< 4])
@@ -58,14 +58,14 @@ suite "websocket frame codec":
     check d.next(f)
     check f.payload == "hello world"
 
-  test "decodes two frames from one buffer":
+  test "the frame codec should decode two frames from one buffer":
     var d: WsDecoder
     d.feed(encodeFrame(opPing, "") & encodeFrame(opText, "hi"))
     var f: Frame
     check d.next(f) and f.opcode == opPing
     check d.next(f) and f.opcode == opText and f.payload == "hi"
 
-  test "rejects a reserved opcode (RFC 6455 5.2)":
+  test "the frame codec should reject a reserved opcode (RFC 6455 5.2)":
     var d: WsDecoder
     d.feed("\x83\x00")            # FIN + opcode 0x3 (reserved), unmasked, len 0
     var f: Frame
@@ -73,13 +73,13 @@ suite "websocket frame codec":
       discard d.next(f)
 
 suite "websocket close":
-  test "closePayload carries the big-endian code then the reason":
+  test "the close payload should carry the big-endian code then the reason":
     let p = closePayload(closeNormal, "bye")
     check ord(p[0]) == 0x03 and ord(p[1]) == 0xe8   # 1000
     check p[2 .. ^1] == "bye"
 
 suite "websocket message assembly":
-  test "reassembles a fragmented text message":
+  test "the message assembler should reassemble a fragmented text message":
     var a: WsAssembler
     check not a.offer(Frame(fin: false, opcode: opText, payload: "he")).ready
     let o = a.offer(Frame(fin: true, opcode: opContinuation, payload: "llo"))
@@ -87,14 +87,14 @@ suite "websocket message assembly":
     check o.message.kind == wmText
     check o.message.data == "hello"
 
-  test "a ping asks for a pong with the same payload":
+  test "the message assembler should answer a ping with a pong carrying the same payload":
     var a: WsAssembler
     let o = a.offer(Frame(fin: true, opcode: opPing, payload: "hi"))
     check o.reply == wrPong
     check o.replyPayload == "hi"
     check not o.ready
 
-  test "a close yields wmClose and asks for a close echo":
+  test "the message assembler should yield a close message and ask for a close echo":
     var a: WsAssembler
     let o = a.offer(Frame(fin: true, opcode: opClose,
                           payload: closePayload(closeNormal, "bye")))
@@ -163,7 +163,7 @@ proc wsEcho(port: int) {.thread.} =
   server.close()
 
 suite "websocket client end to end":
-  test "handshakes, echoes text and binary, reassembles fragments, closes":
+  test "the WebSocket client should handshake, echo text and binary, reassemble fragments, and close":
     const port = 8996
     var th: Thread[int]
     createThread(th, wsEcho, port)

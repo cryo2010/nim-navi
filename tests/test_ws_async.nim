@@ -60,7 +60,7 @@ proc wsEcho(port: int) {.thread.} =
   server.close()
 
 suite "async websocket client end to end":
-  test "handshakes, echoes text and binary, reassembles fragments, closes":
+  test "the WebSocket client should handshake, echo text and binary, reassemble fragments, and close":
     const port = 8997
     var th: Thread[int]
     createThread(th, wsEcho, port)

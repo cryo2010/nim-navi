@@ -6,7 +6,7 @@ import std/[strutils, options]
 import navi/core/digest
 
 suite "digest computation":
-  test "matches the RFC 2617 section 3.5 example":
+  test "the digest computation should match the worked example (RFC 2617 3.5)":
     let ch = parseChallenge(
       "Digest realm=\"testrealm@host.com\", qop=\"auth,auth-int\", " &
       "nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", " &
@@ -21,7 +21,7 @@ suite "digest computation":
     check "cnonce=\"0a4f113b\"" in header
     check "opaque=\"5ccc069c403ebaf9f0171e9517f40e41\"" in header
 
-  test "matches the RFC 7616 section 3.9.1 SHA-256 example":
+  test "the digest computation should match the SHA-256 worked example (RFC 7616 3.9.1)":
     let ch = parseChallenge(
       "Digest realm=\"http-auth@example.org\", qop=\"auth, auth-int\", " &
       "algorithm=SHA-256, " &
@@ -37,7 +37,7 @@ suite "digest computation":
     check "algorithm=SHA-256" in header
     check "qop=auth" in header
 
-  test "an unsupported algorithm yields no header (rather than a mismatched one)":
+  test "digestAuthHeader should yield no header when the algorithm is unsupported":
     # SHA-512-256 is not implemented; answering with an MD5 digest while echoing
     # algorithm=SHA-512-256 would be a header the server rejects, so refuse it.
     let ch = parseChallenge(
@@ -45,7 +45,7 @@ suite "digest computation":
     check ch.isSome
     check digestAuthHeader("u", "p", "GET", "/", ch.get) == ""
 
-  test "bestChallenge prefers SHA-256 when both MD5 and SHA-256 are offered":
+  test "bestChallenge should prefer SHA-256 when both MD5 and SHA-256 are offered":
     let md5 = "Digest realm=\"r\", nonce=\"n-md5\", algorithm=MD5, qop=\"auth\""
     let sha = "Digest realm=\"r\", nonce=\"n-sha\", algorithm=SHA-256, qop=\"auth\""
     for order in [@[md5, sha], @[sha, md5]]:   # independent of header order
@@ -54,21 +54,21 @@ suite "digest computation":
       check ch.get.algorithm == "SHA-256"
       check ch.get.nonce == "n-sha"
 
-  test "bestChallenge falls back to MD5 when it is the only supported offer":
+  test "bestChallenge should fall back to MD5 when it is the only supported offer":
     let ch = bestChallenge(@[
       "Digest realm=\"r\", nonce=\"n\", algorithm=SHA-512-256",  # unsupported
       "Digest realm=\"r\", nonce=\"n\", algorithm=MD5"])
     check ch.isSome
     check ch.get.algorithm == "MD5"
 
-  test "bestChallenge returns none when no offer is answerable":
+  test "bestChallenge should return none when no offer is answerable":
     check bestChallenge(@["Digest realm=\"r\", nonce=\"n\", algorithm=SHA-512-256",
                           "Basic realm=\"r\""]).isNone
 
-  test "parseChallenge ignores a non-Digest scheme":
+  test "parseChallenge should ignore a non-Digest scheme":
     check parseChallenge("Basic realm=\"x\"").isNone
 
-  test "the legacy no-qop form omits qop, nc, and cnonce":
+  test "digestAuthHeader should omit qop, nc, and cnonce when the challenge has no qop":
     let ch = parseChallenge("Digest realm=\"r\", nonce=\"n\"")
     let header = digestAuthHeader("u", "p", "GET", "/", ch.get)
     check "qop" notin header
@@ -157,7 +157,7 @@ proc serveDigestMulti(port: int) {.thread.} =
   server.close()
 
 suite "digest auth end to end":
-  test "answers a 401 Digest challenge and retries with credentials":
+  test "the client should answer a 401 Digest challenge and retry with credentials":
     const port = 8992
     var th: Thread[int]
     createThread(th, serveDigest, port)
@@ -171,7 +171,7 @@ suite "digest auth end to end":
     check res.body == "welcome"
     joinThread(th)
 
-  test "answers the SHA-256 challenge when the server also offers MD5":
+  test "the client should answer the SHA-256 challenge when the server also offers MD5":
     const port = 8993
     var th: Thread[int]
     createThread(th, serveDigestMulti, port)

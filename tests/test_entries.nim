@@ -38,7 +38,7 @@ proc serve(port: int) {.thread.} =
   server.close()
 
 suite "sync entry end to end":
-  test "GET localhost returns parsed response":
+  test "get should return a parsed response":
     const port = 8971
     var th: Thread[int]
     createThread(th, serve, port)
@@ -52,7 +52,7 @@ suite "sync entry end to end":
     check res.data["ok"].getBool()
     joinThread(th)
 
-  test "reuses a pooled connection for the same origin":
+  test "get should reuse a pooled connection for the same origin":
     const port = 8974
     var accepts = 0
     var th: Thread[KeepAliveCtx]
@@ -71,7 +71,7 @@ suite "sync entry end to end":
     joinThread(th)
     check accepts == 1  # both requests used the one connection
 
-  test "close drains the connection pool":
+  test "close should drain the connection pool":
     const port = 8995
     var accepts = 0
     var th: Thread[KeepAliveCtx]
@@ -85,7 +85,7 @@ suite "sync entry end to end":
     check api.pool.idleCount(key) == 0     # drained (and the socket closed)
     joinThread(th)
 
-  test "stream delivers the response body to a sink and leaves body empty":
+  test "stream should deliver the response body to a sink and leave body empty":
     const port = 8975
     var th: Thread[ServerCtx]
     startServer(th, port)  # responds with {"ok":true}, content-length 11
@@ -100,7 +100,7 @@ suite "sync entry end to end":
     check collected == """{"ok":true}"""
     joinThread(th)
 
-  test "streaming upload sends a chunked body the server reassembles":
+  test "streaming upload should send a chunked body the server reassembles":
     const port = 8976
     var th: Thread[ServerCtx]
     startUploadEcho(th, port)
@@ -117,7 +117,7 @@ suite "sync entry end to end":
     check res.body == "hello streaming world"
     joinThread(th)
 
-  test "connects over IPv6 loopback":
+  test "the client should connect over IPv6 loopback":
     const port = 8977
     var th: Thread[ServerCtx]
     startServer(th, port, ipv6 = true)
@@ -128,7 +128,7 @@ suite "sync entry end to end":
     check res.data["ok"].getBool()
     joinThread(th)
 
-  test "transparently decompresses a gzip response body":
+  test "the client should transparently decompress a gzip response body":
     const port = 8978
     # gzip -n of {"ok":true}
     let gz = hexToBytes("1f8b0800000000000003ab56cacf56b22a292a4dad0500905fd4a70b000000")
@@ -147,7 +147,7 @@ suite "sync entry end to end":
     check not res.headers.contains("content-encoding")  # header dropped
     joinThread(th)
 
-  test "transparently decompresses a brotli response body":
+  test "the client should transparently decompress a brotli response body":
     const port = 8968
     let br = hexToBytes("0f05807b226f6b223a747275657d03")   # brotli of {"ok":true}
     let payload = "HTTP/1.1 200 OK\r\nContent-Encoding: br\r\n" &
@@ -160,7 +160,7 @@ suite "sync entry end to end":
     check res.body == """{"ok":true}"""
     joinThread(th)
 
-  test "transparently decompresses a zstd response body":
+  test "the client should transparently decompress a zstd response body":
     const port = 8969
     let zst = hexToBytes("28b52ffd04585900007b226f6b223a747275657d6abe13c7")  # zstd
     let payload = "HTTP/1.1 200 OK\r\nContent-Encoding: zstd\r\n" &
@@ -173,7 +173,7 @@ suite "sync entry end to end":
     check res.body == """{"ok":true}"""
     joinThread(th)
 
-  test "raises HttpError on a non-2xx response":
+  test "the client should raise HttpError when the response is non-2xx":
     const port = 8979
     let payload = "HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\nConnection: close\r\n\r\nno!"
     var th: Thread[ServerCtx]
@@ -190,7 +190,7 @@ suite "sync entry end to end":
     check raised
     joinThread(th)
 
-  test "throwHttpErrors = false returns the non-2xx response":
+  test "the client should return the non-2xx response when throwHttpErrors is false":
     const port = 8980
     let payload = "HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\nConnection: close\r\n\r\nno!"
     var th: Thread[ServerCtx]
@@ -204,7 +204,7 @@ suite "sync entry end to end":
     check res.body == "no!"
     joinThread(th)
 
-  test "follows a 302 redirect to the final response":
+  test "the client should follow a 302 redirect to the final response":
     const port = 8981
     var th: Thread[ServerCtx]
     startRedirect(th, port)
@@ -215,7 +215,7 @@ suite "sync entry end to end":
     check res.body == "arrived"
     joinThread(th)
 
-  test "maxRedirects = 0 does not follow and surfaces the 3xx":
+  test "the client should not follow and should surface the 3xx when maxRedirects is 0":
     const port = 8982
     let payload = "HTTP/1.1 302 Found\r\nLocation: /final\r\n" &
                   "Content-Length: 0\r\nConnection: close\r\n\r\n"
@@ -231,7 +231,7 @@ suite "sync entry end to end":
     check res.headers.get("location") == "/final"
     joinThread(th)
 
-  test "post json= encodes the body and sets content-type":
+  test "post should encode the body and set content-type when json is given":
     const port = 8983
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)
@@ -242,7 +242,7 @@ suite "sync entry end to end":
     check res.headers.get("x-echo-content-type") == "application/json"
     joinThread(th)
 
-  test "post form= url-encodes the body and sets content-type":
+  test "post should url-encode the body and set content-type when form is given":
     const port = 8984
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)
@@ -254,7 +254,7 @@ suite "sync entry end to end":
     check res.headers.get("x-echo-content-type") == "application/x-www-form-urlencoded"
     joinThread(th)
 
-  test "post multipart= builds a multipart/form-data body":
+  test "post should build a multipart/form-data body when multipart is given":
     const port = 8994
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)
@@ -276,7 +276,7 @@ suite "sync entry end to end":
       "--" & boundary & "--\r\n"
     joinThread(th)
 
-  test "bearer auth sets the Authorization header":
+  test "bearerAuth should set the Authorization header":
     const port = 8985
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)
@@ -288,7 +288,7 @@ suite "sync entry end to end":
     check res.headers.get("x-echo-authorization") == "Bearer secret-token"
     joinThread(th)
 
-  test "basic auth base64-encodes credentials":
+  test "basicAuth should base64-encode credentials":
     const port = 8986
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)
@@ -300,7 +300,7 @@ suite "sync entry end to end":
     check res.headers.get("x-echo-authorization") == "Basic dXNlcjpwYXNz"
     joinThread(th)
 
-  test "retries a 503 then succeeds":
+  test "the client should retry a 503 and then succeed":
     const port = 8987
     var th: Thread[ServerCtx]
     startRetry(th, port, failures = 1)
@@ -311,7 +311,7 @@ suite "sync entry end to end":
     check res.body == "recovered"
     joinThread(th)
 
-  test "maxRetries = 0 returns the failing response without retrying":
+  test "the client should return the failing response without retrying when retry limit is 0":
     const port = 8988
     let payload = "HTTP/1.1 503 Service Unavailable\r\n" &
                   "Content-Length: 0\r\nConnection: close\r\n\r\n"
@@ -326,7 +326,7 @@ suite "sync entry end to end":
     check res.status == 503
     joinThread(th)
 
-  test "times out a stalled response":
+  test "the client should time out when the response is stalled":
     const port = 8996
     var th: Thread[ServerCtx]
     startHang(th, port)  # accepts, reads the request, never replies
@@ -343,7 +343,7 @@ suite "sync entry end to end":
     check raised
     joinThread(th)
 
-  test "parallel times out a stalled response":
+  test "parallel should time out when the response is stalled":
     const port = 8997
     var th: Thread[ServerCtx]
     startHang(th, port)
@@ -359,7 +359,7 @@ suite "sync entry end to end":
     check raised
     joinThread(th)
 
-  test "middleware modifies the request and observes the response":
+  test "middleware should modify the request and observe the response":
     const port = 8989
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)
@@ -373,7 +373,7 @@ suite "sync entry end to end":
     check observed[] == 200
     joinThread(th)
 
-  test "middleware can short-circuit without sending a request":
+  test "middleware should short-circuit without sending a request":
     # No server here: if the request were dialed it would fail to connect, so a
     # 299 proves `ctx.next()` was never called.
     var cfg = initNaviConfig()
@@ -383,7 +383,7 @@ suite "sync entry end to end":
     check res.status == 299
     check res.body == "from middleware"
 
-  test "stores a Set-Cookie and replays it on the next request":
+  test "the client should store a Set-Cookie and replay it on the next request":
     const port = 8990
     var th: Thread[ServerCtx]
     startCookies(th, port)
@@ -394,7 +394,7 @@ suite "sync entry end to end":
     check res.body == "sid=abc123"
     joinThread(th)
 
-  test "routes an http request through a proxy with an absolute-URI":
+  test "the client should route an http request through a proxy with an absolute-URI":
     const port = 8991
     var th: Thread[ServerCtx]
     startProxy(th, port)
@@ -407,7 +407,7 @@ suite "sync entry end to end":
     check res.body == "http://example.test/path?q=1"  # proxy saw the absolute URI
     joinThread(th)
 
-  test "parallel fetches multiple same-origin URLs over one connection":
+  test "parallel should fetch multiple same-origin URLs over one connection":
     const port = 8993
     var accepts = 0
     var th: Thread[KeepAliveCtx]
@@ -424,7 +424,7 @@ suite "sync entry end to end":
     joinThread(th)
     check accepts == 1  # all three reused the one connection
 
-  test "options sends an OPTIONS request":
+  test "options should send an OPTIONS request":
     const port = 8994
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)
@@ -435,7 +435,7 @@ suite "sync entry end to end":
     check res.headers.get("x-echo-method") == "OPTIONS"
     joinThread(th)
 
-  test "extend layers headers and prefixUrl":
+  test "extend should layer headers and prefixUrl":
     var bcfg = initNaviConfig()
     bcfg.headers = initHeaders({"x-base": "1"})
     let base = newNavi(bcfg)
@@ -445,7 +445,7 @@ suite "sync entry end to end":
     check child.config.prefixUrl == "http://api.test"
     check child.config.headers.get("x-base") == "1"
 
-  test "params (map-like @{}) appends an encoded query string to the target":
+  test "params should append an encoded query string to the target when given a map-like @{}":
     const port = 8951
     var th: Thread[ServerCtx]
     startEchoLine(th, port)
@@ -457,7 +457,7 @@ suite "sync entry end to end":
     check res.body == "GET /search?q=test&n=2 HTTP/1.1"
     joinThread(th)
 
-  test "params accepts an OrderedTable (order preserved)":
+  test "params should accept an OrderedTable and preserve order":
     const port = 8950
     var th: Thread[ServerCtx]
     startEchoLine(th, port)
@@ -469,7 +469,7 @@ suite "sync entry end to end":
     check res.body == "GET /search?q=test&n=2 HTTP/1.1"
     joinThread(th)
 
-  test "maxResponseBytes rejects an oversized buffered body":
+  test "maxResponseBytes should reject an oversized buffered body":
     const port = 8952
     let payload = "HTTP/1.1 200 OK\r\nContent-Length: 50\r\n" &
                   "Connection: close\r\n\r\n" & repeat('x', 50)
@@ -483,7 +483,7 @@ suite "sync entry end to end":
       discard api.get("http://127.0.0.1:" & $port & "/")
     joinThread(th)
 
-  test "maxResponseBytes allows a body within the limit":
+  test "maxResponseBytes should allow a body within the limit":
     const port = 8953
     let payload = "HTTP/1.1 200 OK\r\nContent-Length: 50\r\n" &
                   "Connection: close\r\n\r\n" & repeat('x', 50)
@@ -497,7 +497,7 @@ suite "sync entry end to end":
     check res.body.len == 50
     joinThread(th)
 
-  test "maxResponseBytes caps a streamed body incrementally":
+  test "maxResponseBytes should cap a streamed body incrementally":
     const port = 8954
     let payload = "HTTP/1.1 200 OK\r\nContent-Length: 50\r\n" &
                   "Connection: close\r\n\r\n" & repeat('y', 50)
@@ -512,7 +512,7 @@ suite "sync entry end to end":
         sink = proc(data: openArray[byte]) = discard)
     joinThread(th)
 
-  test "retry statuses are configurable":
+  test "retry statuses should be configurable so an ineligible status is not retried":
     const port = 8955
     let payload = "HTTP/1.1 503 Service Unavailable\r\n" &
                   "Content-Length: 0\r\nConnection: close\r\n\r\n"
@@ -527,14 +527,14 @@ suite "sync entry end to end":
     check res.status == 503
     joinThread(th)
 
-  test "a cancelled token aborts before dispatch":
+  test "the client should abort before dispatch when the cancel token is cancelled":
     let api = newNavi()
     let tok = newCancelToken()
     tok.cancel()
     expect RequestCancelledError:
       discard api.get("http://127.0.0.1:1/", cancel = tok)
 
-  test "an un-cancelled token leaves the request unaffected":
+  test "the client should leave the request unaffected when the cancel token is un-cancelled":
     const port = 8956
     var th: Thread[ServerCtx]
     startServer(th, port)
@@ -545,7 +545,7 @@ suite "sync entry end to end":
     joinThread(th)
 
 suite "TLS session resumption config":
-  test "resumption is on by default and allocates a per-client session cache":
+  test "resumeSessions should be on by default and allocate a per-client session cache":
     check initNaviConfig().tls.resumeSessions
     let api = newNavi()
     when defined(ssl):
@@ -553,13 +553,13 @@ suite "TLS session resumption config":
     else:
       check api.config.tls.sessionCache.isNil   # no OpenSSL, no cache
 
-  test "resumeSessions = false leaves no session cache":
+  test "the client should leave no session cache when resumeSessions is false":
     var cfg = initNaviConfig()
     cfg.tls.resumeSessions = false
     let api = newNavi(cfg)
     check api.config.tls.sessionCache.isNil
 
-  test "extend gives the derived client its own cache":
+  test "extend should give the derived client its own cache":
     let parent = newNavi()
     let child = parent.extend(initNaviConfig())
     when defined(ssl):
@@ -567,7 +567,7 @@ suite "TLS session resumption config":
       check not (child.config.tls.sessionCache == parent.config.tls.sessionCache)
 
 suite "per-phase timeouts":
-  test "resolvers read the struct; total falls back to legacy timeout":
+  test "timeout resolvers should read the struct and fall back to the legacy timeout for total":
     var cfg = initNaviConfig()
     check (cfg.connectMs, cfg.readMs, cfg.totalMs) == (0, 0, 0)
     cfg.timeout = 500
@@ -575,7 +575,7 @@ suite "per-phase timeouts":
     cfg.timeouts = Timeouts(connect: 100, read: 200, total: 300)
     check (cfg.connectMs, cfg.readMs, cfg.totalMs) == (100, 200, 300)
 
-  test "read timeout fires on a stalled response":
+  test "the read timeout should fire when the response is stalled":
     const port = 8998
     var th: Thread[ServerCtx]
     startHang(th, port)
@@ -589,7 +589,7 @@ suite "per-phase timeouts":
     check raised
     joinThread(th)
 
-  test "total timeout fires on a stalled response":
+  test "the total timeout should fire when the response is stalled":
     const port = 8999
     var th: Thread[ServerCtx]
     startHang(th, port)
@@ -604,7 +604,7 @@ suite "per-phase timeouts":
     joinThread(th)
 
 suite "TLS version pinning config":
-  test "min/max default to tlsDefault and are settable":
+  test "tls minVersion and maxVersion should default to tlsDefault and be settable":
     var cfg = initNaviConfig()
     check cfg.tls.minVersion == tlsDefault
     check cfg.tls.maxVersion == tlsDefault
@@ -614,7 +614,7 @@ suite "TLS version pinning config":
     check cfg.tls.maxVersion == tls13
 
 suite "TLS cipher selection config":
-  test "ciphers/cipherSuites default empty and are settable":
+  test "ciphers and cipherSuites should default empty and be settable":
     var cfg = initNaviConfig()
     check cfg.tls.ciphers == "" and cfg.tls.cipherSuites == ""
     cfg.tls.ciphers = "ECDHE-RSA-AES128-GCM-SHA256"
@@ -626,7 +626,7 @@ suite "TLS cipher selection config":
   # socket work), never be silently ignored. newTlsContext runs before the dial,
   # so an unreachable URL never gets connected to.
   when defined(ssl):
-    test "an unusable ciphers value raises rather than being ignored":
+    test "ciphers should raise rather than be ignored when the value is unusable":
       var cfg = initNaviConfig()
       cfg.tls.verify = false
       cfg.retry.limit = 0
@@ -636,7 +636,7 @@ suite "TLS cipher selection config":
         discard api.get("https://127.0.0.1:1/")
       api.close()
 
-    test "an unusable cipherSuites value raises rather than being ignored":
+    test "cipherSuites should raise rather than be ignored when the value is unusable":
       var cfg = initNaviConfig()
       cfg.tls.verify = false
       cfg.retry.limit = 0
