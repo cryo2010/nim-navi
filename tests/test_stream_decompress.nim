@@ -26,17 +26,17 @@ suite "incremental decoder across chunk boundaries":
     "zstd": "28b52ffd04585900007b226f6b223a747275657d6abe13c7",
   }
   for (encoding, hex) in cases:
-    test encoding & " decodes when fed one byte at a time":
+    test "the incremental decoder should decode " & encoding & " when fed one byte at a time":
       check feedSliced(encoding, hexToBytes(hex), 1) == """{"ok":true}"""
-    test encoding & " decodes when fed in 3-byte slices":
+    test "the incremental decoder should decode " & encoding & " when fed in 3-byte slices":
       check feedSliced(encoding, hexToBytes(hex), 3) == """{"ok":true}"""
 
-  test "an unknown encoding yields no decoder (pass-through)":
+  test "the incremental decoder should yield no decoder when the encoding is unknown":
     check newStreamDecoder("identity") == nil
     check newStreamDecoder("") == nil
 
 suite "stream() decompresses the response body":
-  test "a gzip body reaches the sink decoded, not compressed":
+  test "stream should deliver a gzip body to the sink decoded":
     const port = 8965
     let gz = hexToBytes("1f8b0800000000000003ab56cacf56b22a292a4dad0500905fd4a70b000000")
     let payload = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n" &
@@ -54,7 +54,7 @@ suite "stream() decompresses the response body":
     check collected == """{"ok":true}"""      # decoded on the way to the sink
     joinThread(th)
 
-  test "decompress = false leaves the streamed body compressed":
+  test "stream should leave the body compressed when decompress is false":
     const port = 8966
     let gz = hexToBytes("1f8b0800000000000003ab56cacf56b22a292a4dad0500905fd4a70b000000")
     let payload = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n" &
@@ -74,7 +74,7 @@ suite "stream() decompresses the response body":
     joinThread(th)
 
 suite "stacked content-encoding":
-  test "a buffered get decodes a doubly-encoded body (gzip, gzip)":
+  test "a buffered get should decode a doubly-encoded body (gzip, gzip)":
     const port = 8968
     # {"ok":true} gzipped twice; Content-Encoding lists them in applied order.
     let body = hexToBytes(

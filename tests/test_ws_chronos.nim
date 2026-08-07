@@ -80,7 +80,7 @@ proc wsEcho(port: int) {.thread.} =
   server.close()
 
 suite "chronos websocket client end to end":
-  test "handshakes, echoes text and binary, reassembles fragments, closes":
+  test "the WebSocket client should handshake, echo text and binary, reassemble fragments, and close":
     const port = 8998
     var th: Thread[int]
     createThread(th, wsEcho, port)
@@ -109,7 +109,7 @@ suite "chronos websocket client end to end":
     check m[2].kind == wmText and m[2].data == "frag-ment"
     check m[3].kind == wmClose and m[3].closeCode == closeNormal
 
-  test "open times out when the server never completes the handshake":
+  test "the WebSocket client should time out on open when the server never completes the handshake":
     const port = 8997
     var th: Thread[int]
     createThread(th, wsStall, port)

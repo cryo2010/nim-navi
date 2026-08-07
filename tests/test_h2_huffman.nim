@@ -9,29 +9,29 @@ proc hex(s: string): string =
     result.add char(parseHexInt(s[i .. i + 1]))
 
 suite "huffman decode (RFC 7541 vectors)":
-  test "C.4.1 decodes www.example.com":
+  test "the Huffman decoder should decode www.example.com (C.4.1)":
     check huffmanDecode(hex("f1e3c2e5f23a6ba0ab90f4ff")) == "www.example.com"
 
-  test "C.4.2 decodes no-cache":
+  test "the Huffman decoder should decode no-cache (C.4.2)":
     check huffmanDecode(hex("a8eb10649cbf")) == "no-cache"
 
-  test "C.4.3 decodes custom-key and custom-value":
+  test "the Huffman decoder should decode custom-key and custom-value (C.4.3)":
     check huffmanDecode(hex("25a849e95ba97d7f")) == "custom-key"
     check huffmanDecode(hex("25a849e95bb8e8b4bf")) == "custom-value"
 
-  test "C.6.1 decodes a date header value":
+  test "the Huffman decoder should decode a date header value (C.6.1)":
     check huffmanDecode(hex("d07abe941054d444a8200595040b8166e082a62d1bff")) ==
       "Mon, 21 Oct 2013 20:13:21 GMT"
 
 suite "huffman encode":
-  test "C.4.1 encodes www.example.com":
+  test "the Huffman encoder should encode www.example.com (C.4.1)":
     check huffmanEncode("www.example.com") == hex("f1e3c2e5f23a6ba0ab90f4ff")
 
-  test "round-trips every byte value":
+  test "the Huffman codec should round-trip every byte value":
     for b in 0 .. 255:
       let s = $char(b)
       check huffmanDecode(huffmanEncode(s)) == s
 
-  test "round-trips mixed ASCII":
+  test "the Huffman codec should round-trip mixed ASCII":
     let s = "GET /path?x=1&y=2 HTTP/2 Bearer.Token_09"
     check huffmanDecode(huffmanEncode(s)) == s

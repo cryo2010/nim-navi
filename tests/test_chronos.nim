@@ -6,7 +6,7 @@ import navi/chronos
 import ./support
 
 suite "chronos entry end to end":
-  test "GET localhost returns parsed response":
+  test "the chronos client should return a parsed response for a GET to localhost":
     const port = 8973
     var th: Thread[ServerCtx]
     startServer(th, port)
@@ -18,7 +18,7 @@ suite "chronos entry end to end":
     check res.data["ok"].getBool()
     joinThread(th)
 
-  test "cancel aborts an in-flight request":
+  test "cancel should abort an in-flight request":
     const port = 8969
     var th: Thread[ServerCtx]
     startHang(th, port)  # accepts, reads the request, never replies
@@ -33,7 +33,7 @@ suite "chronos entry end to end":
       waitFor run(newNavi(), "http://127.0.0.1:" & $port & "/")
     joinThread(th)
 
-  test "closure middleware captures config and modifies the request":
+  test "closure middleware should capture config and modify the request":
     const port = 8967
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)  # echoes each request header back as x-echo-<name>
@@ -53,14 +53,14 @@ suite "chronos entry end to end":
 suite "chronos TLS config":
   # BearSSL has a fixed cipher profile, so cipher selection cannot be honored.
   # The backend rejects it up front (before dialing), so no server is needed.
-  test "cipher selection is rejected rather than silently ignored":
+  test "the chronos backend should reject cipher selection rather than ignore it":
     var cfg = initNaviConfig()
     cfg.tls.ciphers = "ECDHE-RSA-AES128-GCM-SHA256"
     let api = newNavi(cfg)
     expect ValueError:
       discard waitFor api.get("https://127.0.0.1:1/")
 
-  test "cipherSuites selection is rejected rather than silently ignored":
+  test "the chronos backend should reject cipherSuites selection rather than ignore it":
     var cfg = initNaviConfig()
     cfg.tls.cipherSuites = "TLS_AES_128_GCM_SHA256"
     let api = newNavi(cfg)

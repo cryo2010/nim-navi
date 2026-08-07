@@ -20,7 +20,7 @@ proc newServerConn(maxBody = 0): H2Conn =
   discard result.feed(encodeSettings([]))
 
 suite "h2 client connection":
-  test "sends preface and SETTINGS":
+  test "the h2 client should send the preface and SETTINGS":
     let c = newServerConn()
     let pre = c.preamble()
     check pre.startsWith(connectionPreface)
@@ -32,7 +32,7 @@ suite "h2 client connection":
     check d.next(f)
     check f.typ == uint8(ftWindowUpdate)
 
-  test "encodes a request as a HEADERS frame with pseudo-headers":
+  test "the h2 client should encode a request as a HEADERS frame with pseudo-headers":
     let c = newServerConn()
     let id = c.openStream()
     check id == 1'u32
@@ -51,7 +51,7 @@ suite "h2 client connection":
       (":method", "GET"), (":scheme", "https"), (":path", "/"),
       (":authority", "example.com")]
 
-  test "assembles a response and acks control frames":
+  test "the h2 client should assemble a response and ACK control frames":
     let c = newServerConn()
     let id = c.openStream()
     var server = encodeSettings([])
@@ -71,7 +71,7 @@ suite "h2 client connection":
     check f.typ == uint8(ftSettings)
     check (f.flags and flagAck) != 0
 
-  test "assigns odd, incrementing stream ids and reuses one connection":
+  test "the h2 client should assign odd, incrementing stream ids and reuse one connection":
     let c = newServerConn()
     let a = c.openStream()
     let b = c.openStream()
@@ -85,21 +85,21 @@ suite "h2 client connection":
     check c.takeResponse(a).body == "first"
     check c.takeResponse(b).body == "second"
 
-  test "reports a stream reset":
+  test "the h2 client should report a stream reset when the server sends RST_STREAM":
     let c = newServerConn()
     let id = c.openStream()
     discard c.feed(encodeRstStream(id, 1))
     check c.streamDone(id)
     check c.streamReset(id)
 
-  test "GOAWAY marks the connection unreusable":
+  test "the connection should become unreusable after GOAWAY":
     let c = newServerConn()
     check c.canReuse()
     discard c.feed(encodeFrame(ftGoAway, 0, 0, "\x00\x00\x00\x00\x00\x00\x00\x00"))
     check c.goneAway
     check not c.canReuse()
 
-  test "responds to a server PING with an ACK":
+  test "the h2 client should respond to a server PING with an ACK":
     let c = newServerConn()
     let toSend = c.feed(encodePing("01234567"))
     var d: FrameDecoder
@@ -119,7 +119,7 @@ proc firstFrameOfType(s: string, typ: FrameType): bool =
     if f.typ == uint8(typ): return true
 
 suite "h2 client DoS limits":
-  test "RSTs a CONTINUATION flood instead of buffering unbounded headers":
+  test "the h2 client should RST a CONTINUATION flood instead of buffering unbounded headers":
     let c = newServerConn()
     let id = c.openStream()
     # A HEADERS frame with END_STREAM but never END_HEADERS, then a flood of
@@ -132,7 +132,7 @@ suite "h2 client DoS limits":
     check c.streamReset(id)                # bounded and reset, not OOM
     check firstFrameOfType(toSend, ftRstStream)
 
-  test "RSTs a response body that exceeds maxResponseBytes":
+  test "the h2 client should RST a response body when it exceeds maxResponseBytes":
     let c = newServerConn(maxBody = 10)       # 10-byte cap
     let id = c.openStream()
     var server = encodeHeaders(id,
@@ -143,7 +143,7 @@ suite "h2 client DoS limits":
     check c.streamTooLarge(id)
     check firstFrameOfType(toSend, ftRstStream)
 
-  test "a body within maxResponseBytes is delivered normally":
+  test "the h2 client should deliver a body normally when it is within maxResponseBytes":
     let c = newServerConn(maxBody = 100)
     let id = c.openStream()
     discard c.feed(serverResponse(id, "200", @[], "short body"))
@@ -152,21 +152,21 @@ suite "h2 client DoS limits":
     check c.takeResponse(id).body == "short body"
 
 suite "h2 retry classification":
-  test "REFUSED_STREAM marks the stream unprocessed (safe to retry)":
+  test "the stream should be marked unprocessed when reset with REFUSED_STREAM (safe to retry)":
     let c = newServerConn()
     let id = c.openStream()
     discard c.feed(encodeRstStream(id, errRefusedStream))
     check c.streamReset(id)
     check c.streamUnprocessed(id)
 
-  test "a non-refused RST_STREAM is not unprocessed":
+  test "the stream should not be marked unprocessed when reset with a non-refused RST_STREAM":
     let c = newServerConn()
     let id = c.openStream()
     discard c.feed(encodeRstStream(id, errProtocolError))   # processed then failed
     check c.streamReset(id)
     check not c.streamUnprocessed(id)
 
-  test "streams above GOAWAY's last-processed id are unprocessed":
+  test "streams should be marked unprocessed when above GOAWAY's last-processed id":
     let c = newServerConn()
     let a = c.openStream()   # id 1
     let b = c.openStream()   # id 3
@@ -181,7 +181,7 @@ proc headForStream(id: uint32): string =
                 endStream = false, endHeaders = true)
 
 suite "h2 receive-side flow control":
-  test "advertises a larger initial window in SETTINGS":
+  test "the receive window should advertise a larger initial window in SETTINGS":
     let c = newServerConn()
     var d: FrameDecoder
     d.feed(c.preamble()[connectionPreface.len .. ^1])
@@ -193,7 +193,7 @@ suite "h2 receive-side flow control":
       if id == settingsInitialWindowSize: initWin = v
     check initWin > 65535'u32                    # bigger than the 64 KiB default
 
-  test "batches WINDOW_UPDATEs (no ack for a small body)":
+  test "the receive window should batch WINDOW_UPDATEs when the body is small":
     let c = newServerConn()
     let id = c.openStream()
     var server = headForStream(id)
@@ -201,7 +201,7 @@ suite "h2 receive-side flow control":
     let toSend = c.feed(server)
     check not firstFrameOfType(toSend, ftWindowUpdate)
 
-  test "replenishes once consumed crosses the threshold":
+  test "the receive window should replenish with a WINDOW_UPDATE when consumed crosses the threshold":
     let c = newServerConn()
     let id = c.openStream()
     var server = headForStream(id)
@@ -219,7 +219,7 @@ proc dataBytes(s: string): int =
     if f.typ == uint8(ftData): result += f.payload.len
 
 suite "h2 send-side flow control":
-  test "caps the initial body to the window and releases on WINDOW_UPDATE":
+  test "the send window should cap the initial body to the window and release the rest on WINDOW_UPDATE":
     let c = newServerConn()
     let sid = c.openStream()
     let body = repeat("x", 200_000)          # > the 65535 default send window
@@ -237,14 +237,14 @@ suite "h2 send-side flow control":
     check dataBytes(out1) + dataBytes(out2) + dataBytes(out3) == 200_000
 
 suite "h2 max concurrent streams":
-  test "reads the peer's MAX_CONCURRENT_STREAMS from SETTINGS":
+  test "the h2 client should read the peer's MAX_CONCURRENT_STREAMS from SETTINGS":
     let c = newServerConn()
     check c.maxConcurrentStreams == int.high        # unlimited until advertised
     discard c.feed(encodeSettings({settingsMaxConcurrentStreams: 3'u32}))
     check c.maxConcurrentStreams == 3
 
 suite "h2 CONTINUATION on send":
-  test "splits a large header block across HEADERS and CONTINUATION frames":
+  test "the h2 client should split a large header block across HEADERS and CONTINUATION frames":
     let c = newServerConn()
     let sid = c.openStream()
     let big = repeat("v", 20_000)          # forces the block over the 16384 frame size
@@ -272,21 +272,21 @@ suite "h2 CONTINUATION on send":
     check dec.decode(hb) == want                           # reassembles losslessly
 
 suite "h2 connection errors":
-  test "rejects a server whose first frame is not SETTINGS":
+  test "the h2 client should reject a server when its first frame is not SETTINGS (GOAWAY)":
     let c = initH2Conn()                       # deliberately NOT pre-fed a preface
     let toSend = c.feed(encodePing("01234567"))  # first frame is PING, not SETTINGS
     check c.connError.len > 0
     check not c.canReuse()
     check firstFrameOfType(toSend, ftGoAway)
 
-  test "rejects a frame larger than the max frame size":
+  test "the h2 client should reject a frame when it is larger than the max frame size (GOAWAY)":
     let c = newServerConn()
     let oversized = encodeFrame(ftData, 0, 1'u32, repeat("x", 20_000))  # > 16384
     let toSend = c.feed(oversized)
     check c.connError.len > 0
     check firstFrameOfType(toSend, ftGoAway)
 
-  test "rejects an unexpected PUSH_PROMISE (push disabled)":
+  test "the h2 client should reject an unexpected PUSH_PROMISE when push is disabled (GOAWAY)":
     let c = newServerConn()
     let toSend = c.feed(encodeFrame(ftPushPromise, 0, 1'u32, "\x00\x00\x00\x02hdr"))
     check c.connError.len > 0
@@ -298,7 +298,7 @@ proc paddedData(id: uint32, data: string, padLen: int, endStream: bool): string 
   encodeFrame(ftData, flags, id, char(padLen) & data & repeat('\0', padLen))
 
 suite "h2 frame padding":
-  test "strips DATA frame padding from the body":
+  test "the h2 client should strip DATA frame padding from the body":
     let c = newServerConn()
     let id = c.openStream()
     var server = headForStream(id)
@@ -307,7 +307,7 @@ suite "h2 frame padding":
     check c.streamDone(id)
     check c.takeResponse(id).body == "hello"     # pad byte + 7 padding bytes gone
 
-  test "strips HEADERS frame padding before HPACK decode":
+  test "the h2 client should strip HEADERS frame padding before HPACK decode":
     let c = newServerConn()
     let id = c.openStream()
     let block0 = (HpackEncoder()).encode(@[(":status", "200"), ("x-k", "v")])
@@ -321,7 +321,7 @@ suite "h2 frame padding":
     check resp.headers == @[("x-k", "v")]        # padding did not corrupt HPACK
     check resp.body == "body"
 
-  test "delivers a zero-data padded DATA frame as empty":
+  test "a zero-data padded DATA frame should be delivered as empty":
     let c = newServerConn()
     let id = c.openStream()
     var server = headForStream(id)
@@ -330,7 +330,7 @@ suite "h2 frame padding":
     check c.streamDone(id)
     check c.takeResponse(id).body == ""
 
-  test "rejects DATA padding that meets or exceeds the payload (PROTOCOL_ERROR)":
+  test "the h2 client should reject DATA padding that meets or exceeds the payload (PROTOCOL_ERROR)":
     let c = newServerConn()
     let id = c.openStream()
     var server = headForStream(id)
@@ -349,7 +349,7 @@ proc hasConnWindowUpdate(s: string): bool =
     if f.typ == uint8(ftWindowUpdate) and f.streamId == 0'u32: return true
 
 suite "h2 interim responses and trailers":
-  test "ignores a 1xx interim HEADERS block before the final response":
+  test "the h2 client should ignore a 1xx interim HEADERS block before the final response":
     let c = newServerConn()
     let id = c.openStream()
     let enc = HpackEncoder()                       # one server-side HPACK stream
@@ -367,7 +367,7 @@ suite "h2 interim responses and trailers":
     check resp.headers == @[("content-type", "text/html")]  # 103 "link" did not leak
     check resp.body == "body"
 
-  test "does not surface trailers as response headers":
+  test "the h2 client should not surface trailers as response headers":
     let c = newServerConn()
     let id = c.openStream()
     let enc = HpackEncoder()
@@ -385,7 +385,7 @@ suite "h2 interim responses and trailers":
     check resp.headers == @[("content-type", "text/plain")]  # grpc-status trailer dropped
 
 suite "h2 flow control on reset streams":
-  test "counts DATA on a reset stream toward the connection window":
+  test "the connection window should count DATA on a reset stream toward the connection window":
     # A tiny body cap makes the first DATA reset the stream; the server then keeps
     # sending DATA in-flight on that stream. It must still replenish the connection
     # flow-control window (RFC 9113 6.9.1), or a pooled connection slowly stalls.

@@ -6,7 +6,7 @@ import navi/asyncdispatch
 import ./support
 
 suite "asyncdispatch entry end to end":
-  test "GET localhost returns parsed response":
+  test "the async client should return a parsed response for a GET to localhost":
     const port = 8972
     var th: Thread[ServerCtx]
     startServer(th, port)
@@ -18,7 +18,7 @@ suite "asyncdispatch entry end to end":
     check res.data["ok"].getBool()
     joinThread(th)
 
-  test "retries with async backoff then succeeds":
+  test "the async client should retry with async backoff and then succeed":
     const port = 8992
     var th: Thread[ServerCtx]
     startRetry(th, port, failures = 1)
@@ -29,7 +29,7 @@ suite "asyncdispatch entry end to end":
     check res.body == "recovered"
     joinThread(th)
 
-  test "cancel aborts an in-flight request":
+  test "cancel should abort an in-flight request":
     const port = 8968
     var th: Thread[ServerCtx]
     startHang(th, port)  # accepts, reads the request, never replies
@@ -45,7 +45,7 @@ suite "asyncdispatch entry end to end":
       waitFor run()
     joinThread(th)
 
-  test "closure middleware captures config and modifies the request":
+  test "closure middleware should capture config and modify the request":
     const port = 8967
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)  # echoes each request header back as x-echo-<name>

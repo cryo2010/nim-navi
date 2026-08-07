@@ -22,7 +22,7 @@ proc expectedPairs(headers: JsonNode): seq[HeaderPair] =
 const corpusDir = currentSourcePath.parentDir / "fixtures" / "hpack"
 
 suite "hpack decoder conformance (http2jp/hpack-test-case)":
-  test "the vendored corpus is present":
+  test "the HPACK decoder conformance suite should find the vendored corpus present":
     check dirExists(corpusDir)
     check toSeq(walkDirs(corpusDir / "*")).len > 0
 
@@ -31,7 +31,7 @@ suite "hpack decoder conformance (http2jp/hpack-test-case)":
     var stories = toSeq(walkFiles(encoderDir / "*.json"))
     stories.sort()
     for storyPath in stories:
-      test encoder & "/" & storyPath.extractFilename & " decodes to expected headers":
+      test "the HPACK decoder should decode " & encoder & "/" & storyPath.extractFilename & " to the expected headers":
         # Cases share one dynamic table and are applied in seqno order.
         let cases = sorted(parseFile(storyPath)["cases"].getElems,
           proc(a, b: JsonNode): int = cmp(a["seqno"].getInt, b["seqno"].getInt))
