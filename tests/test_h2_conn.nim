@@ -399,3 +399,63 @@ suite "h2 flow control on reset streams":
     for _ in 0 ..< 270: more.add encodeData(id, repeat("x", 16000), endStream = false)
     let toSend = c.feed(more)                       # 270 x 16000 = 4.32 MB > connReplenish
     check hasConnWindowUpdate(toSend)               # connection window given back
+
+proc allFrames(s: string): seq[Frame] =
+  var d: FrameDecoder
+  d.feed(s)
+  var f: Frame
+  while d.next(f): result.add f
+
+proc endStreamCount(s: string): int =
+  for f in allFrames(s):
+    if (f.flags and flagEndStream) != 0: inc result
+
+proc lastFrameEndsStream(s: string): bool =
+  let fs = allFrames(s)
+  fs.len > 0 and (fs[^1].flags and flagEndStream) != 0
+
+suite "h2 streaming request body":
+  # Pull-based upload: HEADERS without END_STREAM, then DATA frames from the
+  # producer, END_STREAM on the final frame. Exercises the sans-io send API
+  # (encodeRequestHead / queueSend / finishSend) the engine drives.
+  let head = @[(":method", "POST"), (":scheme", "https"),
+               (":path", "/"), (":authority", "x")]
+
+  test "a streamed body should send HEADERS without END_STREAM, DATA per chunk, END_STREAM last":
+    let c = newServerConn()
+    let sid = c.openStream()
+    var wire = c.encodeRequestHead(sid, head)
+    let hs = allFrames(wire)
+    check hs.len == 1 and hs[0].typ == uint8(ftHeaders)
+    check (hs[0].flags and flagEndStream) == 0     # body follows, so not ended here
+    wire.add c.queueSend(sid, "hello ")
+    wire.add c.queueSend(sid, "world")
+    wire.add c.finishSend(sid)
+    check dataBytes(wire) == len("hello world")     # whole body on the wire
+    check endStreamCount(wire) == 1                  # END_STREAM exactly once...
+    check lastFrameEndsStream(wire)                  # ...on the final frame
+
+  test "an empty streamed body should end the stream with an empty DATA frame":
+    let c = newServerConn()
+    let sid = c.openStream()
+    var wire = c.encodeRequestHead(sid, head)
+    wire.add c.finishSend(sid)                       # no chunks produced
+    let fs = allFrames(wire)
+    check fs.len == 2
+    check fs[0].typ == uint8(ftHeaders) and (fs[0].flags and flagEndStream) == 0
+    check fs[1].typ == uint8(ftData) and fs[1].payload.len == 0
+    check (fs[1].flags and flagEndStream) != 0
+
+  test "a streamed chunk over the window should be released by WINDOW_UPDATE with END_STREAM on the tail":
+    let c = newServerConn()
+    let sid = c.openStream()
+    discard c.encodeRequestHead(sid, head)
+    let out1 = c.queueSend(sid, repeat("x", 100_000))  # > 65535 default send window
+    check dataBytes(out1) == 65535                   # only the window goes out now
+    check not c.sendDrained(sid)                     # tail still queued
+    let out2 = c.finishSend(sid)                     # windowed out: nothing to emit yet
+    check dataBytes(out2) == 0
+    let out3 = c.feed(encodeWindowUpdate(sid, 100_000) & encodeWindowUpdate(0, 100_000))
+    check dataBytes(out1) + dataBytes(out3) == 100_000  # the whole body, no more
+    check c.sendDrained(sid)
+    check lastFrameEndsStream(out3)                  # END_STREAM rides the tail
