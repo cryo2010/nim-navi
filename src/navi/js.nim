@@ -168,12 +168,25 @@ proc runChain(ctx: NaviContext): Future[Response] {.async.} =
 proc request*(client: Navi, verb: HttpVerb, target: string,
               headers = initHeaders(), body = "", json: JsonNode = nil,
               form: seq[(string, string)] = @[], multipart: Multipart = @[],
+              bodyStream: BodyProducer = nil,
               params: seq[(string, string)] = @[],
               cancel: CancelToken = nil): Future[Response] {.async.} =
   ## Perform a request; configured middleware wraps the whole call. `params` are
   ## appended to the URL query; `cancel` aborts the fetch.
-  let req = buildRequest(client.config, verb, target, headers, body, json, form,
-                         multipart, nil, params)
+  ##
+  ## `bodyStream` is accepted for parity with the native backends, but the js
+  ## backend **buffers** it: `fetch` cannot reliably stream a request body
+  ## (`ReadableStream` + `duplex: "half"` support is uneven across runtimes), so
+  ## the producer is drained into a full body before sending.
+  var buffered = body
+  if bodyStream != nil:
+    buffered = ""
+    while true:
+      let chunk = bodyStream()
+      if chunk.len == 0: break
+      buffered.add chunk
+  let req = buildRequest(client.config, verb, target, headers, buffered, json,
+                         form, multipart, nil, params)
   if client.config.middleware.len == 0: return await runCore(client, req, cancel)
   let ctx = NaviContext(req: req, clientv: client, cancel: cancel)
   return await runChain(ctx)

@@ -143,6 +143,16 @@ proc main() {.async.} =
       sink = proc(data: openArray[byte]) = total += data.len)
     total == 2048 and r.body.len == 0
 
+  check "a bodyStream upload is buffered and arrives intact":
+    # fetch can't reliably stream a request body, so the js backend buffers the
+    # producer -- but the received body must still equal what it yielded.
+    var left = 3
+    let r = await api().request(POST, base & "/post", bodyStream = proc(): string =
+      if left == 0: return ""
+      dec left
+      "chunk-")
+    r.data["data"].getStr == "chunk-chunk-chunk-"
+
   # --- misc response formats -----------------------------------------------
   check "/html is served as text/html":
     (await api().get(base & "/html")).headers["content-type"].contains("text/html")
