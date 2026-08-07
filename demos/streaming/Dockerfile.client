@@ -1,0 +1,18 @@
+# Compile the navi/asyncdispatch streaming examples and run them against the
+# FastAPI HTTP/2 server. Build context is the repo root so the navi sources under
+# src/ are available to the compiler.
+FROM nimlang/nim:2.2.10 AS build
+WORKDIR /build
+RUN nimble install -y checksums          # navi's SHA-1/MD5 dependency
+COPY src ./src
+COPY demos/streaming/download.nim demos/streaming/upload.nim ./
+RUN nim c --path:src -d:ssl -d:release --hints:off -o:download download.nim \
+ && nim c --path:src -d:ssl -d:release --hints:off -o:upload   upload.nim
+
+FROM debian:stable-slim
+RUN apt-get update && apt-get install -y --no-install-recommends libssl3 ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY demos/streaming/run-client.sh ./run-client.sh
+COPY --from=build /build/download /build/upload ./
+CMD ["sh", "run-client.sh"]
