@@ -193,3 +193,13 @@ task exampleDownload, "Streaming file-download example (self-contained; verifies
   # Streams a response body to disk from a local server and asserts the downloaded
   # file hash-matches the original. No network.
   exec "nim c -r --hints:off examples/streaming/download_file.nim"
+
+task demoStreaming, "Streaming upload+download demo: navi/asyncdispatch vs a FastAPI HTTP/2 server (Docker)":
+  # Builds a FastAPI server (Hypercorn, TLS + h2) and a navi/asyncdispatch client
+  # that streams an upload and a download and asserts each SHA-1 matches. Requires
+  # Docker; exits non-zero if a transfer is corrupted.
+  let compose = "docker compose -f demos/streaming/docker-compose.yml"
+  try:
+    exec compose & " up --build --abort-on-container-exit --exit-code-from client"
+  finally:
+    exec compose & " down"

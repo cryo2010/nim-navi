@@ -10,6 +10,7 @@
 import std/[asyncdispatch, tables, deques]
 import ../proto/h2/conn
 import ../core/response          # for ResponseTooLargeError
+import ../core/request           # for BodyProducer
 import ./asyncdispatch as be
 
 type
@@ -18,6 +19,8 @@ type
     h2: H2Conn
     waiters: Table[uint32, Future[H2Response]]
     pendingSlots: Deque[Future[void]]  ## requests waiting for a concurrency slot
+    sendReady: Table[uint32, Future[void]]  ## streaming uploads waiting for the send
+                                            ## window to drain their queued chunk
     sendTail: Future[void]   ## tail of the serialized send chain
     alive: bool
 
@@ -62,6 +65,19 @@ proc dispatch(mux: H2Mux) =
       else:
         fut.fail(newException(IOError, "navi: http/2 connection went away"))
 
+proc wakeSenders(mux: H2Mux) =
+  ## Wake streaming uploads whose queued chunk has drained onto the wire (the
+  ## reader just released a window-blocked tail on WINDOW_UPDATE), or whose stream
+  ## is finished/gone, so they pull the next chunk or stop.
+  var wake: seq[uint32]
+  for sid, ready in mux.sendReady:
+    if not ready.finished and (not mux.alive or mux.h2.goneAway or
+        mux.h2.sendDrained(sid) or mux.h2.streamEnded(sid)):
+      wake.add sid
+  for sid in wake:
+    let r = mux.sendReady[sid]
+    if not r.finished: r.complete()
+
 proc failAll(mux: H2Mux, msg: string) =
   mux.alive = false
   for sid, fut in mux.waiters:
@@ -71,6 +87,7 @@ proc failAll(mux: H2Mux, msg: string) =
   while mux.pendingSlots.len > 0:                 # wake blocked requests; they see
     let s = mux.pendingSlots.popFirst()           # `not alive` and raise
     if not s.finished: s.complete()
+  mux.wakeSenders()                               # unblock in-flight streaming uploads
 
 proc send(mux: H2Mux, data: string) {.async.} =
   ## Serialize writes (chained on the previous send) so concurrent streams don't
@@ -93,6 +110,7 @@ proc reader(mux: H2Mux) {.async.} =
       let toSend = mux.h2.feed(chunk)
       if toSend.len > 0: await mux.send(toSend)   # includes a GOAWAY on a conn error
       mux.dispatch()
+      mux.wakeSenders()                           # a WINDOW_UPDATE may have drained a send
       if mux.h2.connError.len > 0: break          # fatal: fail all in-flight below
       if mux.h2.goneAway and mux.waiters.len == 0: break
   except CatchableError:
@@ -106,6 +124,7 @@ proc newH2Mux*(transport: be.Conn, maxBody = 0): Future[H2Mux] {.async.} =
   ## start the background reader.
   let mux = H2Mux(transport: transport, h2: initH2Conn(maxBody), alive: true,
                   waiters: initTable[uint32, Future[H2Response]](),
+                  sendReady: initTable[uint32, Future[void]](),
                   pendingSlots: initDeque[Future[void]]())
   await be.sendAll(transport, mux.h2.preamble())
   asyncCheck reader(mux)
@@ -122,11 +141,34 @@ proc close*(mux: H2Mux) {.async.} =
   try: await be.close(mux.transport)
   except CatchableError: discard
 
-proc request*(mux: H2Mux, headers: seq[(string, string)],
-              body: string): Future[H2Response] {.async.} =
+proc streamBody(mux: H2Mux, sid: uint32, fut: Future[H2Response],
+                bodyStream: BodyProducer) {.async.} =
+  ## Send DATA frames pulled from `bodyStream`, pulling the next chunk only once
+  ## the previous one has drained onto the wire (the reader releases window-blocked
+  ## bytes on WINDOW_UPDATE and wakes us), so buffered upload memory stays ~one
+  ## chunk. END_STREAM rides the final frame via `finishSend`.
+  while mux.alive and not fut.finished:
+    if mux.h2.sendDrained(sid):
+      let chunk = bodyStream()
+      if chunk.len == 0:
+        await mux.send(mux.h2.finishSend(sid))
+        break
+      await mux.send(mux.h2.queueSend(sid, chunk))
+    else:
+      let ready = newFuture[void]("h2mux.drain")
+      mux.sendReady[sid] = ready
+      if mux.h2.sendDrained(sid) or fut.finished or not mux.alive:
+        mux.sendReady.del(sid)                     # drained between check and register
+      else:
+        await ready
+        mux.sendReady.del(sid)
+
+proc request*(mux: H2Mux, headers: seq[(string, string)], body: string,
+              bodyStream: BodyProducer = nil): Future[H2Response] {.async.} =
   ## Open a stream, send the request, and await this stream's response. Blocks
   ## while the connection is at the peer's MAX_CONCURRENT_STREAMS, resuming when
   ## a stream completes (so a burst of concurrent requests is queued, not RST).
+  ## When `bodyStream` is set the body is streamed chunk by chunk instead of `body`.
   if not mux.alive:
     raise newException(IOError, "navi: http/2 connection not usable")
   while mux.alive and mux.waiters.len >= mux.h2.maxConcurrentStreams:
@@ -138,5 +180,9 @@ proc request*(mux: H2Mux, headers: seq[(string, string)],
   let sid = mux.h2.openStream()
   let fut = newFuture[H2Response]("h2mux.stream")
   mux.waiters[sid] = fut
-  await mux.send(mux.h2.encodeRequest(sid, headers, body))
+  if bodyStream != nil:
+    await mux.send(mux.h2.encodeRequestHead(sid, headers))
+    await mux.streamBody(sid, fut, bodyStream)
+  else:
+    await mux.send(mux.h2.encodeRequest(sid, headers, body))
   result = await fut

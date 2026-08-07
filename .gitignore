@@ -47,6 +47,9 @@ examples/concurrency/async_multiplex
 examples/concurrency/parallel
 examples/streaming/upload_file
 examples/streaming/download_file
+# Compiled streaming-demo client binaries (sources are .nim)
+demos/streaming/upload
+demos/streaming/download
 # Compiled WebSocket example binaries (sources are .nim)
 examples/websocket/echo_server
 examples/websocket/sync

@@ -5,7 +5,7 @@
 ## the reference server. Driven by tests/interop/run.sh.
 
 import unittest
-import std/os
+import std/[os, strutils]
 import navi/asyncdispatch
 
 let base = getEnv("NAVI_INTEROP_URL")
@@ -29,6 +29,24 @@ suite "nghttpd interop (asyncdispatch, http/2 mux)":
     check res[0].body == "hello from nghttpd\n"    # exact: HEADERS + DATA padding stripped
     check res[1].status == 200
     check res[1].body.len == 262144                # multi-frame padded body intact
+
+  test "round-trips a streamed upload (bodyStream) over the mux":
+    # A pull-based body over the async h2 mux: HEADERS then DATA frames from the
+    # producer, larger than the send window so the reader releases the tail on
+    # WINDOW_UPDATE and wakes the producer. nghttpd echoes it back verbatim.
+    proc run(): Future[Response] {.async.} =
+      var cfg = initNaviConfig()
+      cfg.tls.caFile = cert
+      let api = newNavi(cfg)
+      var left = 5                        # 5 x 50k = 250 KB > the 64 KiB send window
+      result = await api.request(POST, base & "/echo", bodyStream = proc(): string =
+        if left == 0: return ""
+        dec left
+        repeat("z", 50_000))
+    let res = waitFor run()
+    check res.status == 200
+    check res.httpVersion == "HTTP/2"
+    check res.body == repeat("z", 250_000)
 
   test "concurrent GETs multiplex over a single connection":
     proc run(): Future[seq[Response]] {.async.} =
