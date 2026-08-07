@@ -208,6 +208,17 @@ template runAll() =
       sink = proc(data: openArray[byte]) = total += data.len)
     total == 2048 and r.body.len == 0
 
+  check "a bodyStream upload is streamed and arrives intact over " & wantVersion:
+    # A pull-based producer over each native backend (chunked on h1, DATA frames
+    # on h2); httpbin echoes the received body, which must equal what we produced.
+    let chunk = repeat("s", 10_000)
+    var left = 3                          # 3 x 10k, produced across several calls
+    let r = await api().request(POST, base & "/post", bodyStream = proc(): string =
+      if left == 0: return ""
+      dec left
+      chunk)
+    r.data["data"].getStr == repeat("s", 30_000)
+
   check "/stream/5 yields five newline-delimited JSON objects":
     var n = 0
     for ln in (await api().get(base & "/stream/5")).body.splitLines:
