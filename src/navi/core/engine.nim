@@ -62,7 +62,29 @@ template h2Stream(transport, h2, req, sink, decompress: typed): Response =
   ## One HTTP/2 request/response on a new stream of the shared connection `h2`.
   block:
     let sid = h2.openStream()
-    await sendAll(transport, h2.encodeRequest(sid, h2HeaderList(req), req.body))
+    if req.bodyStream != nil:
+      # Stream the request body: HEADERS now, then DATA frames pulled from the
+      # producer. When the send window closes, read so the peer's WINDOW_UPDATE
+      # releases more of the body; the producer is pulled only once the queued
+      # bytes are on the wire, so buffered upload memory stays ~one chunk.
+      await sendAll(transport, h2.encodeRequestHead(sid, h2HeaderList(req)))
+      var sending = true
+      while sending and h2.connError.len == 0 and not h2.streamDone(sid):
+        if h2.sendDrained(sid):
+          var chunk: string
+          {.cast(gcsafe).}: chunk = req.bodyStream()
+          if chunk.len == 0:
+            await sendAll(transport, h2.finishSend(sid))
+            sending = false
+          else:
+            await sendAll(transport, h2.queueSend(sid, chunk))
+        else:
+          let inbound = await recvSome(transport)
+          if inbound.len == 0: break
+          let toSend = h2.feed(inbound)
+          if toSend.len > 0: await sendAll(transport, toSend)
+    else:
+      await sendAll(transport, h2.encodeRequest(sid, h2HeaderList(req), req.body))
     while not h2.streamDone(sid):
       let chunk = await recvSome(transport)
       if chunk.len == 0: break

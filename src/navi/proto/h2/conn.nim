@@ -35,6 +35,8 @@ type
     sendBuf: string       ## request body not yet on the wire (flow-control bound)
     sendOff: int          ## bytes of sendBuf already sent
     sendWindow: int       ## per-stream send window (peer's INITIAL_WINDOW_SIZE)
+    sendClosed: bool      ## the request body is complete; END_STREAM may be sent
+    endSent: bool         ## END_STREAM has already been emitted for this body
 
   H2Conn* = ref object
     enc: HpackEncoder
@@ -93,46 +95,91 @@ proc openStream*(c: H2Conn): uint32 =
   c.streams[result] = Stream(sendWindow: c.peerInitialWindow)
 
 proc flushSend(c: H2Conn, streamId: uint32, s: Stream, outbuf: var string) =
-  ## Emit as many DATA frames as the stream and connection send windows allow,
-  ## setting END_STREAM on the frame that drains the body.
+  ## Emit as many DATA frames as the stream and connection send windows allow.
+  ## END_STREAM rides the final DATA frame once the body is closed (`sendClosed`);
+  ## a body that closes with nothing pending gets an empty END_STREAM DATA frame.
+  if s.endSent: return
   while s.sendOff < s.sendBuf.len:
     let avail = min(s.sendWindow, c.connSendWindow)
-    if avail <= 0: break                       # windowed out; wait for a WINDOW_UPDATE
+    if avail <= 0: return                      # windowed out; wait for a WINDOW_UPDATE
     let n = min(min(avail, c.maxFrameSize), s.sendBuf.len - s.sendOff)
+    let last = s.sendClosed and s.sendOff + n >= s.sendBuf.len
     outbuf.add encodeData(streamId, s.sendBuf[s.sendOff ..< s.sendOff + n],
-                          endStream = s.sendOff + n >= s.sendBuf.len)
+                          endStream = last)
     s.sendOff += n
     s.sendWindow -= n
     c.connSendWindow -= n
+    if last: s.endSent = true
+  if s.sendClosed and not s.endSent:           # closed with all bytes already sent
+    outbuf.add encodeData(streamId, "", endStream = true)
+    s.endSent = true
 
-proc encodeRequest*(c: H2Conn, streamId: uint32, headers: openArray[HeaderPair],
-                    body: string): string =
-  ## `headers` must start with the pseudo-headers (:method, :scheme, :path,
-  ## :authority) in order, followed by regular headers. Sends the header block
-  ## and as much of the body as the send window allows now; the rest is released
-  ## by `feed` as the peer sends WINDOW_UPDATE frames.
+proc encodeHeaderFrames(c: H2Conn, streamId: uint32, headers: openArray[HeaderPair],
+                        endStream: bool): string =
+  ## Encode the header block as a HEADERS frame, splitting it across CONTINUATION
+  ## frames when it exceeds the peer's max frame size (RFC 9113 6.2/6.10); a single
+  ## oversized HEADERS frame would be a FRAME_SIZE_ERROR.
   let headerBlock = c.enc.encode(headers)
-  let hasBody = body.len > 0
-  # Split a header block larger than the peer's max frame size across a HEADERS
-  # frame and one or more CONTINUATION frames (RFC 9113 6.2/6.10); a single
-  # oversized HEADERS frame would be a FRAME_SIZE_ERROR.
   let mfs = c.maxFrameSize
   if headerBlock.len <= mfs:
-    result = encodeHeaders(streamId, headerBlock, endStream = not hasBody,
+    result = encodeHeaders(streamId, headerBlock, endStream = endStream,
                            endHeaders = true)
   else:
     result = encodeHeaders(streamId, headerBlock[0 ..< mfs],
-                           endStream = not hasBody, endHeaders = false)
+                           endStream = endStream, endHeaders = false)
     var i = mfs
     while i < headerBlock.len:
       let n = min(mfs, headerBlock.len - i)
       result.add encodeContinuation(streamId, headerBlock[i ..< i + n],
                                     endHeaders = i + n >= headerBlock.len)
       i += n
+
+proc encodeRequest*(c: H2Conn, streamId: uint32, headers: openArray[HeaderPair],
+                    body: string): string =
+  ## `headers` must start with the pseudo-headers (:method, :scheme, :path,
+  ## :authority) in order, followed by regular headers. Sends the header block
+  ## and as much of the (buffered) body as the send window allows now; the rest is
+  ## released by `feed` as the peer sends WINDOW_UPDATE frames.
+  let hasBody = body.len > 0
+  result = c.encodeHeaderFrames(streamId, headers, endStream = not hasBody)
   if hasBody:
     let s = c.streams[streamId]
     s.sendBuf = body
+    s.sendClosed = true                        # whole body known: END_STREAM on last DATA
     c.flushSend(streamId, s, result)
+
+proc encodeRequestHead*(c: H2Conn, streamId: uint32,
+                        headers: openArray[HeaderPair]): string =
+  ## HEADERS for a request whose body is streamed via `queueSend`/`finishSend`.
+  ## END_STREAM is not set here; it rides the last DATA frame.
+  c.encodeHeaderFrames(streamId, headers, endStream = false)
+
+proc sendDrained*(c: H2Conn, streamId: uint32): bool =
+  ## True when every queued request-body byte is on the wire, so the caller may
+  ## pull the next chunk -- keeping buffered upload memory to ~one chunk.
+  let s = c.streams.getOrDefault(streamId)
+  s == nil or s.sendOff >= s.sendBuf.len
+
+proc queueSend*(c: H2Conn, streamId: uint32, data: string): string =
+  ## Append a streamed request-body chunk and emit as much as the send window
+  ## allows now; the remainder is released by `feed` on WINDOW_UPDATE. Compacts
+  ## the already-sent prefix so buffered memory stays bounded.
+  let s = c.streams.getOrDefault(streamId)
+  if s == nil or data.len == 0: return
+  if s.sendOff > 0:                            # drop the sent prefix
+    s.sendBuf = s.sendBuf[s.sendOff .. ^1]
+    s.sendOff = 0
+  s.sendBuf.add data
+  c.flushSend(streamId, s, result)
+
+proc finishSend*(c: H2Conn, streamId: uint32): string =
+  ## Mark the streamed request body complete. Emits END_STREAM -- on the last DATA
+  ## frame, or an empty DATA frame if nothing is pending. Bytes still blocked by
+  ## the send window are released (with END_STREAM) by `feed` on WINDOW_UPDATE.
+  let s = c.streams.getOrDefault(streamId)
+  if s == nil: return
+  s.sendClosed = true
+  c.flushSend(streamId, s, result)
 
 proc replenishConn(c: H2Conn, n: int, outbuf: var string) =
   ## Give back connection-level receive-window credit for `n` consumed DATA bytes,

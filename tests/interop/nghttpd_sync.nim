@@ -42,6 +42,20 @@ suite "nghttpd interop (sync, http/2)":
     check res.status == 200
     check res.body == payload
 
+  test "round-trips a streamed upload (bodyStream) via echo-upload":
+    # A pull-based body over h2: HEADERS then DATA frames from the producer, larger
+    # than the send window so the tail is released by WINDOW_UPDATE. nghttpd echoes
+    # it back, so the response body must equal everything the producer yielded.
+    let chunk = repeat("y", 50_000)
+    var left = 5                        # 5 x 50k = 250 KB > the 64 KiB send window
+    let res = client().request(POST, base & "/echo", bodyStream = proc(): string =
+      if left == 0: return ""
+      dec left
+      chunk)
+    check res.status == 200
+    check res.httpVersion == "HTTP/2"
+    check res.body == repeat("y", 250_000)
+
   test "parallel multiplexes several requests over one connection":
     let res = client().parallel(
       @[base & "/small.txt", base & "/small.txt", base & "/small.txt"])
