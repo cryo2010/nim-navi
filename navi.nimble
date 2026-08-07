@@ -183,3 +183,13 @@ task demoHello, "Run the hello demo (navi/js client + FastAPI server via Docker)
     exec compose & " up --build --abort-on-container-exit --exit-code-from client"
   finally:
     exec compose & " down"
+
+task exampleUpload, "Streaming file-upload example (self-contained; verifies the round-trip)":
+  # Streams a file as a chunked request body to a local echo server and asserts the
+  # echoed bytes hash-match the original. No network; generates a temp file.
+  exec "nim c -r --hints:off examples/streaming/upload_file.nim"
+
+task exampleDownload, "Streaming file-download example (self-contained; verifies the round-trip)":
+  # Streams a response body to disk from a local server and asserts the downloaded
+  # file hash-matches the original. No network.
+  exec "nim c -r --hints:off examples/streaming/download_file.nim"
