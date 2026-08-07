@@ -479,8 +479,11 @@ suite "sync entry end to end":
     var cfg = initNaviConfig()
     cfg.maxResponseBytes = 10
     let api = newNavi(cfg)
-    expect ResponseTooLargeError:
+    var msg = ""
+    try:
       discard api.get("http://127.0.0.1:" & $port & "/")
+    except ResponseTooLargeError as e: msg = e.msg
+    check "maxResponseBytes" in msg
     joinThread(th)
 
   test "maxResponseBytes should allow a body within the limit":
@@ -507,9 +510,12 @@ suite "sync entry end to end":
     var cfg = initNaviConfig()
     cfg.maxResponseBytes = 10
     let api = newNavi(cfg)
-    expect ResponseTooLargeError:
+    var msg = ""
+    try:
       discard api.stream(GET, "http://127.0.0.1:" & $port & "/",
         sink = proc(data: openArray[byte]) = discard)
+    except ResponseTooLargeError as e: msg = e.msg
+    check "maxResponseBytes" in msg
     joinThread(th)
 
   test "retry statuses should be configurable so an ineligible status is not retried":
@@ -531,8 +537,11 @@ suite "sync entry end to end":
     let api = newNavi()
     let tok = newCancelToken()
     tok.cancel()
-    expect RequestCancelledError:
+    var msg = ""
+    try:
       discard api.get("http://127.0.0.1:1/", cancel = tok)
+    except RequestCancelledError as e: msg = e.msg
+    check "cancelled" in msg
 
   test "the client should leave the request unaffected when the cancel token is un-cancelled":
     const port = 8956
@@ -632,8 +641,11 @@ suite "TLS cipher selection config":
       cfg.retry.limit = 0
       cfg.tls.ciphers = "NOT-A-REAL-CIPHER"
       let api = newNavi(cfg)
-      expect ValueError:
+      var msg = ""
+      try:
         discard api.get("https://127.0.0.1:1/")
+      except ValueError as e: msg = e.msg
+      check "no usable cipher" in msg
       api.close()
 
     test "cipherSuites should raise rather than be ignored when the value is unusable":
@@ -642,6 +654,9 @@ suite "TLS cipher selection config":
       cfg.retry.limit = 0
       cfg.tls.cipherSuites = "NOT-A-REAL-SUITE"
       let api = newNavi(cfg)
-      expect ValueError:
+      var msg = ""
+      try:
         discard api.get("https://127.0.0.1:1/")
+      except ValueError as e: msg = e.msg
+      check "ciphersuite" in msg   # OpenSSL: "no usable ciphersuite"; LibreSSL: "does not support ... ciphersuites"
       api.close()
