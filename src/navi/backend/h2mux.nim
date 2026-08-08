@@ -10,7 +10,8 @@
 import std/[asyncdispatch, tables, deques]
 import ../proto/h2/conn
 import ../core/response          # for ResponseTooLargeError
-import ../core/request           # for BodyProducer
+import ../core/request           # for BodyProducer / BodySink
+import ../core/decompress        # for streaming response decompression
 import ./asyncdispatch as be
 
 type
@@ -21,6 +22,9 @@ type
     pendingSlots: Deque[Future[void]]  ## requests waiting for a concurrency slot
     sendReady: Table[uint32, Future[void]]  ## streaming uploads waiting for the send
                                             ## window to drain their queued chunk
+    sinks: Table[uint32, BodySink]     ## per-stream download sink (streaming requests)
+    decoders: Table[uint32, StreamDecoder]  ## per-stream body decoder (lazy; key present = built)
+    decompress: bool                   ## decode content-encoding before the sink
     sendTail: Future[void]   ## tail of the serialized send chain
     alive: bool
 
@@ -44,6 +48,7 @@ proc dispatch(mux: H2Mux) =
       let unprocessed = mux.h2.streamUnprocessed(sid)
       discard mux.h2.takeResponse(sid)
       mux.waiters.del(sid)
+      mux.sinks.del(sid); mux.decoders.del(sid)
       mux.releaseSlot()
       if tooLarge:
         fut.fail(newException(ResponseTooLargeError,
@@ -55,11 +60,13 @@ proc dispatch(mux: H2Mux) =
     elif mux.h2.streamEnded(sid):
       let resp = mux.h2.takeResponse(sid)
       mux.waiters.del(sid)
+      mux.sinks.del(sid); mux.decoders.del(sid)
       mux.releaseSlot()
       fut.complete(resp)
     elif mux.h2.goneAway:
       let unprocessed = mux.h2.streamUnprocessed(sid)
       mux.waiters.del(sid)
+      mux.sinks.del(sid); mux.decoders.del(sid)
       if unprocessed:              # above GOAWAY's last id: not processed, retryable
         fut.fail(newException(UnprocessedError, "navi: http/2 request not processed"))
       else:
@@ -102,6 +109,28 @@ proc send(mux: H2Mux, data: string) {.async.} =
   finally:
     mine.complete()
 
+proc deliver(mux: H2Mux, sid: uint32) =
+  ## Push newly-arrived response body for `sid` to its sink, decoding
+  ## content-encoding incrementally. Bounds memory: the body is drained per feed
+  ## rather than accumulated whole. The sink is synchronous here (stage 1).
+  let sink = mux.sinks.getOrDefault(sid, nil)
+  if sink == nil: return
+  let body = mux.h2.takeBody(sid)
+  if body.len == 0: return
+  if not mux.decoders.hasKey(sid):             # build the decoder once headers are in
+    mux.decoders[sid] =
+      if mux.decompress: newStreamDecoder(mux.h2.respHeader(sid, "content-encoding"))
+      else: nil
+  let dec = mux.decoders[sid]
+  let decoded = if dec != nil: dec.update(body.toOpenArrayByte(0, body.high)) else: body
+  if decoded.len > 0:
+    {.cast(gcsafe).}: sink(decoded.toOpenArrayByte(0, decoded.high))
+
+proc deliverAll(mux: H2Mux) =
+  var sids: seq[uint32]
+  for sid in mux.sinks.keys: sids.add sid       # snapshot: dispatch may drop entries
+  for sid in sids: mux.deliver(sid)
+
 proc reader(mux: H2Mux) {.async.} =
   try:
     while mux.alive:
@@ -109,6 +138,7 @@ proc reader(mux: H2Mux) {.async.} =
       if chunk.len == 0: break                 # peer closed
       let toSend = mux.h2.feed(chunk)
       if toSend.len > 0: await mux.send(toSend)   # includes a GOAWAY on a conn error
+      mux.deliverAll()                            # stream new body to sinks before completing
       mux.dispatch()
       mux.wakeSenders()                           # a WINDOW_UPDATE may have drained a send
       if mux.h2.connError.len > 0: break          # fatal: fail all in-flight below
@@ -119,12 +149,15 @@ proc reader(mux: H2Mux) {.async.} =
   try: await be.close(mux.transport)
   except CatchableError: discard
 
-proc newH2Mux*(transport: be.Conn, maxBody = 0): Future[H2Mux] {.async.} =
+proc newH2Mux*(transport: be.Conn, maxBody = 0, decompress = false): Future[H2Mux] {.async.} =
   ## Take ownership of a freshly connected h2 transport, send the preface, and
   ## start the background reader.
   let mux = H2Mux(transport: transport, h2: initH2Conn(maxBody), alive: true,
+                  decompress: decompress,
                   waiters: initTable[uint32, Future[H2Response]](),
                   sendReady: initTable[uint32, Future[void]](),
+                  sinks: initTable[uint32, BodySink](),
+                  decoders: initTable[uint32, StreamDecoder](),
                   pendingSlots: initDeque[Future[void]]())
   await be.sendAll(transport, mux.h2.preamble())
   asyncCheck reader(mux)
@@ -164,11 +197,14 @@ proc streamBody(mux: H2Mux, sid: uint32, fut: Future[H2Response],
         mux.sendReady.del(sid)
 
 proc request*(mux: H2Mux, headers: seq[(string, string)], body: string,
-              bodyStream: BodyProducer = nil): Future[H2Response] {.async.} =
+              bodyStream: BodyProducer = nil,
+              sink: BodySink = nil): Future[H2Response] {.async.} =
   ## Open a stream, send the request, and await this stream's response. Blocks
   ## while the connection is at the peer's MAX_CONCURRENT_STREAMS, resuming when
   ## a stream completes (so a burst of concurrent requests is queued, not RST).
   ## When `bodyStream` is set the body is streamed chunk by chunk instead of `body`.
+  ## When `sink` is set the response body is delivered to it incrementally as it
+  ## arrives (the returned response's body is empty), instead of being buffered.
   if not mux.alive:
     raise newException(IOError, "navi: http/2 connection not usable")
   while mux.alive and mux.waiters.len >= mux.h2.maxConcurrentStreams:
@@ -180,6 +216,7 @@ proc request*(mux: H2Mux, headers: seq[(string, string)], body: string,
   let sid = mux.h2.openStream()
   let fut = newFuture[H2Response]("h2mux.stream")
   mux.waiters[sid] = fut
+  if sink != nil: mux.sinks[sid] = sink        # deliver the body incrementally
   if bodyStream != nil:
     await mux.send(mux.h2.encodeRequestHead(sid, headers))
     await mux.streamBody(sid, fut, bodyStream)

@@ -5,7 +5,7 @@
 import std/tables
 import navi/private/entryguard
 import navi/core/public
-import navi/core/[engine, pool, session, proxy, h2glue, decompress]
+import navi/core/[engine, pool, session, proxy, h2glue]
 import navi/proto/ws
 import navi/backend/[asyncdispatch, h2mux]
 from std/strutils import startsWith, find, splitLines, contains
@@ -85,14 +85,10 @@ proc close*(client: Navi): Future[void] {.async.} =
 
 proc muxRequest(client: Navi, mux: H2Mux, req: Request,
                 sink: BodySink): Future[Response] {.async.} =
-  var r = toResponse(await mux.request(h2HeaderList(req), req.body, req.bodyStream))
-  # For a streaming request the h2 body is buffered by the mux; decode it once
-  # before handing it to the sink (the buffered path decodes via decodeBody).
-  if not sink.isNil and client.config.wantsDecompress and r.body.len > 0:
-    let dec = newStreamDecoder(r.headers.get("content-encoding"))
-    if dec != nil: r.body = dec.update(r.body.toOpenArrayByte(0, r.body.high))
-  applySink(r, sink)
-  result = r
+  # The mux delivers a streaming request's body to `sink` incrementally (decoding
+  # content-encoding as it arrives), so the returned response's body is empty.
+  # A non-streaming request (sink == nil) still buffers into r.body as before.
+  result = toResponse(await mux.request(h2HeaderList(req), req.body, req.bodyStream, sink))
 
 proc h1OnConn(client: Navi, conn: Conn, origin: string, req: Request,
               sink: BodySink): Future[Response] {.async.} =
@@ -144,7 +140,8 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
                                client.config.tls, proxyTarget, alpn,
                                client.config.connectMs, client.config.readMs)
       if conn.protocol == "h2":
-        let mux = await newH2Mux(conn, client.config.maxResponseBytes)
+        let mux = await newH2Mux(conn, client.config.maxResponseBytes,
+                                 client.config.wantsDecompress)
         client.muxes[origin] = mux
         client.pendingMux.del(origin)
         pending.complete(mux)
