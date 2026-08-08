@@ -140,7 +140,7 @@ proc main() {.async.} =
   check "stream() delivers the exact byte count to a sink":
     var total = 0
     let r = await api().stream(GET, base & "/bytes/2048",
-      sink = proc(data: openArray[byte]) = total += data.len)
+      sink = proc(data: seq[byte]) {.async.} = total += data.len)
     total == 2048 and r.body.len == 0
 
   check "a bodyStream upload is buffered and arrives intact":

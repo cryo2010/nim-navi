@@ -47,10 +47,6 @@ type
   H1State = enum
     stStatusLine, stHeaders, stBody, stChunkSize, stChunkData, stTrailers, stDone
 
-  SinkFactory* = proc(headers: Headers): BodySink {.closure, raises: [CatchableError].}
-    ## Chooses the body sink once response headers are known (e.g. to wrap it in
-    ## a content-encoding decoder). Keeps the parser ignorant of decompression.
-
   H1Parser* = object
     state: H1State
     buf: string
@@ -61,26 +57,33 @@ type
     version: string
     headers: Headers
     body: string
-    sink: BodySink          ## when set, body bytes go here instead of `body`
-    sinkFactory: SinkFactory ## when set, builds `sink` from the parsed headers
+    streaming: bool         ## when set, body bytes accumulate in `pending` for
+                            ## the engine to drain and hand to a sink, not `body`
+    pending: string         ## streaming body received since the last `takeBody`
     headRequest: bool       ## response is to a HEAD request -> never has a body
 
-proc initH1Parser*(sink: BodySink = nil, sinkFactory: SinkFactory = nil,
-                   headRequest = false): H1Parser =
+proc initH1Parser*(streaming = false, headRequest = false): H1Parser =
   result.state = stStatusLine
   result.bodyMode = bmUntilClose
-  result.sink = sink
-  result.sinkFactory = sinkFactory
+  result.streaming = streaming
   result.headRequest = headRequest
 
 proc emitBody(p: var H1Parser, chunk: string) =
-  if p.sink != nil:
-    # navi runs on a single thread (one event loop, or blocking sync), so the
-    # user's sink need not be marked gcsafe for chronos's gcsafe async procs.
-    {.cast(gcsafe).}:
-      p.sink(chunk.toOpenArrayByte(0, chunk.high))
+  if p.streaming:
+    p.pending.add(chunk)
   else:
     p.body.add(chunk)
+
+proc takeBody*(p: var H1Parser): string =
+  ## Move the streaming body received so far out of the parser, leaving it empty.
+  ## The engine drains this per feed, decodes it, and hands it to the sink, so raw
+  ## body bytes never accumulate whole in the parser.
+  result = move(p.pending)
+
+proc contentEncoding*(p: H1Parser): string =
+  ## The response's Content-Encoding (once headers are parsed); "" if absent. The
+  ## engine uses it to build a streaming decoder for the body it drains.
+  p.headers.get("content-encoding")
 
 proc finished*(p: H1Parser): bool {.inline.} = p.state == stDone
 
@@ -125,10 +128,6 @@ proc finishHeaders(p: var H1Parser) =
     p.bodyMode = bmLength     # self-delimited (zero length): stays keep-alive reusable
     p.state = stDone
     return
-  if p.sinkFactory != nil:      # now that headers are known, choose the sink
-    # single-threaded client; the factory need not be gcsafe (see emitBody).
-    {.cast(gcsafe).}:
-      p.sink = p.sinkFactory(p.headers)
   let te = p.headers.get("transfer-encoding")
   if te.len > 0 and "chunked" in te.toLowerAscii:
     p.bodyMode = bmChunked

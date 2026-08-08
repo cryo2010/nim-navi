@@ -314,16 +314,6 @@ proc newStreamDecoder*(encoding: string): StreamDecoder =
   else:
     nil
 
-proc decodingSink*(encoding: string, inner: BodySink): BodySink =
-  ## Wrap `inner` so streamed body chunks are decompressed per `encoding` before
-  ## delivery. Returns `inner` unchanged for identity/unknown encodings.
-  if inner == nil: return nil
-  let dec = newStreamDecoder(encoding)
-  if dec == nil: return inner
-  result = proc(data: openArray[byte]) =
-    let plain = dec.update(data)
-    if plain.len > 0: inner(plain.toOpenArrayByte(0, plain.high))
-
 proc decodeBody*(resp: var Response, opts: NaviConfigBase) =
   ## Decompress the body in place per Content-Encoding, then drop the headers that
   ## described the encoded form. Handles a stacked encoding (e.g. `gzip, br`) by

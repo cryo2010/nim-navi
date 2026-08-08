@@ -13,6 +13,14 @@ import ../core/response  # for navi's TimeoutError
 
 export api, chronos
 
+type
+  BodySink* = proc(data: seq[byte]): Future[void] {.closure.}
+    ## Streaming download sink for the chronos backend. Awaitable: the engine
+    ## `await`s it, so a slow sink applies cooperative backpressure (stalling the
+    ## per-read loop) rather than buffering the whole body in memory. Takes an owned
+    ## `seq[byte]` (not `openArray`): the chunk crosses an `await`, so a borrowed
+    ## view would violate memory safety on capture into the async env.
+
 proc chronosVer(v: api.TlsVersion,
                 whenDefault: tlsstream.TLSVersion): tlsstream.TLSVersion =
   ## Map a navi `TlsVersion` to chronos's (`TLSVersion` collides by name, so both

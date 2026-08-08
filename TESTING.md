@@ -151,6 +151,17 @@ Streaming is verified per **backend × direction**, always by hashing the transf
 against the original. Upload uses a pull-based `bodyStream` producer; download
 uses a `sink` that receives chunks as they arrive.
 
+The download `sink` is per backend: `proc(data: openArray[byte])` on sync, and an
+**awaitable** `proc(data: seq[byte]): Future[void]` on the async backends
+(asyncdispatch, chronos, js). Because the engine and the h2 mux `await` the async
+sink, a slow consumer applies cooperative backpressure — over h2 the stream's
+receive window is only replenished (`ackRecv`) after the sink has consumed each
+chunk, so the peer stalls that one stream without blocking the mux reader or the
+other multiplexed streams; over h1 the awaited sink pauses the read loop. The
+`nghttpd_async` interop asserts a 256 KiB body reaches the sink in **more than one
+call** (incremental, not buffered whole) and that the mux heap stays flat across
+5000 requests (no leak or deadlock in the drain path).
+
 | | `navi` (sync) | `navi/asyncdispatch` | `navi/chronos` | `navi/js` |
 | --- | :---: | :---: | :---: | :---: |
 | Download (`sink`) | ✓ | ✓ | ✓ | ✓ |

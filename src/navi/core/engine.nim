@@ -36,31 +36,55 @@ template sendRequest(conn, req: typed) =
   else:
     await sendAll(conn, serializeRequest(req))
 
-template h1Exchange*(transport, req, sink, keep, decompress: typed): Response =
+template h1Exchange*(transport, req, sink, keep, decompress, cap: typed): Response =
   ## One HTTP/1.1 request/response over `transport`. Sets `keep` to whether the
-  ## connection may be reused; does not pool or close. When `sink` is set and
-  ## `decompress` is on, body chunks are decompressed as they arrive.
+  ## connection may be reused; does not pool or close. When `sink` is set the body
+  ## is drained per read, decoded (if `decompress`), size-capped at `cap` decoded
+  ## bytes, and `await`ed into the sink -- so a slow sink stalls the read loop
+  ## (backpressure) instead of buffering, and the parser never holds the whole body.
   block:
+    mixin BodySink
     sendRequest(transport, req)
     let noBody = req.verb == HEAD          # a HEAD response never carries a body
-    var parser =
-      if not sink.isNil and decompress:
-        initH1Parser(sinkFactory = proc(h: Headers): BodySink =
-          decodingSink(h.get("content-encoding"), sink), headRequest = noBody)
-      else:
-        initH1Parser(sink, headRequest = noBody)
+    let streaming = not sink.isNil
+    var parser = initH1Parser(streaming = streaming, headRequest = noBody)
+    var dec: StreamDecoder = nil
+    var decReady = false                    # decoder chosen once headers are in
+    var seen = 0
     while not parser.finished:
       let chunk = await recvSome(transport)
-      if chunk.len == 0:
-        parser.eof()
-        break
-      parser.feed(chunk)
+      if chunk.len == 0: parser.eof()
+      else: parser.feed(chunk)
+      if streaming:
+        let raw = parser.takeBody()
+        if raw.len > 0:
+          if not decReady:
+            dec = if decompress: newStreamDecoder(parser.contentEncoding()) else: nil
+            decReady = true
+          let decoded =
+            if dec != nil: dec.update(raw.toOpenArrayByte(0, raw.high)) else: raw
+          if decoded.len > 0:
+            seen += decoded.len
+            if cap > 0 and seen > cap:
+              raise newException(ResponseTooLargeError,
+                "navi: response exceeded maxResponseBytes")
+            # single-threaded client; the sink need not be gcsafe (see sendRequest).
+            # An owned seq[byte]: on the async backends the chunk crosses an await,
+            # so the sink cannot take a borrowed openArray view (memory safety). A
+            # seq[byte] argument also satisfies the sync backend's openArray sink.
+            # The raises cast discharges chronos's strict-raises obligation on the
+            # portable (annotation-free) sink type, as the middleware path does.
+            {.cast(gcsafe).}:
+              {.cast(raises: [CatchableError]).}:
+                await sink(@(decoded.toOpenArrayByte(0, decoded.high)))
+      if chunk.len == 0: break
     keep = parser.keepAliveAfter()
     parser.toResponse()
 
-template h2Stream(transport, h2, req, sink, decompress: typed): Response =
+template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
   ## One HTTP/2 request/response on a new stream of the shared connection `h2`.
   block:
+    mixin BodySink
     let sid = h2.openStream()
     if req.bodyStream != nil:
       # Stream the request body: HEADERS now, then DATA frames pulled from the
@@ -86,25 +110,37 @@ template h2Stream(transport, h2, req, sink, decompress: typed): Response =
     else:
       await sendAll(transport, h2.encodeRequest(sid, h2HeaderList(req), req.body))
     # Deliver the body to the sink incrementally as DATA arrives (bounded memory),
-    # or buffer it for a non-streaming request. The decoder-wrapped sink is built
-    # once the response headers are in (so content-encoding is known); the loop
-    # runs once more after the END_STREAM feed, so the final chunk is delivered
-    # too. On the buffered path `takeBody` is never called, so the whole body
-    # accumulates in the connection as before.
-    var streamSink: BodySink = nil
+    # or buffer it for a non-streaming request. The decoder is built once the
+    # response headers are in (so content-encoding is known); the loop runs once
+    # more after the END_STREAM feed, so the final chunk is delivered too. The sink
+    # is `await`ed, so a slow sink stalls this read loop and, in turn, the peer
+    # (backpressure). On the buffered path `takeBody` is never called, so the whole
+    # body accumulates in the connection as before.
+    var dec: StreamDecoder = nil
+    var decReady = false
+    var seen = 0
     while not h2.streamDone(sid):
       let chunk = await recvSome(transport)
       if chunk.len == 0: break
       let toSend = h2.feed(chunk)
       if toSend.len > 0: await sendAll(transport, toSend)
       if not sink.isNil:
-        let body = h2.takeBody(sid)
-        if body.len > 0:
-          if streamSink.isNil:
-            streamSink =
-              if decompress: decodingSink(h2.respHeader(sid, "content-encoding"), sink)
-              else: sink
-          {.cast(gcsafe).}: streamSink(body.toOpenArrayByte(0, body.high))
+        let raw = h2.takeBody(sid)
+        if raw.len > 0:
+          if not decReady:
+            dec = if decompress: newStreamDecoder(h2.respHeader(sid, "content-encoding"))
+                  else: nil
+            decReady = true
+          let decoded =
+            if dec != nil: dec.update(raw.toOpenArrayByte(0, raw.high)) else: raw
+          if decoded.len > 0:
+            seen += decoded.len
+            if cap > 0 and seen > cap:
+              raise newException(ResponseTooLargeError,
+                "navi: response exceeded maxResponseBytes")
+            {.cast(gcsafe).}:
+              {.cast(raises: [CatchableError]).}:
+                await sink(@(decoded.toOpenArrayByte(0, decoded.high)))
     let wasReset = h2.streamReset(sid)
     let tooLarge = h2.streamTooLarge(sid)
     let unprocessed = h2.streamUnprocessed(sid)
@@ -126,7 +162,7 @@ template poolTransport*(client, req, sink: typed): Response =
   ## Pool-based transport: reuse a pooled connection (http/1.1 or a persistent
   ## h2 connection) or open a fresh one, negotiating the protocol via ALPN.
   ## One request at a time per connection. Used by the sync and chronos entries.
-  mixin connect, sendAll, recvSome, close, await
+  mixin connect, sendAll, recvSome, close, await, BodySink
   block:
     var rq = req
     let proxy = resolveProxy(client.config, rq.url)
@@ -141,12 +177,14 @@ template poolTransport*(client, req, sink: typed): Response =
     if found:
       try:
         if pc.h2 != nil:
-          resp = h2Stream(pc.transport, pc.h2, rq, sink, client.config.wantsDecompress)
+          resp = h2Stream(pc.transport, pc.h2, rq, sink,
+                          client.config.wantsDecompress, client.config.maxResponseBytes)
           if not (pc.h2.canReuse and pushIdle(client.pool, key, pc)):
             await close(pc.transport)
         else:
           var keep = false
-          resp = h1Exchange(pc.transport, rq, sink, keep, client.config.wantsDecompress)
+          resp = h1Exchange(pc.transport, rq, sink, keep,
+                            client.config.wantsDecompress, client.config.maxResponseBytes)
           if not (keep and pushIdle(client.pool, key, pc)):
             await close(pc.transport)
         served = true
@@ -162,12 +200,14 @@ template poolTransport*(client, req, sink: typed): Response =
       if transport.protocol == "h2":
         npc.h2 = initH2Conn(client.config.maxResponseBytes)
         await sendAll(transport, npc.h2.preamble())
-        resp = h2Stream(transport, npc.h2, rq, sink, client.config.wantsDecompress)
+        resp = h2Stream(transport, npc.h2, rq, sink,
+                        client.config.wantsDecompress, client.config.maxResponseBytes)
         if not (npc.h2.canReuse and pushIdle(client.pool, key, npc)):
           await close(transport)
       else:
         var keep = false
-        resp = h1Exchange(transport, rq, sink, keep, client.config.wantsDecompress)
+        resp = h1Exchange(transport, rq, sink, keep,
+                          client.config.wantsDecompress, client.config.maxResponseBytes)
         if not (keep and pushIdle(client.pool, key, npc)):
           await close(transport)
     resp
@@ -187,6 +227,7 @@ template maybeDigest(client, rreq, resp: typed) =
   ## On a 401 Digest challenge, when digest auth is configured and the request
   ## carries no Authorization yet, compute the response and retry once. Expands
   ## inline so the retry's `await`s run in the caller's async proc.
+  mixin BodySink
   if resp.status == 401 and client.config.auth.kind == akDigest and
      not rreq.headers.contains("authorization"):
     let chal = bestChallenge(resp.headers.getAll("www-authenticate"))
@@ -201,6 +242,7 @@ template maybeDigest(client, rreq, resp: typed) =
 template followRedirects(client, startReq, resp: typed) =
   ## Issue `startReq`, following redirects into `resp`. Expands inline so its
   ## `await`s run in the caller's async proc.
+  mixin BodySink
   var rreq = startReq
   var hops = 0
   let limit = client.config.redirectLimit
@@ -221,7 +263,7 @@ template performRequest*(client, req0: typed; cancel: CancelToken = nil): Respon
   ## can wrap, short-circuit, or observe) is composed around this by the entry
   ## module. `cancel` is checked between attempts (cooperative on the sync
   ## backend; the async backends also abort in-flight via their guard).
-  mixin sleep
+  mixin sleep, BodySink
   block:
     var req = req0
     var resp: Response
@@ -256,8 +298,7 @@ template performStream*(client, req, sink: typed; cancel: CancelToken = nil): Re
   ## bytes delivered; a non-2xx still raises HttpError unless disabled.
   block:
     throwIfCancelled(cancel)
-    let limited = limitedSink(sink, client.config.maxResponseBytes)
-    let resp = run(client, req, limited)
+    let resp = run(client, req, sink)
     if client.config.wantsThrow and not resp.ok:
       raiseHttpError(req, resp)
     resp

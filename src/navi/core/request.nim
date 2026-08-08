@@ -90,8 +90,10 @@ type
 
   BodyProducer* = proc(): string {.closure, raises: [CatchableError].}
     ## Pull-based upload source: returns the next chunk, or "" at end of body.
-  BodySink* = proc(data: openArray[byte]) {.closure, raises: [CatchableError].}
-    ## Download sink: receives response body chunks as they arrive.
+    ##
+    ## The download sink type (`BodySink`) is defined per backend, since it is
+    ## awaitable on the async backends (`proc(data: seq[byte]): Future[void]`) and
+    ## a plain `proc(data: openArray[byte])` on the sync backend.
 
   Request* = object
     verb*: HttpVerb
@@ -110,22 +112,6 @@ proc defaultRetryPolicy*(): RetryPolicy =
     methods: {GET, HEAD, PUT, DELETE, OPTIONS},
     statuses: @[408, 413, 429, 500, 502, 503, 504],
     maxDelay: 10_000)
-
-proc limitedSink*(inner: BodySink, limit: int): BodySink =
-  ## Wrap `inner` so the cumulative bytes delivered are capped at `limit`, raising
-  ## `ResponseTooLargeError` once exceeded (the overflowing chunk is not
-  ## delivered). Returns `inner` unchanged when the limit is disabled (0) or there
-  ## is no sink. On the native backends this wraps the user's sink *inside*
-  ## `decodingSink`, so the cap counts decompressed bytes (a decompression-bomb
-  ## guard); the browser decodes for the js backend, so it counts wire bytes there.
-  if inner == nil or limit <= 0: return inner
-  var seen = 0
-  result = proc(data: openArray[byte]) =
-    seen += data.len
-    if seen > limit:
-      raise newException(ResponseTooLargeError,
-        "navi: response exceeded maxResponseBytes (" & $limit & ")")
-    inner(data)
 
 # Readers take the base by value; a derived NaviConfig slices to it cleanly.
 proc wantsDecompress*(opts: NaviConfigBase): bool = opts.decompress

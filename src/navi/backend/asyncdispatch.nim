@@ -17,6 +17,14 @@ when defined(ssl):
 
 export api, asyncdispatch
 
+type
+  BodySink* = proc(data: seq[byte]): Future[void] {.closure.}
+    ## Streaming download sink for the asyncdispatch backend. Awaitable: the engine
+    ## and h2 mux `await` it, so a slow sink applies cooperative backpressure (it
+    ## stalls the peer via the gated receive window) rather than buffering in memory.
+    ## Takes an owned `seq[byte]` (not `openArray`): the chunk crosses an `await`, so
+    ## it cannot be a borrowed view (that would violate memory safety on capture).
+
 # Disable Nagle on the connection socket: without it the TLS handshake's final
 # flight plus the first request stall ~40ms on the peer's delayed ACK, paid on
 # every fresh (unpooled) connection.
