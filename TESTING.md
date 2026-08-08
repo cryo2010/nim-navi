@@ -175,7 +175,14 @@ Where each is exercised:
   on the three native backends, and buffered on js (`httpbin_test.nim` builds for
   sync/async/chronos, `httpbin_js.nim` for js).
 - **nghttpd `interop` job** — streamed `bodyStream` upload over real h2 on the
-  sync backend and the async mux.
+  sync backend and the async mux, plus a streamed download that must reach the sink
+  in **more than one call** (incremental, not buffered whole) and leave the mux
+  heap flat across 5000 requests (no leak/deadlock in the drain path).
+- **Backpressure (sans-io, `test_h2_conn`)** — the flow-control gating an async
+  sink relies on: a `sinkMode` stream holds its stream `WINDOW_UPDATE` past the
+  replenish threshold until `ackRecv` releases it (a normal stream replenishes
+  eagerly, as the control case), so a slow consumer stalls the peer. Also covers
+  incremental `takeBody` drain and the running-total size cap.
 - **Unit** — `test_entries` caps a streamed body incrementally and sends a chunked
   upload; `test_stream_decompress` decodes a streamed body through the `sink`.
 
