@@ -15,6 +15,12 @@ when defined(ssl):
 
 export api
 
+type
+  BodySink* = proc(data: openArray[byte]) {.closure, raises: [CatchableError].}
+    ## Streaming download sink for the sync backend: receives decoded response
+    ## body chunks as they arrive. Synchronous (no backpressure needed: a blocking
+    ## read only pulls the next chunk once this returns).
+
 when defined(windows):
   import std/winlean
   proc sysConnect(fd: SocketHandle, sa: ptr SockAddr, sl: SockLen): cint =

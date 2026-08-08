@@ -93,7 +93,8 @@ proc muxRequest(client: Navi, mux: H2Mux, req: Request,
 proc h1OnConn(client: Navi, conn: Conn, origin: string, req: Request,
               sink: BodySink): Future[Response] {.async.} =
   var keep = false
-  result = h1Exchange(conn, req, sink, keep, client.config.wantsDecompress)
+  result = h1Exchange(conn, req, sink, keep,
+                      client.config.wantsDecompress, client.config.maxResponseBytes)
   let pc = PooledConn[Conn](transport: conn)
   if not (keep and pushIdle(client.pool, origin, pc)):
     await close(conn)
@@ -120,7 +121,8 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
   if found:
     try:
       var keep = false
-      result = h1Exchange(pc.transport, req, sink, keep, client.config.wantsDecompress)
+      result = h1Exchange(pc.transport, req, sink, keep,
+                          client.config.wantsDecompress, client.config.maxResponseBytes)
       if not (keep and pushIdle(client.pool, origin, pc)): await close(pc.transport)
       return
     except CatchableError:

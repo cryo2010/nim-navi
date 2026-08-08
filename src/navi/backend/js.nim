@@ -13,6 +13,13 @@ import std/[asyncjs, jsffi]
 from std/strutils import cmpIgnoreCase
 import ../core/[headers, url, request, response, cancel]
 
+type
+  BodySink* = proc(data: seq[byte]): Future[void] {.closure.}
+    ## Streaming download sink for the js backend. Awaitable: `drainToSink` `await`s
+    ## it per chunk read from the fetch `ReadableStream`, so a slow sink naturally
+    ## paces reads from the stream rather than buffering the whole body. Takes an
+    ## owned `seq[byte]` (the chunk crosses an `await`).
+
 # --- fetch / DOM bindings ---
 proc fetch(url: cstring, init: JsObject): Future[JsObject] {.importjs: "fetch(#, #)".}
 proc newHeaders(): JsObject {.importjs: "new Headers()".}
@@ -65,9 +72,13 @@ proc toResponse(res: JsObject, body: string): Response =
                "",                    # fetch does not expose the negotiated version
                readHeaders(res), body)
 
-proc drainToSink(res: JsObject, sink: BodySink) {.async.} =
+proc drainToSink(res: JsObject, sink: BodySink, cap: int) {.async.} =
   ## Stream the response body to `sink`, copying each Uint8Array chunk to bytes.
+  ## `await`ing the sink paces reads from the stream (backpressure). When `cap` is
+  ## set, the cumulative bytes read are capped (the browser already decoded the
+  ## body, so this counts decoded bytes) and `ResponseTooLargeError` is raised.
   let reader = bodyReader(res)
+  var seen = 0
   while true:
     let chunk = await readChunk(reader)
     if chunk["done"].to(bool): break
@@ -75,13 +86,18 @@ proc drainToSink(res: JsObject, sink: BodySink) {.async.} =
     var bytes = newSeq[byte](jsLen(arr))
     for i in 0 ..< bytes.len:
       bytes[i] = byte(arr[i].to(int))
-    sink(bytes)
+    seen += bytes.len
+    if cap > 0 and seen > cap:
+      raise newException(ResponseTooLargeError,
+        "navi: response exceeded maxResponseBytes")
+    await sink(bytes)
 
 proc fetchExchange*(req: Request, sink: BodySink, timeout = 0,
-                    cancel: CancelToken = nil): Future[Response] {.async.} =
+                    cancel: CancelToken = nil, cap = 0): Future[Response] {.async.} =
   ## One request/response through `fetch`. With a `sink`, the body streams to it
   ## and `Response.body` is left empty; otherwise the body is buffered. A nonzero
   ## `timeout` aborts the fetch after that many ms; `cancel` aborts it on demand.
+  ## `cap` (when > 0) caps the streamed body size.
   var controller: JsObject
   let wantCancel = cancel != nil
   if wantCancel:
@@ -106,7 +122,7 @@ proc fetchExchange*(req: Request, sink: BodySink, timeout = 0,
   if sink.isNil:
     result = toResponse(res, $(await jsText(res)))
   else:
-    await drainToSink(res, sink)
+    await drainToSink(res, sink, cap)
     result = toResponse(res, "")
 
 proc sleep*(ms: int): Future[void] =

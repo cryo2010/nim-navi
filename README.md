@@ -152,12 +152,16 @@ backends differ:
 | Max TLS version | system | system | 1.2 | runtime |
 | Keep-alive / connection pool | ✓ | ✓ | ✓ | ✗ |
 | Streaming upload | ✓ | ✓ | ✓ | buffered |
+| Streaming download (sink) | sync sink | async sink | async sink | async sink |
 | Cookie jar | ✓ | ✓ | ✓ | ✓ |
 | Proxy configuration | ✓ | ✓ | ✓ | ✗ |
 
 Legend: ✓ supported · ✗ not supported · **runtime** = provided by the
 browser/Node platform rather than navi · **buffered** = `bodyStream` is accepted
-but drained and sent as one body (`fetch` cannot reliably stream a request body). (`navi/js` keeps its own cookie jar off
+but drained and sent as one body (`fetch` cannot reliably stream a request body) ·
+**sync sink** = `proc(data: openArray[byte])` · **async sink** = awaitable
+`proc(data: seq[byte]): Future[void]`, which back-pressures the peer (see
+[Streaming](#streaming)). (`navi/js` keeps its own cookie jar off
 a browser, and defers to the browser store on one; see below.)
 
 Two backends carry caveats:
@@ -582,6 +586,28 @@ discard api.stream(GET, "https://example.com/large", sink = proc(data: openArray
 file.close()
 ```
 
+The sink type is per backend. On the **sync** backend it is a plain
+`proc(data: openArray[byte])`, as above. On the **async** backends
+(`navi/asyncdispatch`, `navi/chronos`, `navi/js`) it is **awaitable** and takes an
+owned buffer, `proc(data: seq[byte]): Future[void]` — so you write it as
+`{.async.}` and the engine `await`s it:
+
+```nim
+var file = open("out.bin", fmWrite)
+discard await api.stream(GET, "https://example.com/large",
+  sink = proc(data: seq[byte]) {.async.} =
+    discard file.writeBuffer(unsafeAddr data[0], data.len))
+file.close()
+```
+
+Because the async sink is awaited, a slow consumer applies **cooperative
+backpressure**: over HTTP/2 the stream's receive window is only replenished once
+the sink has consumed each chunk, so the peer stalls that one stream (without
+starving the other multiplexed streams or blocking the connection reader) instead
+of the body piling up in memory. Over HTTP/1.1 the awaited sink pauses the read
+loop, which back-pressures the peer through TCP. The size cap
+(`maxResponseBytes`) is enforced incrementally on the streamed bytes.
+
 Stream an upload from a pull-based producer, sent as chunked transfer-encoding:
 
 ```nim
@@ -656,8 +682,11 @@ transfer-encoding (return `""` to end). Not available on `navi/js`.
 
 ### client.stream(verb, target, sink, headers = initHeaders(), params = @[], cancel = nil)
 
-Deliver the response body to `sink: proc(data: openArray[byte])` as it arrives;
-the returned `Response.body` stays empty.
+Deliver the response body to `sink` as it arrives; the returned `Response.body`
+stays empty. The sink type is per backend: `proc(data: openArray[byte])` on sync,
+and an awaitable `proc(data: seq[byte]): Future[void]` on `navi/asyncdispatch`,
+`navi/chronos`, and `navi/js` (awaiting it back-pressures the peer — see
+[Streaming](#streaming)). Not available for uploads on `navi/js`.
 
 ### client.websocket(url, headers = initHeaders())
 

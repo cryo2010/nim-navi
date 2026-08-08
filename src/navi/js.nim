@@ -138,8 +138,8 @@ proc runCoreStream(client: Navi, req: Request, sink: BodySink,
   throwIfCancelled(cancel)
   var rq = req
   if not client.jar.isNil: applyCookies(client.jar, rq)
-  let limited = limitedSink(sink, client.config.maxResponseBytes)
-  var resp = await fetchExchange(rq, limited, client.config.totalMs, cancel)
+  var resp = await fetchExchange(rq, sink, client.config.totalMs, cancel,
+                                 client.config.maxResponseBytes)
   if not client.jar.isNil: storeCookies(client.jar, rq.url, resp)
   client.maybeThrow(rq, resp)
   result = resp

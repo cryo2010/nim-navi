@@ -42,7 +42,8 @@ proc initResponse*(status: int; reason, httpVersion: string; headers: Headers;
 
 proc enforceMaxResponse*(r: Response, limit: int) =
   ## Raise `ResponseTooLargeError` if a buffered body exceeds `limit` (0 = off).
-  ## The streaming path enforces the same cap incrementally via `limitedSink`.
+  ## The streaming path enforces the same cap incrementally as chunks are decoded
+  ## in the engine (and via the h2 receive-window RST on the async mux).
   if limit > 0 and r.body.len > limit:
     raise newException(ResponseTooLargeError,
       "navi: response body of " & $r.body.len & " bytes exceeds " &
