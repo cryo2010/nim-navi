@@ -493,3 +493,52 @@ suite "h2 incremental response body":
     check c.takeBody(sid).len == 8                  # drained; resp.body is now empty
     discard c.feed(encodeData(sid, repeat("x", 8), endStream = false))  # total 16 > 10
     check c.streamTooLarge(sid)                     # cap tracks the running total, not the buffer
+
+proc hasStreamWindowUpdate(s: string, sid: uint32): bool =
+  for f in allFrames(s):
+    if f.typ == uint8(ftWindowUpdate) and f.streamId == sid: return true
+
+proc feedBody(c: H2Conn, sid: uint32, total: int): string =
+  ## Feed `total` body bytes as a run of DATA frames (each within the max frame
+  ## size); return the control bytes the connection emits back.
+  var srv = ""
+  var left = total
+  while left > 0:
+    let n = min(16000, left)
+    srv.add encodeData(sid, repeat("x", n), endStream = false)
+    left -= n
+  c.feed(srv)
+
+suite "h2 gated receive window (sink backpressure)":
+  # A sinkMode stream holds its receive-window credit until the sink acks
+  # consumption, so a slow consumer stalls the peer instead of buffering without
+  # bound. > streamReplenish (recvWindowSize div 2 = 4 MiB) so the eager path
+  # would otherwise emit a stream WINDOW_UPDATE.
+  const overThreshold = 4 * 1024 * 1024 + 16000
+  let head = @[(":method", "GET"), (":scheme", "https"),
+               (":path", "/"), (":authority", "x")]
+
+  proc respond200(c: H2Conn, sid: uint32) =
+    let enc = HpackEncoder()
+    discard c.feed(encodeHeaders(sid, enc.encode(@[(":status", "200")]),
+                                 endStream = false, endHeaders = true))
+
+  test "a sinkMode stream holds its stream WINDOW_UPDATE until ackRecv":
+    let c = newServerConn()
+    let sid = c.openStream()
+    discard c.encodeRequest(sid, head, "")
+    c.respond200(sid)
+    c.setSinkMode(sid)
+    let out1 = c.feedBody(sid, overThreshold)
+    check not hasStreamWindowUpdate(out1, sid)      # gated: stream window held despite > threshold
+    discard c.takeBody(sid)                         # deliver to the (slow) sink...
+    let ack = c.ackRecv(sid, overThreshold)         # ...then ack once it has consumed
+    check hasStreamWindowUpdate(ack, sid)           # now the stream window is released
+
+  test "a non-sinkMode stream replenishes its window eagerly (control)":
+    let c = newServerConn()
+    let sid = c.openStream()
+    discard c.encodeRequest(sid, head, "")
+    c.respond200(sid)
+    let out1 = c.feedBody(sid, overThreshold)
+    check hasStreamWindowUpdate(out1, sid)          # eager: emitted during feed, no ack needed
