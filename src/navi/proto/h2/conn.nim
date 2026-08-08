@@ -34,6 +34,8 @@ type
     recvPending: int      ## received bytes not yet acked with a WINDOW_UPDATE
     bodyTotal: int        ## total body bytes received (for the size cap; `resp.body`
                           ## is drained incrementally by `takeBody`)
+    sinkMode: bool        ## hold the stream receive window until `ackRecv`, so a
+                          ## slow sink backpressures the peer (see setSinkMode)
     sendBuf: string       ## request body not yet on the wire (flow-control bound)
     sendOff: int          ## bytes of sendBuf already sent
     sendWindow: int       ## per-stream send window (peer's INITIAL_WINDOW_SIZE)
@@ -328,7 +330,12 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
         c.replenishConn(f.payload.len, outbuf)   # still owe the connection window
       else:
         if f.payload.len > 0:
-          c.replenishRecv(f.streamId, s, f.payload.len, outbuf)
+          if s.sinkMode:
+            # Hold the stream window until the sink consumes (via ackRecv); still
+            # replenish the shared connection window so other streams don't stall.
+            c.replenishConn(f.payload.len, outbuf)
+          else:
+            c.replenishRecv(f.streamId, s, f.payload.len, outbuf)
         if (f.flags and flagEndStream) != 0: s.ended = true
     elif f.payload.len > 0:
       c.replenishConn(f.payload.len, outbuf)     # reset/unknown stream: keep the conn window in sync
@@ -413,6 +420,27 @@ proc respHeader*(c: H2Conn, streamId: uint32, name: string): string =
   if s != nil:
     for (k, v) in s.resp.headers:
       if k == name: return v
+
+proc setSinkMode*(c: H2Conn, streamId: uint32) =
+  ## Defer this stream's receive-window replenishment to `ackRecv`, so the stream
+  ## window is held until a (possibly slow) sink has consumed the delivered bytes.
+  ## Use for a streaming download that must apply backpressure to the peer.
+  let s = c.streams.getOrDefault(streamId)
+  if s != nil: s.sinkMode = true
+
+proc ackRecv*(c: H2Conn, streamId: uint32, n: int): string =
+  ## Acknowledge that the sink consumed `n` received body bytes, replenishing the
+  ## STREAM receive window (batched, like the eager path). For a sinkMode stream
+  ## whose DATA handler deferred the stream-level WINDOW_UPDATE, this releases it;
+  ## holding it until now is what turns a slow consumer into peer backpressure.
+  ## (The connection window is replenished in the DATA handler, so other streams
+  ## are never starved.) Returns the WINDOW_UPDATE bytes to send, if any.
+  let s = c.streams.getOrDefault(streamId)
+  if s == nil: return
+  s.recvPending += n
+  if s.recvPending >= streamReplenish:
+    result.add encodeWindowUpdate(streamId, uint32(s.recvPending))
+    s.recvPending = 0
 
 proc takeResponse*(c: H2Conn, streamId: uint32): H2Response =
   ## Return the stream's response and drop the stream.
