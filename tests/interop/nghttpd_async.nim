@@ -48,6 +48,24 @@ suite "nghttpd interop (asyncdispatch, http/2 mux)":
     check res.httpVersion == "HTTP/2"
     check res.body == repeat("z", 250_000)
 
+  test "streams a response body to a sink incrementally over the mux":
+    # The mux delivers DATA to the sink as it arrives rather than buffering the
+    # whole body; a 256 KiB body must therefore arrive in more than one sink call.
+    proc run(): Future[(int, int, string)] {.async.} =
+      var cfg = initNaviConfig()
+      cfg.tls.caFile = cert
+      let api = newNavi(cfg)
+      var calls, total = 0
+      let res = await api.stream(GET, base & "/large.bin",
+        sink = proc(data: openArray[byte]) =
+          inc calls
+          total += data.len)
+      return (calls, total, res.httpVersion)
+    let (calls, total, ver) = waitFor run()
+    check ver == "HTTP/2"
+    check total == 262144                 # 256 KiB body delivered in full
+    check calls > 1                       # ...incrementally, not buffered into one call
+
   test "concurrent GETs multiplex over a single connection":
     proc run(): Future[seq[Response]] {.async.} =
       var cfg = initNaviConfig()
