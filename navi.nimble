@@ -121,6 +121,17 @@ task streaming, "File-streaming interop: http1/http2 x upload/download (needs ng
     for dir in ["upload", "download"]:
       exec "bash tests/interop/streaming.sh " & proto & " " & dir
 
+task streamConcurrent, "Concurrent streaming interop: 50 simultaneous streamed uploads + downloads over the h2 mux (Docker)":
+  # Fires N (default 50, set NAVI_CONCURRENT_N) simultaneous streamed downloads,
+  # uploads, and a mixed batch over one h2 connection against a FastAPI server,
+  # verifies every transfer by SHA-1, and asserts they multiplexed onto a single
+  # connection. Requires Docker; exits non-zero on any mismatch.
+  let compose = "docker compose -f tests/interop/streaming_concurrent/docker-compose.yml"
+  try:
+    exec compose & " up --build --abort-on-container-exit --exit-code-from client"
+  finally:
+    exec compose & " down"
+
 task servers, "Multi-server HTTP/2 interop: nginx, Caddy, h2o (needs Docker + openssl)":
   # Runs navi's h2 client (and chronos h1) against three unrelated server stacks.
   exec "bash tests/interop/servers.sh"

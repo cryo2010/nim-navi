@@ -33,11 +33,16 @@ PAYLOAD_SHA1 = hashlib.sha1(PAYLOAD).hexdigest()
 
 
 @app.get("/download")
-def download() -> Response:
+def download(size: int | None = None) -> Response:
+    # Default streams the fixed 3 MiB payload (the demo). `?size=N` streams N
+    # deterministic bytes instead, used by the concurrent-streaming interop test
+    # to fan out many lighter transfers.
+    content = PAYLOAD if size is None else make_payload(size)
+    sha1 = PAYLOAD_SHA1 if size is None else hashlib.sha1(content).hexdigest()
     return Response(
-        content=PAYLOAD,
+        content=content,
         media_type="application/octet-stream",
-        headers={"x-sha1": PAYLOAD_SHA1},
+        headers={"x-sha1": sha1},
     )
 
 
