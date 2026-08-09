@@ -167,5 +167,14 @@ proc close*(c: Conn): Future[void] {.async.} =
   await c.reader.closeWait()
   await c.transport.closeWait()
 
+proc closeSync*(c: Conn) =
+  ## Synchronous close, for a destructor that cannot `await` (an abandoned
+  ## streaming handle reclaimed by GC). chronos's non-`Wait` `close` initiates
+  ## teardown and returns; the event loop frees the resources afterwards. Same
+  ## teardown as `close`, minus the awaits.
+  if not c.writer.isNil: c.writer.close()
+  if not c.reader.isNil: c.reader.close()
+  if not c.transport.isNil: c.transport.close()
+
 proc sleep*(ms: int): Future[void] {.async.} =
   await sleepAsync(ms.milliseconds)

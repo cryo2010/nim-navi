@@ -4,6 +4,7 @@ import unittest
 import std/strutils
 import pkg/chronos
 import navi/chronos
+import navi/core/pool      # for pool.idleCount in the streaming lifecycle tests
 import ./support
 
 suite "chronos entry end to end":
@@ -17,6 +18,61 @@ suite "chronos entry end to end":
     check res.status == 200
     check res.ok
     check res.data["ok"].getBool()
+    joinThread(th)
+
+  test "stream should expose headers before the body and deliver it via each":
+    const port = 9010
+    var th: Thread[ServerCtx]
+    startServer(th, port)  # responds with {"ok":true}
+
+    # `api`/`key` are passed as parameters (not captured): chronos's async macro
+    # rejects an async proc that closes over a GC'd local as "not GC-safe".
+    proc run(api: Navi): Future[(int, string)] {.async.} =
+      let res = await api.stream(GET, "http://127.0.0.1:" & $port & "/")
+      var collected = ""
+      res.each(chunk): collected.add chunk
+      return (res.status, collected)     # status is read before the body was drained
+    let (status, body) = waitFor run(newNavi())
+    check status == 200
+    check body == """{"ok":true}"""
+    joinThread(th)
+
+  test "stream should return the connection to the pool after a full drain":
+    const port = 9011
+    var accepts = 0
+    var th: Thread[KeepAliveCtx]
+    startKeepAlive(th, port, requests = 2, accepts = addr accepts)
+
+    proc run(api: Navi, key: string): Future[(string, int, string)] {.async.} =
+      var got = ""
+      let res = await api.stream(GET, key & "/")
+      res.each(chunk): got.add chunk
+      let idle = api.pool.idleCount(key)          # returned after a full drain
+      let second = await api.get(key & "/")       # ...and reused
+      return (got, idle, second.body)
+    let (got, idle, second) = waitFor run(newNavi(), "http://127.0.0.1:" & $port)
+    check got == "n=0"
+    check idle == 1
+    check second == "n=1"
+    joinThread(th)
+    check accepts == 1                            # both requests used the one connection
+
+  test "stream should close (not pool) the connection when the drain fails":
+    const port = 9012
+    var accepts = 0
+    var th: Thread[KeepAliveCtx]
+    startKeepAlive(th, port, requests = 1, accepts = addr accepts)
+
+    proc run(api: Navi, key: string): Future[(bool, int)] {.async.} =
+      var raised = false
+      let res = await api.stream(GET, key & "/")
+      try:
+        res.each(chunk): raise newException(ValueError, "consumer failed")
+      except ValueError: raised = true
+      return (raised, api.pool.idleCount(key))
+    let (raised, idle) = waitFor run(newNavi(), "http://127.0.0.1:" & $port)
+    check raised                                  # the error propagates out of each
+    check idle == 0                               # a failed drain closes, never pools
     joinThread(th)
 
   test "cancel should abort an in-flight request":

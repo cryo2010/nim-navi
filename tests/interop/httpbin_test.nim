@@ -203,18 +203,13 @@ template runAll() =
     (await api().get(base & "/bytes/1024")).body.len == 1024
 
   check "stream() delivers the body incrementally via each":
+    # One pull API across all three native backends: `await` is identity on sync,
+    # and `each` bakes in the await on asyncdispatch/chronos. Each chunk is an
+    # owned string; status/headers are available before the body is drained.
     var total = 0
-    when defined(useChronos):
-      # chronos migrates to the pull API in Stage 3; use the sink form for now.
-      let sink = proc(data: string) {.async.} = total += data.len
-      let r = await api().stream(GET, base & "/bytes/2048", sink = sink)
-      total == 2048 and r.body.len == 0
-    else:
-      # sync + asyncdispatch pull API: `await` is identity on sync, and `each`
-      # bakes in the await on asyncdispatch. Each chunk is an owned string.
-      let r = await api().stream(GET, base & "/bytes/2048")
-      r.each(chunk): total += chunk.len
-      total == 2048 and r.status == 200
+    let r = await api().stream(GET, base & "/bytes/2048")
+    r.each(chunk): total += chunk.len
+    total == 2048 and r.status == 200
 
   check "a bodyStream upload is streamed and arrives intact over " & wantVersion:
     # A pull-based producer over each native backend (chunked on h1, DATA frames
