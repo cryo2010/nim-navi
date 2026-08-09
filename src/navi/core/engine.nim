@@ -1,10 +1,12 @@
 ## The request algorithm, written once and shared by every engine backend.
 ##
-## `performRequest`/`performStream` are templates so they can expand inside both
-## a plain proc (sync) and an `{.async.}` proc (asyncdispatch/chronos). The
-## transport ops (`connect`, `sendAll`, `recvSome`, `close`) and `await` are
-## resolved at the instantiation site: real await in async backends, an identity
-## template in the sync one.
+## `performRequest` is a template so it can expand inside both a plain proc (sync)
+## and an `{.async.}` proc (asyncdispatch/chronos). The transport ops (`connect`,
+## `sendAll`, `recvSome`, `close`) and `await` are resolved at the instantiation
+## site: real await in async backends, an identity template in the sync one. The
+## exchange is also split into header-read (`h1SendAndReadHeaders`/
+## `h2SendAndReadHeaders`) and body-drain (`h1DrainBody`/`h2DrainBody`) phases, so
+## the pull-based `stream()` handle can return after the headers and drain later.
 ##
 ## Connections are pooled per origin (keep-alive). A connection taken from the
 ## pool may have been closed by the server in the meantime, so a failed reused
@@ -410,17 +412,6 @@ template performRequest*(client, req0: typed; cancel: CancelToken = nil): Respon
       inc attempt
       await sleep(backoffMs(attempt, resp, policy))
     enforceMaxResponse(resp, client.config.maxResponseBytes)
-    if client.config.wantsThrow and not resp.ok:
-      raiseHttpError(req, resp)
-    resp
-
-template performStream*(client, req, sink: typed; cancel: CancelToken = nil): Response =
-  ## Streaming request: body chunks are delivered to `sink` as they arrive and
-  ## `Response.body` is left empty. The size cap is enforced incrementally on the
-  ## bytes delivered; a non-2xx still raises HttpError unless disabled.
-  block:
-    throwIfCancelled(cancel)
-    let resp = run(client, req, sink)
     if client.config.wantsThrow and not resp.ok:
       raiseHttpError(req, resp)
     resp

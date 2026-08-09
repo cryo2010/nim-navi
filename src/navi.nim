@@ -29,7 +29,6 @@ type
     req*: Request            ## the outgoing request; modify it before `next`
     res*: Response           ## the response; set by `next`, adjust it after
     clientv: Navi            ## the owning client (see `client`)
-    sink: BodySink           ## non-nil for a streaming request
     cancel: CancelToken      ## caller's cancellation token, or nil
     idx: int                 ## index of the next middleware to run
   NaviMiddleware* = proc(ctx: NaviContext) {.closure.}
@@ -97,10 +96,6 @@ proc runCore(client: Navi, req: Request, cancel: CancelToken): Response =
   ## The innermost `next`: the full policy layer for one buffered request.
   performRequest(client, req, cancel)
 
-proc runCoreStream(client: Navi, req: Request, sink: BodySink,
-                   cancel: CancelToken): Response =
-  performStream(client, req, sink, cancel)
-
 proc client*(ctx: NaviContext): Navi = ctx.clientv
   ## The client handling this request (e.g. to read `ctx.client.config`).
 
@@ -109,9 +104,7 @@ proc next*(ctx: NaviContext) =
   ## exhausted -- the request itself. The outcome lands in `ctx.res`.
   let mws = ctx.clientv.config.middleware
   if ctx.idx >= mws.len:
-    ctx.res =
-      if ctx.sink.isNil: runCore(ctx.clientv, ctx.req, ctx.cancel)
-      else: runCoreStream(ctx.clientv, ctx.req, ctx.sink, ctx.cancel)
+    ctx.res = runCore(ctx.clientv, ctx.req, ctx.cancel)
   else:
     let m = mws[ctx.idx]
     inc ctx.idx

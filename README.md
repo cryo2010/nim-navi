@@ -86,7 +86,7 @@ discard main()
 - **TLS** on all three backends (OpenSSL for sync/asyncdispatch, BearSSL for chronos), with certificate verification on by default
 - **Connection pooling / keep-alive**, with automatic retry on a stale pooled connection
 - **Happy Eyeballs** (RFC 8305) address racing on the sync backend, so a slow/blackholed address doesn't stall the connect
-- **Streaming** uploads (chunked) and downloads (chunk sink)
+- **Streaming** uploads (chunked) and downloads (headers-first pull handle with backpressure)
 - **Retries** with capped exponential backoff, honoring `Retry-After`
 - **Redirect following** with method rewrites and cross-origin `Authorization` stripping
 - **Throw-on-non-2xx** by default (`HttpError`), opt-out available
@@ -152,17 +152,18 @@ backends differ:
 | Max TLS version | system | system | 1.2 | runtime |
 | Keep-alive / connection pool | ✓ | ✓ | ✓ | ✗ |
 | Streaming upload | ✓ | ✓ | ✓ | buffered |
-| Streaming download (sink) | sync sink | async sink | async sink | async sink |
+| Streaming download (pull) | ✓ | ✓ | ✓ | ✓ |
 | Cookie jar | ✓ | ✓ | ✓ | ✓ |
 | Proxy configuration | ✓ | ✓ | ✓ | ✗ |
 
 Legend: ✓ supported · ✗ not supported · **runtime** = provided by the
 browser/Node platform rather than navi · **buffered** = `bodyStream` is accepted
 but drained and sent as one body (`fetch` cannot reliably stream a request body) ·
-**sync sink** = `proc(data: string)` · **async sink** = awaitable
-`proc(data: string): Future[void]` (`seq[byte]` on `navi/js`), which back-pressures
-the peer (see [Streaming](#streaming)). (`navi/js` keeps its own cookie jar off
-a browser, and defers to the browser store on one; see below.)
+**pull download** = `stream()` returns a headers-first handle consumed with
+`each`/`drain`, which back-pressures the peer per chunk (see
+[Streaming](#streaming)); `chunk` is a `string` on the native backends and
+`seq[byte]` on `navi/js`. (`navi/js` keeps its own cookie jar off a browser, and
+defers to the browser store on one; see below.)
 
 Two backends carry caveats:
 
@@ -577,39 +578,46 @@ When a host resolves to several addresses (typical of dual-stack IPv4/IPv6 hosts
 
 ### Streaming
 
-Stream a download to a sink as bytes arrive (the returned `Response.body` stays empty):
+`stream()` returns a handle whose status and headers are available immediately,
+while the body is pulled on demand. You inspect the headers, then consume the body
+a chunk at a time with `each`. The connection is returned to the pool once the body
+is fully read (or closed if you `close` the handle first).
 
 ```nim
 var file = open("out.bin", fmWrite)
-discard api.stream(GET, "https://example.com/large", sink = proc(data: string) =
-  discard file.writeBuffer(unsafeAddr data[0], data.len))
+let res = api.stream(GET, "https://example.com/large")
+if res.status == 200:
+  res.each(chunk):
+    discard file.writeBuffer(unsafeAddr chunk[0], chunk.len)
 file.close()
 ```
 
-The sink type is per backend. On the **sync** backend it is a plain
-`proc(data: string)`, as above. On the **async** backends (`navi/asyncdispatch`,
-`navi/chronos`) it is **awaitable** and takes an owned buffer,
-`proc(data: string): Future[void]` — so you write it as `{.async.}` and the engine
-`await`s it. Both take navi's native body type (`string`, an 8-bit-clean byte
-buffer), so each chunk is moved to the sink with no copy:
+On the **async** backends (`navi/asyncdispatch`, `navi/chronos`, `navi/js`) the
+same code awaits the open, and the `each` body may await (the `await` is baked into
+`each`, so there is none on the `each` line itself):
 
 ```nim
-var file = open("out.bin", fmWrite)
-discard await api.stream(GET, "https://example.com/large",
-  sink = proc(data: string) {.async.} =
-    discard file.writeBuffer(unsafeAddr data[0], data.len))
-file.close()
+let res = await api.stream(GET, "https://example.com/large")
+res.each(chunk):
+  await sink.write(chunk)
 ```
 
-`navi/js` is the exception: its sink takes `seq[byte]` (the bytes come from a JS
-`Uint8Array`, and `seq[byte]` keeps binary intact), e.g.
-`proc(data: seq[byte]) {.async.} = ...`.
+`chunk` is an owned `string` on the native backends, moved out of navi's read
+buffer with no copy; on `navi/js` it is `seq[byte]` (the bytes come from a JS
+`Uint8Array`). Because `each`'s body runs as a proc, `break`/`continue`/`return`
+cannot escape it: to stop early, don't call `each` and `close` the handle, or raise
+from the body (which closes the connection and propagates). For an explicit sink
+instead of the loop, use `res.drain(sink)`.
 
-Because the async sink is awaited, a slow consumer applies **cooperative
+A handle you open but do not fully drain holds its connection, so `close` it if you
+decide not to read the body. The native handles also close on destruction as a
+backstop; on `navi/js` (no deterministic destructors) call `close` explicitly.
+
+Because each chunk is awaited, a slow consumer applies **cooperative
 backpressure**: over HTTP/2 the stream's receive window is only replenished once
-the sink has consumed each chunk, so the peer stalls that one stream (without
+the consumer has taken each chunk, so the peer stalls that one stream (without
 starving the other multiplexed streams or blocking the connection reader) instead
-of the body piling up in memory. Over HTTP/1.1 the awaited sink pauses the read
+of the body piling up in memory. Over HTTP/1.1 the awaited consumer pauses the read
 loop, which back-pressures the peer through TCP. The size cap
 (`maxResponseBytes`) is enforced incrementally on the streamed bytes.
 
@@ -685,13 +693,15 @@ Returns a `Response` on the sync backend, or a `Future[Response]` on
 Any verb explicitly. `bodyStream: proc(): string` streams an upload as chunked
 transfer-encoding (return `""` to end). Not available on `navi/js`.
 
-### client.stream(verb, target, sink, headers = initHeaders(), params = @[], cancel = nil)
+### client.stream(verb, target, headers = initHeaders(), params = @[], cancel = nil)
 
-Deliver the response body to `sink` as it arrives; the returned `Response.body`
-stays empty. The sink type is per backend: `proc(data: string)` on sync, and an
-awaitable `proc(data: string): Future[void]` on `navi/asyncdispatch` and
-`navi/chronos` (`seq[byte]` on `navi/js`; awaiting it back-pressures the peer — see
-[Streaming](#streaming)). Not available for uploads on `navi/js`.
+Open a streaming response and return a `StreamResponse` handle: `status`,
+`reason`, `httpVersion`, `headers`, and `ok` are available immediately (this call
+does not throw on a non-2xx status), while the body is pulled on demand. Consume it
+with `res.each(chunk): ...` (async backends await; the `await` is baked into `each`)
+or an explicit `res.drain(sink)`, and `res.close()` a handle you will not fully
+read. `chunk` is a `string` on the native backends and `seq[byte]` on `navi/js`.
+Awaiting each chunk back-pressures the peer (see [Streaming](#streaming)).
 
 ### client.websocket(url, headers = initHeaders())
 

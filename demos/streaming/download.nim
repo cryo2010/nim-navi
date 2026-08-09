@@ -16,11 +16,11 @@ proc main() {.async.} =
 
   var f = open(outPath, fmWrite)
   var written = 0
-  let res = await api.stream(GET, getEnv("BASE") & "/download",
-    sink = proc(chunk: string) {.async.} =
-      if chunk.len > 0:
-        discard f.writeBuffer(unsafeAddr chunk[0], chunk.len)
-        written += chunk.len)
+  let res = await api.stream(GET, getEnv("BASE") & "/download")
+  res.each(chunk):
+    if chunk.len > 0:
+      discard f.writeBuffer(unsafeAddr chunk[0], chunk.len)
+      written += chunk.len
   f.close()
 
   let expected = res.headers.get("x-sha1").toLowerAscii
