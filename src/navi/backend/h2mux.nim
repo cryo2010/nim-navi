@@ -41,6 +41,8 @@ type
     decompress: bool                   ## decode content-encoding before the sink
     sendTail: Future[void]   ## tail of the serialized send chain
     alive: bool
+    readerDone: Future[void] ## completed when the background reader has exited and
+                             ## closed the transport, so `close` can join it
 
 proc activeStreams(mux: H2Mux): int =
   ## Streams counting against the peer's MAX_CONCURRENT_STREAMS: buffered
@@ -164,14 +166,16 @@ proc reader(mux: H2Mux) {.async.} =
   except CatchableError:
     discard
   mux.failAll("navi: http/2 connection closed")
-  try: await be.close(mux.transport)
+  try: await be.close(mux.transport)   # the reader owns the transport close
   except CatchableError: discard
+  if not mux.readerDone.finished: mux.readerDone.complete()
 
 proc newH2Mux*(transport: be.Conn, maxBody = 0, decompress = false): Future[H2Mux] {.async.} =
   ## Take ownership of a freshly connected h2 transport, send the preface, and
   ## start the background reader.
   let mux = H2Mux(transport: transport, h2: initH2Conn(maxBody), alive: true,
                   decompress: decompress,
+                  readerDone: newFuture[void]("h2mux.readerDone"),
                   waiters: initTable[uint32, Future[H2Response]](),
                   sendReady: initTable[uint32, Future[void]](),
                   sinkStreams: initHashSet[uint32](),
@@ -185,13 +189,15 @@ proc newH2Mux*(transport: be.Conn, maxBody = 0, decompress = false): Future[H2Mu
 proc canReuse*(mux: H2Mux): bool = mux.alive and mux.h2.canReuse
 
 proc close*(mux: H2Mux) {.async.} =
-  ## Shut the shared connection down: fail any in-flight streams and close the
-  ## transport (which also frees its TLS context). The background reader unblocks
-  ## on the closed transport and exits.
-  if not mux.alive and mux.activeStreams == 0: return
+  ## Shut the shared connection down: fail any in-flight streams, wake the
+  ## background reader (socket shutdown), and wait for it to exit and close the
+  ## transport. Joining the reader (rather than closing the transport out from
+  ## under it) avoids leaving it suspended on a dead fd, which crashes at teardown.
+  if mux.readerDone.finished: return   # reader already exited (e.g. peer closed)
+  mux.alive = false
   mux.failAll("navi: client closed")
-  try: await be.close(mux.transport)
-  except CatchableError: discard
+  be.shutdownConn(mux.transport)       # unblock the reader's pending read/write
+  await mux.readerDone                  # it observes EOF, closes the transport, exits
 
 proc streamBody(mux: H2Mux, sid: uint32, bodyStream: BodyProducer) {.async.} =
   ## Send DATA frames pulled from `bodyStream`, pulling the next chunk only once

@@ -211,6 +211,18 @@ proc closeSync*(c: Conn) =
     # client does not leak one context per connection.
     if not c.ctx.isNil: c.ctx.destroyContext()
 
+proc shutdownConn*(c: Conn) =
+  ## Shut the socket down in both directions so a pending read or write unblocks
+  ## with EOF/error. Used to wake the h2 mux's background reader on client close so
+  ## it exits its loop (and does the real close itself) instead of being left
+  ## suspended on a closed fd, which would crash at process teardown. Does not free
+  ## anything; `close`/`closeSync` still run afterward.
+  if c.fd == invalidFd: return
+  when defined(windows):
+    discard winlean.shutdown(c.fd.SocketHandle, 2)          # SD_BOTH
+  else:
+    discard posix.shutdown(c.fd.SocketHandle, posix.SHUT_RDWR)
+
 proc close*(c: Conn): Future[void] {.async.} =
   c.closeSync()
 
