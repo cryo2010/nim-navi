@@ -46,12 +46,10 @@ suite "stream() decompresses the response body":
 
     let api = newNavi()
     var collected = ""
-    let res = api.stream(GET, "http://127.0.0.1:" & $port & "/",
-      sink = proc(data: openArray[byte]) =
-        for b in data: collected.add char(b))
-    check res.status == 200
-    check res.body == ""                      # streamed, not buffered
-    check collected == """{"ok":true}"""      # decoded on the way to the sink
+    let res = api.stream(GET, "http://127.0.0.1:" & $port & "/")
+    check res.status == 200                    # headers available before draining
+    res.each(chunk): collected.add chunk
+    check collected == """{"ok":true}"""       # decoded on the way to the sink
     joinThread(th)
 
   test "stream should leave the body compressed when decompress is false":
@@ -66,10 +64,9 @@ suite "stream() decompresses the response body":
     cfg.decompress = false
     let api = newNavi(cfg)
     var collected = ""
-    let res = api.stream(GET, "http://127.0.0.1:" & $port & "/",
-      sink = proc(data: openArray[byte]) =
-        for b in data: collected.add char(b))
+    let res = api.stream(GET, "http://127.0.0.1:" & $port & "/")
     check res.status == 200
+    res.each(chunk): collected.add chunk
     check collected == gz                      # raw compressed bytes
     joinThread(th)
 

@@ -151,9 +151,11 @@ Streaming is verified per **backend × direction**, always by hashing the transf
 against the original. Upload uses a pull-based `bodyStream` producer; download
 uses a `sink` that receives chunks as they arrive.
 
-The download `sink` is per backend: `proc(data: openArray[byte])` on sync, and an
-**awaitable** `proc(data: seq[byte]): Future[void]` on the async backends
-(asyncdispatch, chronos, js). Because the engine and the h2 mux `await` the async
+The download `sink` is per backend: `proc(data: string)` on sync, and an
+**awaitable** `proc(data: string): Future[void]` on the async backends
+(asyncdispatch, chronos; `seq[byte]` on js, whose bytes come from a JS Uint8Array).
+Both native forms take navi's native body type, so each chunk is moved to the sink
+with no copy. Because the engine and the h2 mux `await` the async
 sink, a slow consumer applies cooperative backpressure — over h2 the stream's
 receive window is only replenished (`ackRecv`) after the sink has consumed each
 chunk, so the peer stalls that one stream without blocking the mux reader or the

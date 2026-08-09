@@ -36,25 +36,40 @@ template sendRequest(conn, req: typed) =
   else:
     await sendAll(conn, serializeRequest(req))
 
-template h1Exchange*(transport, req, sink, keep, decompress, cap: typed): Response =
-  ## One HTTP/1.1 request/response over `transport`. Sets `keep` to whether the
-  ## connection may be reused; does not pool or close. When `sink` is set the body
+template h1SendAndReadHeaders*(transport, req, streaming: typed): H1Parser =
+  ## Send an HTTP/1.1 request and read up to the end of the response headers,
+  ## returning the parser (status/headers available via `toResponse`; body bytes
+  ## that arrived alongside the headers stay buffered in the parser for the drain).
+  ## The header/body split lets a pull-based caller return a handle here and drain
+  ## the body later.
+  mixin await, sendAll, recvSome
+  block:
+    sendRequest(transport, req)
+    let noBody = req.verb == HEAD          # a HEAD response never carries a body
+    # positional args: `streaming` is a template param, so a named `streaming =`
+    # would be hygienically renamed and not match initH1Parser's parameter.
+    var parser = initH1Parser(streaming, noBody)
+    while not parser.headersReady and not parser.finished:
+      let chunk = await recvSome(transport)
+      if chunk.len == 0: parser.eof(); break
+      parser.feed(chunk)
+    parser
+
+template h1DrainBody*(transport, parser, sink, keep, decompress, cap: typed) =
+  ## Read and parse the response body over `transport`. When `sink` is set the body
   ## is drained per read, decoded (if `decompress`), size-capped at `cap` decoded
   ## bytes, and `await`ed into the sink -- so a slow sink stalls the read loop
   ## (backpressure) instead of buffering, and the parser never holds the whole body.
+  ## With a nil sink the body accumulates in the parser (buffered request). Sets
+  ## `keep` to whether the connection may be reused. Body bytes buffered during the
+  ## header read are delivered first.
+  mixin await, recvSome, BodySink
   block:
-    mixin BodySink
-    sendRequest(transport, req)
-    let noBody = req.verb == HEAD          # a HEAD response never carries a body
     let streaming = not sink.isNil
-    var parser = initH1Parser(streaming = streaming, headRequest = noBody)
     var dec: StreamDecoder = nil
     var decReady = false                    # decoder chosen once headers are in
     var seen = 0
-    while not parser.finished:
-      let chunk = await recvSome(transport)
-      if chunk.len == 0: parser.eof()
-      else: parser.feed(chunk)
+    template deliver() =
       if streaming:
         let raw = parser.takeBody()
         if raw.len > 0:
@@ -69,16 +84,32 @@ template h1Exchange*(transport, req, sink, keep, decompress, cap: typed): Respon
               raise newException(ResponseTooLargeError,
                 "navi: response exceeded maxResponseBytes")
             # single-threaded client; the sink need not be gcsafe (see sendRequest).
-            # An owned seq[byte]: on the async backends the chunk crosses an await,
-            # so the sink cannot take a borrowed openArray view (memory safety). A
-            # seq[byte] argument also satisfies the sync backend's openArray sink.
-            # The raises cast discharges chronos's strict-raises obligation on the
-            # portable (annotation-free) sink type, as the middleware path does.
+            # `decoded` is navi's native body type (`string`), which the sink also
+            # takes, so its last use here moves the buffer straight into the sink
+            # (into the async env on the async backends) with no copy. The raises
+            # cast discharges chronos's strict-raises obligation on the portable
+            # (annotation-free) sink type, as the middleware path does.
             {.cast(gcsafe).}:
               {.cast(raises: [CatchableError]).}:
-                await sink(@(decoded.toOpenArrayByte(0, decoded.high)))
+                await sink(decoded)
+    deliver()                               # body read alongside the headers
+    while not parser.finished:
+      let chunk = await recvSome(transport)
+      if chunk.len == 0: parser.eof()
+      else: parser.feed(chunk)
+      deliver()
       if chunk.len == 0: break
     keep = parser.keepAliveAfter()
+
+template h1Exchange*(transport, req, sink, keep, decompress, cap: typed): Response =
+  ## One HTTP/1.1 request/response over `transport` (send + read headers + drain
+  ## the body), composed from the header/body split above. Sets `keep` to whether
+  ## the connection may be reused; does not pool or close.
+  block:
+    mixin BodySink
+    let streaming = not sink.isNil
+    var parser = h1SendAndReadHeaders(transport, req, streaming)
+    h1DrainBody(transport, parser, sink, keep, decompress, cap)
     parser.toResponse()
 
 template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
@@ -140,7 +171,7 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
                 "navi: response exceeded maxResponseBytes")
             {.cast(gcsafe).}:
               {.cast(raises: [CatchableError]).}:
-                await sink(@(decoded.toOpenArrayByte(0, decoded.high)))
+                await sink(decoded)     # native body type -> moved in, no copy
     let wasReset = h2.streamReset(sid)
     let tooLarge = h2.streamTooLarge(sid)
     let unprocessed = h2.streamUnprocessed(sid)
@@ -157,6 +188,97 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
       raise newException(IOError, "navi: http/2 request did not complete")
     if not sink.isNil: r.body = ""  # delivered incrementally above
     r
+
+template h2SendAndReadHeaders*(transport, h2, req: typed): uint32 =
+  ## Open an h2 stream, send the request (including a streamed upload body), and
+  ## read frames until the final response headers arrive; returns the stream id.
+  ## The header/body split lets a pull-based caller return a handle here and drain
+  ## the body later. Raises if the stream fails before any headers (so the caller's
+  ## retry/redirect loop can react), mirroring `h2Stream`'s terminal errors.
+  mixin await, sendAll, recvSome
+  block:
+    let sid = h2.openStream()
+    if req.bodyStream != nil:
+      await sendAll(transport, h2.encodeRequestHead(sid, h2HeaderList(req)))
+      var sending = true
+      while sending and h2.connError.len == 0 and not h2.streamDone(sid):
+        if h2.sendDrained(sid):
+          var chunk: string
+          {.cast(gcsafe).}: chunk = req.bodyStream()
+          if chunk.len == 0:
+            await sendAll(transport, h2.finishSend(sid))
+            sending = false
+          else:
+            await sendAll(transport, h2.queueSend(sid, chunk))
+        else:
+          let inbound = await recvSome(transport)
+          if inbound.len == 0: break
+          let toSend = h2.feed(inbound)
+          if toSend.len > 0: await sendAll(transport, toSend)
+    else:
+      await sendAll(transport, h2.encodeRequest(sid, h2HeaderList(req), req.body))
+    while not h2.headersReady(sid) and not h2.streamDone(sid):
+      let chunk = await recvSome(transport)
+      if chunk.len == 0: break
+      let toSend = h2.feed(chunk)
+      if toSend.len > 0: await sendAll(transport, toSend)
+    if not h2.headersReady(sid):            # stream died before a response
+      let connErr = h2.connError
+      let unprocessed = h2.streamUnprocessed(sid)
+      discard h2.takeResponse(sid)
+      if connErr.len > 0: raise newException(IOError, "navi: http/2 " & connErr)
+      if unprocessed:
+        raise newException(UnprocessedError, "navi: http/2 request not processed")
+      raise newException(IOError, "navi: http/2 request did not complete")
+    sid
+
+template h2DrainBody*(transport, h2, sid, sink, decompress, cap: typed) =
+  ## Drain an h2 response body to `sink` incrementally (bounded memory), decoding
+  ## if `decompress` and enforcing `cap`. A slow sink stalls the read loop and, in
+  ## turn, the peer (backpressure). Raises on reset / oversized / unprocessed, like
+  ## `h2Stream`. Drops the stream when done. `sink` must be non-nil (pull path).
+  mixin await, sendAll, recvSome, BodySink
+  block:
+    var dec: StreamDecoder = nil
+    var decReady = false
+    var seen = 0
+    template deliver() =
+      let raw = h2.takeBody(sid)
+      if raw.len > 0:
+        if not decReady:
+          dec = if decompress: newStreamDecoder(h2.respHeader(sid, "content-encoding"))
+                else: nil
+          decReady = true
+        let decoded =
+          if dec != nil: dec.update(raw.toOpenArrayByte(0, raw.high)) else: raw
+        if decoded.len > 0:
+          seen += decoded.len
+          if cap > 0 and seen > cap:
+            raise newException(ResponseTooLargeError,
+              "navi: response exceeded maxResponseBytes")
+          {.cast(gcsafe).}:
+            {.cast(raises: [CatchableError]).}:
+              await sink(decoded)     # native body type -> moved in, no copy
+    deliver()                         # body read alongside the headers
+    while not h2.streamDone(sid):
+      let chunk = await recvSome(transport)
+      if chunk.len == 0: break
+      let toSend = h2.feed(chunk)
+      if toSend.len > 0: await sendAll(transport, toSend)
+      deliver()
+    let wasReset = h2.streamReset(sid)
+    let tooLarge = h2.streamTooLarge(sid)
+    let unprocessed = h2.streamUnprocessed(sid)
+    let connErr = h2.connError
+    discard h2.takeResponse(sid)       # body delivered; drop the stream
+    if connErr.len > 0: raise newException(IOError, "navi: http/2 " & connErr)
+    if tooLarge:
+      raise newException(ResponseTooLargeError,
+        "navi: response exceeded maxResponseBytes")
+    if unprocessed:
+      raise newException(UnprocessedError, "navi: http/2 request not processed")
+    if wasReset:
+      raise newException(IOError, "navi: http/2 request did not complete")
 
 template poolTransport*(client, req, sink: typed): Response =
   ## Pool-based transport: reuse a pooled connection (http/1.1 or a persistent

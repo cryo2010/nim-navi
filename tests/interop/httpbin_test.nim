@@ -204,12 +204,13 @@ template runAll() =
 
   check "stream() delivers the body to a sink and leaves res.body empty":
     var total = 0
-    # The sink type is per backend: awaitable (seq[byte]) on the async backends,
-    # a plain openArray sink on sync.
+    # The sink type is per backend: awaitable (string) on the async backends, a
+    # plain (string) sink on sync -- both navi's native body type. (js takes
+    # seq[byte]; see httpbin_js.nim.)
     when defined(useAsync) or defined(useChronos):
-      let sink = proc(data: seq[byte]) {.async.} = total += data.len
+      let sink = proc(data: string) {.async.} = total += data.len
     else:
-      let sink = proc(data: openArray[byte]) = total += data.len
+      let sink = proc(data: string) = total += data.len
     let r = await api().stream(GET, base & "/bytes/2048", sink = sink)
     total == 2048 and r.body.len == 0
 

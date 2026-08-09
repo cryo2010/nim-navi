@@ -57,7 +57,7 @@ suite "nghttpd interop (asyncdispatch, http/2 mux)":
       let api = newNavi(cfg)
       var calls, total = 0
       let res = await api.stream(GET, base & "/large.bin",
-        sink = proc(data: seq[byte]) {.async.} =
+        sink = proc(data: string) {.async.} =
           inc calls
           total += data.len)
       return (calls, total, res.httpVersion)

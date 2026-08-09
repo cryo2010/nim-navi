@@ -12,6 +12,7 @@ import std/tables
 import navi/private/entryguard
 import navi/core/public
 import navi/core/[engine, pool, session, decompress, redirect, retry, proxy, h2glue]
+import navi/core/[cookies, digest, cancel, url]
 import navi/proto/h1
 import navi/proto/h2/conn
 import navi/proto/ws
@@ -133,16 +134,172 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
   ctx.next()
   ctx.res
 
-proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
+# --- Streaming downloads (pull-based handle) ---
+
+type
+  StreamResponseObj = object
+    ## The response of a streaming request: status/headers are available
+    ## immediately while the body is drained on demand. Holds the checked-out
+    ## connection (removed from the pool) until `drain` returns it or `close`
+    ## disposes it.
+    resp: Response             ## header snapshot (status/headers; empty body)
+    client: Navi
+    key: string                ## origin key, for returning the connection to the pool
+    pc: PooledConn[Conn]       ## the checked-out connection (h2 conn when pc.h2 != nil)
+    parser: H1Parser           ## used when pc.h2 == nil (http/1.1)
+    sid: uint32                ## used when pc.h2 != nil (http/2 stream id)
+    decompress: bool
+    cap: int
+    cancel: CancelToken
+    drained: bool              ## body fully read; connection returned or closed
+    closed: bool               ## connection disposed without draining
+  StreamResponse* = ref StreamResponseObj
+
+proc disposeConn(o: StreamResponseObj) =
+  ## Close the underlying connection. A partially-read response cannot be pooled,
+  ## so we always close (h2: closing the connection drops the pending stream). Only
+  ## call when the handle owns the connection (not drained, not already closed).
+  try: o.pc.transport.close()
+  except CatchableError: discard
+
+proc `=destroy`(o: StreamResponseObj) =
+  ## Backstop: a handle dropped without draining must not leak its connection.
+  if not (o.drained or o.closed): disposeConn(o)
+
+proc close*(sr: StreamResponse) =
+  ## Dispose a streaming handle whose body will not be fully drained: closes the
+  ## underlying connection (a partially-read response cannot be safely pooled).
+  ## Idempotent, and a no-op once the body has been drained.
+  if sr.drained or sr.closed: return
+  sr.closed = true
+  disposeConn(sr[])
+
+proc status*(sr: StreamResponse): int = sr.resp.status
+  ## The response status code, available before the body is drained.
+proc reason*(sr: StreamResponse): string = sr.resp.reason
+proc httpVersion*(sr: StreamResponse): string = sr.resp.httpVersion
+proc headers*(sr: StreamResponse): Headers = sr.resp.headers
+proc ok*(sr: StreamResponse): bool = sr.resp.ok
+  ## Whether the status is 2xx (checked by the caller; the pull API never throws).
+
+proc openStream(client: Navi, req0: Request): StreamResponse =
+  ## Send one request and read its headers, returning a handle that holds the
+  ## checked-out connection with the body pending. A stale pooled connection is
+  ## retried once on a fresh one. Does not throw on non-2xx.
+  var rq = req0
+  let proxy = resolveProxy(client.config, rq.url)
+  rq.absoluteForm = proxy.isSet and not rq.url.isTls
+  let alpn = if client.config.wantsH2 and rq.url.isTls: @["h2", "http/1.1"] else: @[]
+  let key = originKey(rq.url)
+  let decompress = client.config.wantsDecompress
+  let cap = client.config.maxResponseBytes
+
+  var (found, pc) = popIdle(client.pool, key)
+  if found:
+    try:
+      if pc.h2 != nil:
+        let sid = h2SendAndReadHeaders(pc.transport, pc.h2, rq)
+        return StreamResponse(resp: toResponse(pc.h2.respSnapshot(sid)), client: client,
+                              key: key, pc: pc, sid: sid, decompress: decompress, cap: cap)
+      else:
+        let parser = h1SendAndReadHeaders(pc.transport, rq, true)
+        return StreamResponse(resp: parser.toResponse(), client: client, key: key,
+                              pc: pc, parser: parser, decompress: decompress, cap: cap)
+    except CatchableError:
+      try: pc.transport.close()          # pooled connection was stale; open a fresh one
+      except CatchableError: discard
+
+  let transport = connect(rq.url.host, rq.url.port, rq.url.isTls, client.config.tls,
+                          proxy, alpn, client.config.connectMs, client.config.readMs,
+                          client.config.totalMs)
+  var npc = PooledConn[Conn](transport: transport)
+  if transport.protocol == "h2":
+    npc.h2 = initH2Conn(client.config.maxResponseBytes)
+    transport.sendAll(npc.h2.preamble())
+    let sid = h2SendAndReadHeaders(transport, npc.h2, rq)
+    result = StreamResponse(resp: toResponse(npc.h2.respSnapshot(sid)), client: client,
+                            key: key, pc: npc, sid: sid, decompress: decompress, cap: cap)
+  else:
+    let parser = h1SendAndReadHeaders(transport, rq, true)
+    result = StreamResponse(resp: parser.toResponse(), client: client, key: key,
+                            pc: npc, parser: parser, decompress: decompress, cap: cap)
+
+proc stream*(client: Navi, verb: HttpVerb, target: string,
              headers = initHeaders(), params: seq[(string, string)] = @[],
-             cancel: CancelToken = nil): Response =
-  ## Perform a request and deliver the response body to `sink` as it arrives.
-  ## The returned Response carries status and headers but an empty body.
-  let req = buildRequest(client.config, verb, target, headers, params = params)
-  if client.config.middleware.len == 0: return runCoreStream(client, req, sink, cancel)
-  let ctx = NaviContext(req: req, clientv: client, sink: sink, cancel: cancel)
-  ctx.next()
-  ctx.res
+             cancel: CancelToken = nil): StreamResponse =
+  ## Open a streaming response: perform the request, follow redirects and digest
+  ## auth to the final response, and return a handle whose status/headers are
+  ## available immediately while the body streams on demand via `each`/`drain`.
+  ##
+  ## Unlike `request`, this does NOT throw on a non-2xx status (inspect `status`),
+  ## and middleware is not applied. Redirect/digest hops are opened as streams and
+  ## their bodies discarded (their connections closed). Consume the returned handle
+  ## with `each`/`drain`, or `close` it if you decide not to read the body.
+  var rreq = buildRequest(client.config, verb, target, headers, params = params)
+  var hops = 0
+  let limit = client.config.redirectLimit
+  while true:
+    throwIfCancelled(cancel)
+    applyCookies(client.jar, rreq)
+    let handle = openStream(client, rreq)
+    handle.cancel = cancel
+    storeCookies(client.jar, rreq.url, handle.resp)
+    # 401 Digest challenge: re-open with an Authorization header (mirrors the
+    # buffered path's maybeDigest), discarding the challenge body.
+    if handle.status == 401 and client.config.auth.kind == akDigest and
+       not rreq.headers.contains("authorization"):
+      let chal = bestChallenge(handle.headers.getAll("www-authenticate"))
+      if chal.isSome:
+        let auth = digestAuthHeader(client.config.auth.user, client.config.auth.pass,
+                                    $rreq.verb, rreq.url.requestTarget, chal.get)
+        if auth.len > 0:
+          handle.close()
+          rreq.headers["authorization"] = auth
+          continue
+    let location = handle.headers.get("location")
+    if limit > 0 and hops < limit and isRedirect(handle.status) and location.len > 0:
+      handle.close()
+      rreq = redirectRequest(rreq, handle.status, location)
+      inc hops
+    else:
+      return handle
+
+proc drain*(sr: StreamResponse, sink: BodySink) =
+  ## Deliver the response body to `sink` as it arrives (decoded and size-capped),
+  ## then return the connection to the pool (or close it if it cannot be reused).
+  ## Consumes the handle: call once. On error the connection is closed and the
+  ## error re-raised. Prefer the `each` template for the common case.
+  if sr.drained or sr.closed:
+    raise newException(IOError, "navi: stream already drained or closed")
+  throwIfCancelled(sr.cancel)
+  try:
+    if sr.pc.h2 != nil:
+      h2DrainBody(sr.pc.transport, sr.pc.h2, sr.sid, sink, sr.decompress, sr.cap)
+      sr.drained = true
+      if not (sr.pc.h2.canReuse and pushIdle(sr.client.pool, sr.key, sr.pc)):
+        disposeConn(sr[])
+    else:
+      var keep = false
+      h1DrainBody(sr.pc.transport, sr.parser, sink, keep, sr.decompress, sr.cap)
+      sr.drained = true
+      if not (keep and pushIdle(sr.client.pool, sr.key, sr.pc)):
+        disposeConn(sr[])
+  except CatchableError:
+    if not sr.drained: sr.drained = true   # mark consumed so =destroy won't double-close
+    disposeConn(sr[])
+    raise
+
+template each*(sr: StreamResponse; chunk, body: untyped): untyped =
+  ## Drain the streaming body, running `body` for each decoded chunk with `chunk`
+  ## bound to it (an owned `string`, moved from navi's read buffer, no copy):
+  ##   let res = api.stream(GET, url)
+  ##   res.each(chunk): outFile.write(chunk)
+  ## Sugar over `drain`; the connection is returned/closed when the body is done.
+  ##
+  ## `body` runs as a proc, so `break`/`continue`/`return` cannot escape the loop
+  ## from inside it. To stop early, either don't call `each` and `close` the handle,
+  ## or raise from `body` (which closes the connection and propagates out of `each`).
+  sr.drain(proc(chunk: string) {.raises: [CatchableError].} = body)
 
 include navi/private/verbs
 

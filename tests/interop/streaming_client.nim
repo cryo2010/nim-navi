@@ -54,7 +54,7 @@ proc runDownload() =
   var f = open(outPath, fmWrite)
   var written = 0
   let res = api.stream(GET, base & "/download",
-    sink = proc(chunk: openArray[byte]) =
+    sink = proc(chunk: string) =
       if chunk.len > 0:
         discard f.writeBuffer(unsafeAddr chunk[0], chunk.len)
         written += chunk.len)

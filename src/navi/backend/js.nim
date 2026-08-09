@@ -19,6 +19,13 @@ type
     ## it per chunk read from the fetch `ReadableStream`, so a slow sink naturally
     ## paces reads from the stream rather than buffering the whole body. Takes an
     ## owned `seq[byte]` (the chunk crosses an `await`).
+    ##
+    ## Deliberately `seq[byte]`, unlike the native backends' `string` sink: the chunk
+    ## originates as a JS `Uint8Array` (marshaled byte-by-byte into Nim, so there is
+    ## no owned Nim buffer to move regardless of type), and `seq[byte]` is the
+    ## binary-clean representation here -- a Nim js `string` is a JS (UTF-16) string,
+    ## so routing bytes through it risks the same lossiness as the buffered `.text()`
+    ## path. Portable sinks targeting both js and native must handle both element types.
 
 # --- fetch / DOM bindings ---
 proc fetch(url: cstring, init: JsObject): Future[JsObject] {.importjs: "fetch(#, #)".}

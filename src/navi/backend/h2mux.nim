@@ -236,19 +236,21 @@ proc drainDownload(mux: H2Mux, sid: uint32, sink: BodySink): Future[H2Response] 
         else:
           raise newException(IOError, "navi: http/2 stream reset")
       if mux.recvq.hasKey(sid) and mux.recvq[sid].len > 0:
-        let raw = mux.recvq[sid].popFirst()
+        var raw = mux.recvq[sid].popFirst()
+        let rawLen = raw.len   # window is acked by raw (wire) bytes, captured before the move
         if not decReady:
           dec = if mux.decompress:
                   newStreamDecoder(mux.h2.respHeader(sid, "content-encoding"))
                 else: nil
           decReady = true
         let decoded =
-          if dec != nil: dec.update(raw.toOpenArrayByte(0, raw.high)) else: raw
+          if dec != nil: dec.update(raw.toOpenArrayByte(0, raw.high)) else: move raw
         if decoded.len > 0:
-          # single-threaded client; the sink need not be gcsafe (see engine). An
-          # owned seq[byte]: the chunk crosses the `await sink` boundary.
-          {.cast(gcsafe).}: await sink(@(decoded.toOpenArrayByte(0, decoded.high)))
-        await mux.send(mux.h2.ackRecv(sid, raw.len))  # replenish window: gated by the sink
+          # single-threaded client; the sink need not be gcsafe (see engine).
+          # `decoded` is navi's native body type (`string`), which the sink also
+          # takes, so its last use moves the buffer into the async env, no copy.
+          {.cast(gcsafe).}: await sink(decoded)
+        await mux.send(mux.h2.ackRecv(sid, rawLen))  # replenish window: gated by the sink
         continue
       if mux.h2.streamEnded(sid): break   # ended and the queue is drained
       if mux.h2.goneAway:

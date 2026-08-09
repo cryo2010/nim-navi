@@ -159,9 +159,9 @@ backends differ:
 Legend: ✓ supported · ✗ not supported · **runtime** = provided by the
 browser/Node platform rather than navi · **buffered** = `bodyStream` is accepted
 but drained and sent as one body (`fetch` cannot reliably stream a request body) ·
-**sync sink** = `proc(data: openArray[byte])` · **async sink** = awaitable
-`proc(data: seq[byte]): Future[void]`, which back-pressures the peer (see
-[Streaming](#streaming)). (`navi/js` keeps its own cookie jar off
+**sync sink** = `proc(data: string)` · **async sink** = awaitable
+`proc(data: string): Future[void]` (`seq[byte]` on `navi/js`), which back-pressures
+the peer (see [Streaming](#streaming)). (`navi/js` keeps its own cookie jar off
 a browser, and defers to the browser store on one; see below.)
 
 Two backends carry caveats:
@@ -581,24 +581,29 @@ Stream a download to a sink as bytes arrive (the returned `Response.body` stays 
 
 ```nim
 var file = open("out.bin", fmWrite)
-discard api.stream(GET, "https://example.com/large", sink = proc(data: openArray[byte]) =
+discard api.stream(GET, "https://example.com/large", sink = proc(data: string) =
   discard file.writeBuffer(unsafeAddr data[0], data.len))
 file.close()
 ```
 
 The sink type is per backend. On the **sync** backend it is a plain
-`proc(data: openArray[byte])`, as above. On the **async** backends
-(`navi/asyncdispatch`, `navi/chronos`, `navi/js`) it is **awaitable** and takes an
-owned buffer, `proc(data: seq[byte]): Future[void]` — so you write it as
-`{.async.}` and the engine `await`s it:
+`proc(data: string)`, as above. On the **async** backends (`navi/asyncdispatch`,
+`navi/chronos`) it is **awaitable** and takes an owned buffer,
+`proc(data: string): Future[void]` — so you write it as `{.async.}` and the engine
+`await`s it. Both take navi's native body type (`string`, an 8-bit-clean byte
+buffer), so each chunk is moved to the sink with no copy:
 
 ```nim
 var file = open("out.bin", fmWrite)
 discard await api.stream(GET, "https://example.com/large",
-  sink = proc(data: seq[byte]) {.async.} =
+  sink = proc(data: string) {.async.} =
     discard file.writeBuffer(unsafeAddr data[0], data.len))
 file.close()
 ```
+
+`navi/js` is the exception: its sink takes `seq[byte]` (the bytes come from a JS
+`Uint8Array`, and `seq[byte]` keeps binary intact), e.g.
+`proc(data: seq[byte]) {.async.} = ...`.
 
 Because the async sink is awaited, a slow consumer applies **cooperative
 backpressure**: over HTTP/2 the stream's receive window is only replenished once
@@ -683,9 +688,9 @@ transfer-encoding (return `""` to end). Not available on `navi/js`.
 ### client.stream(verb, target, sink, headers = initHeaders(), params = @[], cancel = nil)
 
 Deliver the response body to `sink` as it arrives; the returned `Response.body`
-stays empty. The sink type is per backend: `proc(data: openArray[byte])` on sync,
-and an awaitable `proc(data: seq[byte]): Future[void]` on `navi/asyncdispatch`,
-`navi/chronos`, and `navi/js` (awaiting it back-pressures the peer — see
+stays empty. The sink type is per backend: `proc(data: string)` on sync, and an
+awaitable `proc(data: string): Future[void]` on `navi/asyncdispatch` and
+`navi/chronos` (`seq[byte]` on `navi/js`; awaiting it back-pressures the peer — see
 [Streaming](#streaming)). Not available for uploads on `navi/js`.
 
 ### client.websocket(url, headers = initHeaders())
