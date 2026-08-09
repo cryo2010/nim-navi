@@ -1,0 +1,23 @@
+services:
+  server:
+    # Reuse the streaming demo's FastAPI HTTP/2 server (Hypercorn + TLS + h2).
+    build:
+      context: ../../../demos/streaming
+      dockerfile: Dockerfile.server
+    healthcheck:
+      # Ready once it accepts TLS and negotiates h2 over ALPN.
+      test: ["CMD", "sh", "-c", "echo | openssl s_client -connect localhost:8443 -alpn h2 2>/dev/null | grep -q 'ALPN protocol: h2'"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  client:
+    build:
+      context: ../../..
+      dockerfile: tests/interop/streaming_concurrent/Dockerfile.client
+    environment:
+      BASE: https://server:8443
+      NAVI_CONCURRENT_N: "${NAVI_CONCURRENT_N:-50}"
+    depends_on:
+      server:
+        condition: service_healthy
