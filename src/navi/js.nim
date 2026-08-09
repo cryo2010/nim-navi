@@ -19,7 +19,7 @@ when not defined(js):
   {.error: "navi/js requires the JavaScript backend; compile with `nim js` " &
            "(import `navi` for the native sync client).".}
 
-import std/asyncjs
+import std/[asyncjs, jsffi]
 from std/strutils import startsWith
 import navi/private/entryguard
 import navi/core/public
@@ -39,7 +39,6 @@ type
     req*: Request            ## the outgoing request; modify it before `next`
     res*: Response           ## the response; set by `next`, adjust it after
     clientv: Navi            ## the owning client (see `client`); a shared ref
-    sink: BodySink           ## non-nil for a streaming request
     cancel: CancelToken      ## caller's cancellation token, or nil
     idx: int                 ## index of the next middleware to run
   NaviMiddleware* = proc(ctx: NaviContext): Future[void] {.closure.}
@@ -133,17 +132,6 @@ proc runCore(client: Navi, req0: Request, cancel: CancelToken): Future[Response]
   client.maybeThrow(req, resp)
   result = resp
 
-proc runCoreStream(client: Navi, req: Request, sink: BodySink,
-                   cancel: CancelToken): Future[Response] {.async.} =
-  throwIfCancelled(cancel)
-  var rq = req
-  if not client.jar.isNil: applyCookies(client.jar, rq)
-  var resp = await fetchExchange(rq, sink, client.config.totalMs, cancel,
-                                 client.config.maxResponseBytes)
-  if not client.jar.isNil: storeCookies(client.jar, rq.url, resp)
-  client.maybeThrow(rq, resp)
-  result = resp
-
 proc client*(ctx: NaviContext): Navi = ctx.clientv
   ## The client handling this request (e.g. to read `ctx.client.config`).
 
@@ -152,10 +140,7 @@ proc next*(ctx: NaviContext): Future[void] {.async.} =
   ## exhausted -- the request itself. The outcome lands in `ctx.res`.
   let mws = ctx.clientv.config.middleware
   if ctx.idx >= mws.len:
-    if ctx.sink.isNil:
-      ctx.res = await runCore(ctx.clientv, ctx.req, ctx.cancel)
-    else:
-      ctx.res = await runCoreStream(ctx.clientv, ctx.req, ctx.sink, ctx.cancel)
+    ctx.res = await runCore(ctx.clientv, ctx.req, ctx.cancel)
   else:
     let m = mws[ctx.idx]
     inc ctx.idx
@@ -191,15 +176,91 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
   let ctx = NaviContext(req: req, clientv: client, cancel: cancel)
   return await runChain(ctx)
 
-proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
+# --- Streaming downloads (pull-based handle) ---
+
+type
+  StreamResponseObj = object
+    ## The response of a streaming request: status/headers are available
+    ## immediately while the body is drained on demand from the fetch
+    ## `ReadableStream`. There is no connection pool here (the runtime owns
+    ## connections); `close` aborts an undrained body so the runtime frees it.
+    resp: Response             ## header snapshot (status/headers; empty body)
+    client: Navi
+    res: JsObject              ## the fetch Response (body still unread)
+    controller: JsObject       ## AbortController for the body stream
+    cancel: CancelToken
+    cap: int
+    drained: bool              ## body fully read
+    closed: bool               ## body aborted without draining
+  StreamResponse* = ref StreamResponseObj
+
+# No `=destroy` on the js backend: Nim's JavaScript backend does not run Nim
+# destructors deterministically (the JS engine's GC owns object lifetime), so a
+# backstop would not fire. Call `close` explicitly for a stream you open but will
+# not fully read; otherwise the runtime reclaims the response on GC.
+
+proc close*(sr: StreamResponse): Future[void] {.async.} =
+  ## Dispose a streaming handle whose body will not be drained: aborts the fetch
+  ## body stream so the runtime frees the connection. Idempotent; a no-op once the
+  ## body has been drained. Async for parity with the native backends' `close`.
+  if sr.drained or sr.closed: return
+  sr.closed = true
+  if not sr.cancel.isNil: sr.cancel.disarmHook()
+  abortBody(sr.controller)
+
+proc status*(sr: StreamResponse): int = sr.resp.status
+  ## The response status code, available before the body is drained.
+proc reason*(sr: StreamResponse): string = sr.resp.reason
+proc httpVersion*(sr: StreamResponse): string = sr.resp.httpVersion
+proc headers*(sr: StreamResponse): Headers = sr.resp.headers
+proc ok*(sr: StreamResponse): bool = sr.resp.ok
+  ## Whether the status is 2xx (checked by the caller; the pull API never throws).
+
+proc stream*(client: Navi, verb: HttpVerb, target: string,
              headers = initHeaders(), params: seq[(string, string)] = @[],
-             cancel: CancelToken = nil): Future[Response] {.async.} =
-  ## Deliver the response body to `sink` as it arrives; `Response.body` stays
-  ## empty. Not retried (the stream is consumed as it is read).
-  let req = buildRequest(client.config, verb, target, headers, params = params)
-  if client.config.middleware.len == 0: return await runCoreStream(client, req, sink, cancel)
-  let ctx = NaviContext(req: req, clientv: client, sink: sink, cancel: cancel)
-  return await runChain(ctx)
+             cancel: CancelToken = nil): Future[StreamResponse] {.async.} =
+  ## Open a streaming response: fetch and resolve status/headers, returning a
+  ## handle whose body streams on demand via `each`/`drain`. Does NOT throw on a
+  ## non-2xx status (inspect `status`), and middleware is not applied. Redirects,
+  ## body decoding, and the cookie store are the runtime's here, as for `request`.
+  throwIfCancelled(cancel)
+  var rq = buildRequest(client.config, verb, target, headers, params = params)
+  if not client.jar.isNil: applyCookies(client.jar, rq)
+  let (res, controller) = await fetchOpen(rq, client.config.totalMs)
+  if not cancel.isNil:
+    cancel.armHook(proc() {.gcsafe, raises: [].} = abortBody(controller))
+  let handle = StreamResponse(resp: headerSnapshot(res), client: client, res: res,
+    controller: controller, cancel: cancel, cap: client.config.maxResponseBytes)
+  if not client.jar.isNil: storeCookies(client.jar, rq.url, handle.resp)
+  return handle
+
+proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
+  ## Deliver the response body to `sink` as it arrives (size-capped), awaiting it
+  ## per chunk so a slow sink paces reads from the stream. Consumes the handle:
+  ## call once. On error the body is left aborted and the error re-raised. Prefer
+  ## the `each` template for the common case.
+  if sr.drained or sr.closed:
+    raise newException(IOError, "navi: stream already drained or closed")
+  throwIfCancelled(sr.cancel)
+  try:
+    await drainToSink(sr.res, sink, sr.cap)
+    sr.drained = true
+  except CatchableError:
+    sr.drained = true
+    raise
+  finally:
+    if not sr.cancel.isNil: sr.cancel.disarmHook()
+
+template each*(sr: StreamResponse; chunk, body: untyped): untyped =
+  ## Drain the streaming body, running `body` for each chunk with `chunk` bound to
+  ## it. On js `chunk` is a `seq[byte]` (chunks come from a JS `Uint8Array`), unlike
+  ## the native backends' `string`. The outer `await` is baked in:
+  ##   let res = await api.stream(GET, url)
+  ##   res.each(chunk): total += chunk.len
+  ##
+  ## `body` runs as a proc, so `break`/`continue`/`return` cannot escape the loop
+  ## from inside it. To stop early, don't call `each` and `close` the handle.
+  await sr.drain(proc(chunk: seq[byte]): Future[void] {.async.} = body)
 
 proc websocket*(client: Navi, url: string,
                 headers = initHeaders()): Future[WebSocket] =

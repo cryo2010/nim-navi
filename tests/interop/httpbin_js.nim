@@ -137,11 +137,11 @@ proc main() {.async.} =
     # buffered path. Exact binary length is covered by the stream() sink below.
     (await api().get(base & "/base64/aGVsbG8=")).body == "hello"
 
-  check "stream() delivers the exact byte count to a sink":
+  check "stream() delivers the exact byte count via each":
     var total = 0
-    let r = await api().stream(GET, base & "/bytes/2048",
-      sink = proc(data: seq[byte]) {.async.} = total += data.len)
-    total == 2048 and r.body.len == 0
+    let r = await api().stream(GET, base & "/bytes/2048")
+    r.each(chunk): total += chunk.len
+    total == 2048 and r.status == 200
 
   check "a bodyStream upload is buffered and arrives intact":
     # fetch can't reliably stream a request body, so the js backend buffers the
