@@ -179,6 +179,11 @@ Where each is exercised:
   (`httpbin_test.nim` builds for sync/async/chronos, `httpbin_js.nim` for js).
 - **nghttpd `interop` job** — streamed `bodyStream` upload over real h2 on the
   sync backend and the async mux, plus the incremental `each` drain over the mux.
+- **Backpressure (sans-io, `test_h2_conn`)** — the flow-control gating an awaited
+  `each`/`drain` consumer relies on: a `sinkMode` stream holds its stream
+  `WINDOW_UPDATE` past the replenish threshold until `ackRecv` releases it (a normal
+  stream replenishes eagerly, as the control case), so a slow consumer stalls the
+  peer. Also covers incremental `takeBody` drain and the running-total size cap.
 - **Unit** — `test_entries`/`test_async`/`test_chronos` cover headers-first,
   full-drain-pools-and-reuses, failed-drain-closes, and an incremental cap;
   `test_stream_decompress` decodes a streamed body through `each`.
