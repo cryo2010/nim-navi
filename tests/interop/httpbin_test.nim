@@ -202,17 +202,19 @@ template runAll() =
   check "/bytes returns an exact length":
     (await api().get(base & "/bytes/1024")).body.len == 1024
 
-  check "stream() delivers the body to a sink and leaves res.body empty":
+  check "stream() delivers the body incrementally via each":
     var total = 0
-    # The sink type is per backend: awaitable (string) on the async backends, a
-    # plain (string) sink on sync -- both navi's native body type. (js takes
-    # seq[byte]; see httpbin_js.nim.)
-    when defined(useAsync) or defined(useChronos):
+    when defined(useChronos):
+      # chronos migrates to the pull API in Stage 3; use the sink form for now.
       let sink = proc(data: string) {.async.} = total += data.len
+      let r = await api().stream(GET, base & "/bytes/2048", sink = sink)
+      total == 2048 and r.body.len == 0
     else:
-      let sink = proc(data: string) = total += data.len
-    let r = await api().stream(GET, base & "/bytes/2048", sink = sink)
-    total == 2048 and r.body.len == 0
+      # sync + asyncdispatch pull API: `await` is identity on sync, and `each`
+      # bakes in the await on asyncdispatch. Each chunk is an owned string.
+      let r = await api().stream(GET, base & "/bytes/2048")
+      r.each(chunk): total += chunk.len
+      total == 2048 and r.status == 200
 
   check "a bodyStream upload is streamed and arrives intact over " & wantVersion:
     # A pull-based producer over each native backend (chunked on h1, DATA frames

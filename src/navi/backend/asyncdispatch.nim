@@ -198,7 +198,9 @@ proc recvSome*(c: Conn): Future[string] {.async.} =
                        "navi: read timed out after " & $c.readMs & " ms")
   return await readFut
 
-proc close*(c: Conn): Future[void] {.async.} =
+proc closeSync*(c: Conn) =
+  ## Synchronous close, for a destructor that cannot `await` (an abandoned
+  ## streaming handle reclaimed by GC). Same teardown as `close`.
   when defined(ssl):
     if not c.ssl.isNil:
       discard SSL_shutdown(c.ssl)
@@ -208,6 +210,9 @@ proc close*(c: Conn): Future[void] {.async.} =
     # newContext leaves the SSL_CTX without a destructor; free it so a long-lived
     # client does not leak one context per connection.
     if not c.ctx.isNil: c.ctx.destroyContext()
+
+proc close*(c: Conn): Future[void] {.async.} =
+  c.closeSync()
 
 proc sleep*(ms: int): Future[void] = sleepAsync(ms)
 

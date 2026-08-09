@@ -465,4 +465,12 @@ proc takeResponse*(c: H2Conn, streamId: uint32): H2Response =
     result = s.resp
     c.streams.del(streamId)
 
+proc resetStream*(c: H2Conn, streamId: uint32): string =
+  ## Encode RST_STREAM(CANCEL) for a stream the client is abandoning (a streaming
+  ## download whose handle is closed before the body is fully read) and drop the
+  ## stream locally, so the peer stops sending DATA and the stream state is freed.
+  if c.streams.hasKey(streamId):
+    result = encodeRstStream(streamId, errCancel)
+    c.streams.del(streamId)
+
 proc canReuse*(c: H2Conn): bool = not c.goneAway and c.fatal.len == 0

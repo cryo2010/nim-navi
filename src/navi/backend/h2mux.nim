@@ -214,7 +214,7 @@ proc streamBody(mux: H2Mux, sid: uint32, bodyStream: BodyProducer) {.async.} =
         await ready
         mux.sendReady.del(sid)
 
-proc drainDownload(mux: H2Mux, sid: uint32, sink: BodySink): Future[H2Response] {.async.} =
+proc drainDownload*(mux: H2Mux, sid: uint32, sink: BodySink): Future[H2Response] {.async.} =
   ## Own a streaming (`sink`) stream end to end: drain DATA to the sink as it
   ## arrives, decoding content-encoding incrementally, ack the receive window per
   ## chunk (so the peer is paced by the sink -- backpressure), and return the
@@ -273,6 +273,110 @@ proc drainDownload(mux: H2Mux, sid: uint32, sink: BodySink): Future[H2Response] 
     mux.sinkStreams.excl sid
     discard mux.h2.takeResponse(sid)   # drop the stream if the success path didn't
     mux.releaseSlot()
+
+proc respSnapshot*(mux: H2Mux, sid: uint32): H2Response =
+  ## Status + headers of a stream whose headers are in, without dropping it (the
+  ## body is still to be drained). For the pull-based streaming handle.
+  mux.h2.respSnapshot(sid)
+
+proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: string,
+                         bodyStream: BodyProducer = nil): Future[uint32] {.async.} =
+  ## Open a sink stream, send the request, and await only until the response
+  ## HEADERS arrive; return the stream id with the stream left open and its body
+  ## queuing into `recvq` for a later `drainDownload`. The header/body split lets a
+  ## pull-based caller inspect status/headers before deciding to drain. The stream
+  ## is in `sinkStreams` (gated receive window), so buffered body is bounded until
+  ## the drain acks it. Raises on reset/goaway before headers, like `request`.
+  if not mux.alive:
+    raise newException(IOError, "navi: http/2 connection not usable")
+  while mux.alive and mux.activeStreams >= mux.h2.maxConcurrentStreams:
+    let slot = newFuture[void]("h2mux.slot")
+    mux.pendingSlots.addLast(slot)
+    await slot
+  if not mux.alive:
+    raise newException(IOError, "navi: http/2 connection not usable")
+  let sid = mux.h2.openStream()
+  mux.h2.setSinkMode(sid)                 # gate the receive window; drainDownload acks it
+  mux.sinkStreams.incl sid
+  if bodyStream != nil:
+    await mux.send(mux.h2.encodeRequestHead(sid, headers))
+    await mux.streamBody(sid, bodyStream)
+  else:
+    await mux.send(mux.h2.encodeRequest(sid, headers, body))
+  # Wait for the response headers. As in drainDownload, there is no yield between
+  # the state checks and registering `recvReady`, so the reader (which runs only
+  # while we await) cannot slip a wake in between: no lost wakeup.
+  while true:
+    if not mux.alive:
+      mux.sinkStreams.excl sid
+      mux.recvq.del(sid)
+      discard mux.h2.takeResponse(sid)
+      mux.releaseSlot()
+      raise newException(IOError, "navi: http/2 connection closed")
+    if mux.h2.streamReset(sid):
+      let tooLarge = mux.h2.streamTooLarge(sid)
+      let unprocessed = mux.h2.streamUnprocessed(sid)
+      mux.sinkStreams.excl sid
+      mux.recvq.del(sid)
+      discard mux.h2.takeResponse(sid)
+      mux.releaseSlot()
+      if tooLarge:
+        raise newException(ResponseTooLargeError, "navi: response exceeded maxResponseBytes")
+      elif unprocessed:
+        raise newException(UnprocessedError, "navi: http/2 request not processed")
+      else:
+        raise newException(IOError, "navi: http/2 stream reset")
+    if mux.h2.headersReady(sid): break
+    if mux.h2.streamEnded(sid): break        # headers-only response (no body)
+    if mux.h2.goneAway:
+      let unprocessed = mux.h2.streamUnprocessed(sid)
+      mux.sinkStreams.excl sid
+      mux.recvq.del(sid)
+      discard mux.h2.takeResponse(sid)
+      mux.releaseSlot()
+      if unprocessed:
+        raise newException(UnprocessedError, "navi: http/2 request not processed")
+      else:
+        raise newException(IOError, "navi: http/2 connection went away")
+    let ready = newFuture[void]("h2mux.recvhdr")
+    mux.recvReady[sid] = ready
+    await ready
+    mux.recvReady.del(sid)
+  return sid
+
+proc dropStream*(mux: H2Mux, sid: uint32) =
+  ## Non-awaiting cleanup of an abandoned (never-drained) sink stream, for a
+  ## destructor: free its slot and buffers so it cannot leak. A best-effort
+  ## RST_STREAM is fired and forgotten (the event loop flushes it later); it may
+  ## not be sent if the connection is already gone.
+  if sid notin mux.sinkStreams: return
+  mux.sinkStreams.excl sid
+  mux.recvq.del(sid)
+  mux.recvReady.del(sid)
+  mux.releaseSlot()
+  if mux.alive:
+    let rst = mux.h2.resetStream(sid)        # also drops the stream in the conn
+    if rst.len > 0:
+      try: asyncCheck mux.send(rst)
+      except CatchableError: discard
+  else:
+    discard mux.h2.takeResponse(sid)
+
+proc abandon*(mux: H2Mux, sid: uint32): Future[void] {.async.} =
+  ## Await-capable abandon (from `close`): RST the stream and flush it, then free
+  ## its slot and buffers.
+  if sid notin mux.sinkStreams: return
+  mux.sinkStreams.excl sid
+  mux.recvq.del(sid)
+  mux.recvReady.del(sid)
+  mux.releaseSlot()
+  if mux.alive:
+    let rst = mux.h2.resetStream(sid)
+    if rst.len > 0:
+      try: await mux.send(rst)
+      except CatchableError: discard
+  else:
+    discard mux.h2.takeResponse(sid)
 
 proc request*(mux: H2Mux, headers: seq[(string, string)], body: string,
               bodyStream: BodyProducer = nil,
