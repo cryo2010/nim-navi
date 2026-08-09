@@ -14,12 +14,13 @@ import ../core/response  # for navi's TimeoutError
 export api, chronos
 
 type
-  BodySink* = proc(data: seq[byte]): Future[void] {.closure.}
+  BodySink* = proc(data: string): Future[void] {.closure.}
     ## Streaming download sink for the chronos backend. Awaitable: the engine
     ## `await`s it, so a slow sink applies cooperative backpressure (stalling the
     ## per-read loop) rather than buffering the whole body in memory. Takes an owned
-    ## `seq[byte]` (not `openArray`): the chunk crosses an `await`, so a borrowed
-    ## view would violate memory safety on capture into the async env.
+    ## `string` (navi's native body type, an 8-bit-clean byte buffer): the chunk
+    ## crosses an `await` so it must be owned, not a borrowed view; being navi's own
+    ## body type lets the engine move each chunk in with no copy.
 
 proc chronosVer(v: api.TlsVersion,
                 whenDefault: tlsstream.TLSVersion): tlsstream.TLSVersion =
@@ -165,6 +166,15 @@ proc close*(c: Conn): Future[void] {.async.} =
   await c.writer.closeWait()
   await c.reader.closeWait()
   await c.transport.closeWait()
+
+proc closeSync*(c: Conn) =
+  ## Synchronous close, for a destructor that cannot `await` (an abandoned
+  ## streaming handle reclaimed by GC). chronos's non-`Wait` `close` initiates
+  ## teardown and returns; the event loop frees the resources afterwards. Same
+  ## teardown as `close`, minus the awaits.
+  if not c.writer.isNil: c.writer.close()
+  if not c.reader.isNil: c.reader.close()
+  if not c.transport.isNil: c.transport.close()
 
 proc sleep*(ms: int): Future[void] {.async.} =
   await sleepAsync(ms.milliseconds)

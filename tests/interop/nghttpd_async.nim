@@ -48,21 +48,23 @@ suite "nghttpd interop (asyncdispatch, http/2 mux)":
     check res.httpVersion == "HTTP/2"
     check res.body == repeat("z", 250_000)
 
-  test "streams a response body to a sink incrementally over the mux":
+  test "streams a response body to each incrementally over the mux":
     # The mux delivers DATA to the sink as it arrives rather than buffering the
-    # whole body; a 256 KiB body must therefore arrive in more than one sink call.
-    proc run(): Future[(int, int, string)] {.async.} =
+    # whole body; a 256 KiB body must therefore arrive in more than one each call.
+    # The handle also exposes status/headers (HTTP/2) before the body is drained.
+    proc run(): Future[(int, int, int, string)] {.async.} =
       var cfg = initNaviConfig()
       cfg.tls.caFile = cert
       let api = newNavi(cfg)
       var calls, total = 0
-      let res = await api.stream(GET, base & "/large.bin",
-        sink = proc(data: seq[byte]) {.async.} =
-          inc calls
-          total += data.len)
-      return (calls, total, res.httpVersion)
-    let (calls, total, ver) = waitFor run()
+      let res = await api.stream(GET, base & "/large.bin")   # returns after headers
+      res.each(chunk):
+        inc calls
+        total += chunk.len
+      return (calls, total, res.status, res.httpVersion)
+    let (calls, total, status, ver) = waitFor run()
     check ver == "HTTP/2"
+    check status == 200
     check total == 262144                 # 256 KiB body delivered in full
     check calls > 1                       # ...incrementally, not buffered into one call
 

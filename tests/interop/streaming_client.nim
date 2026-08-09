@@ -53,11 +53,11 @@ proc runDownload() =
   let outPath = getTempDir() / "navi-stream-dl.bin"
   var f = open(outPath, fmWrite)
   var written = 0
-  let res = api.stream(GET, base & "/download",
-    sink = proc(chunk: openArray[byte]) =
-      if chunk.len > 0:
-        discard f.writeBuffer(unsafeAddr chunk[0], chunk.len)
-        written += chunk.len)
+  let res = api.stream(GET, base & "/download")
+  res.each(chunk):
+    if chunk.len > 0:
+      discard f.writeBuffer(unsafeAddr chunk[0], chunk.len)
+      written += chunk.len
   f.close()
   doAssert res.status == 200, "unexpected status " & $res.status
   doAssert res.httpVersion == proto,

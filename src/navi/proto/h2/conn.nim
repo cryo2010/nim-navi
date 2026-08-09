@@ -421,6 +421,22 @@ proc respHeader*(c: H2Conn, streamId: uint32, name: string): string =
     for (k, v) in s.resp.headers:
       if k == name: return v
 
+proc headersReady*(c: H2Conn, streamId: uint32): bool =
+  ## True once the final (non-1xx) response HEADERS block has arrived, so status
+  ## and headers can be read while the body is still streaming. Lets a pull-based
+  ## caller return a handle after the headers and drain the body on demand.
+  let s = c.streams.getOrDefault(streamId)
+  s != nil and s.sawFinal
+
+proc respSnapshot*(c: H2Conn, streamId: uint32): H2Response =
+  ## Status + headers snapshot (empty body) WITHOUT dropping the stream, so a
+  ## streaming caller can read the headers and then keep draining the body. Use
+  ## `takeResponse` (which deletes the stream) only once the body is drained.
+  let s = c.streams.getOrDefault(streamId)
+  if s != nil:
+    result.status = s.resp.status
+    result.headers = s.resp.headers
+
 proc setSinkMode*(c: H2Conn, streamId: uint32) =
   ## Defer this stream's receive-window replenishment to `ackRecv`, so the stream
   ## window is held until a (possibly slow) sink has consumed the delivered bytes.
@@ -447,6 +463,14 @@ proc takeResponse*(c: H2Conn, streamId: uint32): H2Response =
   let s = c.streams.getOrDefault(streamId)
   if s != nil:
     result = s.resp
+    c.streams.del(streamId)
+
+proc resetStream*(c: H2Conn, streamId: uint32): string =
+  ## Encode RST_STREAM(CANCEL) for a stream the client is abandoning (a streaming
+  ## download whose handle is closed before the body is fully read) and drop the
+  ## stream locally, so the peer stops sending DATA and the stream state is freed.
+  if c.streams.hasKey(streamId):
+    result = encodeRstStream(streamId, errCancel)
     c.streams.del(streamId)
 
 proc canReuse*(c: H2Conn): bool = not c.goneAway and c.fatal.len == 0

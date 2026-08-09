@@ -92,8 +92,10 @@ type
     ## Pull-based upload source: returns the next chunk, or "" at end of body.
     ##
     ## The download sink type (`BodySink`) is defined per backend, since it is
-    ## awaitable on the async backends (`proc(data: seq[byte]): Future[void]`) and
-    ## a plain `proc(data: openArray[byte])` on the sync backend.
+    ## awaitable on the async backends (`proc(data: string): Future[void]`) and a
+    ## plain `proc(data: string)` on the sync backend -- both take navi's native
+    ## body type, so each chunk is moved to the sink with no copy. The js backend
+    ## takes `seq[byte]` instead (its bytes come from a JS Uint8Array).
 
   Request* = object
     verb*: HttpVerb

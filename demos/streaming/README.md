@@ -10,8 +10,8 @@ and verifies the bytes arrived intact by comparing SHA-1 hashes at both ends.
   the request body chunk by chunk:
   - [`upload.nim`](upload.nim) streams a file via `bodyStream` and checks the
     server's SHA-1 against the file's own.
-  - [`download.nim`](download.nim) streams the response to disk via a `sink` and
-    checks the file's SHA-1 against the `x-sha1` header.
+  - [`download.nim`](download.nim) streams the response to disk via `stream()`/`each`
+    and checks the file's SHA-1 against the `x-sha1` header.
 
 Each check `doAssert`s, so a corrupted transfer fails the run.
 
@@ -39,8 +39,8 @@ upload: 3145728 bytes over HTTP/2
   3 MiB payload is larger than the flow-control window, so the upload is released
   incrementally as the server sends `WINDOW_UPDATE`s.
 - **Constant memory.** The upload producer is pulled one chunk at a time and the
-  download sink writes each chunk straight to disk; neither side holds the whole
-  file in RAM.
+  download `each` loop writes each chunk straight to disk; neither side holds the
+  whole file in RAM.
 - **TLS.** The server uses a throwaway self-signed cert and the client sets
   `tls.verify = false` — the demo verifies *body integrity*, not the certificate.
   Point navi at a real endpoint with a trusted chain to verify that too.

@@ -4,7 +4,8 @@
 
 import navi/private/entryguard
 import navi/core/public
-import navi/core/[engine, pool, session, proxy]
+import navi/core/[engine, pool, session, proxy, redirect, cookies, digest, cancel]
+import navi/proto/h1
 import navi/proto/ws
 import navi/backend/chronos
 from std/strutils import startsWith, find, splitLines, contains
@@ -19,7 +20,6 @@ type
     req*: Request            ## the outgoing request; modify it before `next`
     res*: Response           ## the response; set by `next`, adjust it after
     clientv: Navi            ## the owning client (see `client`)
-    sink: BodySink           ## non-nil for a streaming request
     idx: int                 ## index of the next middleware to run
   NaviMiddleware* = proc(ctx: NaviContext): Future[void] {.closure, gcsafe.}
     ## A middleware step; may be async. A closure, so it can capture: read/modify
@@ -77,9 +77,6 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
 proc doRequest(client: Navi, req: Request): Future[Response] {.async.} =
   result = performRequest(client, req)
 
-proc doStream(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
-  result = performStream(client, req, sink)
-
 proc guard[T](client: Navi, fut: Future[T], cancel: CancelToken): Future[T] {.async.} =
   ## Bound the whole operation by `timeout` and `cancel`. On either, the in-flight
   ## request is cancelled via chronos structured cancellation (its cleanup closes
@@ -116,10 +113,7 @@ proc next*(ctx: NaviContext): Future[void] {.async.} =
   ## exhausted -- the request itself. The outcome lands in `ctx.res`.
   let mws = ctx.clientv.config.middleware
   if ctx.idx >= mws.len:
-    if ctx.sink.isNil:
-      ctx.res = await doRequest(ctx.clientv, ctx.req)
-    else:
-      ctx.res = await doStream(ctx.clientv, ctx.req, ctx.sink)
+    ctx.res = await doRequest(ctx.clientv, ctx.req)
   else:
     let m = mws[ctx.idx]
     inc ctx.idx
@@ -148,15 +142,145 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
   let ctx = NaviContext(req: req, clientv: client)
   return await client.guard(runChain(ctx), cancel)
 
-proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
+# --- Streaming downloads (pull-based handle) ---
+
+type
+  StreamResponseObj = object
+    ## The response of a streaming request: status/headers are available
+    ## immediately while the body is drained on demand. Holds the checked-out
+    ## http/1.1 connection (removed from the pool) until `drain` returns it or
+    ## `close` disposes it. chronos is http/1.1 only (BearSSL has no client ALPN),
+    ## so there is no h2 variant.
+    resp: Response             ## header snapshot (status/headers; empty body)
+    client: Navi
+    key: string                ## origin key, for returning the connection to the pool
+    transport: Conn            ## the checked-out http/1.1 connection
+    parser: H1Parser
+    decompress: bool
+    cap: int
+    cancel: CancelToken
+    drained: bool              ## body fully read; connection returned/closed
+    closed: bool               ## disposed without draining
+  StreamResponse* = ref StreamResponseObj
+
+proc `=destroy`(o: StreamResponseObj) =
+  ## Backstop: a handle dropped without draining must not leak its connection.
+  ## Cannot `await`, so it does the synchronous teardown only.
+  if not (o.drained or o.closed): o.transport.closeSync()
+
+proc close*(sr: StreamResponse): Future[void] {.async.} =
+  ## Dispose a streaming handle whose body will not be fully drained: closes the
+  ## connection (a partially-read response cannot be pooled). Idempotent; a no-op
+  ## once the body has been drained.
+  if sr.drained or sr.closed: return
+  sr.closed = true
+  await close(sr.transport)
+
+proc status*(sr: StreamResponse): int = sr.resp.status
+  ## The response status code, available before the body is drained.
+proc reason*(sr: StreamResponse): string = sr.resp.reason
+proc httpVersion*(sr: StreamResponse): string = sr.resp.httpVersion
+proc headers*(sr: StreamResponse): Headers = sr.resp.headers
+proc ok*(sr: StreamResponse): bool = sr.resp.ok
+  ## Whether the status is 2xx (checked by the caller; the pull API never throws).
+
+proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.} =
+  ## Send one request and read its headers, returning a handle with the body
+  ## pending over a pooled http/1.1 connection. A stale pooled connection is
+  ## retried once on a fresh one. Does not throw on non-2xx.
+  let origin = originKey(req.url)
+  let decompress = client.config.wantsDecompress
+  let cap = client.config.maxResponseBytes
+
+  var (found, pc) = popIdle(client.pool, origin)
+  if found:
+    try:
+      let parser = h1SendAndReadHeaders(pc.transport, req, true)
+      return StreamResponse(transport: pc.transport, parser: parser,
+        resp: parser.toResponse(), client: client, key: origin,
+        decompress: decompress, cap: cap)
+    except CatchableError:
+      await close(pc.transport)     # pooled connection was stale; open a fresh one
+
+  var rq = req
+  let proxyTarget = resolveProxy(client.config, rq.url)
+  rq.absoluteForm = proxyTarget.isSet and not rq.url.isTls
+  let conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
+                           client.config.tls, proxyTarget, @[],
+                           client.config.connectMs, client.config.readMs)
+  let parser = h1SendAndReadHeaders(conn, rq, true)
+  return StreamResponse(transport: conn, parser: parser,
+    resp: parser.toResponse(), client: client, key: origin,
+    decompress: decompress, cap: cap)
+
+proc stream*(client: Navi, verb: HttpVerb, target: string,
              headers = initHeaders(), params: seq[(string, string)] = @[],
-             cancel: CancelToken = nil): Future[Response] {.async.} =
-  ## Deliver the response body to `sink` as it arrives; Response.body is empty.
-  let req = buildRequest(client.config, verb, target, headers, params = params)
-  if client.config.middleware.len == 0:
-    return await client.guard(doStream(client, req, sink), cancel)
-  let ctx = NaviContext(req: req, clientv: client, sink: sink)
-  return await client.guard(runChain(ctx), cancel)
+             cancel: CancelToken = nil): Future[StreamResponse] {.async.} =
+  ## Open a streaming response: perform the request, follow redirects and digest
+  ## auth to the final response, and return a handle whose status/headers are
+  ## available immediately while the body streams on demand via `each`/`drain`.
+  ##
+  ## Unlike `request`, this does NOT throw on a non-2xx status (inspect `status`),
+  ## and middleware is not applied. Redirect/digest hops are closed. Consume the
+  ## returned handle with `each`/`drain`, or `close` it to skip the body.
+  var rreq = buildRequest(client.config, verb, target, headers, params = params)
+  var hops = 0
+  let limit = client.config.redirectLimit
+  while true:
+    throwIfCancelled(cancel)
+    applyCookies(client.jar, rreq)
+    let handle = await openStreamConn(client, rreq)
+    handle.cancel = cancel
+    storeCookies(client.jar, rreq.url, handle.resp)
+    if handle.status == 401 and client.config.auth.kind == akDigest and
+       not rreq.headers.contains("authorization"):
+      let chal = bestChallenge(handle.headers.getAll("www-authenticate"))
+      if chal.isSome:
+        let auth = digestAuthHeader(client.config.auth.user, client.config.auth.pass,
+                                    $rreq.verb, rreq.url.requestTarget, chal.get)
+        if auth.len > 0:
+          await handle.close()
+          rreq.headers["authorization"] = auth
+          continue
+    let location = handle.headers.get("location")
+    if limit > 0 and hops < limit and isRedirect(handle.status) and location.len > 0:
+      await handle.close()
+      rreq = redirectRequest(rreq, handle.status, location)
+      inc hops
+    else:
+      return handle
+
+proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
+  ## Deliver the response body to `sink` as it arrives (decoded and size-capped),
+  ## awaiting it per chunk so a slow sink backpressures the peer. Then return the
+  ## connection to the pool (or close it if it cannot be reused). Consumes the
+  ## handle: call once. On error the connection is closed and the error re-raised.
+  ## Prefer the `each` template for the common case.
+  if sr.drained or sr.closed:
+    raise newException(IOError, "navi: stream already drained or closed")
+  throwIfCancelled(sr.cancel)
+  try:
+    var keep = false
+    h1DrainBody(sr.transport, sr.parser, sink, keep, sr.decompress, sr.cap)
+    sr.drained = true
+    if not (keep and pushIdle(sr.client.pool, sr.key, PooledConn[Conn](transport: sr.transport))):
+      await close(sr.transport)
+  except CatchableError:
+    if not sr.drained: sr.drained = true   # mark consumed so =destroy won't double-close
+    await close(sr.transport)
+    raise
+
+template each*(sr: StreamResponse; chunk, body: untyped): untyped =
+  ## Drain the streaming body, running `body` for each decoded chunk with `chunk`
+  ## bound to it (an owned `string`, moved from navi's read buffer). The outer
+  ## `await` is baked in, so call it inside an async proc without one:
+  ##   let res = await api.stream(GET, url)
+  ##   res.each(chunk): await outFile.write(chunk)
+  ##
+  ## `body` runs as a proc, so `break`/`continue`/`return` cannot escape the loop
+  ## from inside it. To stop early, don't call `each` and `close` the handle, or
+  ## raise from `body` (which closes the connection and propagates).
+  await sr.drain(proc(chunk: string): Future[void] {.async.} = body)
 
 include navi/private/verbs
 

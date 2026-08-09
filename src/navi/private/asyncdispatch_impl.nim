@@ -6,6 +6,9 @@ import std/tables
 import navi/private/entryguard
 import navi/core/public
 import navi/core/[engine, pool, session, proxy, h2glue]
+import navi/core/[redirect, cookies, digest, cancel]
+import navi/proto/h1
+import navi/proto/h2/conn
 import navi/proto/ws
 import navi/backend/[asyncdispatch, h2mux]
 from std/strutils import startsWith, find, splitLines, contains
@@ -20,7 +23,6 @@ type
     req*: Request            ## the outgoing request; modify it before `next`
     res*: Response           ## the response; set by `next`, adjust it after
     clientv: Navi            ## the owning client (see `client`)
-    sink: BodySink           ## non-nil for a streaming request
     idx: int                 ## index of the next middleware to run
   NaviMiddleware* = proc(ctx: NaviContext): Future[void] {.closure.}
     ## A middleware step; may be async. A closure, so it can capture: read/modify
@@ -165,9 +167,6 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
 proc doRequest(client: Navi, req: Request): Future[Response] {.async.} =
   result = performRequest(client, req)
 
-proc doStream(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
-  result = performStream(client, req, sink)
-
 proc guard(client: Navi, fut: Future[Response],
            cancel: CancelToken): Future[Response] {.async.} =
   ## Bound the whole request (all attempts) by `timeout` and `cancel`. On expiry
@@ -204,10 +203,7 @@ proc next*(ctx: NaviContext): Future[void] {.async.} =
   ## exhausted -- the request itself. The outcome lands in `ctx.res`.
   let mws = ctx.clientv.config.middleware
   if ctx.idx >= mws.len:
-    if ctx.sink.isNil:
-      ctx.res = await doRequest(ctx.clientv, ctx.req)
-    else:
-      ctx.res = await doStream(ctx.clientv, ctx.req, ctx.sink)
+    ctx.res = await doRequest(ctx.clientv, ctx.req)
   else:
     let m = mws[ctx.idx]
     inc ctx.idx
@@ -232,15 +228,213 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
   let ctx = NaviContext(req: req, clientv: client)
   return await client.guard(runChain(ctx), cancel)
 
-proc stream*(client: Navi, verb: HttpVerb, target: string, sink: BodySink,
+# --- Streaming downloads (pull-based handle) ---
+
+type
+  StreamKind = enum skH1, skH2
+  StreamResponseObj = object
+    ## The response of a streaming request: status/headers are available
+    ## immediately while the body is drained on demand. Holds either a checked-out
+    ## http/1.1 connection (removed from the pool) or an open stream on the shared
+    ## h2 mux, until `drain` finishes it or `close` disposes it.
+    resp: Response             ## header snapshot (status/headers; empty body)
+    client: Navi
+    key: string                ## origin key, for returning an h1 connection to the pool
+    decompress: bool
+    cap: int
+    cancel: CancelToken
+    drained: bool              ## body fully read; connection returned/finished
+    closed: bool               ## disposed without draining
+    case kind: StreamKind
+    of skH1:
+      transport: Conn          ## the checked-out http/1.1 connection
+      parser: H1Parser
+    of skH2:
+      mux: H2Mux               ## the shared connection (stays live for reuse)
+      sid: uint32              ## our stream on it
+  StreamResponse* = ref StreamResponseObj
+
+proc `=destroy`(o: StreamResponseObj) =
+  ## Backstop: a handle dropped without draining must not leak its connection or
+  ## stream. Cannot `await`, so it does the synchronous teardown only (an h2
+  ## RST_STREAM is fired and forgotten by `dropStream`).
+  if not (o.drained or o.closed):
+    case o.kind
+    of skH1: o.transport.closeSync()
+    of skH2:
+      if o.mux != nil: o.mux.dropStream(o.sid)
+
+proc close*(sr: StreamResponse): Future[void] {.async.} =
+  ## Dispose a streaming handle whose body will not be fully drained: closes the
+  ## http/1.1 connection (a partially-read response cannot be pooled) or resets the
+  ## h2 stream (the shared connection stays up). Idempotent; a no-op once drained.
+  if sr.drained or sr.closed: return
+  sr.closed = true
+  case sr.kind
+  of skH1: await close(sr.transport)
+  of skH2: await sr.mux.abandon(sr.sid)
+
+proc status*(sr: StreamResponse): int = sr.resp.status
+  ## The response status code, available before the body is drained.
+proc reason*(sr: StreamResponse): string = sr.resp.reason
+proc httpVersion*(sr: StreamResponse): string = sr.resp.httpVersion
+proc headers*(sr: StreamResponse): Headers = sr.resp.headers
+proc ok*(sr: StreamResponse): bool = sr.resp.ok
+  ## Whether the status is 2xx (checked by the caller; the pull API never throws).
+
+proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.} =
+  ## Send one request and read its headers, returning a handle with the body
+  ## pending: multiplexed over a shared h2 connection when available/negotiable,
+  ## otherwise a pooled http/1.1 connection. Mirrors `transport`, but stops at the
+  ## response headers. Does not throw on non-2xx.
+  let origin = originKey(req.url)
+  let wantH2 = client.config.wantsH2 and req.url.isTls
+  let decompress = client.config.wantsDecompress
+  let cap = client.config.maxResponseBytes
+
+  if wantH2:
+    if client.muxes.hasKey(origin) and client.muxes[origin].canReuse:
+      let mux = client.muxes[origin]
+      let sid = await mux.sendAndReadHeaders(h2HeaderList(req), req.body, req.bodyStream)
+      return StreamResponse(kind: skH2, mux: mux, sid: sid,
+        resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
+        decompress: decompress, cap: cap)
+    if client.pendingMux.hasKey(origin):
+      let mux = await client.pendingMux[origin]
+      if mux != nil and mux.canReuse:
+        let sid = await mux.sendAndReadHeaders(h2HeaderList(req), req.body, req.bodyStream)
+        return StreamResponse(kind: skH2, mux: mux, sid: sid,
+          resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
+          decompress: decompress, cap: cap)
+
+  var (found, pc) = popIdle(client.pool, origin)
+  if found:
+    try:
+      let parser = h1SendAndReadHeaders(pc.transport, req, true)
+      return StreamResponse(kind: skH1, transport: pc.transport, parser: parser,
+        resp: parser.toResponse(), client: client, key: origin,
+        decompress: decompress, cap: cap)
+    except CatchableError:
+      await close(pc.transport)     # pooled connection was stale; open a fresh one
+
+  var rq = req
+  let proxyTarget = resolveProxy(client.config, rq.url)
+  rq.absoluteForm = proxyTarget.isSet and not rq.url.isTls
+  let alpn = if wantH2: @["h2", "http/1.1"] else: @[]
+
+  if wantH2:
+    let pending = newFuture[H2Mux]("navi.pendingMux")
+    client.pendingMux[origin] = pending
+    try:
+      let conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
+                               client.config.tls, proxyTarget, alpn,
+                               client.config.connectMs, client.config.readMs)
+      if conn.protocol == "h2":
+        let mux = await newH2Mux(conn, client.config.maxResponseBytes, decompress)
+        client.muxes[origin] = mux
+        client.pendingMux.del(origin)
+        pending.complete(mux)
+        let sid = await mux.sendAndReadHeaders(h2HeaderList(rq), rq.body, rq.bodyStream)
+        return StreamResponse(kind: skH2, mux: mux, sid: sid,
+          resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
+          decompress: decompress, cap: cap)
+      else:
+        client.pendingMux.del(origin)
+        pending.complete(nil)
+        let parser = h1SendAndReadHeaders(conn, rq, true)
+        return StreamResponse(kind: skH1, transport: conn, parser: parser,
+          resp: parser.toResponse(), client: client, key: origin,
+          decompress: decompress, cap: cap)
+    except CatchableError as e:
+      client.pendingMux.del(origin)
+      pending.fail(e)
+      raise
+
+  let conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
+                           client.config.tls, proxyTarget, alpn,
+                           client.config.connectMs, client.config.readMs)
+  let parser = h1SendAndReadHeaders(conn, rq, true)
+  return StreamResponse(kind: skH1, transport: conn, parser: parser,
+    resp: parser.toResponse(), client: client, key: origin,
+    decompress: decompress, cap: cap)
+
+proc stream*(client: Navi, verb: HttpVerb, target: string,
              headers = initHeaders(), params: seq[(string, string)] = @[],
-             cancel: CancelToken = nil): Future[Response] {.async.} =
-  ## Deliver the response body to `sink` as it arrives; Response.body is empty.
-  let req = buildRequest(client.config, verb, target, headers, params = params)
-  if client.config.middleware.len == 0:
-    return await client.guard(doStream(client, req, sink), cancel)
-  let ctx = NaviContext(req: req, clientv: client, sink: sink)
-  return await client.guard(runChain(ctx), cancel)
+             cancel: CancelToken = nil): Future[StreamResponse] {.async.} =
+  ## Open a streaming response: perform the request, follow redirects and digest
+  ## auth to the final response, and return a handle whose status/headers are
+  ## available immediately while the body streams on demand via `each`/`drain`.
+  ##
+  ## Unlike `request`, this does NOT throw on a non-2xx status (inspect `status`),
+  ## and middleware is not applied. Redirect/digest hops are closed. Consume the
+  ## returned handle with `each`/`drain`, or `close` it to skip the body.
+  var rreq = buildRequest(client.config, verb, target, headers, params = params)
+  var hops = 0
+  let limit = client.config.redirectLimit
+  while true:
+    throwIfCancelled(cancel)
+    applyCookies(client.jar, rreq)
+    let handle = await openStreamConn(client, rreq)
+    handle.cancel = cancel
+    storeCookies(client.jar, rreq.url, handle.resp)
+    if handle.status == 401 and client.config.auth.kind == akDigest and
+       not rreq.headers.contains("authorization"):
+      let chal = bestChallenge(handle.headers.getAll("www-authenticate"))
+      if chal.isSome:
+        let auth = digestAuthHeader(client.config.auth.user, client.config.auth.pass,
+                                    $rreq.verb, rreq.url.requestTarget, chal.get)
+        if auth.len > 0:
+          await handle.close()
+          rreq.headers["authorization"] = auth
+          continue
+    let location = handle.headers.get("location")
+    if limit > 0 and hops < limit and isRedirect(handle.status) and location.len > 0:
+      await handle.close()
+      rreq = redirectRequest(rreq, handle.status, location)
+      inc hops
+    else:
+      return handle
+
+proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
+  ## Deliver the response body to `sink` as it arrives (decoded and size-capped),
+  ## awaiting it per chunk so a slow sink backpressures the peer. Then return an
+  ## http/1.1 connection to the pool (or close it if it cannot be reused); an h2
+  ## stream just finishes on the shared connection. Consumes the handle: call once.
+  ## On error the connection is closed/reset and the error re-raised. Prefer `each`.
+  if sr.drained or sr.closed:
+    raise newException(IOError, "navi: stream already drained or closed")
+  throwIfCancelled(sr.cancel)
+  case sr.kind
+  of skH2:
+    try:
+      discard await sr.mux.drainDownload(sr.sid, sink)
+      sr.drained = true                 # drainDownload's finally freed the stream
+    except CatchableError:
+      sr.drained = true                 # ...on error too, so =destroy won't double-free
+      raise
+  of skH1:
+    try:
+      var keep = false
+      h1DrainBody(sr.transport, sr.parser, sink, keep, sr.decompress, sr.cap)
+      sr.drained = true
+      if not (keep and pushIdle(sr.client.pool, sr.key, PooledConn[Conn](transport: sr.transport))):
+        await close(sr.transport)
+    except CatchableError:
+      if not sr.drained: sr.drained = true
+      await close(sr.transport)
+      raise
+
+template each*(sr: StreamResponse; chunk, body: untyped): untyped =
+  ## Drain the streaming body, running `body` for each decoded chunk with `chunk`
+  ## bound to it (an owned `string`, moved from navi's read buffer). The outer
+  ## `await` is baked in, so call it inside an async proc without one:
+  ##   let res = await api.stream(GET, url)
+  ##   res.each(chunk): await outFile.write(chunk)
+  ##
+  ## `body` runs as a proc, so `break`/`continue`/`return` cannot escape the loop
+  ## from inside it. To stop early, don't call `each` and `close` the handle, or
+  ## raise from `body` (which closes/resets the connection and propagates).
+  await sr.drain(proc(chunk: string): Future[void] {.async.} = body)
 
 include navi/private/verbs
 

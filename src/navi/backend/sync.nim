@@ -16,10 +16,12 @@ when defined(ssl):
 export api
 
 type
-  BodySink* = proc(data: openArray[byte]) {.closure, raises: [CatchableError].}
+  BodySink* = proc(data: string) {.closure, raises: [CatchableError].}
     ## Streaming download sink for the sync backend: receives decoded response
     ## body chunks as they arrive. Synchronous (no backpressure needed: a blocking
-    ## read only pulls the next chunk once this returns).
+    ## read only pulls the next chunk once this returns). `data` is navi's native
+    ## body type (`string`, an 8-bit-clean byte buffer), so the engine moves each
+    ## chunk in with no copy; write it to a stream/file or index it as bytes.
 
 when defined(windows):
   import std/winlean

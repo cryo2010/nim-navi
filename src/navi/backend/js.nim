@@ -19,6 +19,13 @@ type
     ## it per chunk read from the fetch `ReadableStream`, so a slow sink naturally
     ## paces reads from the stream rather than buffering the whole body. Takes an
     ## owned `seq[byte]` (the chunk crosses an `await`).
+    ##
+    ## Deliberately `seq[byte]`, unlike the native backends' `string` sink: the chunk
+    ## originates as a JS `Uint8Array` (marshaled byte-by-byte into Nim, so there is
+    ## no owned Nim buffer to move regardless of type), and `seq[byte]` is the
+    ## binary-clean representation here -- a Nim js `string` is a JS (UTF-16) string,
+    ## so routing bytes through it risks the same lossiness as the buffered `.text()`
+    ## path. Portable sinks targeting both js and native must handle both element types.
 
 # --- fetch / DOM bindings ---
 proc fetch(url: cstring, init: JsObject): Future[JsObject] {.importjs: "fetch(#, #)".}
@@ -72,7 +79,7 @@ proc toResponse(res: JsObject, body: string): Response =
                "",                    # fetch does not expose the negotiated version
                readHeaders(res), body)
 
-proc drainToSink(res: JsObject, sink: BodySink, cap: int) {.async.} =
+proc drainToSink*(res: JsObject, sink: BodySink, cap: int) {.async.} =
   ## Stream the response body to `sink`, copying each Uint8Array chunk to bytes.
   ## `await`ing the sink paces reads from the stream (backpressure). When `cap` is
   ## set, the cumulative bytes read are capped (the browser already decoded the
@@ -124,6 +131,30 @@ proc fetchExchange*(req: Request, sink: BodySink, timeout = 0,
   else:
     await drainToSink(res, sink, cap)
     result = toResponse(res, "")
+
+proc fetchOpen*(req: Request, timeout = 0): Future[(JsObject, JsObject)] {.async.} =
+  ## Fetch and resolve the response (status + headers), leaving the body unread for
+  ## the pull-based streaming handle. Returns `(response, abortController)`; the
+  ## controller aborts the still-open body stream when the caller closes the handle
+  ## without draining it. Redirects and decoding are the runtime's, as in
+  ## `fetchExchange`. A nonzero `timeout` aborts the fetch after that many ms.
+  let controller = newAbortController()
+  let signal = if timeout > 0: anySignal(signalOf(controller), abortAfter(timeout))
+               else: signalOf(controller)
+  var res: JsObject
+  try:
+    res = await fetch(cstring(req.url.absoluteTarget), buildInit(req, signal, true))
+  except:  # noqa: bare - a fetch rejection is a native JS error (see fetchExchange).
+    raise newException(IOError, "navi: fetch failed: " & getCurrentExceptionMsg())
+  result = (res, controller)
+
+proc headerSnapshot*(res: JsObject): Response = toResponse(res, "")
+  ## The status/headers of a fetch response, with an empty body: the snapshot a
+  ## streaming handle exposes before its body is drained.
+
+proc abortBody*(controller: JsObject) = controller.abort()
+  ## Abort a fetch whose body stream is still open, so the runtime frees the
+  ## connection. Used when a streaming handle is closed without being drained.
 
 proc sleep*(ms: int): Future[void] =
   ## Retry backoff, resolved by the runtime's timer.

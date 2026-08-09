@@ -18,12 +18,13 @@ when defined(ssl):
 export api, asyncdispatch
 
 type
-  BodySink* = proc(data: seq[byte]): Future[void] {.closure.}
+  BodySink* = proc(data: string): Future[void] {.closure.}
     ## Streaming download sink for the asyncdispatch backend. Awaitable: the engine
     ## and h2 mux `await` it, so a slow sink applies cooperative backpressure (it
     ## stalls the peer via the gated receive window) rather than buffering in memory.
-    ## Takes an owned `seq[byte]` (not `openArray`): the chunk crosses an `await`, so
-    ## it cannot be a borrowed view (that would violate memory safety on capture).
+    ## Takes an owned `string` (navi's native body type, an 8-bit-clean byte buffer):
+    ## the chunk crosses an `await` so it must be owned, not a borrowed view; being
+    ## navi's own body type lets the engine move each chunk in with no copy.
 
 # Disable Nagle on the connection socket: without it the TLS handshake's final
 # flight plus the first request stall ~40ms on the peer's delayed ACK, paid on
@@ -197,7 +198,9 @@ proc recvSome*(c: Conn): Future[string] {.async.} =
                        "navi: read timed out after " & $c.readMs & " ms")
   return await readFut
 
-proc close*(c: Conn): Future[void] {.async.} =
+proc closeSync*(c: Conn) =
+  ## Synchronous close, for a destructor that cannot `await` (an abandoned
+  ## streaming handle reclaimed by GC). Same teardown as `close`.
   when defined(ssl):
     if not c.ssl.isNil:
       discard SSL_shutdown(c.ssl)
@@ -207,6 +210,9 @@ proc close*(c: Conn): Future[void] {.async.} =
     # newContext leaves the SSL_CTX without a destructor; free it so a long-lived
     # client does not leak one context per connection.
     if not c.ctx.isNil: c.ctx.destroyContext()
+
+proc close*(c: Conn): Future[void] {.async.} =
+  c.closeSync()
 
 proc sleep*(ms: int): Future[void] = sleepAsync(ms)
 

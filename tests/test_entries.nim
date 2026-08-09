@@ -85,19 +85,55 @@ suite "sync entry end to end":
     check api.pool.idleCount(key) == 0     # drained (and the socket closed)
     joinThread(th)
 
-  test "stream should deliver the response body to a sink and leave body empty":
+  test "stream should expose headers before the body and deliver it via each":
     const port = 8975
     var th: Thread[ServerCtx]
     startServer(th, port)  # responds with {"ok":true}, content-length 11
 
     let api = newNavi()
     var collected = ""
-    let res = api.stream(GET, "http://127.0.0.1:" & $port & "/",
-      sink = proc(data: openArray[byte]) =
-        for b in data: collected.add char(b))
-    check res.status == 200
-    check res.body == ""            # not buffered
+    let res = api.stream(GET, "http://127.0.0.1:" & $port & "/")
+    check res.status == 200         # headers available before the body is drained
+    res.each(chunk): collected.add chunk
     check collected == """{"ok":true}"""
+    joinThread(th)
+
+  test "stream should return the connection to the pool after a full drain":
+    const port = 8996
+    var accepts = 0
+    var th: Thread[KeepAliveCtx]
+    startKeepAlive(th, port, requests = 2, accepts = addr accepts)
+
+    let api = newNavi()
+    let key = "http://127.0.0.1:" & $port
+    var got = ""
+    block:
+      let res = api.stream(GET, key & "/")
+      check res.status == 200
+      check api.pool.idleCount(key) == 0   # checked out while the handle is live
+      res.each(chunk): got.add chunk
+    check got == "n=0"
+    check api.pool.idleCount(key) == 1     # returned to the pool after a full drain
+    check api.get(key & "/").body == "n=1" # ...and reused
+    joinThread(th)
+    check accepts == 1                      # both requests used the one connection
+
+  test "stream should close (not pool) the connection when the drain fails":
+    const port = 8997
+    var accepts = 0
+    var th: Thread[KeepAliveCtx]
+    startKeepAlive(th, port, requests = 1, accepts = addr accepts)
+
+    let api = newNavi()
+    let key = "http://127.0.0.1:" & $port
+    var raised = false
+    let res = api.stream(GET, key & "/")
+    check res.status == 200
+    try:
+      res.each(chunk): raise newException(ValueError, "consumer failed")
+    except ValueError: raised = true
+    check raised                            # the block's error propagates out of each
+    check api.pool.idleCount(key) == 0      # a failed drain closes, never pools
     joinThread(th)
 
   test "streaming upload should send a chunked body the server reassembles":
@@ -512,8 +548,8 @@ suite "sync entry end to end":
     let api = newNavi(cfg)
     var msg = ""
     try:
-      discard api.stream(GET, "http://127.0.0.1:" & $port & "/",
-        sink = proc(data: openArray[byte]) = discard)
+      let res = api.stream(GET, "http://127.0.0.1:" & $port & "/")
+      res.each(chunk): discard          # cap is enforced during the drain
     except ResponseTooLargeError as e: msg = e.msg
     check "maxResponseBytes" in msg
     joinThread(th)

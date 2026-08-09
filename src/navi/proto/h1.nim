@@ -87,6 +87,12 @@ proc contentEncoding*(p: H1Parser): string =
 
 proc finished*(p: H1Parser): bool {.inline.} = p.state == stDone
 
+proc headersReady*(p: H1Parser): bool {.inline.} =
+  ## True once the status line and all headers are parsed (the body may still be
+  ## pending). Lets a streaming caller inspect status/headers, via `toResponse`,
+  ## before it starts draining the body.
+  p.state notin {stStatusLine, stHeaders}
+
 proc takeLine(p: var H1Parser, line: var string): bool =
   ## Pop one CRLF-terminated line from the buffer, if a full line is present.
   let idx = p.buf.find("\r\n")

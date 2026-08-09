@@ -202,16 +202,14 @@ template runAll() =
   check "/bytes returns an exact length":
     (await api().get(base & "/bytes/1024")).body.len == 1024
 
-  check "stream() delivers the body to a sink and leaves res.body empty":
+  check "stream() delivers the body incrementally via each":
+    # One pull API across all three native backends: `await` is identity on sync,
+    # and `each` bakes in the await on asyncdispatch/chronos. Each chunk is an
+    # owned string; status/headers are available before the body is drained.
     var total = 0
-    # The sink type is per backend: awaitable (seq[byte]) on the async backends,
-    # a plain openArray sink on sync.
-    when defined(useAsync) or defined(useChronos):
-      let sink = proc(data: seq[byte]) {.async.} = total += data.len
-    else:
-      let sink = proc(data: openArray[byte]) = total += data.len
-    let r = await api().stream(GET, base & "/bytes/2048", sink = sink)
-    total == 2048 and r.body.len == 0
+    let r = await api().stream(GET, base & "/bytes/2048")
+    r.each(chunk): total += chunk.len
+    total == 2048 and r.status == 200
 
   check "a bodyStream upload is streamed and arrives intact over " & wantVersion:
     # A pull-based producer over each native backend (chunked on h1, DATA frames
