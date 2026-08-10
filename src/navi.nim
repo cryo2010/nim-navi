@@ -9,7 +9,7 @@
 ## one entry module per program).
 
 import std/tables
-import navi/private/entryguard
+import navi/private/[entryguard, streamguard]
 import navi/core/public
 import navi/core/[engine, pool, session, decompress, redirect, retry, proxy, h2glue]
 import navi/core/[cookies, digest, cancel, url]
@@ -169,18 +169,9 @@ type
     cancel: CancelToken
     drained: bool              ## body fully read; connection returned or closed
     closed: bool               ## connection disposed without draining
+    guard: StreamGuard         ## closes the connection if the handle is dropped
+                               ## before drain/close (see navi/private/streamguard)
   StreamResponse* = ref StreamResponseObj
-
-proc disposeConn(o: StreamResponseObj) =
-  ## Close the underlying connection. A partially-read response cannot be pooled,
-  ## so we always close (h2: closing the connection drops the pending stream). Only
-  ## call when the handle owns the connection (not drained, not already closed).
-  try: o.pc.transport.close()
-  except CatchableError: discard
-
-proc `=destroy`(o: StreamResponseObj) =
-  ## Backstop: a handle dropped without draining must not leak its connection.
-  if not (o.drained or o.closed): disposeConn(o)
 
 proc close*(sr: StreamResponse) =
   ## Dispose a streaming handle whose body will not be fully drained: closes the
@@ -188,7 +179,7 @@ proc close*(sr: StreamResponse) =
   ## Idempotent, and a no-op once the body has been drained.
   if sr.drained or sr.closed: return
   sr.closed = true
-  disposeConn(sr[])
+  closeNow(sr.guard)
 
 proc status*(sr: StreamResponse): int = sr.resp.status
   ## The response status code, available before the body is drained.
@@ -259,6 +250,13 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
     applyCookies(client.jar, rreq)
     let handle = openStream(client, rreq)
     handle.cancel = cancel
+    # Arm the leak-guard: if the handle is dropped without drain/close, close its
+    # connection. Captures only `pc` (not `handle`, which would cycle).
+    let pc = handle.pc
+    handle.guard = newStreamGuard(proc() {.gcsafe, raises: [].} =
+      {.cast(gcsafe).}:
+        try: pc.transport.close()
+        except Exception: discard)     # best-effort finalizer: never propagate
     storeCookies(client.jar, rreq.url, handle.resp)
     # 401 Digest challenge: re-open with an Authorization header (mirrors the
     # buffered path's maybeDigest), discarding the challenge body.
@@ -292,17 +290,17 @@ proc drain*(sr: StreamResponse, sink: BodySink) =
     if sr.pc.h2 != nil:
       h2DrainBody(sr.pc.transport, sr.pc.h2, sr.sid, sink, sr.decompress, sr.cap)
       sr.drained = true
-      if not (sr.pc.h2.canReuse and pushIdle(sr.client.pool, sr.key, sr.pc)):
-        disposeConn(sr[])
+      if sr.pc.h2.canReuse and pushIdle(sr.client.pool, sr.key, sr.pc): disarm(sr.guard)
+      else: closeNow(sr.guard)
     else:
       var keep = false
       h1DrainBody(sr.pc.transport, sr.parser, sink, keep, sr.decompress, sr.cap)
       sr.drained = true
-      if not (keep and pushIdle(sr.client.pool, sr.key, sr.pc)):
-        disposeConn(sr[])
+      if keep and pushIdle(sr.client.pool, sr.key, sr.pc): disarm(sr.guard)
+      else: closeNow(sr.guard)
   except CatchableError:
-    if not sr.drained: sr.drained = true   # mark consumed so =destroy won't double-close
-    disposeConn(sr[])
+    if not sr.drained: sr.drained = true   # mark consumed for the "call once" guard
+    closeNow(sr.guard)
     raise
 
 template each*(sr: StreamResponse; chunk, body: untyped): untyped =

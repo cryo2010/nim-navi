@@ -46,10 +46,36 @@ proc exerciseFailedHandshake(): int =
     inc result
   api.close()
 
+proc exerciseStream(): int =
+  ## Streaming pull API. First fully drain each handle (connection returned to the
+  ## pool); then open handles and drop them WITHOUT drain/close, so the handle's
+  ## leak-guard runs its teardown. Both paths must free the handle's fields (the
+  ## header snapshot, parser, key) -- a custom =destroy on the handle used to
+  ## suppress that and leak them, which Valgrind now guards against.
+  var cfg = initNaviConfig()
+  cfg.tls.caFile = cert
+  let api = newNavi(cfg)
+  for _ in 0 ..< iters:
+    let r = api.stream(GET, url)
+    doAssert r.status == 200, "unexpected stream status " & $r.status
+    var n = 0
+    r.each(chunk): n += chunk.len
+    doAssert n > 0, "empty streamed body"
+    inc result
+  for _ in 0 ..< iters:
+    let r = api.stream(GET, url)
+    doAssert r.status == 200, "unexpected stream status " & $r.status
+    inc result          # r goes out of scope undrained -> the guard closes it
+  api.close()
+
 let completed = exercise()
 doAssert completed == iters,
   "only " & $completed & " of " & $iters & " requests completed"
 let refused = exerciseFailedHandshake()
 doAssert refused == iters, "only " & $refused & " of " & $iters & " handshakes failed"
+let streamed = exerciseStream()
+doAssert streamed == iters * 2,
+  "only " & $streamed & " of " & $(iters * 2) & " streams completed"
 GC_fullCollect()
-echo "completed ", completed, " https requests + ", refused, " rejected handshakes"
+echo "completed ", completed, " https requests + ", refused,
+     " rejected handshakes + ", streamed, " streamed responses"
