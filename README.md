@@ -99,7 +99,7 @@ discard main()
 ## Install
 
 ```shell
-nimble install navi
+nimble add navi
 ```
 
 ## Requirements
