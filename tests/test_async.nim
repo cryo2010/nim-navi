@@ -129,6 +129,23 @@ suite "asyncdispatch entry end to end":
     joinThread(th)
     check accepts == 1
 
+  test "sse should parse events over the async backend":
+    const port = 9006
+    let payload = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n" &
+                  "Connection: close\r\n\r\nevent: e\ndata: a\n\ndata: b\nid: 3\n\n"
+    var th: Thread[ServerCtx]
+    startRaw(th, port, payload)
+    proc run(): Future[seq[SseEvent]] {.async.} =
+      let s = await newNavi().sse("http://127.0.0.1:" & $port & "/", reconnect = false)
+      var events: seq[SseEvent]
+      s.each(ev): events.add ev
+      return events
+    let events = waitFor run()
+    joinThread(th)
+    check events.len == 2
+    check events[0].event == "e" and events[0].data == "a"
+    check events[1].data == "b" and events[1].id == "3"
+
   test "stream should close (not pool) the connection when the drain fails":
     const port = 9001
     var accepts = 0
