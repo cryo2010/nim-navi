@@ -3,7 +3,7 @@
 # `nim js` without pulling in std/asyncdispatch (which has no JS backend).
 
 import std/tables
-import navi/private/entryguard
+import navi/private/[entryguard, streamguard]
 import navi/core/public
 import navi/core/[engine, pool, session, proxy, h2glue]
 import navi/core/[redirect, cookies, digest, cancel]
@@ -245,6 +245,8 @@ type
     cancel: CancelToken
     drained: bool              ## body fully read; connection returned/finished
     closed: bool               ## disposed without draining
+    guard: StreamGuard         ## closes/resets if the handle is dropped before
+                               ## drain/close (see navi/private/streamguard)
     case kind: StreamKind
     of skH1:
       transport: Conn          ## the checked-out http/1.1 connection
@@ -254,22 +256,13 @@ type
       sid: uint32              ## our stream on it
   StreamResponse* = ref StreamResponseObj
 
-proc `=destroy`(o: StreamResponseObj) =
-  ## Backstop: a handle dropped without draining must not leak its connection or
-  ## stream. Cannot `await`, so it does the synchronous teardown only (an h2
-  ## RST_STREAM is fired and forgotten by `dropStream`).
-  if not (o.drained or o.closed):
-    case o.kind
-    of skH1: o.transport.closeSync()
-    of skH2:
-      if o.mux != nil: o.mux.dropStream(o.sid)
-
 proc close*(sr: StreamResponse): Future[void] {.async.} =
   ## Dispose a streaming handle whose body will not be fully drained: closes the
   ## http/1.1 connection (a partially-read response cannot be pooled) or resets the
   ## h2 stream (the shared connection stays up). Idempotent; a no-op once drained.
   if sr.drained or sr.closed: return
   sr.closed = true
+  disarm(sr.guard)                    # we do the awaitable teardown ourselves
   case sr.kind
   of skH1: await close(sr.transport)
   of skH2: await sr.mux.abandon(sr.sid)
@@ -376,6 +369,23 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
     applyCookies(client.jar, rreq)
     let handle = await openStreamConn(client, rreq)
     handle.cancel = cancel
+    # Arm the leak-guard for the synchronous fallback teardown if the handle is
+    # dropped without drain/close. Captures only the connection essentials (never
+    # `handle`, which would cycle): the h1 transport, or the mux + stream id.
+    case handle.kind
+    of skH1:
+      let t = handle.transport
+      handle.guard = newStreamGuard(proc() {.gcsafe, raises: [].} =
+        {.cast(gcsafe).}:
+          try: t.closeSync()
+          except Exception: discard)     # best-effort finalizer: never propagate
+    of skH2:
+      let mux = handle.mux
+      let sid = handle.sid
+      handle.guard = newStreamGuard(proc() {.gcsafe, raises: [].} =
+        {.cast(gcsafe).}:
+          try: (if mux != nil: mux.dropStream(sid))
+          except Exception: discard)
     storeCookies(client.jar, rreq.url, handle.resp)
     if handle.status == 401 and client.config.auth.kind == akDigest and
        not rreq.headers.contains("authorization"):
@@ -404,13 +414,14 @@ proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
   if sr.drained or sr.closed:
     raise newException(IOError, "navi: stream already drained or closed")
   throwIfCancelled(sr.cancel)
+  disarm(sr.guard)                      # from here `drain` owns the teardown
   case sr.kind
   of skH2:
     try:
       discard await sr.mux.drainDownload(sr.sid, sink)
       sr.drained = true                 # drainDownload's finally freed the stream
     except CatchableError:
-      sr.drained = true                 # ...on error too, so =destroy won't double-free
+      sr.drained = true                 # ...on error too, so the guard won't double-free
       raise
   of skH1:
     try:

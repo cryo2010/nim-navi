@@ -2,7 +2,7 @@
 # targets. Kept separate so the entry can fall back to navi/js under `nim js`
 # without pulling in the chronos package (which has no JavaScript backend).
 
-import navi/private/entryguard
+import navi/private/[entryguard, streamguard]
 import navi/core/public
 import navi/core/[engine, pool, session, proxy, redirect, cookies, digest, cancel]
 import navi/proto/h1
@@ -161,12 +161,9 @@ type
     cancel: CancelToken
     drained: bool              ## body fully read; connection returned/closed
     closed: bool               ## disposed without draining
+    guard: StreamGuard         ## closes the connection if the handle is dropped
+                               ## before drain/close (see navi/private/streamguard)
   StreamResponse* = ref StreamResponseObj
-
-proc `=destroy`(o: StreamResponseObj) =
-  ## Backstop: a handle dropped without draining must not leak its connection.
-  ## Cannot `await`, so it does the synchronous teardown only.
-  if not (o.drained or o.closed): o.transport.closeSync()
 
 proc close*(sr: StreamResponse): Future[void] {.async.} =
   ## Dispose a streaming handle whose body will not be fully drained: closes the
@@ -174,6 +171,7 @@ proc close*(sr: StreamResponse): Future[void] {.async.} =
   ## once the body has been drained.
   if sr.drained or sr.closed: return
   sr.closed = true
+  disarm(sr.guard)                    # we do the awaitable teardown ourselves
   await close(sr.transport)
 
 proc status*(sr: StreamResponse): int = sr.resp.status
@@ -231,6 +229,13 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
     applyCookies(client.jar, rreq)
     let handle = await openStreamConn(client, rreq)
     handle.cancel = cancel
+    # Arm the leak-guard for the synchronous fallback teardown if the handle is
+    # dropped without drain/close. Captures only `transport` (not `handle`, cycle).
+    let t = handle.transport
+    handle.guard = newStreamGuard(proc() {.gcsafe, raises: [].} =
+      {.cast(gcsafe).}:
+        try: t.closeSync()
+        except Exception: discard)     # best-effort finalizer: never propagate
     storeCookies(client.jar, rreq.url, handle.resp)
     if handle.status == 401 and client.config.auth.kind == akDigest and
        not rreq.headers.contains("authorization"):
@@ -259,6 +264,7 @@ proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
   if sr.drained or sr.closed:
     raise newException(IOError, "navi: stream already drained or closed")
   throwIfCancelled(sr.cancel)
+  disarm(sr.guard)                         # from here `drain` owns the teardown
   try:
     var keep = false
     h1DrainBody(sr.transport, sr.parser, sink, keep, sr.decompress, sr.cap)
@@ -266,7 +272,7 @@ proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
     if not (keep and pushIdle(sr.client.pool, sr.key, PooledConn[Conn](transport: sr.transport))):
       await close(sr.transport)
   except CatchableError:
-    if not sr.drained: sr.drained = true   # mark consumed so =destroy won't double-close
+    if not sr.drained: sr.drained = true   # mark consumed for the "call once" guard
     await close(sr.transport)
     raise
 
