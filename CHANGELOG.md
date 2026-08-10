@@ -1,0 +1,144 @@
+# Changelog
+
+All notable changes to navi are documented here. The format is based on
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project aims to
+follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) from 1.0.0
+onward (pre-1.0, minor versions may include breaking changes).
+
+## [Unreleased]
+
+## [0.4.0] - 2026-08-10
+
+Theme: a full streaming stack (both directions, all backends) and the memory- and
+shutdown-correctness fixes it surfaced.
+
+### Added
+- Pull-based streaming downloads: `stream()` returns a headers-first
+  `StreamResponse` handle, consumed with `each`/`drain`/`close`, across all four
+  backends. Each chunk is moved (no copy) from navi's read buffer (#108).
+- Cooperative backpressure for streamed responses: awaiting the consumer stalls
+  the peer instead of buffering. Over HTTP/2 this is a gated receive window
+  replenished per consumed chunk, so a slow reader stalls only its own stream
+  (#103, #104, #105, #106).
+- Streaming request bodies (`bodyStream`) over HTTP/2, including the async mux;
+  buffered on `navi/js` for cross-backend parity (#96, #98, #101).
+- Concurrent-streaming interop as a one-command Dockerized task
+  (`nimble streamConcurrent`): 50+ simultaneous uploads and downloads multiplexed
+  over one h2 connection, verified by SHA-1 (#110).
+- CI: four file-streaming checks (http1/http2 x upload/download) (#99) and a
+  private-CA (`TlsConfig.caFile`) verification check on the sync backend (#92).
+- Self-verifying file-streaming examples and a Dockerized FastAPI h2 demo
+  (#97, #98).
+
+### Changed
+- **Breaking:** the free `stream(url, sink)` is removed; use
+  `stream(url).drain(sink)` or the `each` template. The pull API does not throw on
+  non-2xx (inspect `status`) and is not run through middleware (#108).
+- **Breaking:** async response sinks take navi's native body type (`string`) and
+  are handed each chunk by move rather than copy; `navi/js` keeps `seq[byte]`
+  (its bytes come from a JS `Uint8Array`) (#106).
+
+### Fixed
+- HTTP/2 mux shutdown crash: `close()` now joins the background reader (via a
+  socket shutdown + a `readerDone` future) instead of closing the transport out
+  from under it, which orphaned the reader and segfaulted at teardown (#109).
+- Sync client leaked idle pooled connections (and their ~85 KB OpenSSL contexts)
+  when collected without `close()`; a `=destroy` leak-guard now closes them (#112).
+- `StreamResponse` handles leaked their fields: a custom `=destroy` suppresses
+  Nim's field destruction, so each handle leaked its header snapshot, parser, and
+  key. Fixed by isolating the connection backstop in a small guard type so the
+  handle needs no `=destroy` (#113).
+- chronos: pass a `Duration` to `withTimeout`, dropping a deprecation warning
+  (#94).
+
+### Docs / tests
+- TESTING.md records the streaming coverage matrix and backpressure tests
+  (#102, #107); the valgrind harness now exercises `stream()` so this leak class
+  is covered (#113).
+- Unit tests renamed to the `<subject> should <effect>` convention (#93) and every
+  previously check-less test now asserts on the raised error (#95).
+
+## [0.3.0] - 2026-08-04
+
+### Added
+- TLS min/max version pinning (#85) and cipher-suite selection (#87).
+- TLS session resumption across connections (#81).
+- Happy Eyeballs (RFC 8305) address racing and handshake-aware address fallback
+  on the sync backend (#86, #76).
+- Per-phase timeouts: connect / read / total deadlines (#84).
+
+### Changed
+- **Breaking:** `Navi` is a `ref object` again, with `newNavi` restored (#74).
+- **Breaking:** `newNaviConfig`/`newNavi` renamed to `initNaviConfig`/`initNavi`
+  (#73).
+- Performance: the sync and asyncdispatch backends now own the socket and drive
+  the TLS handshake directly instead of going through `std/net`/`asyncnet`,
+  cutting per-connection overhead (#80, #82). First-party `SSL_CTX` builder folds
+  ALPN and credentials (#75). `NaviContext` holds the client by ref (#77).
+
+### Fixed
+- Security: HPACK decode is bounded to prevent a decompression-bomb DoS (#78).
+
+### Docs / bench
+- Added SECURITY.md (#90) and the TESTING.md test registry (#88).
+- Dockerized multi-client benchmark (navi vs std/httpclient, Go, Rust) with
+  Node.js and Python (requests) clients added (#79, #83).
+
+## [0.2.0] - 2026-07-27
+
+### Added
+- Client certificates (mTLS) from encrypted PEM, DER, PKCS#12, and in-memory PEM
+  (#70).
+
+### Changed
+- Retry policy: `backoffCap` renamed to `maxDelay` (#71).
+
+### Fixed
+- Sync backend read-timeout bug (#68).
+
+### Tests
+- Local httpbin interop behind Caddy (methods, auth, cookies, streaming) (#69) and
+  multi-server + live interop suites (#68).
+
+## [0.1.0] - 2026-07-27
+
+Initial release: a batteries-included HTTP client for Nim with a uniform API
+across four backends.
+
+### Added
+- **Backends:** sync (OpenSSL), asyncdispatch (OpenSSL), chronos (BearSSL), and
+  js (`fetch`), sharing one API. The async entries fall back to `navi/js` under
+  `nim js` (#59).
+- **HTTP/2:** a sans-io implementation (frame layer, HPACK core + Huffman,
+  connection driver), ALPN negotiation, send/receive flow control, CONTINUATION
+  frames, `MAX_CONCURRENT_STREAMS` handling, frame-padding stripping, a
+  shared-connection async multiplexer, and a multiplexed parallel batch API
+  (#54 and the h2 series).
+- **HTTP/1.1** request/response with an incremental parser.
+- **TLS:** verification on by default; client certificates (mTLS) on the OpenSSL
+  backends; chronos custom-CA verification (`TlsConfig.caFile`).
+- **Auth:** basic, bearer, and Digest (RFC 7616/2617) with SHA-256 and strongest-
+  offered-algorithm negotiation.
+- **Cookies:** a per-client jar (RFC 6265; Max-Age and Expires), plus an opt-in js
+  cookie jar for runtimes without a cookie store (#47).
+- **Decompression:** gzip, deflate, brotli, and zstd, incremental for HTTP/1.1,
+  with brotli/zstd loaded lazily.
+- **Middleware:** onion-style middleware (replacing lifecycle hooks) that can wrap,
+  short-circuit, or observe a request (#48, #53).
+- **Ergonomics:** query params (accepts `Table`/`OrderedTable`/bare `{}`),
+  cancellation tokens, configurable retry with backoff, response size cap,
+  request timeouts, a multipart/form-data helper, http/https proxy support, an
+  `options()` verb shortcut, and a cached `res.data` accessor.
+- **WebSocket:** RFC 6455 client on all four backends.
+- **Connection pooling / keep-alive** with automatic retry on a stale pooled
+  connection.
+
+### Security
+- TLS certificates verified by default; HPACK bounds, negative `Content-Length`
+  rejection, chunk-size bounds, and malformed-input rejection instead of crashes.
+
+[Unreleased]: https://github.com/cryo2010/nim-navi/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/cryo2010/nim-navi/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/cryo2010/nim-navi/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/cryo2010/nim-navi/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/cryo2010/nim-navi/releases/tag/v0.1.0
