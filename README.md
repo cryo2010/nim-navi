@@ -87,6 +87,7 @@ discard main()
 - **Connection pooling / keep-alive**, with automatic retry on a stale pooled connection
 - **Happy Eyeballs** (RFC 8305) address racing on the sync backend, so a slow/blackholed address doesn't stall the connect
 - **Streaming** uploads (chunked) and downloads (headers-first pull handle with backpressure)
+- **Server-Sent Events** (`sse()`) with transparent reconnection (Last-Event-ID + `retry:`), any method/headers
 - **Retries** with capped exponential backoff, honoring `Retry-After`
 - **Redirect following** with method rewrites and cross-origin `Authorization` stripping
 - **Throw-on-non-2xx** by default (`HttpError`), opt-out available
@@ -632,6 +633,33 @@ discard api.request(POST, "https://example.com/upload", bodyStream = proc(): str
     inc i)
 ```
 
+### Server-Sent Events
+
+`sse()` opens a `text/event-stream` and returns a handle consumed with a pull
+`next()` or the `each` sugar. It **reconnects transparently** on a drop (resending
+`Last-Event-ID` and honoring the server's `retry:`), and unlike the platform
+`EventSource` it accepts any method, headers, and body.
+
+```nim
+let s = await api.sse("https://example.com/events")   # sync: no await
+s.each(ev):
+  echo ev.event, " #", ev.id, ": ", ev.data
+  if ev.event == "done": break                        # a real loop, so break works
+s.close()
+```
+
+Because `next()` is a pull (it returns `none` at end), `each` is a real loop, so
+`break`/`continue`/`return` work inside it. Parameters: `verb`/`body`/`headers`/
+`params` (POST-SSE, auth), `lastEventId` (resume a prior stream), `reconnect`
+(default true), and `retryMs`/`maxRetryMs` (reconnect backoff). The initial response
+must be `200 text/event-stream`, or `sse()` raises.
+
+The stream runs with the size cap and read/total timeouts off (SSE is long-lived)
+and shares the client's cookie jar. **Call `close()` when done** so the connection
+is disposed (on the native backends it also joins the h2 mux reader). On `navi/js`
+events go through `fetch`, so any method/headers work and chunks are decoded as
+UTF-8 text.
+
 ### WebSocket
 
 Open a WebSocket with `websocket()`, then `send`, `receive`, and `close`. It works
@@ -702,6 +730,16 @@ with `res.each(chunk): ...` (async backends await; the `await` is baked into `ea
 or an explicit `res.drain(sink)`, and `res.close()` a handle you will not fully
 read. `chunk` is a `string` on the native backends and `seq[byte]` on `navi/js`.
 Awaiting each chunk back-pressures the peer (see [Streaming](#streaming)).
+
+### client.sse(target, verb = GET, headers = initHeaders(), body = "", params = @[], lastEventId = "", reconnect = true, retryMs = 3000, maxRetryMs = 30000, cancel = nil)
+
+Open a Server-Sent Events stream and return an `SseStream`. Consume it with pull
+`next()` (returns `Option[SseEvent]`, `none` at end) or `res.each(ev): ...` (a real
+loop, so `break`/`return` work). `SseEvent` has `event`, `data`, `id`, `retry`. It
+reconnects transparently on a drop (resending `Last-Event-ID`, honoring the server's
+`retry:` with backoff to `maxRetryMs`) unless `reconnect = false`. The initial
+response must be `200 text/event-stream` or it raises. `close()` when done. See
+[Server-Sent Events](#server-sent-events).
 
 ### client.websocket(url, headers = initHeaders())
 

@@ -1,0 +1,16 @@
+# Compile the SSE reconnect interop client and run it against the FastAPI SSE
+# server. Build context is the repo root so the navi sources under src/ are
+# available to the compiler.
+FROM nimlang/nim:2.2.10 AS build
+WORKDIR /build
+RUN nimble install -y checksums          # navi's SHA/MD5 dependency (Digest auth)
+COPY src ./src
+COPY tests/interop/sse/client.nim ./
+RUN nim c --path:src -d:ssl -d:release --hints:off -o:client client.nim
+
+FROM debian:stable-slim
+RUN apt-get update && apt-get install -y --no-install-recommends libssl3 ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=build /build/client ./
+CMD ["./client"]

@@ -132,6 +132,16 @@ task streamConcurrent, "Concurrent streaming interop: 50 simultaneous streamed u
   finally:
     exec compose & " down"
 
+task sse, "SSE reconnect interop: server drops mid-stream, client resumes via Last-Event-ID over the h2 mux (Docker)":
+  # A FastAPI SSE server drops the connection after 3 events per request; the
+  # navi/asyncdispatch client must reconnect and resume from Last-Event-ID to
+  # receive all 10 events in order. One command, exits non-zero on any gap.
+  let compose = "docker compose -f tests/interop/sse/docker-compose.yml"
+  try:
+    exec compose & " up --build --abort-on-container-exit --exit-code-from client"
+  finally:
+    exec compose & " down"
+
 task servers, "Multi-server HTTP/2 interop: nginx, Caddy, h2o (needs Docker + openssl)":
   # Runs navi's h2 client (and chronos h1) against three unrelated server stacks.
   exec "bash tests/interop/servers.sh"
