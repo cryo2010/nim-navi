@@ -19,10 +19,12 @@ when not defined(js):
   {.error: "navi/js requires the JavaScript backend; compile with `nim js` " &
            "(import `navi` for the native sync client).".}
 
-import std/[asyncjs, jsffi]
-from std/strutils import startsWith
+import std/[asyncjs, jsffi, options]
+from std/strutils import startsWith, toLowerAscii
 import navi/private/entryguard
+import navi/proto/sse
 import navi/core/public
+export sse.SseEvent
 import navi/core/retry
 import navi/backend/js
 import navi/backend/jsws
@@ -288,6 +290,132 @@ template each*(sr: StreamResponse; chunk, body: untyped): untyped =
   ## `body` runs as a proc, so `break`/`continue`/`return` cannot escape the loop
   ## from inside it. To stop early, don't call `each` and `close` the handle.
   await sr.drain(proc(chunk: seq[byte]): Future[void] {.async.} = body)
+
+# --- Server-Sent Events (text/event-stream) ---
+
+type
+  SseStreamObj = object
+    ## A first-class SSE stream over fetch. Pulls parsed events via `next`/`each`,
+    ## reconnecting transparently (Last-Event-ID + the server's retry:) unless
+    ## `reconnect` is off. Uses fetch directly (not the byte `StreamResponse`), so
+    ## chunks are decoded as UTF-8 text, and supports any verb/headers unlike the
+    ## platform EventSource.
+    client: Navi
+    req: Request
+    reconnect: bool
+    baseRetryMs: int
+    retryMs: int
+    maxRetryMs: int
+    res: JsObject             ## current fetch Response
+    controller: JsObject      ## AbortController for the current body
+    reader: JsObject          ## its ReadableStream reader
+    decoder: JsObject         ## a streaming TextDecoder
+    haveConn: bool
+    parser: SseParser
+    started: bool
+    closed: bool
+  SseStream* = ref SseStreamObj
+
+proc openConn(s: SseStream): Future[void] {.async.} =
+  ## (Re)open the fetch stream and require a 200 text/event-stream response.
+  s.parser.reset()
+  var req = s.req
+  let lid = s.parser.lastEventId()
+  if lid.len > 0: req.headers["last-event-id"] = lid
+  let (res, controller) = await fetchOpen(req, 0)   # no total timeout: long-lived
+  let snap = headerSnapshot(res)
+  if snap.status != 200:
+    abortBody(controller)
+    raise newException(IOError, "navi: SSE got status " & $snap.status &
+      " (expected 200)")
+  if not snap.headers.get("content-type").toLowerAscii.startsWith("text/event-stream"):
+    let ct = snap.headers.get("content-type")
+    abortBody(controller)
+    raise newException(IOError,
+      "navi: SSE expected Content-Type text/event-stream, got '" & ct & "'")
+  s.res = res
+  s.controller = controller
+  s.reader = bodyReader(res)
+  s.decoder = newTextDecoder()
+  s.haveConn = true
+
+proc sse*(client: Navi, target: string, verb = GET,
+          headers = initHeaders(), body = "",
+          params: seq[(string, string)] = @[],
+          lastEventId = "", reconnect = true,
+          retryMs = 3000, maxRetryMs = 30_000,
+          cancel: CancelToken = nil): Future[SseStream] {.async.} =
+  ## Open a Server-Sent Events stream over fetch. The initial response is validated
+  ## up front (a non-200 or non `text/event-stream` response raises). Consume with
+  ## `next` (none at end) or `each` (a real loop, so break/return work). Reconnects
+  ## transparently on a drop, resending Last-Event-ID and honoring the server's
+  ## retry: (backoff to `maxRetryMs`), unless `reconnect` is false. Redirects,
+  ## cookies, and decoding are the runtime's, as elsewhere on js.
+  var h = headers
+  if not h.contains("accept"): h["accept"] = "text/event-stream"
+  if not h.contains("cache-control"): h["cache-control"] = "no-cache"
+  let s = SseStream(
+    client: client, req: buildRequest(client.config, verb, target, h, body,
+                                      params = params),
+    reconnect: reconnect, baseRetryMs: retryMs, retryMs: retryMs,
+    maxRetryMs: maxRetryMs, parser: initSseParser(lastEventId))
+  await s.openConn()
+  s.started = true
+  return s
+
+proc close*(s: SseStream) =
+  ## Stop consuming and abort the body so the runtime frees the connection.
+  ## Idempotent. Not awaitable (abort is synchronous).
+  if s.closed: return
+  s.closed = true
+  if s.haveConn:
+    abortBody(s.controller)
+    s.haveConn = false
+
+proc lastEventId*(s: SseStream): string = s.parser.lastEventId()
+
+proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
+  ## The next event, or none once the stream ends. Reconnects transparently on a
+  ## drop when enabled, resending Last-Event-ID.
+  if s.closed: return none(SseEvent)
+  while true:
+    let ev = s.parser.next()
+    if ev.isSome:
+      if s.parser.retryMs() >= 0:
+        s.baseRetryMs = min(s.parser.retryMs(), s.maxRetryMs)
+      return ev
+    if not s.haveConn:
+      if not s.reconnect: return none(SseEvent)
+      await sleep(min(s.retryMs, s.maxRetryMs))
+      try:
+        await s.openConn()
+        s.retryMs = s.baseRetryMs
+      except CatchableError:
+        if s.closed: return none(SseEvent)
+        s.retryMs = min(max(s.retryMs, s.baseRetryMs) * 2, s.maxRetryMs)
+        continue
+    var chunk = ""
+    try:
+      chunk = await readTextChunk(s.reader, s.decoder)
+    except CatchableError:
+      abortBody(s.controller)
+      s.haveConn = false
+      if not s.reconnect: raise
+      continue
+    if chunk.len == 0:
+      s.haveConn = false
+      if not s.reconnect: return none(SseEvent)
+      continue
+    s.parser.feed(chunk)
+
+template each*(s: SseStream; ev, body: untyped): untyped =
+  ## Consume events until the stream ends, binding `ev` to each `SseEvent`. A real
+  ## loop (over the awaited `next`), so break/continue/return work.
+  while true:
+    let evOpt = await s.next()
+    if evOpt.isNone: break
+    let ev = evOpt.get
+    body
 
 proc websocket*(client: Navi, url: string,
                 headers = initHeaders()): Future[WebSocket] =

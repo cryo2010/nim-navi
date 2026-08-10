@@ -99,6 +99,21 @@ proc drainToSink*(res: JsObject, sink: BodySink, cap: int) {.async.} =
         "navi: response exceeded maxResponseBytes")
     await sink(bytes)
 
+proc newTextDecoder*(): JsObject {.importjs: "new TextDecoder()".}
+proc decodeStream(dec: JsObject, arr: JsObject): cstring
+  {.importjs: "#.decode(#, {stream: true})".}
+
+proc readTextChunk*(reader: JsObject, dec: JsObject): Future[string] {.async.} =
+  ## Read one chunk from a fetch body reader and decode it as UTF-8 text (streaming,
+  ## so a multi-byte character split across chunk boundaries is handled correctly),
+  ## or "" at end of body. For the SSE reader, which needs text, not raw bytes.
+  while true:
+    let chunk = await readChunk(reader)
+    if chunk["done"].to(bool): return ""
+    let s = $decodeStream(dec, chunk["value"])
+    if s.len == 0: continue                 # only a partial char so far: read more
+    return s
+
 proc readOne*(reader: JsObject): Future[seq[byte]] {.async.} =
   ## Read one non-empty chunk from a fetch body reader as bytes, or @[] at end of
   ## body. The pull equivalent of `drainToSink`; the caller holds the reader across
