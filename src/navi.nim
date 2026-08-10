@@ -171,6 +171,9 @@ type
     closed: bool               ## connection disposed without draining
     guard: StreamGuard         ## closes the connection if the handle is dropped
                                ## before drain/close (see navi/private/streamguard)
+    dec: StreamDecoder         ## decode + size-cap state carried across readChunk
+    decReady: bool             ## calls (chosen once the response headers are in)
+    seen: int
   StreamResponse* = ref StreamResponseObj
 
 proc close*(sr: StreamResponse) =
@@ -277,6 +280,35 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
       inc hops
     else:
       return handle
+
+proc readChunk*(sr: StreamResponse): string =
+  ## Pull the next decoded body chunk, or "" once the body is fully read. At end the
+  ## connection is returned to the pool (or closed) and the guard disarmed, exactly
+  ## as `drain` does; a size-cap breach or an h2 reset closes the connection and
+  ## reraises. Call it until it returns "". This is the break-friendly pull form
+  ## (a `while (let c = sr.readChunk(); c.len > 0)` loop) that the SSE reader builds
+  ## on; `drain`/`each` remain the push form.
+  if sr.drained or sr.closed: return ""
+  try:
+    if sr.pc.h2 != nil:
+      result = h2ReadChunk(sr.pc.transport, sr.pc.h2, sr.sid,
+                           sr.dec, sr.decReady, sr.seen, sr.decompress, sr.cap)
+      if result.len == 0:                       # end of stream
+        sr.drained = true
+        if sr.pc.h2.canReuse and pushIdle(sr.client.pool, sr.key, sr.pc): disarm(sr.guard)
+        else: closeNow(sr.guard)
+    else:
+      result = h1ReadChunk(sr.pc.transport, sr.parser,
+                           sr.dec, sr.decReady, sr.seen, sr.decompress, sr.cap)
+      if result.len == 0:                       # end of body
+        sr.drained = true
+        if sr.parser.keepAliveAfter() and pushIdle(sr.client.pool, sr.key, sr.pc):
+          disarm(sr.guard)
+        else: closeNow(sr.guard)
+  except CatchableError:
+    if not sr.drained: sr.drained = true        # consumed; the guard must not re-close
+    closeNow(sr.guard)
+    raise
 
 proc drain*(sr: StreamResponse, sink: BodySink) =
   ## Deliver the response body to `sink` as it arrives (decoded and size-capped),

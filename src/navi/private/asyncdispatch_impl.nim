@@ -7,6 +7,7 @@ import navi/private/[entryguard, streamguard]
 import navi/core/public
 import navi/core/[engine, pool, session, proxy, h2glue]
 import navi/core/[redirect, cookies, digest, cancel]
+import navi/core/decompress   # StreamDecoder, for the h1 readChunk decode state
 import navi/proto/h1
 import navi/proto/h2/conn
 import navi/proto/ws
@@ -247,6 +248,9 @@ type
     closed: bool               ## disposed without draining
     guard: StreamGuard         ## closes/resets if the handle is dropped before
                                ## drain/close (see navi/private/streamguard)
+    dec: StreamDecoder         ## h1 decode + size-cap state carried across readChunk
+    decReady: bool             ## calls (h2 keeps its decoder in the mux)
+    seen: int
     case kind: StreamKind
     of skH1:
       transport: Conn          ## the checked-out http/1.1 connection
@@ -405,6 +409,40 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
     else:
       return handle
 
+proc readChunk*(sr: StreamResponse): Future[string] {.async.} =
+  ## Pull the next decoded body chunk, or "" once the body is fully read. At end an
+  ## h1 connection is returned to the pool (or closed) and an h2 stream is dropped
+  ## on the shared connection, and the guard is disarmed; a cap breach or h2 reset
+  ## closes/drops and reraises. The guard stays armed across the incremental reads,
+  ## so a handle dropped before EOF is still cleaned up by it.
+  if sr.drained or sr.closed: return ""
+  case sr.kind
+  of skH2:
+    try:
+      result = await sr.mux.readChunk(sr.sid)
+      if result.len == 0:                 # stream ended; readChunk dropped it
+        sr.drained = true
+        disarm(sr.guard)
+    except CatchableError:
+      if not sr.drained: sr.drained = true
+      disarm(sr.guard)                    # readChunk dropped the stream; mux stays up
+      raise
+  of skH1:
+    try:
+      result = h1ReadChunk(sr.transport, sr.parser,
+                           sr.dec, sr.decReady, sr.seen, sr.decompress, sr.cap)
+      if result.len == 0:                 # end of body: we own the teardown now
+        sr.drained = true
+        disarm(sr.guard)
+        if not (sr.parser.keepAliveAfter() and
+                pushIdle(sr.client.pool, sr.key, PooledConn[Conn](transport: sr.transport))):
+          await close(sr.transport)
+    except CatchableError:
+      if not sr.drained: sr.drained = true
+      disarm(sr.guard)
+      await close(sr.transport)
+      raise
+
 proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
   ## Deliver the response body to `sink` as it arrives (decoded and size-capped),
   ## awaiting it per chunk so a slow sink backpressures the peer. Then return an
@@ -418,8 +456,8 @@ proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
   case sr.kind
   of skH2:
     try:
-      discard await sr.mux.drainDownload(sr.sid, sink)
-      sr.drained = true                 # drainDownload's finally freed the stream
+      await sr.mux.drainDownload(sr.sid, sink)
+      sr.drained = true                 # drainDownload freed the stream
     except CatchableError:
       sr.drained = true                 # ...on error too, so the guard won't double-free
       raise

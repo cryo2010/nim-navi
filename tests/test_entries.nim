@@ -153,6 +153,40 @@ suite "sync entry end to end":
     check api.pool.idleCount(key) == 0      # a failed drain closes, never pools
     joinThread(th)
 
+  test "readChunk should deliver the body in order and end by pooling the connection":
+    const port = 8999
+    var accepts = 0
+    var th: Thread[KeepAliveCtx]
+    startKeepAlive(th, port, requests = 2, accepts = addr accepts)
+
+    let api = newNavi()
+    let key = "http://127.0.0.1:" & $port
+    let res = api.stream(GET, key & "/")
+    check res.status == 200
+    var body = ""
+    while (let c = res.readChunk(); c.len > 0):   # break-friendly pull loop
+      body.add c
+    check body == "n=0"
+    check api.pool.idleCount(key) == 1      # full read to EOF returns it to the pool
+    check api.get(key & "/").body == "n=1"  # ...and it is reused
+    joinThread(th)
+    check accepts == 1
+
+  test "a readChunk stream dropped before EOF should be closed by the guard":
+    const port = 9001
+    var accepts = 0
+    var th: Thread[KeepAliveCtx]
+    startKeepAlive(th, port, requests = 1, accepts = addr accepts)
+
+    let api = newNavi()
+    let key = "http://127.0.0.1:" & $port
+    let pool = block:
+      let res = api.stream(GET, key & "/")
+      discard res.readChunk()               # read a chunk but do not reach EOF
+      api.pool                              # res dropped here without finishing
+    check pool.idleCount(key) == 0          # not pooled: the guard closed it
+    joinThread(th)
+
   test "streaming upload should send a chunked body the server reassembles":
     const port = 8976
     var th: Thread[ServerCtx]
