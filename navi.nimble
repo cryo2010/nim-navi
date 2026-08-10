@@ -231,3 +231,13 @@ task demoStreaming, "Streaming upload+download demo: navi/asyncdispatch vs a Fas
     exec compose & " up --build --abort-on-container-exit --exit-code-from client"
   finally:
     exec compose & " down"
+
+task demoSse, "Server-Sent Events demo: navi/asyncdispatch reconnects through a mid-stream drop (Docker)":
+  # A FastAPI SSE server streams tick events over h2 and drops once midway; the
+  # navi client reconnects transparently (Last-Event-ID) and receives all ticks in
+  # order. Requires Docker; exits non-zero if a tick is missing.
+  let compose = "docker compose -f demos/sse/docker-compose.yml"
+  try:
+    exec compose & " up --build --abort-on-container-exit --exit-code-from client"
+  finally:
+    exec compose & " down"
