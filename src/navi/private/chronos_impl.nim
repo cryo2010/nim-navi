@@ -5,6 +5,7 @@
 import navi/private/[entryguard, streamguard]
 import navi/core/public
 import navi/core/[engine, pool, session, proxy, redirect, cookies, digest, cancel]
+import navi/core/decompress   # StreamDecoder, for the readChunk decode state
 import navi/proto/h1
 import navi/proto/ws
 import navi/backend/chronos
@@ -163,6 +164,9 @@ type
     closed: bool               ## disposed without draining
     guard: StreamGuard         ## closes the connection if the handle is dropped
                                ## before drain/close (see navi/private/streamguard)
+    dec: StreamDecoder         ## decode + size-cap state carried across readChunk
+    decReady: bool             ## calls (chosen once the response headers are in)
+    seen: int
   StreamResponse* = ref StreamResponseObj
 
 proc close*(sr: StreamResponse): Future[void] {.async.} =
@@ -254,6 +258,28 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
       inc hops
     else:
       return handle
+
+proc readChunk*(sr: StreamResponse): Future[string] {.async.} =
+  ## Pull the next decoded body chunk, or "" once the body is fully read. Like
+  ## `drain`, the terminal returns the connection to the pool or closes it and
+  ## disarms the guard; a cap breach closes and reraises. Call until it returns "".
+  ## The guard stays armed across the incremental reads, so a handle dropped before
+  ## EOF is still closed by it.
+  if sr.drained or sr.closed: return ""
+  try:
+    result = h1ReadChunk(sr.transport, sr.parser,
+                         sr.dec, sr.decReady, sr.seen, sr.decompress, sr.cap)
+    if result.len == 0:                        # end of body: we own the teardown now
+      sr.drained = true
+      disarm(sr.guard)
+      if not (sr.parser.keepAliveAfter() and
+              pushIdle(sr.client.pool, sr.key, PooledConn[Conn](transport: sr.transport))):
+        await close(sr.transport)
+  except CatchableError:
+    if not sr.drained: sr.drained = true
+    disarm(sr.guard)
+    await close(sr.transport)
+    raise
 
 proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
   ## Deliver the response body to `sink` as it arrives (decoded and size-capped),

@@ -104,6 +104,31 @@ suite "asyncdispatch entry end to end":
     joinThread(th)
     check accepts == 1                            # both requests used the one connection
 
+  test "readChunk should deliver the body in order and end by pooling the connection":
+    const port = 9002
+    var accepts = 0
+    var th: Thread[KeepAliveCtx]
+    startKeepAlive(th, port, requests = 2, accepts = addr accepts)
+
+    let api = newNavi()
+    let key = "http://127.0.0.1:" & $port
+    proc run(): Future[(string, int, string)] {.async.} =
+      var body = ""
+      let res = await api.stream(GET, key & "/")
+      while true:                                 # break-friendly pull loop
+        let c = await res.readChunk()
+        if c.len == 0: break
+        body.add c
+      let idle = api.pool.idleCount(key)          # returned after a full read
+      let second = await api.get(key & "/")       # ...and reused
+      return (body, idle, second.body)
+    let (body, idle, second) = waitFor run()
+    check body == "n=0"
+    check idle == 1
+    check second == "n=1"
+    joinThread(th)
+    check accepts == 1
+
   test "stream should close (not pool) the connection when the drain fails":
     const port = 9001
     var accepts = 0

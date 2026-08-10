@@ -192,6 +192,9 @@ type
     cap: int
     drained: bool              ## body fully read
     closed: bool               ## body aborted without draining
+    reader: JsObject           ## body ReadableStream reader (lazy, for readChunk)
+    readerReady: bool
+    seen: int
   StreamResponse* = ref StreamResponseObj
 
 # No `=destroy` on the js backend: Nim's JavaScript backend does not run Nim
@@ -233,6 +236,30 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
     controller: controller, cancel: cancel, cap: client.config.maxResponseBytes)
   if not client.jar.isNil: storeCookies(client.jar, rq.url, handle.resp)
   return handle
+
+proc readChunk*(sr: StreamResponse): Future[seq[byte]] {.async.} =
+  ## Pull the next body chunk as bytes, or an empty seq once the body is fully read.
+  ## Marks the handle drained at end; a cap breach aborts the body and reraises. On
+  ## js the runtime owns connections, so there is no pool return; drop or `close` an
+  ## unfinished handle to free it. Chunks are `seq[byte]` (from a JS Uint8Array), as
+  ## with the js sink.
+  if sr.drained or sr.closed: return newSeq[byte](0)
+  if not sr.readerReady:
+    sr.reader = bodyReader(sr.res)
+    sr.readerReady = true
+  var bytes = await readOne(sr.reader)
+  if bytes.len == 0:                      # end of body
+    sr.drained = true
+    if not sr.cancel.isNil: sr.cancel.disarmHook()
+    return bytes
+  sr.seen += bytes.len
+  if sr.cap > 0 and sr.seen > sr.cap:
+    sr.drained = true
+    abortBody(sr.controller)
+    if not sr.cancel.isNil: sr.cancel.disarmHook()
+    raise newException(ResponseTooLargeError,
+      "navi: response exceeded maxResponseBytes")
+  return bytes
 
 proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
   ## Deliver the response body to `sink` as it arrives (size-capped), awaiting it

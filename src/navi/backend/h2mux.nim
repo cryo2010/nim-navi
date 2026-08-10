@@ -38,6 +38,8 @@ type
                                          ## by the receive window (ack is gated by the sink)
     recvReady: Table[uint32, Future[void]]  ## a sink stream's drain loop waiting for
                                             ## the reader to feed more DATA
+    decoders: Table[uint32, StreamDecoder]  ## per-sink-stream decoder, created lazily
+                                            ## once headers are in (presence = chosen)
     decompress: bool                   ## decode content-encoding before the sink
     sendTail: Future[void]   ## tail of the serialized send chain
     alive: bool
@@ -181,6 +183,7 @@ proc newH2Mux*(transport: be.Conn, maxBody = 0, decompress = false): Future[H2Mu
                   sinkStreams: initHashSet[uint32](),
                   recvq: initTable[uint32, Deque[string]](),
                   recvReady: initTable[uint32, Future[void]](),
+                  decoders: initTable[uint32, StreamDecoder](),
                   pendingSlots: initDeque[Future[void]]())
   await be.sendAll(transport, mux.h2.preamble())
   asyncCheck reader(mux)
@@ -220,15 +223,23 @@ proc streamBody(mux: H2Mux, sid: uint32, bodyStream: BodyProducer) {.async.} =
         await ready
         mux.sendReady.del(sid)
 
-proc drainDownload*(mux: H2Mux, sid: uint32, sink: BodySink): Future[H2Response] {.async.} =
-  ## Own a streaming (`sink`) stream end to end: drain DATA to the sink as it
-  ## arrives, decoding content-encoding incrementally, ack the receive window per
-  ## chunk (so the peer is paced by the sink -- backpressure), and return the
-  ## response (empty body) once the stream ends. Runs concurrently with the reader
-  ## and the other streams' coroutines; the reader wakes `recvReady[sid]` when new
+proc endStream(mux: H2Mux, sid: uint32) =
+  ## Free a sink stream's per-stream state once it is done (or errored). Idempotent:
+  ## called at the end of `readChunk` and again if a sink error unwinds through the
+  ## drain loop.
+  mux.recvReady.del(sid)
+  mux.recvq.del(sid)
+  mux.sinkStreams.excl sid
+  mux.decoders.del(sid)
+  discard mux.h2.takeResponse(sid)
+
+proc readChunk*(mux: H2Mux, sid: uint32): Future[string] {.async.} =
+  ## Pull one decoded body chunk of the sink stream `sid`, or "" once the stream
+  ## ends (dropping the stream). Raises on reset / oversized / unprocessed / gone,
+  ## like the old drain loop. The per-stream decoder lives in `mux.decoders`. The
+  ## gated receive window is acked per chunk, so a slow puller backpressures the
+  ## peer. Runs concurrently with the reader, which wakes `recvReady[sid]` when new
   ## DATA lands or the stream finishes.
-  var dec: StreamDecoder = nil
-  var decReady = false             # decoder chosen once headers are in
   try:
     while true:
       if not mux.alive:
@@ -244,21 +255,18 @@ proc drainDownload*(mux: H2Mux, sid: uint32, sink: BodySink): Future[H2Response]
       if mux.recvq.hasKey(sid) and mux.recvq[sid].len > 0:
         var raw = mux.recvq[sid].popFirst()
         let rawLen = raw.len   # window is acked by raw (wire) bytes, captured before the move
-        if not decReady:
-          dec = if mux.decompress:
-                  newStreamDecoder(mux.h2.respHeader(sid, "content-encoding"))
-                else: nil
-          decReady = true
+        if not mux.decoders.hasKey(sid):
+          mux.decoders[sid] = if mux.decompress:
+              newStreamDecoder(mux.h2.respHeader(sid, "content-encoding")) else: nil
+        let dec = mux.decoders[sid]
         let decoded =
           if dec != nil: dec.update(raw.toOpenArrayByte(0, raw.high)) else: move raw
-        if decoded.len > 0:
-          # single-threaded client; the sink need not be gcsafe (see engine).
-          # `decoded` is navi's native body type (`string`), which the sink also
-          # takes, so its last use moves the buffer into the async env, no copy.
-          {.cast(gcsafe).}: await sink(decoded)
-        await mux.send(mux.h2.ackRecv(sid, rawLen))  # replenish window: gated by the sink
-        continue
-      if mux.h2.streamEnded(sid): break   # ended and the queue is drained
+        await mux.send(mux.h2.ackRecv(sid, rawLen))  # replenish window: gated by the puller
+        if decoded.len > 0: return decoded
+        continue                                     # decoder buffered input; pull more
+      if mux.h2.streamEnded(sid):                    # ended and the queue is drained
+        mux.endStream(sid)
+        return ""
       if mux.h2.goneAway:
         if mux.h2.streamUnprocessed(sid):
           raise newException(UnprocessedError, "navi: http/2 request not processed")
@@ -272,12 +280,24 @@ proc drainDownload*(mux: H2Mux, sid: uint32, sink: BodySink): Future[H2Response]
       mux.recvReady[sid] = ready
       await ready
       mux.recvReady.del(sid)
-    result = mux.h2.takeResponse(sid)
-  finally:
-    mux.recvReady.del(sid)
-    mux.recvq.del(sid)
-    mux.sinkStreams.excl sid
-    discard mux.h2.takeResponse(sid)   # drop the stream if the success path didn't
+  except CatchableError:
+    mux.endStream(sid)
+    raise
+
+proc drainDownload*(mux: H2Mux, sid: uint32, sink: BodySink): Future[void] {.async.} =
+  ## Own a streaming (`sink`) stream: pull chunks and `await` them into the sink (so
+  ## the peer is paced by the sink -- backpressure) until the stream ends. Terminal
+  ## cleanup and errors are `readChunk`'s; a sink error also drops the stream.
+  try:
+    while true:
+      let c = await mux.readChunk(sid)
+      if c.len == 0: break
+      # single-threaded client; the sink need not be gcsafe (see engine). `c` is a
+      # native `string`, moved into the sink's async env with no copy.
+      {.cast(gcsafe).}: await sink(c)
+  except CatchableError:
+    mux.endStream(sid)                # sink raised: readChunk returned, so clean up here
+    raise
     mux.releaseSlot()
 
 proc respSnapshot*(mux: H2Mux, sid: uint32): H2Response =
@@ -359,6 +379,7 @@ proc dropStream*(mux: H2Mux, sid: uint32) =
   mux.sinkStreams.excl sid
   mux.recvq.del(sid)
   mux.recvReady.del(sid)
+  mux.decoders.del(sid)
   mux.releaseSlot()
   if mux.alive:
     let rst = mux.h2.resetStream(sid)        # also drops the stream in the conn
@@ -375,6 +396,7 @@ proc abandon*(mux: H2Mux, sid: uint32): Future[void] {.async.} =
   mux.sinkStreams.excl sid
   mux.recvq.del(sid)
   mux.recvReady.del(sid)
+  mux.decoders.del(sid)
   mux.releaseSlot()
   if mux.alive:
     let rst = mux.h2.resetStream(sid)
@@ -402,16 +424,10 @@ proc request*(mux: H2Mux, headers: seq[(string, string)], body: string,
     await slot
   if not mux.alive:
     raise newException(IOError, "navi: http/2 connection not usable")
+  # Streaming responses go through sendAndReadHeaders + readChunk/drainDownload on
+  # the handle, not here, so this path is buffered: it waits for the whole response.
+  # (`bodyStream` still streams the request body up.)
   let sid = mux.h2.openStream()
-  if sink != nil:
-    mux.h2.setSinkMode(sid)              # gate the receive window: replenish via ackRecv
-    mux.sinkStreams.incl sid
-    if bodyStream != nil:
-      await mux.send(mux.h2.encodeRequestHead(sid, headers))
-      await mux.streamBody(sid, bodyStream)
-    else:
-      await mux.send(mux.h2.encodeRequest(sid, headers, body))
-    return await mux.drainDownload(sid, sink)
   let fut = newFuture[H2Response]("h2mux.stream")
   mux.waiters[sid] = fut
   if bodyStream != nil:

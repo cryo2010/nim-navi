@@ -35,7 +35,7 @@ proc jsText(res: JsObject): Future[cstring] {.importjs: "#.text()".}
 proc headerEntries(res: JsObject): JsObject {.importjs: "Array.from(#.headers.entries())".}
 proc setCookieList(res: JsObject): JsObject {.importjs: "(#.headers.getSetCookie?.() ?? [])".}
 proc jsLen(arr: JsObject): int {.importjs: "#.length".}
-proc bodyReader(res: JsObject): JsObject {.importjs: "#.body.getReader()".}
+proc bodyReader*(res: JsObject): JsObject {.importjs: "#.body.getReader()".}
 proc readChunk(reader: JsObject): Future[JsObject] {.importjs: "#.read()".}
 proc setTimeout(cb: proc (), ms: int) {.importjs: "setTimeout(#, #)".}
 proc abortAfter(ms: int): JsObject {.importjs: "AbortSignal.timeout(#)".}
@@ -98,6 +98,20 @@ proc drainToSink*(res: JsObject, sink: BodySink, cap: int) {.async.} =
       raise newException(ResponseTooLargeError,
         "navi: response exceeded maxResponseBytes")
     await sink(bytes)
+
+proc readOne*(reader: JsObject): Future[seq[byte]] {.async.} =
+  ## Read one non-empty chunk from a fetch body reader as bytes, or @[] at end of
+  ## body. The pull equivalent of `drainToSink`; the caller holds the reader across
+  ## calls and applies the size cap.
+  while true:
+    let chunk = await readChunk(reader)
+    if chunk["done"].to(bool): return newSeq[byte](0)
+    let arr = chunk["value"]
+    if jsLen(arr) == 0: continue            # empty chunk mid-stream: read more
+    var bytes = newSeq[byte](jsLen(arr))
+    for i in 0 ..< bytes.len:
+      bytes[i] = byte(arr[i].to(int))
+    return bytes
 
 proc fetchExchange*(req: Request, sink: BodySink, timeout = 0,
                     cancel: CancelToken = nil, cap = 0): Future[Response] {.async.} =

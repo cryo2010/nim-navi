@@ -103,6 +103,83 @@ template h1DrainBody*(transport, parser, sink, keep, decompress, cap: typed) =
       if chunk.len == 0: break
     keep = parser.keepAliveAfter()
 
+template h1ReadChunk*(transport, parser, dec, decReady, seen, decompress, cap: typed): string =
+  ## Pull the next decoded body chunk over `transport`, or "" at end of body.
+  ## `dec`/`decReady`/`seen` hold the caller's persistent decode + size-cap state
+  ## across calls (fields on the streaming handle). "" is returned only at true end
+  ## of body; a decoder that buffers input without producing output loops for more.
+  ## The caller does the terminal pool/close once "" comes back (`keepAliveAfter`
+  ## is valid then). This is the single read/decode/cap path `drain` loops over.
+  mixin await, recvSome
+  block:
+    var res = ""
+    while true:
+      let raw = parser.takeBody()
+      if raw.len == 0:
+        if parser.finished: break            # end of body: res stays ""
+        let chunk = await recvSome(transport)
+        if chunk.len == 0: parser.eof() else: parser.feed(chunk)
+        continue
+      if not decReady:
+        dec = if decompress: newStreamDecoder(parser.contentEncoding()) else: nil
+        decReady = true
+      let decoded =
+        if dec != nil: dec.update(raw.toOpenArrayByte(0, raw.high)) else: raw
+      if decoded.len == 0: continue          # decoder buffered input; read more
+      seen += decoded.len
+      if cap > 0 and seen > cap:
+        raise newException(ResponseTooLargeError,
+          "navi: response exceeded maxResponseBytes")
+      res = decoded
+      break
+    res
+
+template h2ReadChunk*(transport, h2, sid, dec, decReady, seen, decompress, cap: typed): string =
+  ## Pull the next decoded body chunk of an h2 stream over `transport` (the sync
+  ## single-connection h2 path), or "" at end of stream, having dropped the stream.
+  ## Sends any control frames the feed produces. Raises on reset / oversized /
+  ## unprocessed / connection error, like the old drain loop. Persistent decode +
+  ## cap state lives in `dec`/`decReady`/`seen`.
+  mixin await, sendAll, recvSome
+  block:
+    var res = ""
+    while true:
+      let raw = h2.takeBody(sid)
+      if raw.len > 0:
+        if not decReady:
+          dec = if decompress: newStreamDecoder(h2.respHeader(sid, "content-encoding"))
+                else: nil
+          decReady = true
+        let decoded =
+          if dec != nil: dec.update(raw.toOpenArrayByte(0, raw.high)) else: raw
+        if decoded.len == 0: continue
+        seen += decoded.len
+        if cap > 0 and seen > cap:
+          raise newException(ResponseTooLargeError,
+            "navi: response exceeded maxResponseBytes")
+        res = decoded
+        break
+      if h2.streamDone(sid):                  # no more body: terminal, drop the stream
+        let wasReset = h2.streamReset(sid)
+        let tooLarge = h2.streamTooLarge(sid)
+        let unprocessed = h2.streamUnprocessed(sid)
+        let connErr = h2.connError
+        discard h2.takeResponse(sid)
+        if connErr.len > 0: raise newException(IOError, "navi: http/2 " & connErr)
+        if tooLarge:
+          raise newException(ResponseTooLargeError,
+            "navi: response exceeded maxResponseBytes")
+        if unprocessed:
+          raise newException(UnprocessedError, "navi: http/2 request not processed")
+        if wasReset:
+          raise newException(IOError, "navi: http/2 request did not complete")
+        break                                 # clean end: res ""
+      let chunk = await recvSome(transport)
+      if chunk.len == 0: break                # transport EOF: treat as end
+      let toSend = h2.feed(chunk)
+      if toSend.len > 0: await sendAll(transport, toSend)
+    res
+
 template h1Exchange*(transport, req, sink, keep, decompress, cap: typed): Response =
   ## One HTTP/1.1 request/response over `transport` (send + read headers + drain
   ## the body), composed from the header/body split above. Sets `keep` to whether
