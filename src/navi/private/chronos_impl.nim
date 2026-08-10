@@ -387,12 +387,14 @@ proc sse*(client: Navi, target: string, verb = GET,
   return s
 
 proc close*(s: SseStream): Future[void] {.async.} =
-  ## Stop consuming and dispose the underlying connection. Idempotent.
+  ## Stop consuming and dispose the connection, including the dedicated internal
+  ## client (its pool). Idempotent. Call it when done with the stream.
   if s.closed: return
   s.closed = true
   if s.handle != nil:
     await s.handle.close()
     s.handle = nil
+  await s.client.close()
 
 proc lastEventId*(s: SseStream): string = s.parser.lastEventId()
 
