@@ -302,6 +302,26 @@ jobs:
       - name: Run the httpbin interop suite
         run: bash tests/interop/httpbin.sh
 
+  sse:
+    runs-on: ubuntu-latest
+    name: SSE reconnect interop
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fully Dockerized: a FastAPI SSE server plus a navi/asyncdispatch client
+      # compiled inside the image, so no Nim toolchain is needed on the runner
+      # (Docker Compose ships on ubuntu-latest). The server drops the connection
+      # after every 3 events; the client must reconnect and resume from
+      # Last-Event-ID to receive all 10 in order over the h2 mux.
+      - name: Run the SSE reconnect interop
+        run: >
+          docker compose -f tests/interop/sse/docker-compose.yml
+          up --build --abort-on-container-exit --exit-code-from client
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f tests/interop/sse/docker-compose.yml down
+
   leak:
     runs-on: ubuntu-latest
     strategy:

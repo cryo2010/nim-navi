@@ -15,7 +15,7 @@ fall into six groups:
 
 The **CI** column says which check runs it on every PR (see
 `.github/workflows/`). "local" means it is not wired into per-PR CI and is run on
-demand; "nightly" runs on a schedule. A green PR is **29 checks**: 18 from
+demand; "nightly" runs on a schedule. A green PR is **30 checks**: 19 from
 `ci.yml`, 10 from `fuzz.yml`, 1 from `badssl.yml` (`live.yml` is nightly only).
 
 ## Running at a glance
@@ -144,7 +144,7 @@ own **`streaming`** matrix job (four separate checks) — see the row below and 
 | `streaming.sh` → `streaming_client.nim` (+ `streaming_server.nim` for h1) | **yes** (`file streaming …`, 4 checks) | File streaming (sync) as a matrix of protocol × direction: for http/1.1 (a local Nim server) and http/2 (nghttpd), upload via `bodyStream` and download via `stream()`/`each`. Each check asserts the transfer used that protocol (`res.httpVersion`) and the bytes hash-match a 3 MiB original |
 | `servers.sh` → `servers_{sync,async}.nim` | **yes** (`multiserver`) | h2 client against three unrelated stacks (nginx, Caddy/Go, h2o) over TLS via docker compose, plus the chronos h1+TLS leg; ALPN negotiation and a 256 KiB body (receive flow control) |
 | `streaming_concurrent/` (`nimble streamConcurrent`) | local | Concurrent streaming (navi/asyncdispatch): fires N (default 50, `NAVI_CONCURRENT_N`) simultaneous streamed downloads, then uploads, then a mixed batch, over one h2 connection against the FastAPI server; verifies every transfer by SHA-1 and asserts they all multiplexed onto a single connection (`openedConnections == 1`). Docker compose, one command |
-| `sse/` (`nimble sse`) | local | SSE reconnection (navi/asyncdispatch): a FastAPI SSE server drops the connection after 3 events per request, so the client must reconnect and resume from Last-Event-ID to receive all 10 events in order over the h2 mux. Also exercises the SSE client shutdown (close joins the mux). Docker compose, one command |
+| `sse/` (`nimble sse`) | **yes** (`SSE reconnect interop`) | SSE reconnection (navi/asyncdispatch): a FastAPI SSE server drops the connection after 3 events per request, so the client must reconnect and resume from Last-Event-ID to receive all 10 events in order over the h2 mux. Also exercises the SSE client shutdown (close joins the mux). Docker compose, one command |
 | `httpbin.sh` → `httpbin_test.nim`, `httpbin_js.nim` | **yes** (`httpbin`) | Full httpbin breadth (every method, bodies, auth, redirects, decompression, cookies) behind Caddy (TLS+h2) across all four backends; also streaming download via `stream()`/`each` on all four and `bodyStream` upload on the native backends (buffered on js); offline (never published to the host) |
 | `badssl.nim` (`badssl.yml`) | **yes** (`badssl TLS conformance`) | Certificate-verification conformance: navi rejects invalid server certs with verification on (the default) and accepts a valid one. Hits badssl.com (network) |
 | `chronos_cafile.sh` → `chronos_cafile.nim` | local | Custom-CA verification for chronos/BearSSL (`TlsConfig.caFile`): a server cert signed by a private CA is verified against that CA (uses a dNSName SAN, which BearSSL matches) |

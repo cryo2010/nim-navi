@@ -1,0 +1,19 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    healthcheck:
+      test: ["CMD", "sh", "-c", "echo | openssl s_client -connect localhost:8443 -alpn h2 2>/dev/null | grep -q 'ALPN protocol: h2'"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  client:
+    build:
+      context: ../..
+      dockerfile: demos/sse/Dockerfile.client
+    environment:
+      BASE: https://server:8443
+    depends_on:
+      server:
+        condition: service_healthy
