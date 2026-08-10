@@ -187,6 +187,57 @@ suite "sync entry end to end":
     check pool.idleCount(key) == 0          # not pooled: the guard closed it
     joinThread(th)
 
+  test "sse should parse events from an event-stream and end when the server closes":
+    const port = 9003
+    let payload = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n" &
+                  "Connection: close\r\n\r\n" &
+                  "retry: 1000\n" &
+                  "event: greeting\ndata: hello\n\n" &
+                  ": keep-alive\n\n" &
+                  "data: line1\ndata: line2\nid: 7\n\n"
+    var th: Thread[ServerCtx]
+    startRaw(th, port, payload)
+
+    let api = newNavi()
+    let s = api.sse("http://127.0.0.1:" & $port & "/", reconnect = false)
+    var events: seq[SseEvent]
+    s.each(ev): events.add ev             # ends when the server closes (reconnect off)
+    joinThread(th)
+    check events.len == 2
+    check events[0].event == "greeting" and events[0].data == "hello"
+    check events[0].retry == 1000
+    check events[1].data == "line1\nline2" and events[1].id == "7"
+    check s.lastEventId() == "7"
+
+  test "sse should reject a non-event-stream response":
+    const port = 9004
+    let payload = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n" &
+                  "Content-Length: 2\r\nConnection: close\r\n\r\nhi"
+    var th: Thread[ServerCtx]
+    startRaw(th, port, payload)
+
+    let api = newNavi()
+    expect IOError:
+      discard api.sse("http://127.0.0.1:" & $port & "/", reconnect = false)
+    joinThread(th)
+
+  test "sse each should support break":
+    const port = 9005
+    let payload = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n" &
+                  "Connection: close\r\n\r\ndata: 1\n\ndata: 2\n\ndata: 3\n\n"
+    var th: Thread[ServerCtx]
+    startRaw(th, port, payload)
+
+    let api = newNavi()
+    let s = api.sse("http://127.0.0.1:" & $port & "/", reconnect = false)
+    var got: seq[string]
+    s.each(ev):
+      got.add ev.data
+      if ev.data == "2": break            # a real loop, so break works
+    s.close()
+    joinThread(th)
+    check got == @["1", "2"]
+
   test "streaming upload should send a chunked body the server reassembles":
     const port = 8976
     var th: Thread[ServerCtx]
