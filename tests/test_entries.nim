@@ -85,6 +85,23 @@ suite "sync entry end to end":
     check api.pool.idleCount(key) == 0     # drained (and the socket closed)
     joinThread(th)
 
+  test "a client dropped without close should still close its pooled connections":
+    const port = 8998
+    var accepts = 0
+    var th: Thread[KeepAliveCtx]
+    startKeepAlive(th, port, requests = 1, accepts = addr accepts)
+    let key = "http://127.0.0.1:" & $port
+
+    # Keep a handle to the pool, then let the client go out of scope WITHOUT
+    # close(): its =destroy leak-guard must drain (and close) the pooled connection.
+    let pool = block:
+      let api = newNavi()
+      check api.get(key & "/").status == 200
+      check api.pool.idleCount(key) == 1   # pooled, not yet closed
+      api.pool                             # `api` is unreferenced past here -> destroyed
+    check pool.idleCount(key) == 0         # the destructor drained and closed it
+    joinThread(th)
+
   test "stream should expose headers before the body and deliver it via each":
     const port = 8975
     var th: Thread[ServerCtx]

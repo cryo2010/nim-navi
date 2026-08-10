@@ -44,10 +44,34 @@ type
     ## `initNaviConfig()`.
     middleware*: seq[NaviMiddleware]
 
-  Navi* = ref object
+  NaviObj = object
     config: NaviConfig
     pool*: Pool[PooledConn[Conn]]
     jar*: CookieJar
+  Navi* = ref NaviObj
+
+proc closeIdle(pool: Pool[PooledConn[Conn]]) =
+  ## Close every idle pooled connection, freeing each one's OpenSSL context.
+  ## Shared by `close` and the destructor leak-guard; safe to call twice, since
+  ## `drain` empties the pool. Guarded so it never raises out of a destructor.
+  for pc in pool.drain():
+    try: pc.transport.close()
+    except CatchableError: discard
+
+proc `=destroy`(o: var NaviObj) =
+  ## Leak-guard: a client collected without an explicit `close` still gets its idle
+  ## pooled connections closed here (each holds an ~85 KB OpenSSL context, so they
+  ## add up under connection churn). Best-effort and synchronous, so it does not
+  ## touch the shared TLS session store (freeing that belongs to the deterministic
+  ## `close`, and doing it here could double-free). No-op after `close`, which has
+  ## already drained the pool. `close` remains the recommended shutdown. Declared
+  ## before `newNavi` so it binds before NaviObj is first constructed.
+  if o.pool != nil: closeIdle(o.pool)
+  # A custom `=destroy` suppresses the compiler's field destruction, so destroy the
+  # managed fields explicitly or they leak. Keep in sync with NaviObj's fields.
+  `=destroy`(o.config)
+  `=destroy`(o.pool)
+  `=destroy`(o.jar)
 
 proc initNaviConfig*(): NaviConfig =
   ## The only way to build a config: `NaviConfig` requires every field. Sets the
@@ -84,8 +108,7 @@ proc close*(client: Navi) =
   ## sessions. Optional but recommended when done with a client: a later request
   ## just opens fresh connections. Without it, pooled connections are reclaimed
   ## only at process exit (and their OpenSSL contexts leak until then).
-  for pc in client.pool.drain():
-    pc.transport.close()
+  closeIdle(client.pool)
   closeTlsStore(client.config.tls.sessionCache)
 
 proc transport(client: Navi, req: Request, sink: BodySink): Response =
