@@ -7,6 +7,38 @@ onward (pre-1.0, minor versions may include breaking changes).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-10
+
+Theme: Server-Sent Events as a first-class primitive across every backend, plus
+the leak- and sanitizer CI matrix that hardens it.
+
+### Added
+- Server-Sent Events: `sse()` opens and validates a `text/event-stream` (a
+  non-200 or wrong content type fails fast) and returns an `SseStream`, consumed
+  with `next` (returns `none` at end) or the break-friendly `each` loop. Available
+  on all four backends (#116, #118, #119).
+- Transparent SSE reconnection: on a drop the stream resends `Last-Event-ID` and
+  honors the server's `retry:` with exponential backoff up to `maxRetryMs`, unless
+  `reconnect = false`; `lastEventId()` exposes the resume point. `verb`/`body`/
+  headers enable POST-SSE and auth, which the platform `EventSource` cannot do.
+  `close()` disposes the stream's dedicated client and its pool (#120).
+- Strict sans-io SSE parser (`SseParser`) implementing the WHATWG
+  `text/event-stream` grammar, reusable independent of transport (#116).
+- `readChunk` pull primitive on `StreamResponse`: pulls the next decoded chunk and
+  returns `""` at end (`navi/js`: an empty seq), returning the connection to the
+  pool exactly as `drain` does. It is the break-friendly pull form the SSE reader
+  builds on; `drain`/`each` remain the push form (#117).
+- CI: a per-backend, per-scenario leak-check and sanitizer matrix. Valgrind
+  memcheck with file-descriptor-leak detection (`--track-fds`) and ASan/UBSan
+  across the sync/asyncdispatch/chronos backends, plus a Node heap- and
+  fd-growth check for `navi/js`, over http1, http2, up/down streaming (compressed
+  and not), SSE, and WebSocket (#122).
+
+### Docs / tests
+- Dockerized SSE reconnection demo with a `nimble` task and a CI check (#121); an
+  SSE reconnect interop harness (#120).
+- TESTING.md documents the leak/sanitizer matrix (#122).
+
 ## [0.4.0] - 2026-08-10
 
 Theme: a full streaming stack (both directions, all backends) and the memory- and
@@ -137,7 +169,8 @@ across four backends.
 - TLS certificates verified by default; HPACK bounds, negative `Content-Length`
   rejection, chunk-size bounds, and malformed-input rejection instead of crashes.
 
-[Unreleased]: https://github.com/cryo2010/nim-navi/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/cryo2010/nim-navi/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/cryo2010/nim-navi/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/cryo2010/nim-navi/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/cryo2010/nim-navi/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/cryo2010/nim-navi/compare/v0.1.0...v0.2.0
