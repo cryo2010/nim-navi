@@ -73,7 +73,10 @@ if [ "$MODE" = "valgrind" ]; then
   exit "$rc"
 else
   export ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:print_stacktrace=1"
-  export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
+  # halt_on_error=1 makes any UBSan diagnostic fail the run; navi.ubsan.supp
+  # scopes out only the Nim-stdlib null-check artifact (navi's own code stays
+  # checked). navi UB must be fixed, not suppressed.
+  export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1:suppressions=$LEAK_DIR/navi.ubsan.supp"
   "$BIN"
   echo "PASS: sanitize $TARGET $SCENARIO clean"
 fi

@@ -9,10 +9,16 @@
 FROM nimlang/nim:2.2.10
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      valgrind openssl curl ca-certificates \
+      valgrind openssl curl ca-certificates gnupg \
       libbrotli1 libzstd1 \
       python3 python3-pip python3-venv \
-      nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# The js backend calls `new WebSocket(...)`; the global WebSocket client only
+# exists in Node >= 22 (Debian's packaged nodejs is 20, where the js websocket
+# cells fail with "WebSocket is not defined"). Install Node 22 from NodeSource.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # FastAPI + Hypercorn serve every scenario (plaintext h1 and TLS h1/h2-ALPN).
