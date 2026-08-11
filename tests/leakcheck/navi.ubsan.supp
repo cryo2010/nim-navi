@@ -1,0 +1,13 @@
+# UBSan runtime suppressions for the sanitize cells.
+#
+# Nim's stdlib codegen for the asyncdispatch event loop reads a bool field
+# through the global dispatcher ref during lazy init (asyncdispatch.nim
+# setGlobalDispatcher), which UBSan's `null` check reports as "load of null
+# pointer of type '_Bool'". It is a benign Nim codegen artifact, not a navi
+# bug, and it only reproduces on x86_64. navi cannot fix code in the Nim
+# standard library, so suppress the `null` check ONLY when it originates inside
+# the Nim install tree (*/nim/lib/*). navi's own sources live under /navi/src,
+# never match this path, and stay fully checked (a real null-pointer load in
+# navi still fails the run). Every other UBSan check stays hard-failing
+# everywhere (see UBSAN_OPTIONS=halt_on_error=1 in run.sh).
+null:*/nim/lib/*

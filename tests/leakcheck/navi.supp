@@ -1,0 +1,61 @@
+# Valgrind suppressions for navi's leak check.
+#
+# Scope: we run with --show-leak-kinds=definite,indirect and treat only those as
+# errors, so OpenSSL's process-global "still reachable" caches and "possibly
+# lost" interior pointers are already ignored without suppressions. Entries here
+# are for the residual *definite/indirect* leaks that are genuinely not navi's
+# to free (one-time library/loader initialization). Keep this list short and
+# specific; a navi-owned leak must be fixed, not suppressed.
+
+# One-time dynamic-loader init when the first dlopen'd codec/TLS lib is resolved.
+{
+  dl-init-once
+  Memcheck:Leak
+  match-leak-kinds: definite,indirect
+  ...
+  fun:_dl_init
+}
+
+# --track-fds also reports descriptors still open at exit (CoreError:FdNotClosed),
+# which catches a leaked navi socket or cert file. The event-loop backends
+# (asyncdispatch, chronos) keep their dispatcher's own control descriptors open for
+# the whole process, though: the epoll instance, the eventfd/pipe used to wake the
+# loop, and chronos's timer/signal fds. navi never opens these directly (its
+# sockets show fun:socket / SSL frames), so suppress them by their creating
+# syscall. A real leaked socket does not match and still fails the run.
+{
+  eventloop-epoll-fd
+  CoreError:FdNotClosed
+  fun:epoll_create1
+  ...
+}
+{
+  eventloop-epoll-fd-legacy
+  CoreError:FdNotClosed
+  fun:epoll_create
+  ...
+}
+{
+  eventloop-wakeup-eventfd
+  CoreError:FdNotClosed
+  fun:eventfd
+  ...
+}
+{
+  eventloop-wakeup-pipe
+  CoreError:FdNotClosed
+  fun:pipe2
+  ...
+}
+{
+  eventloop-timerfd
+  CoreError:FdNotClosed
+  fun:timerfd_create
+  ...
+}
+{
+  eventloop-signalfd
+  CoreError:FdNotClosed
+  fun:signalfd
+  ...
+}
