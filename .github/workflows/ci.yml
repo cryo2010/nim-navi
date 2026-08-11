@@ -395,3 +395,178 @@ jobs:
         run: nim c -r --mm:orc -d:useMalloc --hints:off --passC:-fsanitize=address --passL:-fsanitize=address tests/leak_sanitize.nim
         env:
           ASAN_OPTIONS: detect_leaks=1
+
+  # --- Per-scenario, per-target leak-check matrix -------------------------------
+  # Builds one Docker image (native Valgrind + ASan/UBSan, plus a Node heap/fd
+  # check for the js backend) and runs every valid scenario x target cell of
+  # new_ci_checks.txt against a local FastAPI server. Applied decisions: navi does
+  # h2 only over TLS+ALPN, so http2-plaintext cells are dropped and chronos
+  # (BearSSL, h1-only) is excluded from the pure-h2 GET but still runs the
+  # streaming/sse scenarios over h1+TLS; js compiles to JavaScript, which Valgrind/
+  # ASan cannot instrument, so it gets a Node heap/fd leak check instead.
+  leak-matrix-image:
+    runs-on: ubuntu-latest
+    name: leak matrix (build image)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the leak-check image and save it as an artifact
+        run: |
+          docker build -f tests/leakcheck/Dockerfile -t navi-leakcheck .
+          docker save navi-leakcheck | gzip > /tmp/navi-leakcheck.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: navi-leakcheck-image
+          path: /tmp/navi-leakcheck.tar.gz
+          retention-days: 1
+
+  leak-matrix:
+    needs: leak-matrix-image
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: valgrind / http1 (plaintext) / sync / orc
+            run: valgrind sync http1
+          - name: valgrind / http1 (plaintext) / asyncdispatch / orc
+            run: valgrind asyncdispatch http1
+          - name: valgrind / http1 (plaintext) / chronos / orc
+            run: valgrind chronos http1
+          - name: valgrind / http1 (TLS) / sync / orc
+            run: valgrind sync http1s
+          - name: valgrind / http1 (TLS) / asyncdispatch / orc
+            run: valgrind asyncdispatch http1s
+          - name: valgrind / http1 (TLS) / chronos / orc
+            run: valgrind chronos http1s
+          - name: valgrind / http2 (TLS) / sync / orc
+            run: valgrind sync http2s
+          - name: valgrind / http2 (TLS) / asyncdispatch / orc
+            run: valgrind asyncdispatch http2s
+          - name: valgrind / http2 stream up (TLS) / sync / orc
+            run: valgrind sync streamup
+          - name: valgrind / http2 stream up (TLS) / asyncdispatch / orc
+            run: valgrind asyncdispatch streamup
+          - name: valgrind / http2 stream up (TLS) / chronos / orc
+            run: valgrind chronos streamup
+          - name: valgrind / http2c stream up (TLS) / sync / orc
+            run: valgrind sync streamupc
+          - name: valgrind / http2c stream up (TLS) / asyncdispatch / orc
+            run: valgrind asyncdispatch streamupc
+          - name: valgrind / http2c stream up (TLS) / chronos / orc
+            run: valgrind chronos streamupc
+          - name: valgrind / http2 stream down (TLS) / sync / orc
+            run: valgrind sync streamdown
+          - name: valgrind / http2 stream down (TLS) / asyncdispatch / orc
+            run: valgrind asyncdispatch streamdown
+          - name: valgrind / http2 stream down (TLS) / chronos / orc
+            run: valgrind chronos streamdown
+          - name: valgrind / http2c stream down (TLS) / sync / orc
+            run: valgrind sync streamdownc
+          - name: valgrind / http2c stream down (TLS) / asyncdispatch / orc
+            run: valgrind asyncdispatch streamdownc
+          - name: valgrind / http2c stream down (TLS) / chronos / orc
+            run: valgrind chronos streamdownc
+          - name: valgrind / sse (TLS) / sync / orc
+            run: valgrind sync sse
+          - name: valgrind / sse (TLS) / asyncdispatch / orc
+            run: valgrind asyncdispatch sse
+          - name: valgrind / sse (TLS) / chronos / orc
+            run: valgrind chronos sse
+          - name: valgrind / websocket (plaintext) / sync / orc
+            run: valgrind sync ws
+          - name: valgrind / websocket (plaintext) / asyncdispatch / orc
+            run: valgrind asyncdispatch ws
+          - name: valgrind / websocket (plaintext) / chronos / orc
+            run: valgrind chronos ws
+          - name: valgrind / websocket (TLS) / sync / orc
+            run: valgrind sync wss
+          - name: valgrind / websocket (TLS) / asyncdispatch / orc
+            run: valgrind asyncdispatch wss
+          - name: valgrind / websocket (TLS) / chronos / orc
+            run: valgrind chronos wss
+          - name: sanitize / http1 (plaintext) / sync / orc
+            run: sanitize sync http1
+          - name: sanitize / http1 (plaintext) / asyncdispatch / orc
+            run: sanitize asyncdispatch http1
+          - name: sanitize / http1 (plaintext) / chronos / orc
+            run: sanitize chronos http1
+          - name: sanitize / http1 (TLS) / sync / orc
+            run: sanitize sync http1s
+          - name: sanitize / http1 (TLS) / asyncdispatch / orc
+            run: sanitize asyncdispatch http1s
+          - name: sanitize / http1 (TLS) / chronos / orc
+            run: sanitize chronos http1s
+          - name: sanitize / http2 (TLS) / sync / orc
+            run: sanitize sync http2s
+          - name: sanitize / http2 (TLS) / asyncdispatch / orc
+            run: sanitize asyncdispatch http2s
+          - name: sanitize / http2 stream up (TLS) / sync / orc
+            run: sanitize sync streamup
+          - name: sanitize / http2 stream up (TLS) / asyncdispatch / orc
+            run: sanitize asyncdispatch streamup
+          - name: sanitize / http2 stream up (TLS) / chronos / orc
+            run: sanitize chronos streamup
+          - name: sanitize / http2c stream up (TLS) / sync / orc
+            run: sanitize sync streamupc
+          - name: sanitize / http2c stream up (TLS) / asyncdispatch / orc
+            run: sanitize asyncdispatch streamupc
+          - name: sanitize / http2c stream up (TLS) / chronos / orc
+            run: sanitize chronos streamupc
+          - name: sanitize / http2 stream down (TLS) / sync / orc
+            run: sanitize sync streamdown
+          - name: sanitize / http2 stream down (TLS) / asyncdispatch / orc
+            run: sanitize asyncdispatch streamdown
+          - name: sanitize / http2 stream down (TLS) / chronos / orc
+            run: sanitize chronos streamdown
+          - name: sanitize / http2c stream down (TLS) / sync / orc
+            run: sanitize sync streamdownc
+          - name: sanitize / http2c stream down (TLS) / asyncdispatch / orc
+            run: sanitize asyncdispatch streamdownc
+          - name: sanitize / http2c stream down (TLS) / chronos / orc
+            run: sanitize chronos streamdownc
+          - name: sanitize / sse (TLS) / sync / orc
+            run: sanitize sync sse
+          - name: sanitize / sse (TLS) / asyncdispatch / orc
+            run: sanitize asyncdispatch sse
+          - name: sanitize / sse (TLS) / chronos / orc
+            run: sanitize chronos sse
+          - name: sanitize / websocket (plaintext) / sync / orc
+            run: sanitize sync ws
+          - name: sanitize / websocket (plaintext) / asyncdispatch / orc
+            run: sanitize asyncdispatch ws
+          - name: sanitize / websocket (plaintext) / chronos / orc
+            run: sanitize chronos ws
+          - name: sanitize / websocket (TLS) / sync / orc
+            run: sanitize sync wss
+          - name: sanitize / websocket (TLS) / asyncdispatch / orc
+            run: sanitize asyncdispatch wss
+          - name: sanitize / websocket (TLS) / chronos / orc
+            run: sanitize chronos wss
+          - name: js / http1 (plaintext) / js / orc
+            run: js http1
+          - name: js / http1 (TLS) / js / orc
+            run: js http1s
+          - name: js / http2 stream down (TLS) / js / orc
+            run: js streamdown
+          - name: js / http2c stream down (TLS) / js / orc
+            run: js streamdownc
+          - name: js / sse (TLS) / js / orc
+            run: js sse
+          - name: js / websocket (plaintext) / js / orc
+            run: js ws
+          - name: js / websocket (TLS) / js / orc
+            run: js wss
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: navi-leakcheck-image
+          path: /tmp
+      - name: Load the leak-check image
+        run: docker load < /tmp/navi-leakcheck.tar.gz
+      # One cell: build the runner for its target, start the server, and run the
+      # scenario under Valgrind (--track-fds catches leaked descriptors) or ASan/
+      # UBSan; js cells run the Node heap/fd check. Any leak or sanitizer error
+      # fails the cell. navi-owned leaks are fixed, not suppressed.
+      - name: ${{ matrix.name }}
+        run: docker run --rm navi-leakcheck ${{ matrix.run }}

@@ -15,8 +15,9 @@ fall into six groups:
 
 The **CI** column says which check runs it on every PR (see
 `.github/workflows/`). "local" means it is not wired into per-PR CI and is run on
-demand; "nightly" runs on a schedule. A green PR is **30 checks**: 19 from
-`ci.yml`, 10 from `fuzz.yml`, 1 from `badssl.yml` (`live.yml` is nightly only).
+demand; "nightly" runs on a schedule. A green PR is **96 checks**: 85 from
+`ci.yml` (66 of them the leak-check matrix and its image build), 10 from
+`fuzz.yml`, 1 from `badssl.yml` (`live.yml` is nightly only).
 
 ## Running at a glance
 
@@ -211,6 +212,41 @@ reference cycle could differ (`arc` does not collect cycles).
 | `leak.nim` (matrix orc/arc) | **yes** (`leak check`) | Every verb + `request` in a 100,000× loop (800k requests) against an in-process keep-alive server; asserts the Nim heap stays flat (an orc/arc gap would mean a reference cycle) |
 | `leak_valgrind.nim` (matrix orc/arc, Docker) | **yes** (`valgrind leak check`) | navi's HTTPS request loop under Valgrind memcheck; fails on any definite/indirect leak (e.g. a per-connection `SSL_CTX` that `getOccupiedMem` and LeakSanitizer miss) |
 | `leak_sanitize.nim` | **yes** (`leak check (codec FFI…)`) | Codec-FFI leaks LeakSanitizer sees but `getOccupiedMem` cannot: zlib / libbrotlidec / libzstd contexts a dropped `=destroy`/defer would leak (`detect_leaks=1`) |
+| **leak-check matrix** (`tests/leakcheck/`, Docker) | **yes** (65 checks + 1 image build) | Per-scenario, per-target leak check of the full client surface (see below) |
+
+### Leak-check matrix
+
+`leak.nim`/`leak_valgrind.nim` cover the plain GET path; this matrix drives every
+client surface (h1/h2, streaming up/down, compressed bodies, SSE, WebSocket) on
+every backend and looks for a leak that is specific to a protocol or a teardown
+path. One `tests/leakcheck/runner.nim` (native) / `js_leak.nim` (js) opens a fresh
+client each iteration, runs one scenario, and tears it down fully; a leak-free
+navi then leaves nothing behind.
+
+- **Native** (`sync`, `asyncdispatch`, `chronos`), each cell under one of:
+  - **Valgrind** (`--leak-check=full`, definite/indirect only) **plus
+    `--track-fds=yes`** so a leaked socket or cert file fails too. `navi.supp`
+    suppresses only the event loop's own control fds (epoll/eventfd/timer/signal),
+    which live for the whole process; a navi-owned leak is fixed, not suppressed.
+  - **ASan + UBSan** (`-fsanitize=address,undefined -d:useMalloc`), leak
+    detection off (Valgrind owns leaks; ASan owns memory-safety + UB).
+- **js**: `nim js` cannot be run under Valgrind/ASan, so `js_leak.nim` runs under
+  `node --expose-gc` and asserts the V8 heap and the `/proc/self/fd` count are
+  both flat across a long scenario loop.
+
+Scenario/target coverage follows navi's real capabilities: h2 is TLS+ALPN only, so
+there are no http2-plaintext cells and `chronos` (BearSSL, h1-only) is excluded
+from the pure-h2 GET but still runs the streaming/SSE scenarios over h1+TLS; the js
+backend buffers request bodies and the runtime owns h2, so it has no stream-up or
+http2-GET cells. A local FastAPI/Hypercorn server (`tests/leakcheck/server.py`,
+plaintext h1 + TLS h1/h2) serves every scenario. Run one cell locally:
+
+```sh
+docker build -f tests/leakcheck/Dockerfile -t navi-leakcheck .
+docker run --rm navi-leakcheck valgrind asyncdispatch streamdownc
+docker run --rm navi-leakcheck sanitize sync http1s
+docker run --rm navi-leakcheck js wss
+```
 
 ---
 
