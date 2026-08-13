@@ -41,6 +41,8 @@ typedef struct {
   long status;
   char body[65536];
   size_t body_len;
+  char resp_headers[16384]; /* response fields as "name\nvalue\n" (no pseudo) */
+  size_t resp_headers_len;
 } navi_h3_conn;
 
 void navi_h3_close(navi_h3_conn *c); /* forward decl for navi_h3_open cleanup */
@@ -134,6 +136,16 @@ static int on_recv_header(nghttp3_conn *h3, int64_t stream_id, int32_t token,
     size_t k = v.len < 7 ? v.len : 7;
     memcpy(tmp, v.base, k);
     c->status = atol(tmp);
+  } else if (n.len > 0 && n.base[0] != ':') { /* a regular response field */
+    size_t need = n.len + 1 + v.len + 1;
+    if (c->resp_headers_len + need <= sizeof c->resp_headers) {
+      memcpy(c->resp_headers + c->resp_headers_len, n.base, n.len);
+      c->resp_headers_len += n.len;
+      c->resp_headers[c->resp_headers_len++] = '\n';
+      memcpy(c->resp_headers + c->resp_headers_len, v.base, v.len);
+      c->resp_headers_len += v.len;
+      c->resp_headers[c->resp_headers_len++] = '\n';
+    }
   }
   return 0;
 }
@@ -409,31 +421,80 @@ fail:
   return NULL;
 }
 
-int navi_h3_request(navi_h3_conn *c, const char *path_, long *out_status,
-                    char *out_body, size_t out_cap, size_t *out_len) {
+/* req_headers: extra request fields as "name\nvalue\nname\nvalue\n" (already
+ * lowercased and filtered by the caller), or NULL/"" for none. Response fields
+ * are written to out_headers in the same "name\nvalue\n" form. */
+#define H3_MAX_NV 128
+
+int navi_h3_request(navi_h3_conn *c, const char *path_, const char *req_headers,
+                    long *out_status, char *out_body, size_t out_cap,
+                    size_t *out_len, char *out_headers, size_t hdr_cap,
+                    size_t *hdr_len) {
   c->req_done = 0;
   c->status = 0;
   c->body_len = 0;
+  c->resp_headers_len = 0;
 
+  nghttp3_nv nva[4 + H3_MAX_NV];
+  nva[0] = (nghttp3_nv)MAKE_NV(":method", "GET");
+  nva[1] = (nghttp3_nv)MAKE_NV(":scheme", "https");
+  nva[2] = (nghttp3_nv){(uint8_t *)":authority", (uint8_t *)c->authority, 10,
+                        strlen(c->authority), NGHTTP3_NV_FLAG_NONE};
+  nva[3] = (nghttp3_nv){(uint8_t *)":path", (uint8_t *)path_, 5, strlen(path_),
+                        NGHTTP3_NV_FLAG_NONE};
+  size_t nvlen = 4;
+
+  /* Tokenize a mutable copy of req_headers on '\n' into name/value pairs. The
+   * buffer must outlive submit (nghttp3 copies during QPACK encoding). */
+  char *hdrbuf = strdup(req_headers ? req_headers : "");
+  if (!hdrbuf)
+    return -1;
+  char *toks[2 * H3_MAX_NV];
+  int ntok = 0;
+  char *start = hdrbuf;
+  for (char *p = hdrbuf; *p && ntok < 2 * H3_MAX_NV; p++) {
+    if (*p == '\n') {
+      *p = '\0';
+      toks[ntok++] = start;
+      start = p + 1;
+    }
+  }
+  for (int i = 0; i + 1 < ntok && nvlen < 4 + H3_MAX_NV; i += 2) {
+    nva[nvlen].name = (uint8_t *)toks[i];
+    nva[nvlen].namelen = strlen(toks[i]);
+    nva[nvlen].value = (uint8_t *)toks[i + 1];
+    nva[nvlen].valuelen = strlen(toks[i + 1]);
+    nva[nvlen].flags = NGHTTP3_NV_FLAG_NONE;
+    nvlen++;
+  }
+
+  int rv = 0;
   int64_t sid;
-  if (ngtcp2_conn_open_bidi_stream(c->conn, &sid, NULL) != 0)
-    return -1;
+  if (ngtcp2_conn_open_bidi_stream(c->conn, &sid, NULL) != 0) {
+    rv = -1;
+    goto done;
+  }
   c->req_stream = sid;
-  nghttp3_nv nva[] = {MAKE_NV(":method", "GET"), MAKE_NV(":scheme", "https"),
-                      {(uint8_t *)":authority", (uint8_t *)c->authority, 10,
-                       strlen(c->authority), NGHTTP3_NV_FLAG_NONE},
-                      {(uint8_t *)":path", (uint8_t *)path_, 5, strlen(path_),
-                       NGHTTP3_NV_FLAG_NONE}};
-  if (nghttp3_conn_submit_request(c->h3, sid, nva, 4, NULL, NULL) != 0)
-    return -1;
-  if (run_until(c, &c->req_done) != 0)
-    return -1;
+  if (nghttp3_conn_submit_request(c->h3, sid, nva, nvlen, NULL, NULL) != 0) {
+    rv = -1;
+    goto done;
+  }
+  if (run_until(c, &c->req_done) != 0) {
+    rv = -1;
+    goto done;
+  }
 
   *out_status = c->status;
   size_t k = c->body_len < out_cap ? c->body_len : out_cap;
   memcpy(out_body, c->body, k);
   *out_len = k;
-  return 0;
+  size_t hk = c->resp_headers_len < hdr_cap ? c->resp_headers_len : hdr_cap;
+  memcpy(out_headers, c->resp_headers, hk);
+  *hdr_len = hk;
+
+done:
+  free(hdrbuf);
+  return rv;
 }
 
 void navi_h3_close(navi_h3_conn *c) {

@@ -20,6 +20,9 @@ import navi/proto/ws
 import navi/backend/sync
 from std/strutils import startsWith, find, splitLines, strip, cmpIgnoreCase,
                          contains, toLowerAscii
+when defined(naviHttp3):
+  import navi/core/altsvc
+  import navi/backend/quic
 export sse.SseEvent
 
 claimEntry("navi")
@@ -51,6 +54,8 @@ type
     config: NaviConfig
     pool*: Pool[PooledConn[Conn]]
     jar*: CookieJar
+    when defined(naviHttp3):
+      altSvc: AltSvcCache      ## per-origin h3 discovery cache (HTTP/3 builds)
   Navi* = ref NaviObj
 
 proc closeIdle(pool: Pool[PooledConn[Conn]]) =
@@ -75,6 +80,8 @@ proc `=destroy`(o: var NaviObj) =
   `=destroy`(o.config)
   `=destroy`(o.pool)
   `=destroy`(o.jar)
+  when defined(naviHttp3):
+    `=destroy`(o.altSvc)
 
 proc initNaviConfig*(): NaviConfig =
   ## The only way to build a config: `NaviConfig` requires every field. Sets the
@@ -91,7 +98,8 @@ proc newNavi*(config = initNaviConfig()): Navi =
   ## middleware, …).
   var cfg = config
   if cfg.tls.sessionCache.isNil: cfg.tls.sessionCache = newTlsStore(cfg.tls)
-  Navi(config: cfg, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
+  result = Navi(config: cfg, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
+  when defined(naviHttp3): result.altSvc = newAltSvcCache()
 
 proc config*(client: Navi): lent NaviConfig = client.config
   ## Read-only view of the client's config. Config is fixed at construction;
@@ -104,7 +112,8 @@ proc extend*(client: Navi, config: NaviConfig): Navi =
   var merged = mergeBase(client.config, config)
   merged.middleware = client.config.middleware & config.middleware
   merged.tls.sessionCache = newTlsStore(merged.tls)  # its own cache, not the parent's
-  Navi(config: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
+  result = Navi(config: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
+  when defined(naviHttp3): result.altSvc = newAltSvcCache()
 
 proc close*(client: Navi) =
   ## Close all idle pooled connections, freeing their TLS contexts and cached
@@ -114,9 +123,48 @@ proc close*(client: Navi) =
   closeIdle(client.pool)
   closeTlsStore(client.config.tls.sessionCache)
 
+when defined(naviHttp3):
+  # Request fields that must not cross to HTTP/3: pseudo-header sources and
+  # connection-specific fields (RFC 9114), plus accept-encoding (h3 responses are
+  # not decompressed on this path yet).
+  const h3SkipHeaders = ["host", "connection", "keep-alive", "proxy-connection",
+                         "transfer-encoding", "upgrade", "content-length",
+                         "accept-encoding"]
+
+  proc h3Transport(client: Navi, req: Request, ep: AltSvcEndpoint): Response =
+    ## Send `req` (a GET) over HTTP/3 to a discovered endpoint and build a navi
+    ## Response, so the caller's policy layer (cookies, redirects, retries,
+    ## throw-on-non-2xx) is reused unchanged. Raises `QuicError` on failure, which
+    ## `transport` catches to fall back to h2/h1.
+    var fwd: seq[(string, string)]
+    for k, v in req.headers:
+      let lk = k.toLowerAscii
+      if lk notin h3SkipHeaders: fwd.add((lk, v))
+    let conn = h3Open(ep.host, ep.port, sni = req.url.host,
+                      caFile = client.config.tls.caFile,
+                      verify = client.config.tls.wantsVerify)
+    try:
+      let r = conn.get(req.url.requestTarget, fwd)
+      result = initResponse(r.status, "", "HTTP/3", initHeaders(r.headers), r.body)
+    finally:
+      conn.close()
+
 proc transport(client: Navi, req: Request, sink: BodySink): Response =
-  ## Pool-based transport (one request per connection at a time).
-  poolTransport(client, req, sink)
+  ## Pool-based transport (one request per connection at a time). In a
+  ## `-d:naviHttp3` build, a GET to an origin that has advertised h3 (Alt-Svc) is
+  ## sent over HTTP/3; any QUIC failure falls back to h2/h1. The h3 endpoint is
+  ## learned from the `alt-svc` header captured on prior h2/h1 responses.
+  when defined(naviHttp3):
+    if req.verb == GET and client.config.wantsH3 and req.url.isTls:
+      let ep = client.altSvc.h3Endpoint("https", req.url.host, req.url.port)
+      if ep.isSome:
+        try: return h3Transport(client, req, ep.get)
+        except QuicError: discard   # fall back to the h2/h1 transport below
+  result = poolTransport(client, req, sink)
+  when defined(naviHttp3):
+    let alt = result.headers.get("alt-svc")
+    if alt.len > 0:
+      client.altSvc.record("https", req.url.host, req.url.port, alt)
 
 proc runCore(client: Navi, req: Request, cancel: CancelToken): Response =
   ## The innermost `next`: the full policy layer for one buffered request.
