@@ -10,6 +10,9 @@
 https://localhost:4433 {
 	tls /work/cert.pem /work/key.pem
 	header Alt-Svc `h3=":4433"; ma=86400`
+	encode gzip {
+		minimum_length 16
+	}
 
 	# Requests with a body are echoed back, so the client can verify upload.
 	@withbody method POST PUT PATCH
@@ -20,5 +23,12 @@ https://localhost:4433 {
 		respond "echo:{http.request.body}" 200
 	}
 
-	respond "hello from http/3" 200
+	# A large, compressible body (its plaintext is BIG) for the compression test.
+	handle /big {
+		respond "{$BIG}" 200
+	}
+
+	handle {
+		respond "hello from http/3" 200
+	}
 }
