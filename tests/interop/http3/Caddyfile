@@ -1,0 +1,14 @@
+{
+	# No ACME: use the self-signed cert run.sh generates. h1/h2/h3 all served on
+	# the TLS listener; h3 is the one the probe dials over UDP.
+	auto_https off
+	servers {
+		protocols h1 h2 h3
+	}
+}
+
+https://localhost:4433 {
+	tls /work/cert.pem /work/key.pem
+	header Alt-Svc `h3=":4433"; ma=86400`
+	respond "hello from http/3" 200
+}

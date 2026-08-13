@@ -1,0 +1,25 @@
+name: http3
+
+# Phase 2 HTTP/3 verification. Builds the ngtcp2 + nghttp3 + OpenSSL 3.5
+# toolchain image and runs the binding-layer probe against a live Caddy h3
+# origin. Path-filtered so the heavy from-source build only runs when the h3
+# code or its toolchain changes, not on every PR.
+on:
+  pull_request:
+    paths:
+      - 'src/navi/backend/quic.nim'
+      - 'src/navi/core/altsvc.nim'
+      - 'tests/interop/http3/**'
+      - 'docs/http3.md'
+      - '.github/workflows/http3.yml'
+  workflow_dispatch:
+
+jobs:
+  h3-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the HTTP/3 toolchain image and run the binding probe
+        run: |
+          docker build -f tests/interop/http3/Dockerfile -t navi-h3 .
+          docker run --rm navi-h3
