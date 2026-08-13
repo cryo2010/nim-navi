@@ -14,6 +14,7 @@
 when not defined(naviHttp3):
   {.error: "navi/backend/quic is a -d:naviHttp3-only module (HTTP/3 WIP).".}
 
+import std/strutils
 import ../core/altsvc
 export altsvc.AltSvcEndpoint
 
@@ -44,6 +45,7 @@ type
   Http3Response* = object
     status*: int
     body*: string
+    headers*: seq[(string, string)]   ## response fields (lowercased names)
 
   QuicConn* = ref object
     ## A persistent QUIC/h3 connection to one origin. Open it once and issue
@@ -62,9 +64,10 @@ proc nghttp3_version(least: cint): ptr Nghttp3Info
 # status and up to outCap body bytes). navi_h3_close frees it.
 proc navi_h3_open(host, port, sni, caFile: cstring, verify: cint): pointer
   {.importc, cdecl.}
-proc navi_h3_request(c: pointer, path: cstring, outStatus: ptr clong,
-                     outBody: ptr char, outCap: csize_t,
-                     outLen: ptr csize_t): cint {.importc, cdecl.}
+proc navi_h3_request(c: pointer, path, reqHeaders: cstring, outStatus: ptr clong,
+                     outBody: ptr char, outCap: csize_t, outLen: ptr csize_t,
+                     outHeaders: ptr char, hdrCap: csize_t,
+                     hdrLen: ptr csize_t): cint {.importc, cdecl.}
 proc navi_h3_close(c: pointer) {.importc, cdecl.}
 
 proc ngtcp2VersionStr*(): string = $ngtcp2_version(0).version_str
@@ -84,21 +87,36 @@ proc h3Open*(host: string, port: int, sni = "", caFile = "",
       "navi HTTP/3 connect to " & host & ":" & $port & " failed")
   QuicConn(handle: h)
 
-proc get*(c: QuicConn, path = "/"): Http3Response =
-  ## Issue an HTTP/3 GET on an open connection and return the status and body.
-  ## Raises `QuicError` on transport failure.
+proc get*(c: QuicConn, path = "/",
+          headers: openArray[(string, string)] = []): Http3Response =
+  ## Issue an HTTP/3 GET on an open connection and return status, body, and
+  ## response headers. `headers` are extra request fields (names must be
+  ## lowercase, per HTTP/3, and free of connection-specific fields). Raises
+  ## `QuicError` on transport failure.
   if c.handle == nil:
     raise newException(QuicError, "navi HTTP/3: connection is closed")
+  var reqHdr = ""
+  for (k, v) in headers:
+    reqHdr.add k; reqHdr.add '\n'; reqHdr.add v; reqHdr.add '\n'
   var status: clong
-  var blen: csize_t
-  var buf = newString(64 * 1024)
-  let rv = navi_h3_request(c.handle, path.cstring, addr status,
-                           cast[ptr char](addr buf[0]), csize_t(buf.len),
-                           addr blen)
+  var blen, hlen: csize_t
+  var body = newString(64 * 1024)
+  var hbuf = newString(16 * 1024)
+  let rv = navi_h3_request(c.handle, path.cstring, reqHdr.cstring, addr status,
+                           cast[ptr char](addr body[0]), csize_t(body.len),
+                           addr blen, cast[ptr char](addr hbuf[0]),
+                           csize_t(hbuf.len), addr hlen)
   if rv != 0:
     raise newException(QuicError, "navi HTTP/3 GET " & path & " failed")
-  buf.setLen(int(blen))
-  Http3Response(status: int(status), body: buf)
+  body.setLen(int(blen))
+  hbuf.setLen(int(hlen))
+  var hs: seq[(string, string)]
+  let parts = hbuf.split('\n')
+  var i = 0
+  while i + 1 < parts.len:
+    hs.add((parts[i], parts[i + 1]))
+    i += 2
+  Http3Response(status: int(status), body: body, headers: hs)
 
 proc close*(c: QuicConn) =
   ## Close the connection and release its socket and library state. Idempotent.

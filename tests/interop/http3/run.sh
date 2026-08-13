@@ -26,3 +26,7 @@ echo ">>> building and running the navi HTTP/3 GET test"
 export NAVI_H3_CA="$WORK/cert.pem"   # the origin's CA, for the verified GET case
 nim c --hints:off --path:"$ROOT/src" -d:naviHttp3 -o:/tmp/h3get_test "$DIR/h3get_test.nim"
 /tmp/h3get_test
+
+echo ">>> building and running the transparent h3 dispatch test (sync client)"
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/dispatch_test "$DIR/dispatch_test.nim"
+/tmp/dispatch_test
