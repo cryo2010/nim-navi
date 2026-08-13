@@ -61,6 +61,11 @@ COPY --from=caddy:2 /usr/bin/caddy /usr/bin/caddy
 # load the wrong OpenSSL. navi_proto gets an rpath at link time instead.
 ENV PKG_CONFIG_PATH=$OSSL/lib/pkgconfig:$NGHTTP3/lib/pkgconfig:$NGTCP2/lib/pkgconfig
 
+# tc (netem) for the optional lossy/high-latency regime. Its own layer, after the
+# from-source h3 toolchain, so adding it does not invalidate those slow builds.
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY src ./src
 COPY bench ./bench

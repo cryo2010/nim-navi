@@ -157,10 +157,14 @@ task live, "Live interop against real public servers/CDNs (network; nightly)":
   exec "nim c -r --path:src -d:ssl --hints:off tests/interop/live.nim"
 
 task bench, "Dockerized HTTP client benchmark: navi vs std/httpclient, Go, Rust (needs Docker)":
-  # Builds a Nim+Go+Rust image and runs the TLS+gzip+all-methods comparison.
-  # Set NAVI_BENCH_ITERS to change the load, e.g. `NAVI_BENCH_ITERS=5000 nimble bench`.
+  # Builds a Nim+Go+Rust image and runs the TLS+gzip+all-methods comparison, then
+  # a navi h1/h2/h3 x cold/pooled protocol matrix. Set NAVI_BENCH_ITERS to change
+  # the load. `NAVI_BENCH_NETEM=1 nimble bench` adds a lossy/high-latency regime
+  # (needs the NET_ADMIN cap, which is granted below) where h3 pulls ahead of h2.
   exec "docker build -f bench/Dockerfile -t navi-bench ."
-  exec "docker run --rm -e NAVI_BENCH_ITERS navi-bench"
+  exec "docker run --rm --cap-add=NET_ADMIN " &
+       "-e NAVI_BENCH_ITERS -e NAVI_BENCH_COLD_ITERS -e NAVI_BENCH_NETEM " &
+       "-e NAVI_BENCH_CONC -e NAVI_BENCH_NETEM_DELAY -e NAVI_BENCH_NETEM_LOSS navi-bench"
 
 task wsjs, "navi/js WebSocket runtime test (Node client vs a native server)":
   # Runs the navi/js WebSocket client under Node against a native echo server.

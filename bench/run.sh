@@ -115,7 +115,27 @@ run_phase "$work/cold" 1 "$NAVI_BENCH_COLD_ITERS"
 # Runs navi against a Caddy origin that speaks all three protocols, so h1/h2/h3
 # are compared on the same server. GET-only (connection/protocol overhead, not
 # the 7-method body workload above). Skipped if the h3 build/toolchain is absent.
+proto_matrix() {  # one 6-cell table; reads NAVI_BENCH_CONC etc. from the env
+  printf "%-10s %-8s %10s %9s %12s\n" PROTOCOL MODE REQUESTS "TIME(s)" "REQ/S"
+  printf -- "------------------------------------------------------------\n"
+  for proto in h1 h2 h3; do
+    for mode in pooled cold; do
+      local_cold=0; its="$PROTO_ITERS"
+      [ "$mode" = cold ] && { local_cold=1; its="$NAVI_BENCH_COLD_ITERS"; }
+      out="$(NAVI_BENCH_PROTO="$proto" NAVI_BENCH_COLD="$local_cold" NAVI_BENCH_ITERS="$its" \
+             timeout "$NAVI_BENCH_TIMEOUT" "$work/navi_proto" 2>/dev/null | grep '^RESULT' || true)"
+      if [ -n "$out" ]; then
+        echo "$out" | awk -F'\t' -v p="$proto" -v m="$mode" \
+          '{printf "%-10s %-8s %10s %9s %12s\n", p, m, $3, $4, $5}'
+      else
+        printf "%-10s %-8s %10s\n" "$proto" "$mode" "FAILED"
+      fi
+    done
+  done
+}
+
 if [ -x "$work/navi_proto" ] && command -v caddy >/dev/null 2>&1; then
+  netem_conc="${NAVI_BENCH_CONC:-16}"     # concurrency for the netem regime
   export NAVI_BENCH_URL="https://localhost:4433/"
   caddy start --config "$bench/Caddyfile" --adapter caddyfile >/tmp/caddy.log 2>&1 || true
   cready=""
@@ -123,31 +143,40 @@ if [ -x "$work/navi_proto" ] && command -v caddy >/dev/null 2>&1; then
     if curl -sk --max-time 2 https://localhost:4433/ >/dev/null 2>&1; then cready=1; break; fi
     sleep 0.25
   done
-  echo ""
-  echo "=== navi protocol matrix: HTTP/1.1, HTTP/2, HTTP/3 x cold/pooled (GET, TLS) ==="
-  echo "   pooled: $PROTO_ITERS iters on a reused connection"
-  echo "   cold:   $NAVI_BENCH_COLD_ITERS iters, fresh connection + handshake each"
-  echo "           (h3 cold also pays an h1/h2 Alt-Svc discovery round trip per request)"
-  echo ""
-  if [ -n "$cready" ]; then
-    printf "%-10s %-8s %10s %9s %12s\n" PROTOCOL MODE REQUESTS "TIME(s)" "REQ/S"
-    printf -- "------------------------------------------------------------\n"
-    for proto in h1 h2 h3; do
-      for mode in pooled cold; do
-        local_cold=0; its="$PROTO_ITERS"
-        [ "$mode" = cold ] && { local_cold=1; its="$NAVI_BENCH_COLD_ITERS"; }
-        out="$(NAVI_BENCH_PROTO="$proto" NAVI_BENCH_COLD="$local_cold" NAVI_BENCH_ITERS="$its" \
-               timeout "$NAVI_BENCH_TIMEOUT" "$work/navi_proto" 2>/dev/null | grep '^RESULT' || true)"
-        if [ -n "$out" ]; then
-          echo "$out" | awk -F'\t' -v p="$proto" -v m="$mode" \
-            '{printf "%-10s %-8s %10s %9s %12s\n", p, m, $3, $4, $5}'
-        else
-          printf "%-10s %-8s %10s\n" "$proto" "$mode" "FAILED"
-        fi
-      done
-    done
+  if [ -z "$cready" ]; then
+    echo ""; echo "   (Caddy h3 origin did not come up; skipping the protocol matrix)"
   else
-    echo "   (Caddy h3 origin did not come up; skipping the protocol matrix)"
+    echo ""
+    echo "=== navi protocol matrix: HTTP/1.1 / HTTP/2 / HTTP/3, cold vs pooled (GET, TLS) ==="
+    echo "   clean loopback, one request at a time -- raw protocol/connection overhead"
+    echo "   pooled: $PROTO_ITERS iters reused   cold: $NAVI_BENCH_COLD_ITERS iters, fresh conn each"
+    echo "   (h3 cold also pays an h1/h2 Alt-Svc discovery round trip per request)"
+    echo ""
+    export NAVI_BENCH_CONC=1
+    proto_matrix
+
+    # Optional: the same matrix under emulated latency + loss with concurrent
+    # requests -- the regime where h3 pulls ahead of h2 (h2's single connection
+    # suffers TCP head-of-line blocking across streams; h3's are independent).
+    # Needs `tc` (iproute2) and NET_ADMIN; set NAVI_BENCH_NETEM=1 to enable.
+    if [ "${NAVI_BENCH_NETEM:-0}" = 1 ]; then
+      delay="${NAVI_BENCH_NETEM_DELAY:-25ms}"; loss="${NAVI_BENCH_NETEM_LOSS:-1.5%}"
+      if command -v tc >/dev/null 2>&1 && \
+         tc qdisc add dev lo root netem delay "$delay" loss "$loss" 2>/dev/null; then
+        export NAVI_BENCH_CONC="$netem_conc"
+        echo ""
+        echo "=== the same matrix under netem: $delay each-way delay + $loss loss, $netem_conc concurrent ==="
+        echo "   emulates a lossy/high-latency link; here h3 avoids the head-of-line"
+        echo "   blocking h2 suffers, so h3 pooled should beat h2 pooled"
+        echo ""
+        proto_matrix
+        tc qdisc del dev lo root 2>/dev/null || true
+      else
+        echo ""
+        echo "   (NAVI_BENCH_NETEM set but netem is unavailable -- needs iproute2 and"
+        echo "    --cap-add=NET_ADMIN; skipping the netem regime)"
+      fi
+    fi
   fi
   caddy stop 2>/dev/null || true
 fi

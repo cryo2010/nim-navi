@@ -15,6 +15,7 @@ let url = getEnv("NAVI_BENCH_URL", "https://localhost:4433/")
 let proto = getEnv("NAVI_BENCH_PROTO", "h2")
 let cold = getEnv("NAVI_BENCH_COLD", "0") == "1"
 let iters = parseInt(getEnv("NAVI_BENCH_ITERS", "500"))
+let conc = max(1, parseInt(getEnv("NAVI_BENCH_CONC", "1")))   # in-flight requests
 
 proc mkCfg(): NaviConfig =
   result = initNaviConfig()
@@ -29,6 +30,20 @@ proc mkCfg(): NaviConfig =
 proc get1(api: Navi): Future[Response] {.async.} =
   result = await api.get(url)
 
+# module-level so the concurrent coroutines below can update them (single
+# threaded async, so the increments interleave safely at await points).
+var done = 0
+var got = ""
+
+proc coldOne() {.async.} =
+  ## One cold request: a fresh client (full connection setup) per request.
+  let api = newNavi(mkCfg())
+  if proto == "h3": discard await get1(api)   # h1/h2 Alt-Svc discovery, then h3
+  let r = await get1(api)
+  if r.status == 200: inc done
+  got = r.httpVersion
+  await api.close()
+
 proc main() {.async.} =
   let want =
     case proto
@@ -36,8 +51,6 @@ proc main() {.async.} =
     of "h2": "HTTP/2"
     of "h3": "HTTP/3"
     else: ""
-  var got = ""
-  var done = 0
 
   # warm up (and, for h3 pooled, establish the h3 connection via Alt-Svc)
   let warm = if cold: 3 else: max(50, iters div 10)
@@ -48,23 +61,32 @@ proc main() {.async.} =
       discard await get1(api)
     await api.close()
 
+  # `conc` requests are issued at once, in waves, until `iters` complete. With
+  # conc > 1 this exposes multiplexing: over a lossy link h2's single connection
+  # suffers head-of-line blocking across streams, while h3's streams are
+  # independent (and h1 spreads load over separate connections).
   let t0 = getMonoTime()
   if cold:
-    for _ in 0 ..< iters:
-      let api = newNavi(mkCfg())
-      if proto == "h3": discard await get1(api)   # h1/h2 discovery, then h3
-      let r = await get1(api)
-      if r.status == 200: inc done
-      got = r.httpVersion
-      await api.close()
+    var i = 0
+    while i < iters:
+      let n = min(conc, iters - i)
+      var futs: seq[Future[void]]
+      for _ in 0 ..< n: futs.add coldOne()
+      await all(futs)
+      i += n
   else:
     let api = newNavi(mkCfg())
     if proto == "h3":
       discard await get1(api); discard await get1(api)   # establish h3
-    for _ in 0 ..< iters:
-      let r = await get1(api)
-      if r.status == 200: inc done
-      got = r.httpVersion
+    var i = 0
+    while i < iters:
+      let n = min(conc, iters - i)
+      var futs: seq[Future[Response]]
+      for _ in 0 ..< n: futs.add get1(api)
+      for r in await all(futs):
+        if r.status == 200: inc done
+        got = r.httpVersion
+      i += n
     await api.close()
   let secs = (getMonoTime() - t0).inNanoseconds.float / 1e9
 
