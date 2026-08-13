@@ -16,6 +16,10 @@ OPENSSL_CONF=/dev/null "$OSSL/bin/openssl" req -x509 -newkey rsa:2048 -nodes -da
   -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
   >/dev/null 2>&1
 
+# A large, compressible body for the /big route (shared with the test via BIG).
+export BIG
+BIG=$(printf 'navi%.0s' $(seq 1 250))   # 1000 bytes, gzips well
+
 # Start the h3 origin (h3 on UDP 4433). Fatal if it fails: the test dials it.
 caddy start --config "$DIR/Caddyfile" --adapter caddyfile >/tmp/caddy.log 2>&1 \
   || { echo "caddy failed to start"; cat /tmp/caddy.log; exit 1; }

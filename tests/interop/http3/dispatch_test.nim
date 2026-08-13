@@ -39,5 +39,34 @@ doAssert r4.status == 200 and r4.httpVersion == "HTTP/3"
 doAssert r4.body == "echo:put-99", "PUT echo mismatch: " & r4.body
 echo "PUT over ", r4.httpVersion, " echoed the uploaded body"
 
+# 5. Compression over h3: the server gzips /big; navi forwards accept-encoding
+#    and the policy layer decodes the response, so the body arrives as plaintext.
+let expectedBig = getEnv("BIG")
+doAssert expectedBig.len > 0, "BIG must be set by run.sh"
+let big = api.get("https://localhost:4433/big")
+doAssert big.status == 200 and big.httpVersion == "HTTP/3"
+doAssert big.body == expectedBig, "decoded /big mismatch (got " & $big.body.len & " bytes)"
+doAssert big.headers.get("content-encoding") == "",
+  "content-encoding should be stripped after decode"
+echo "GET /big over h3 decoded ", big.body.len, " bytes"
+
 api.close()
+
+# Prove the body really was gzipped on the wire: a client with decompression off
+# and an explicit accept-encoding sees the raw, smaller, gzip-encoded body.
+var rawCfg = initNaviConfig()
+rawCfg.tls.caFile = ca
+rawCfg.http = {H1, H2, H3}
+rawCfg.decompress = false
+let raw = newNavi(rawCfg)
+discard raw.get("https://localhost:4433/")            # h2 first, to learn Alt-Svc
+let rawBig = raw.get("https://localhost:4433/big",
+                     headers = initHeaders([("accept-encoding", "gzip")]))
+doAssert rawBig.httpVersion == "HTTP/3"
+doAssert rawBig.headers.get("content-encoding") == "gzip",
+  "expected gzip on the wire, got: '" & rawBig.headers.get("content-encoding") & "'"
+doAssert rawBig.body.len < expectedBig.len, "compressed body should be smaller"
+raw.close()
+echo "wire body was gzip (", rawBig.body.len, " < ", expectedBig.len, " bytes)"
+
 echo "NAVI HTTP/3 DISPATCH OK"

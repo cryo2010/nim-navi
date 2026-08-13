@@ -125,11 +125,12 @@ proc close*(client: Navi) =
 
 when defined(naviHttp3):
   # Request fields that must not cross to HTTP/3: pseudo-header sources and
-  # connection-specific fields (RFC 9114), plus accept-encoding (h3 responses are
-  # not decompressed on this path yet).
+  # connection-specific fields (RFC 9114). accept-encoding IS forwarded, so the
+  # response is compressed on the wire; the policy layer's decodeBody decompresses
+  # it (keyed on the content-encoding header the h3 response carries), exactly as
+  # for h1/h2.
   const h3SkipHeaders = ["host", "connection", "keep-alive", "proxy-connection",
-                         "transfer-encoding", "upgrade", "content-length",
-                         "accept-encoding"]
+                         "transfer-encoding", "upgrade", "content-length"]
 
   proc h3Transport(client: Navi, req: Request, ep: AltSvcEndpoint): Response =
     ## Send `req` (any verb with a buffered body) over HTTP/3 to a discovered
