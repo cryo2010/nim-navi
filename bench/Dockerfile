@@ -37,7 +37,29 @@ RUN nimble install -y checksums zippy
 # after the toolchains above so their build layers stay cached.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       nodejs python3 python3-requests \
+      autoconf automake libtool \
     && rm -rf /var/lib/apt/lists/*
+
+# HTTP/3 toolchain (OpenSSL 3.5 + nghttp3 + ngtcp2) for the navi protocol matrix,
+# plus Caddy as an h1/h2/h3 origin. Built from source, mirroring
+# tests/interop/http3/Dockerfile. Kept separate from the system OpenSSL the other
+# clients use; navi's h3 build finds it via PKG_CONFIG_PATH.
+ENV OSSL=/opt/ossl NGHTTP3=/opt/nghttp3 NGTCP2=/opt/ngtcp2
+RUN git clone --depth 1 -b openssl-3.5 https://github.com/openssl/openssl /src/openssl \
+ && cd /src/openssl && ./Configure --prefix=$OSSL --libdir=lib \
+ && make -j"$(nproc)" && make install_sw && rm -rf /src/openssl
+RUN git clone --depth 1 --recursive https://github.com/ngtcp2/nghttp3 /src/nghttp3 \
+ && cd /src/nghttp3 && autoreconf -i && ./configure --prefix=$NGHTTP3 --enable-lib-only \
+ && make -j"$(nproc)" && make install && rm -rf /src/nghttp3
+RUN git clone --depth 1 --recursive https://github.com/ngtcp2/ngtcp2 /src/ngtcp2 \
+ && cd /src/ngtcp2 && autoreconf -i \
+ && PKG_CONFIG_PATH=$OSSL/lib/pkgconfig ./configure --prefix=$NGTCP2 --enable-lib-only --with-openssl \
+ && make -j"$(nproc)" && make install && rm -rf /src/ngtcp2
+COPY --from=caddy:2 /usr/bin/caddy /usr/bin/caddy
+# PKG_CONFIG_PATH is build-time only (navi_proto's h3 link). Deliberately NO
+# global LD_LIBRARY_PATH: it would make the system openssl and the other clients
+# load the wrong OpenSSL. navi_proto gets an rpath at link time instead.
+ENV PKG_CONFIG_PATH=$OSSL/lib/pkgconfig:$NGHTTP3/lib/pkgconfig:$NGTCP2/lib/pkgconfig
 
 WORKDIR /app
 COPY src ./src

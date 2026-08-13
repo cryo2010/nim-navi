@@ -28,6 +28,25 @@ and decoding the response — in **two phases**, each printing a table of wall-c
   connection-**setup** cost the pooled phase hides — a full handshake every time,
   so it runs fewer iterations.
 
+## navi protocol matrix (HTTP/1.1 vs HTTP/2 vs HTTP/3)
+
+After the cross-language phases, a navi-only matrix runs each protocol cold and
+pooled against one **Caddy** origin that speaks all three, so h1/h2/h3 are
+compared on the same server (GET-only — connection and protocol overhead, not the
+seven-method body workload). It uses the `asyncdispatch` backend built with
+`-d:naviHttp3`:
+
+| PROTOCOL | MODE | REQ/S (higher is better) |
+| --- | --- | --- |
+| h1 / h2 / h3 | pooled | steady-state, connections reused (h1 keep-alive, h2/h3 mux) |
+| h1 / h2 / h3 | cold | fresh connection + handshake per request |
+
+**h3 cold is not a pure QUIC dial.** HTTP/3 is only reached after an h1/h2
+response advertises `Alt-Svc: h3` (navi has no way to pre-seed that), so a cold h3
+request first does an h1/h2 discovery round trip, then the QUIC handshake — the
+matrix labels this honestly and it explains why `h3 / cold` is the slowest cell.
+The matrix is skipped if the h3 toolchain or Caddy is unavailable.
+
 ## Clients
 
 | Label | Stack |
