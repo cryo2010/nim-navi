@@ -1,15 +1,15 @@
-## HTTP/3 QUIC transport (phase 2, work in progress).
+## HTTP/3 QUIC transport (phase 2b).
 ##
-## Compiled ONLY in a `-d:naviHttp3` build; no CI job enables it yet. The FFI
-## below is verified to link and initialize against the real libraries (ngtcp2 +
-## nghttp3 + the OpenSSL >= 3.5 QUIC crypto binding) by tests/interop/http3, whose
-## Dockerfile builds the toolchain and whose probe exercises exactly these calls.
+## Compiled ONLY in a `-d:naviHttp3` build; no default CI job enables it. It links
+## ngtcp2 + nghttp3 + the OpenSSL >= 3.5 QUIC crypto binding (via pkg-config) and
+## compiles the h3client.c driver, which performs a blocking HTTP/3 GET over QUIC.
+## Verified end to end by tests/interop/http3 (a from-source toolchain image and a
+## live Caddy h3 origin): navi completes the QUIC handshake, runs nghttp3/QPACK,
+## and reads back the response.
 ##
-## What works here: the binding layer (versions, crypto-ossl init, coupling an
-## OpenSSL SSL to ngtcp2's crypto). What is still TODO (phase 2b): the client
-## `ngtcp2_conn` + the ~15 callbacks, the UDP/timer event loop, the nghttp3 h3
-## session, and request/response mapping. Those need a live handshake against the
-## tests/interop/http3 Caddy origin to validate and are not guessed here.
+## Scope: blocking, one GET per call (sync path). TODO (phase 2c): server
+## certificate verification, a persistent/multiplexed connection object, async
+## integration, and streaming bodies (see docs/http3.md).
 
 when not defined(naviHttp3):
   {.error: "navi/backend/quic is a -d:naviHttp3-only module (HTTP/3 WIP).".}
@@ -17,15 +17,15 @@ when not defined(naviHttp3):
 import ../core/altsvc
 export altsvc.AltSvcEndpoint
 
-# Link the h3 stack via pkg-config, so the build follows wherever the libraries
-# are installed (the interop image puts them under /opt and exposes them via
-# PKG_CONFIG_PATH). A -d:naviHttp3 build requires these libraries present.
+# Link the h3 stack via pkg-config so the build follows wherever the libraries
+# are installed (the interop image exposes them via PKG_CONFIG_PATH). A
+# -d:naviHttp3 build requires ngtcp2, nghttp3, and OpenSSL >= 3.5 present.
 {.passC: gorge("pkg-config --cflags libngtcp2 libngtcp2_crypto_ossl libnghttp3 libssl").}
 {.passL: gorge("pkg-config --libs libngtcp2 libngtcp2_crypto_ossl libnghttp3 libssl libcrypto").}
+{.compile: "h3client.c".}
 
 const naviHttp3MinOpenSsl* = "3.5.0"
-  ## Minimum OpenSSL for the QUIC crypto binding (ngtcp2_crypto_ossl). Older
-  ## OpenSSL/quictls/BoringSSL paths are out of scope.
+  ## Minimum OpenSSL for the QUIC crypto binding (ngtcp2_crypto_ossl).
 
 type
   Ngtcp2Info {.importc: "ngtcp2_info", header: "ngtcp2/ngtcp2.h".} = object
@@ -36,59 +36,42 @@ type
     age: cint
     version_num: cint
     version_str: cstring
-  Ssl = pointer
-  SslCtx = pointer
-  Ngtcp2CryptoOsslCtxObj {.importc: "ngtcp2_crypto_ossl_ctx",
-    header: "ngtcp2/ngtcp2_crypto_ossl.h", incompleteStruct.} = object
-  Ngtcp2CryptoOsslCtx = ptr Ngtcp2CryptoOsslCtxObj
+
+  QuicError* = object of CatchableError
+    ## QUIC/h3 transport failure (handshake, stream reset, timeout). The engine
+    ## will treat it as a signal to fall back to h2/h1 for the origin.
+
+  Http3Response* = object
+    status*: int
+    body*: string
 
 proc ngtcp2_version(least: cint): ptr Ngtcp2Info
   {.importc, cdecl, header: "ngtcp2/ngtcp2.h".}
 proc nghttp3_version(least: cint): ptr Nghttp3Info
   {.importc, cdecl, header: "nghttp3/nghttp3.h".}
-proc ngtcp2_crypto_ossl_init(): cint
-  {.importc, cdecl, header: "ngtcp2/ngtcp2_crypto_ossl.h".}
-proc ngtcp2_crypto_ossl_ctx_new(pctx: ptr Ngtcp2CryptoOsslCtx, ssl: Ssl): cint
-  {.importc, cdecl, header: "ngtcp2/ngtcp2_crypto_ossl.h".}
-proc ngtcp2_crypto_ossl_ctx_del(ctx: Ngtcp2CryptoOsslCtx)
-  {.importc, cdecl, header: "ngtcp2/ngtcp2_crypto_ossl.h".}
 
-type
-  QuicConn* = ref object
-    ## Owns one QUIC connection to an origin: the connected UDP socket, the
-    ## ngtcp2 connection, the nghttp3 h3 session, the OpenSSL QUIC crypto context,
-    ## and the loss-recovery timer. Fields are added as phase 2b lands.
-    host*: string
-    port*: int
-
-  QuicError* = object of CatchableError
-    ## QUIC/h3 transport failure (handshake, stream reset, timeout). The engine
-    ## treats it as a signal to fall back to h2/h1 for the origin.
-
-var cryptoInited = false
+# From h3client.c: a blocking HTTP/3 GET. Returns 0 on success, negative on
+# failure; fills status and up to out_cap body bytes (out_len = bytes written).
+proc navi_h3_get(host, port, sni, path: cstring, outStatus: ptr clong,
+                 outBody: ptr char, outCap: csize_t, outLen: ptr csize_t): cint
+  {.importc, cdecl.}
 
 proc ngtcp2VersionStr*(): string = $ngtcp2_version(0).version_str
 proc nghttp3VersionStr*(): string = $nghttp3_version(0).version_str
 
-proc initQuicCrypto*() =
-  ## Initialize the ngtcp2 OpenSSL crypto binding once per process. Verified by
-  ## tests/interop/http3 (the probe runs exactly this path).
-  if cryptoInited: return
-  if ngtcp2_crypto_ossl_init() != 0:
-    raise newException(QuicError, "navi HTTP/3: ngtcp2_crypto_ossl_init failed")
-  cryptoInited = true
-
-template notYet(): untyped =
-  raise newException(QuicError,
-    "navi HTTP/3: QUIC handshake not yet implemented (see docs/http3.md phase 2b)")
-
-proc connectQuic*(endpoint: AltSvcEndpoint, serverName: string): QuicConn =
-  ## Open a QUIC connection to a discovered h3 endpoint and complete the handshake
-  ## (ALPN "h3", TLS verification against `serverName`). Phase 2b: builds on the
-  ## verified crypto binding above (initQuicCrypto + ngtcp2_crypto_ossl_ctx_new).
-  initQuicCrypto()
-  notYet()
-
-proc close*(c: QuicConn) =
-  ## Close the QUIC connection and release the UDP socket and library state.
-  discard   # nothing to release until the connection owns resources
+proc h3Get*(host: string, port: int, sni = "", path = "/"): Http3Response =
+  ## Perform a blocking HTTP/3 GET over QUIC and return the status and body.
+  ## `sni` defaults to `host`. Raises `QuicError` on transport failure. Sync path;
+  ## the server certificate is not yet verified (phase 2c).
+  let name = if sni.len > 0: sni else: host
+  var status: clong
+  var blen: csize_t
+  var buf = newString(64 * 1024)
+  let rv = navi_h3_get(host.cstring, ($port).cstring, name.cstring, path.cstring,
+                       addr status, cast[ptr char](addr buf[0]),
+                       csize_t(buf.len), addr blen)
+  if rv != 0:
+    raise newException(QuicError,
+      "navi HTTP/3 GET to " & host & ":" & $port & path & " failed")
+  buf.setLen(int(blen))
+  Http3Response(status: int(status), body: buf)
