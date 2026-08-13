@@ -30,4 +30,15 @@ let r2 = h3Get("localhost", 4433, sni = "localhost", verify = false)
 doAssert r2.status == 200
 echo "ok: verify=false opt-out"
 
-echo "NAVI HTTP/3 VERIFY OK"
+# 4. Connection reuse: open once, issue several GETs, then close.
+let conn = h3Open("localhost", 4433, sni = "localhost", caFile = ca)
+try:
+  for i in 1 .. 3:
+    let g = conn.get("/")
+    doAssert g.status == 200 and "hello from http/3" in g.body,
+      "reuse request " & $i & " failed"
+finally:
+  conn.close()
+echo "ok: connection reuse (3 GETs on one connection)"
+
+echo "NAVI HTTP/3 OK"
