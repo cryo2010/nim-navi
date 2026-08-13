@@ -5,7 +5,8 @@ author        = "Craig Younker"
 description   = "An HTTP client with HTTP/1.1, HTTP/2, TLS and WebSocket support"
 license       = "MIT"
 srcDir        = "src"
-installExt    = @["nim"]
+installExt    = @["nim", "cpp"]   # ship the HTTP/3 driver (h3client.cpp) so a
+                                  # downstream -d:naviHttp3 build can compile it
 
 
 # Dependencies
