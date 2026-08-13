@@ -21,9 +21,12 @@ export altsvc.AltSvcEndpoint
 # Link the h3 stack via pkg-config so the build follows wherever the libraries
 # are installed (the interop image exposes them via PKG_CONFIG_PATH). A
 # -d:naviHttp3 build requires ngtcp2, nghttp3, and OpenSSL >= 3.5 present.
+{.passC: "-std=c++20".}   # h3client.cpp is C++20 (std::span, RAII); Nim's -w hides
+                          # the "not valid for C" note this adds to the .c files.
 {.passC: gorge("pkg-config --cflags libngtcp2 libngtcp2_crypto_ossl libnghttp3 libssl").}
 {.passL: gorge("pkg-config --libs libngtcp2 libngtcp2_crypto_ossl libnghttp3 libssl libcrypto").}
-{.compile: "h3client.c".}
+{.passL: "-lstdc++".}     # the C++ standard library, for the C++ driver
+{.compile: "h3client.cpp".}
 
 const naviHttp3MinOpenSsl* = "3.5.0"
   ## Minimum OpenSSL for the QUIC crypto binding (ngtcp2_crypto_ossl).

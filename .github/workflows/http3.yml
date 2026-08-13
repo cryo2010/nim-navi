@@ -8,7 +8,7 @@ on:
   pull_request:
     paths:
       - 'src/navi/backend/quic.nim'
-      - 'src/navi/backend/h3client.c'
+      - 'src/navi/backend/h3client.cpp'
       - 'src/navi/core/altsvc.nim'
       - 'src/navi.nim'
       - 'tests/interop/http3/**'
