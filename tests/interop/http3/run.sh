@@ -23,5 +23,6 @@ echo "caddy: h3 origin up on udp/4433"
 sleep 1
 
 echo ">>> building and running the navi HTTP/3 GET test"
+export NAVI_H3_CA="$WORK/cert.pem"   # the origin's CA, for the verified GET case
 nim c --hints:off --path:"$ROOT/src" -d:naviHttp3 -o:/tmp/h3get_test "$DIR/h3get_test.nim"
 /tmp/h3get_test
