@@ -86,11 +86,12 @@ proc navi_h3_handle_timeout*(c: pointer): cint {.importc, cdecl.}
 proc navi_h3_handshake_done*(c: pointer): cint {.importc, cdecl.}
 proc navi_h3_bind*(c: pointer): cint {.importc, cdecl.}
 proc navi_h3_submit*(c: pointer, verb, path, reqHeaders: cstring, body: ptr char,
-                     bodyLen: csize_t): cint {.importc, cdecl.}
-proc navi_h3_request_done*(c: pointer): cint {.importc, cdecl.}
-proc navi_h3_take_response*(c: pointer, outStatus: ptr clong, outBody: ptr char,
-                            outCap: csize_t, outLen: ptr csize_t, outHeaders: ptr char,
-                            hdrCap: csize_t, hdrLen: ptr csize_t): cint {.importc, cdecl.}
+                     bodyLen: csize_t): int64 {.importc, cdecl.}   ## stream id, or -1
+proc navi_h3_stream_done*(c: pointer, sid: int64): cint {.importc, cdecl.}
+proc navi_h3_take_response*(c: pointer, sid: int64, outStatus: ptr clong,
+                            outBody: ptr char, outCap: csize_t, outLen: ptr csize_t,
+                            outHeaders: ptr char, hdrCap: csize_t,
+                            hdrLen: ptr csize_t): cint {.importc, cdecl.}
 
 proc ngtcp2VersionStr*(): string = $ngtcp2_version(0).version_str
 proc nghttp3VersionStr*(): string = $nghttp3_version(0).version_str
