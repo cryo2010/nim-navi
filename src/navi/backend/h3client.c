@@ -43,6 +43,8 @@ typedef struct {
   size_t body_len;
   char resp_headers[16384]; /* response fields as "name\nvalue\n" (no pseudo) */
   size_t resp_headers_len;
+  const char *req_body; /* request body for the in-flight request (borrowed) */
+  size_t req_body_len;
 } navi_h3_conn;
 
 void navi_h3_close(navi_h3_conn *c); /* forward decl for navi_h3_open cleanup */
@@ -212,6 +214,25 @@ static int udp_connect(const char *host, const char *port, ngtcp2_path *path,
     (uint8_t *)(N), (uint8_t *)(V), sizeof(N) - 1, strlen(V),                  \
         NGHTTP3_NV_FLAG_NONE                                                   \
   }
+
+/* Body producer: hand nghttp3 the whole buffered request body in one vec, with
+ * EOF, on the first call. The body is borrowed from the caller for the duration
+ * of the request. */
+static nghttp3_ssize read_body(nghttp3_conn *h3, int64_t stream_id,
+                               nghttp3_vec *vec, size_t veccnt, uint32_t *pflags,
+                               void *cud, void *sud) {
+  (void)h3;
+  (void)stream_id;
+  (void)veccnt;
+  (void)sud;
+  navi_h3_conn *c = cud;
+  *pflags |= NGHTTP3_DATA_FLAG_EOF;
+  if (c->req_body_len == 0)
+    return 0;
+  vec[0].base = (uint8_t *)c->req_body;
+  vec[0].len = c->req_body_len;
+  return 1;
+}
 
 /* Pump reads and writes until *flag becomes nonzero, or an error occurs. */
 static int run_until(navi_h3_conn *c, int *flag) {
@@ -426,7 +447,8 @@ fail:
  * are written to out_headers in the same "name\nvalue\n" form. */
 #define H3_MAX_NV 128
 
-int navi_h3_request(navi_h3_conn *c, const char *path_, const char *req_headers,
+int navi_h3_request(navi_h3_conn *c, const char *method, const char *path_,
+                    const char *req_headers, const char *body, size_t body_len,
                     long *out_status, char *out_body, size_t out_cap,
                     size_t *out_len, char *out_headers, size_t hdr_cap,
                     size_t *hdr_len) {
@@ -434,9 +456,12 @@ int navi_h3_request(navi_h3_conn *c, const char *path_, const char *req_headers,
   c->status = 0;
   c->body_len = 0;
   c->resp_headers_len = 0;
+  c->req_body = body;
+  c->req_body_len = body_len;
 
   nghttp3_nv nva[4 + H3_MAX_NV];
-  nva[0] = (nghttp3_nv)MAKE_NV(":method", "GET");
+  nva[0] = (nghttp3_nv){(uint8_t *)":method", (uint8_t *)method, 7,
+                        strlen(method), NGHTTP3_NV_FLAG_NONE};
   nva[1] = (nghttp3_nv)MAKE_NV(":scheme", "https");
   nva[2] = (nghttp3_nv){(uint8_t *)":authority", (uint8_t *)c->authority, 10,
                         strlen(c->authority), NGHTTP3_NV_FLAG_NONE};
@@ -475,7 +500,9 @@ int navi_h3_request(navi_h3_conn *c, const char *path_, const char *req_headers,
     goto done;
   }
   c->req_stream = sid;
-  if (nghttp3_conn_submit_request(c->h3, sid, nva, nvlen, NULL, NULL) != 0) {
+  nghttp3_data_reader dr = {read_body};
+  const nghttp3_data_reader *drp = body_len > 0 ? &dr : NULL;
+  if (nghttp3_conn_submit_request(c->h3, sid, nva, nvlen, drp, NULL) != 0) {
     rv = -1;
     goto done;
   }
