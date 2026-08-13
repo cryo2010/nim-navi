@@ -26,5 +26,18 @@ doAssert r2.httpVersion == "HTTP/3", "second GET should upgrade to h3, got " & r
 doAssert "hello from http/3" in r2.body
 echo "second GET transparently over ", r2.httpVersion
 
+# 3. A POST with a body goes over h3 and the origin echoes the body back.
+let r3 = api.post("https://localhost:4433/echo", body = "hello-body-42")
+doAssert r3.status == 200, "POST status " & $r3.status
+doAssert r3.httpVersion == "HTTP/3", "POST should be h3, got " & r3.httpVersion
+doAssert r3.body == "echo:hello-body-42", "POST echo mismatch: " & r3.body
+echo "POST over ", r3.httpVersion, " echoed the uploaded body"
+
+# 4. PUT likewise carries its body over h3.
+let r4 = api.put("https://localhost:4433/echo", body = "put-99")
+doAssert r4.status == 200 and r4.httpVersion == "HTTP/3"
+doAssert r4.body == "echo:put-99", "PUT echo mismatch: " & r4.body
+echo "PUT over ", r4.httpVersion, " echoed the uploaded body"
+
 api.close()
 echo "NAVI HTTP/3 DISPATCH OK"

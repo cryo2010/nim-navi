@@ -64,10 +64,10 @@ proc nghttp3_version(least: cint): ptr Nghttp3Info
 # status and up to outCap body bytes). navi_h3_close frees it.
 proc navi_h3_open(host, port, sni, caFile: cstring, verify: cint): pointer
   {.importc, cdecl.}
-proc navi_h3_request(c: pointer, path, reqHeaders: cstring, outStatus: ptr clong,
-                     outBody: ptr char, outCap: csize_t, outLen: ptr csize_t,
-                     outHeaders: ptr char, hdrCap: csize_t,
-                     hdrLen: ptr csize_t): cint {.importc, cdecl.}
+proc navi_h3_request(c: pointer, verb, path, reqHeaders: cstring, body: ptr char,
+                     bodyLen: csize_t, outStatus: ptr clong, outBody: ptr char,
+                     outCap: csize_t, outLen: ptr csize_t, outHeaders: ptr char,
+                     hdrCap: csize_t, hdrLen: ptr csize_t): cint {.importc, cdecl.}
 proc navi_h3_close(c: pointer) {.importc, cdecl.}
 
 proc ngtcp2VersionStr*(): string = $ngtcp2_version(0).version_str
@@ -87,12 +87,14 @@ proc h3Open*(host: string, port: int, sni = "", caFile = "",
       "navi HTTP/3 connect to " & host & ":" & $port & " failed")
   QuicConn(handle: h)
 
-proc get*(c: QuicConn, path = "/",
-          headers: openArray[(string, string)] = []): Http3Response =
-  ## Issue an HTTP/3 GET on an open connection and return status, body, and
-  ## response headers. `headers` are extra request fields (names must be
-  ## lowercase, per HTTP/3, and free of connection-specific fields). Raises
-  ## `QuicError` on transport failure.
+proc request*(c: QuicConn, verb: string, path = "/",
+              headers: openArray[(string, string)] = [],
+              body = ""): Http3Response =
+  ## Issue an HTTP/3 request on an open connection and return status, body, and
+  ## response headers. `verb` is the method (GET/POST/PUT/...), `headers` are
+  ## extra request fields (names must be lowercase, per HTTP/3, and free of
+  ## connection-specific fields), and `body` is an optional buffered request body.
+  ## Raises `QuicError` on transport failure.
   if c.handle == nil:
     raise newException(QuicError, "navi HTTP/3: connection is closed")
   var reqHdr = ""
@@ -100,15 +102,18 @@ proc get*(c: QuicConn, path = "/",
     reqHdr.add k; reqHdr.add '\n'; reqHdr.add v; reqHdr.add '\n'
   var status: clong
   var blen, hlen: csize_t
-  var body = newString(64 * 1024)
+  var rbody = newString(64 * 1024)
   var hbuf = newString(16 * 1024)
-  let rv = navi_h3_request(c.handle, path.cstring, reqHdr.cstring, addr status,
-                           cast[ptr char](addr body[0]), csize_t(body.len),
+  var b = body
+  let bp = if b.len > 0: cast[ptr char](addr b[0]) else: nil
+  let rv = navi_h3_request(c.handle, verb.cstring, path.cstring, reqHdr.cstring,
+                           bp, csize_t(b.len), addr status,
+                           cast[ptr char](addr rbody[0]), csize_t(rbody.len),
                            addr blen, cast[ptr char](addr hbuf[0]),
                            csize_t(hbuf.len), addr hlen)
   if rv != 0:
-    raise newException(QuicError, "navi HTTP/3 GET " & path & " failed")
-  body.setLen(int(blen))
+    raise newException(QuicError, "navi HTTP/3 " & verb & " " & path & " failed")
+  rbody.setLen(int(blen))
   hbuf.setLen(int(hlen))
   var hs: seq[(string, string)]
   let parts = hbuf.split('\n')
@@ -116,7 +121,12 @@ proc get*(c: QuicConn, path = "/",
   while i + 1 < parts.len:
     hs.add((parts[i], parts[i + 1]))
     i += 2
-  Http3Response(status: int(status), body: body, headers: hs)
+  Http3Response(status: int(status), body: rbody, headers: hs)
+
+proc get*(c: QuicConn, path = "/",
+          headers: openArray[(string, string)] = []): Http3Response =
+  ## Issue an HTTP/3 GET (convenience over `request`).
+  c.request("GET", path, headers)
 
 proc close*(c: QuicConn) =
   ## Close the connection and release its socket and library state. Idempotent.

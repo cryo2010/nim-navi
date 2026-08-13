@@ -1,6 +1,6 @@
 {
 	# No ACME: use the self-signed cert run.sh generates. h1/h2/h3 all served on
-	# the TLS listener; h3 is the one the probe dials over UDP.
+	# the TLS listener; h3 is the one the client dials over UDP.
 	auto_https off
 	servers {
 		protocols h1 h2 h3
@@ -10,5 +10,15 @@
 https://localhost:4433 {
 	tls /work/cert.pem /work/key.pem
 	header Alt-Svc `h3=":4433"; ma=86400`
+
+	# Requests with a body are echoed back, so the client can verify upload.
+	@withbody method POST PUT PATCH
+	handle @withbody {
+		request_body {
+			max_size 10MB
+		}
+		respond "echo:{http.request.body}" 200
+	}
+
 	respond "hello from http/3" 200
 }

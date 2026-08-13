@@ -132,10 +132,10 @@ when defined(naviHttp3):
                          "accept-encoding"]
 
   proc h3Transport(client: Navi, req: Request, ep: AltSvcEndpoint): Response =
-    ## Send `req` (a GET) over HTTP/3 to a discovered endpoint and build a navi
-    ## Response, so the caller's policy layer (cookies, redirects, retries,
-    ## throw-on-non-2xx) is reused unchanged. Raises `QuicError` on failure, which
-    ## `transport` catches to fall back to h2/h1.
+    ## Send `req` (any verb with a buffered body) over HTTP/3 to a discovered
+    ## endpoint and build a navi Response, so the caller's policy layer (cookies,
+    ## redirects, retries, throw-on-non-2xx) is reused unchanged. Raises
+    ## `QuicError` on failure, which `transport` catches to fall back to h2/h1.
     var fwd: seq[(string, string)]
     for k, v in req.headers:
       let lk = k.toLowerAscii
@@ -144,7 +144,7 @@ when defined(naviHttp3):
                       caFile = client.config.tls.caFile,
                       verify = client.config.tls.wantsVerify)
     try:
-      let r = conn.get(req.url.requestTarget, fwd)
+      let r = conn.request($req.verb, req.url.requestTarget, fwd, req.body)
       result = initResponse(r.status, "", "HTTP/3", initHeaders(r.headers), r.body)
     finally:
       conn.close()
@@ -155,7 +155,9 @@ proc transport(client: Navi, req: Request, sink: BodySink): Response =
   ## sent over HTTP/3; any QUIC failure falls back to h2/h1. The h3 endpoint is
   ## learned from the `alt-svc` header captured on prior h2/h1 responses.
   when defined(naviHttp3):
-    if req.verb == GET and client.config.wantsH3 and req.url.isTls:
+    # Any verb with a buffered body may use h3; a streaming upload (bodyStream)
+    # is not supported over h3 yet, so it falls through to h2/h1.
+    if client.config.wantsH3 and req.url.isTls and req.bodyStream == nil:
       let ep = client.altSvc.h3Endpoint("https", req.url.host, req.url.port)
       if ep.isSome:
         try: return h3Transport(client, req, ep.get)
