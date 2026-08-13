@@ -47,8 +47,9 @@ type
   HttpVersion* = enum
     H1 = "HTTP/1.1"
     H2 = "HTTP/2"
-    # H3 is intentionally absent until HTTP/3 is real: a config of `http: {H3}`
-    # would otherwise silently fall back to HTTP/1.1 (no ALPN h2 offered).
+    H3 = "HTTP/3"   ## Opt-in only. Unlike H1/H2, H3 is never implied by an empty
+                    ## `http` set; it is honored solely in a `-d:naviHttp3` build
+                    ## and negotiated per origin via Alt-Svc (see docs/http3.md).
 
   RetryPolicy* = object
     ## When and how a request is retried. `initNaviConfig` seeds `defaultRetryPolicy`.
@@ -133,6 +134,12 @@ proc totalMs*(opts: NaviConfigBase): int =
 proc wantsH2*(opts: NaviConfigBase): bool =
   ## An unset `http` (empty set) means "negotiate h2 where possible".
   opts.http.card == 0 or H2 in opts.http
+
+proc wantsH3*(opts: NaviConfigBase): bool =
+  ## H3 is opt-in: it must be listed explicitly (an empty `http` set does not
+  ## imply it, unlike h2) and is only honored in a `-d:naviHttp3` build. The
+  ## native transport upgrades to h3 per origin after Alt-Svc discovery.
+  H3 in opts.http
 
 proc mergeBase*[T: NaviConfigBase](base, overrides: T): T =
   ## Layer `overrides`' addressing/identity fields over `base` for `.extend`,
