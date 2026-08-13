@@ -16,6 +16,9 @@ import navi/proto/h2/conn
 import navi/proto/ws
 import navi/backend/[asyncdispatch, h2mux]
 from std/strutils import startsWith, find, splitLines, contains
+when defined(naviHttp3):
+  import navi/core/altsvc
+  import navi/backend/quic_async
 
 claimEntry("navi/asyncdispatch")
 export public, asyncdispatch
@@ -46,6 +49,8 @@ type
     jar*: CookieJar
     muxes: TableRef[string, H2Mux]              ## live shared h2 connections
     pendingMux: TableRef[string, Future[H2Mux]] ## in-flight connects (coalescing)
+    when defined(naviHttp3):
+      altSvc: AltSvcCache      ## per-origin h3 discovery cache (HTTP/3 builds)
 
 proc initNaviConfig*(): NaviConfig =
   ## The only way to build a config (`NaviConfig` requires every field). Sets the
@@ -59,10 +64,11 @@ proc initNaviConfig*(): NaviConfig =
 proc newNavi*(config = initNaviConfig()): Navi =
   var cfg = config
   if cfg.tls.sessionCache.isNil: cfg.tls.sessionCache = newTlsStore(cfg.tls)
-  Navi(config: cfg,
+  result = Navi(config: cfg,
        pool: newPool[PooledConn[Conn]](), jar: newCookieJar(),
        muxes: newTable[string, H2Mux](),
        pendingMux: newTable[string, Future[H2Mux]]())
+  when defined(naviHttp3): result.altSvc = newAltSvcCache()
 
 proc config*(client: Navi): lent NaviConfig = client.config
   ## Read-only view of the client's config. Config is fixed at construction;
@@ -73,10 +79,11 @@ proc extend*(client: Navi, config: NaviConfig): Navi =
   var merged = mergeBase(client.config, config)
   merged.middleware = client.config.middleware & config.middleware
   merged.tls.sessionCache = newTlsStore(merged.tls)  # its own cache, not the parent's
-  Navi(config: merged,
+  result = Navi(config: merged,
        pool: newPool[PooledConn[Conn]](), jar: newCookieJar(),
        muxes: newTable[string, H2Mux](),
        pendingMux: newTable[string, Future[H2Mux]]())
+  when defined(naviHttp3): result.altSvc = newAltSvcCache()
 
 proc close*(client: Navi): Future[void] {.async.} =
   ## Close all pooled connections and shared h2 connections, freeing their TLS
@@ -105,7 +112,7 @@ proc h1OnConn(client: Navi, conn: Conn, origin: string, req: Request,
   if not (keep and pushIdle(client.pool, origin, pc)):
     await close(conn)
 
-proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
+proc transportInner(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
   ## Multiplex over a shared h2 connection when available/negotiable; otherwise
   ## pool http/1.1. Concurrent connects to the same new origin are coalesced so a
   ## cold burst still ends up on one h2 connection.
@@ -167,6 +174,43 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
                            client.config.tls, proxyTarget, alpn,
                            client.config.connectMs, client.config.readMs)
   result = await client.h1OnConn(conn, origin, rq, sink)
+
+when defined(naviHttp3):
+  # Fields that must not cross to HTTP/3 (RFC 9114 connection-specific + the
+  # pseudo-header sources). accept-encoding IS forwarded so decodeBody decodes.
+  const h3SkipHeaders = ["host", "connection", "keep-alive", "proxy-connection",
+                         "transfer-encoding", "upgrade", "content-length"]
+
+  proc h3TransportAsync(client: Navi, req: Request,
+                        ep: AltSvcEndpoint): Future[Response] {.async.} =
+    ## Send `req` (any verb with a buffered body) over HTTP/3, building a navi
+    ## Response so the policy layer is reused unchanged. Raises `QuicError`.
+    var fwd: seq[(string, string)]
+    for k, v in req.headers:
+      let lk = k.toLowerAscii
+      if lk notin h3SkipHeaders: fwd.add((lk, v))
+    let r = await h3RequestAsync(ep.host, ep.port, req.url.host,
+                                 client.config.tls.caFile,
+                                 client.config.tls.wantsVerify, $req.verb,
+                                 req.url.requestTarget, fwd, req.body)
+    result = initResponse(r.status, "", "HTTP/3", initHeaders(r.headers), r.body)
+
+proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
+  ## The wire transport `run` calls. In a `-d:naviHttp3` build, a buffered-body
+  ## request to an origin that has advertised h3 (Alt-Svc) goes over HTTP/3, with
+  ## any QUIC failure falling back to h2/h1; `alt-svc` on h2/h1 responses is
+  ## captured for later upgrades.
+  when defined(naviHttp3):
+    if client.config.wantsH3 and req.url.isTls and req.bodyStream == nil:
+      let ep = client.altSvc.h3Endpoint("https", req.url.host, req.url.port)
+      if ep.isSome:
+        try: return await h3TransportAsync(client, req, ep.get)
+        except QuicError: discard   # fall back to h2/h1 below
+  result = await transportInner(client, req, sink)
+  when defined(naviHttp3):
+    let alt = result.headers.get("alt-svc")
+    if alt.len > 0:
+      client.altSvc.record("https", req.url.host, req.url.port, alt)
 
 proc doRequest(client: Navi, req: Request): Future[Response] {.async.} =
   result = performRequest(client, req)

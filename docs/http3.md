@@ -230,6 +230,13 @@ This is the real work the library does not do for us:
 - **Link libcurl (built with h3):** gets h3 plus everything else from one dep, but
   effectively turns navi into a libcurl wrapper and abandons the pure-Nim h1/h2
   core. Rejected as contrary to navi's design.
+- **OpenSSL 3.5 built-in QUIC as the transport** (driving nghttp3 on it and
+  dropping ngtcp2): appealing now that OpenSSL 3.5 ships in current LTS distros
+  (e.g. Ubuntu 26.04), since it would cut the QUIC/h3 libraries from two to one.
+  Set aside for now: OpenSSL's client QUIC is the newer implementation and has
+  reported slower throughput and higher memory use than the dedicated stacks, so
+  navi stays on ngtcp2 (what curl/nginx run in production). Revisit once OpenSSL's
+  QUIC matures, at which point it would meaningfully lower the dependency floor.
 - **Wait.** Do nothing until OpenSSL QUIC and the Nim QUIC ecosystem mature. The
   status quo (`core/request.nim` keeps H3 intentionally absent) remains valid if
   the dependency cost is judged too high today.
