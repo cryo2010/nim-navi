@@ -46,13 +46,15 @@ proc step(qc: QuicConnAsync) {.async.} =
     raise newException(QuicError, "navi HTTP/3: send failed")
 
   # Cap the wait so a lost wake costs at most ~100 ms even on an idle connection.
+  # Use sleepAsync (a heap timer) rather than addTimer, which would leak a timerfd
+  # per iteration.
   let to = min(int(navi_h3_timeout_ms(qc.c)), 100)
   let signal = newFuture[void]("navi.h3.wait")
   qc.wakeup = signal
   addRead(qc.fd, proc(a: AsyncFD): bool =
     (if not signal.finished: signal.complete()); true)
-  addTimer(to, oneshot = true, proc(a: AsyncFD): bool =
-    (if not signal.finished: signal.complete()); true)
+  sleepAsync(to).addCallback(proc() =
+    (if not signal.finished: signal.complete()))
   await signal
   qc.wakeup = nil
 

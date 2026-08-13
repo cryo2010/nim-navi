@@ -42,3 +42,15 @@ nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/dispatch_async_
 echo ">>> building and running the h3 multiplexing test (concurrent streams)"
 nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/dispatch_mux_test "$DIR/dispatch_mux_test.nim"
 /tmp/dispatch_mux_test
+
+echo ">>> building and running the h3 leak check (fd + heap growth)"
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/leak_test "$DIR/leak_test.nim"
+/tmp/leak_test
+
+echo ">>> building and running the h3 sanitizer check (ASan + UBSan)"
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -d:useMalloc \
+  --passC:"-fsanitize=address,undefined -fno-omit-frame-pointer" \
+  --passL:"-fsanitize=address,undefined" -o:/tmp/leak_asan "$DIR/leak_test.nim"
+ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:print_stacktrace=1 \
+UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:suppressions="$ROOT/tests/leakcheck/navi.ubsan.supp" \
+  /tmp/leak_asan
