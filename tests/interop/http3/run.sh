@@ -34,3 +34,7 @@ nim c --hints:off --path:"$ROOT/src" -d:naviHttp3 -o:/tmp/h3get_test "$DIR/h3get
 echo ">>> building and running the transparent h3 dispatch test (sync client)"
 nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/dispatch_test "$DIR/dispatch_test.nim"
 /tmp/dispatch_test
+
+echo ">>> building and running the transparent h3 dispatch test (asyncdispatch client)"
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/dispatch_async_test "$DIR/dispatch_async_test.nim"
+/tmp/dispatch_async_test

@@ -9,6 +9,8 @@ on:
     paths:
       - 'src/navi/backend/quic.nim'
       - 'src/navi/backend/h3client.cpp'
+      - 'src/navi/backend/quic_async.nim'
+      - 'src/navi/private/asyncdispatch_impl.nim'
       - 'src/navi/core/altsvc.nim'
       - 'src/navi.nim'
       - 'tests/interop/http3/**'

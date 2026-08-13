@@ -443,14 +443,13 @@ H3Conn *navi_h3_open(const char *host, const char *port, const char *sni,
   return c;
 }
 
-// req_headers: extra request fields as "name\nvalue\nname\nvalue\n" (lowercased
-// and filtered by the caller), or nullptr/"" for none. body may be null. Response
-// fields are written to out_headers in the same "name\nvalue\n" form.
-int navi_h3_request(H3Conn *c, const char *method, const char *path_,
-                    const char *req_headers, const char *body, std::size_t body_len,
-                    long *out_status, char *out_body, std::size_t out_cap,
-                    std::size_t *out_len, char *out_headers, std::size_t hdr_cap,
-                    std::size_t *hdr_len) {
+// Submit one request on the connection (non-blocking): reset per-request state,
+// open a bidi stream, and queue the request. The caller then pumps the step
+// functions until navi_h3_request_done, and reads the result with
+// navi_h3_take_response. req_headers: extra fields as "name\nvalue\n..." or
+// nullptr/"" for none; body may be null. Returns 0, or -1 on error.
+int navi_h3_submit(H3Conn *c, const char *method, const char *path_,
+                   const char *req_headers, const char *body, std::size_t body_len) {
   try {
     c->req_done = false;
     c->status = 0;
@@ -460,20 +459,16 @@ int navi_h3_request(H3Conn *c, const char *method, const char *path_,
                                          reinterpret_cast<const std::uint8_t *>(body), body_len}
                                    : std::span<const std::uint8_t>{};
 
-    // The nghttp3_nv values point into stable memory for the whole request: the
-    // string literals, the C-string params (alive across the FFI call), and
-    // req_headers itself (no copy needed since nv carries explicit lengths).
     std::vector<nghttp3_nv> nva;
     nva.reserve(8);
     nva.push_back(method_nv(method));
     nva.push_back(make_nv(":scheme", "https"));
     nva.push_back(make_nv(":authority", c->authority));
     nva.push_back(make_nv(":path", path_));
-
     if (req_headers) {
       std::string_view hs{req_headers};
-      std::vector<std::string_view> toks;
       std::size_t start = 0;
+      std::vector<std::string_view> toks;
       for (std::size_t i = 0; i < hs.size(); ++i)
         if (hs[i] == '\n') {
           toks.push_back(hs.substr(start, i - start));
@@ -488,10 +483,22 @@ int navi_h3_request(H3Conn *c, const char *method, const char *path_,
     c->req_stream = sid;
     nghttp3_data_reader dr{read_body};
     const nghttp3_data_reader *drp = c->req_body.empty() ? nullptr : &dr;
+    // nghttp3 copies the header data during submit, so nva may be freed after.
     if (nghttp3_conn_submit_request(c->h3, sid, nva.data(), nva.size(), drp, nullptr) != 0)
       return -1;
-    if (drive_until(c, &c->req_done) != 0) return -1;
+    return 0;
+  } catch (...) {
+    return -1;
+  }
+}
 
+int navi_h3_request_done(H3Conn *c) { return c->req_done ? 1 : 0; }
+
+// Copy the completed response (status, body, headers) into the caller's buffers.
+int navi_h3_take_response(H3Conn *c, long *out_status, char *out_body,
+                          std::size_t out_cap, std::size_t *out_len,
+                          char *out_headers, std::size_t hdr_cap, std::size_t *hdr_len) {
+  try {
     *out_status = c->status;
     std::size_t k = std::min(c->body.size(), out_cap);
     std::memcpy(out_body, c->body.data(), k);
@@ -503,6 +510,19 @@ int navi_h3_request(H3Conn *c, const char *method, const char *path_,
   } catch (...) {
     return -1;
   }
+}
+
+// Sync convenience: submit, drive to completion with a blocking poll loop, and
+// take the response.
+int navi_h3_request(H3Conn *c, const char *method, const char *path_,
+                    const char *req_headers, const char *body, std::size_t body_len,
+                    long *out_status, char *out_body, std::size_t out_cap,
+                    std::size_t *out_len, char *out_headers, std::size_t hdr_cap,
+                    std::size_t *hdr_len) {
+  if (navi_h3_submit(c, method, path_, req_headers, body, body_len) != 0) return -1;
+  if (drive_until(c, &c->req_done) != 0) return -1;
+  return navi_h3_take_response(c, out_status, out_body, out_cap, out_len, out_headers,
+                               hdr_cap, hdr_len);
 }
 
 }  // extern "C"
