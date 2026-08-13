@@ -28,6 +28,45 @@ and decoding the response — in **two phases**, each printing a table of wall-c
   connection-**setup** cost the pooled phase hides — a full handshake every time,
   so it runs fewer iterations.
 
+## navi protocol matrix (HTTP/1.1 vs HTTP/2 vs HTTP/3)
+
+After the cross-language phases, a navi-only matrix runs each protocol cold and
+pooled against one **Caddy** origin that speaks all three, so h1/h2/h3 are
+compared on the same server (GET-only — connection and protocol overhead, not the
+seven-method body workload). It uses the `asyncdispatch` backend built with
+`-d:naviHttp3`:
+
+| PROTOCOL | MODE | REQ/S (higher is better) |
+| --- | --- | --- |
+| h1 / h2 / h3 | pooled | steady-state, connections reused (h1 keep-alive, h2/h3 mux) |
+| h1 / h2 / h3 | cold | fresh connection + handshake per request |
+
+**h3 cold is not a pure QUIC dial.** HTTP/3 is only reached after an h1/h2
+response advertises `Alt-Svc: h3` (navi has no way to pre-seed that), so a cold h3
+request first does an h1/h2 discovery round trip, then the QUIC handshake — the
+matrix labels this honestly and it explains why `h3 / cold` is the slowest cell.
+The matrix is skipped if the h3 toolchain or Caddy is unavailable.
+
+### Where h3 beats h2 (`NAVI_BENCH_NETEM=1`)
+
+On a clean loopback, h3 has no advantage to show and pays its overhead (userspace
+QUIC, per-packet crypto), so it roughly ties h2 sequentially. h3's win appears
+when the **network** is the bottleneck and requests are **concurrent**: over a
+lossy link, h2's single connection suffers TCP head-of-line blocking across its
+streams (one lost packet stalls them all), while h3's streams are independent.
+
+```
+NAVI_BENCH_NETEM=1 nimble bench          # adds a second matrix under tc netem
+```
+
+This re-runs the matrix with concurrency (`NAVI_BENCH_CONC`, default 16) under
+`tc qdisc ... netem delay <NAVI_BENCH_NETEM_DELAY> loss <NAVI_BENCH_NETEM_LOSS>`
+on loopback (defaults 25ms each way, 1.5% loss). It needs `tc` (iproute2, in the
+image) and the `NET_ADMIN` capability (the `nimble bench` task grants it via
+`--cap-add=NET_ADMIN`). In this regime **h3 pooled pulls ahead of h2 pooled**
+(observed ~1.6x at 24 concurrent), the head-of-line-blocking win. It is skipped
+cleanly if the capability is unavailable.
+
 ## Clients
 
 | Label | Stack |
