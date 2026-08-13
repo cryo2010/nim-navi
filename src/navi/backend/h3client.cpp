@@ -22,6 +22,7 @@
 #include <openssl/rand.h>
 #include <openssl/x509v3.h>
 
+#include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -35,9 +36,20 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace {
+
+// One in-flight request/response on the connection. Many can be live at once
+// (multiplexing): each is keyed by its QUIC stream id.
+struct Stream {
+  long status = 0;
+  std::string body;
+  std::string resp_headers;                  // response fields as "name\nvalue\n"
+  bool done = false;
+  std::string req_body;   // owned copy (so the caller need not keep it alive)
+};
 
 // One QUIC/h3 connection. RAII: the destructor releases the library objects and
 // the socket in the required order, replacing the old manual cleanup + goto.
@@ -53,13 +65,7 @@ struct H3Conn {
   ngtcp2_crypto_ossl_ctx *ossl = nullptr;
   std::string authority;
   bool handshake_done = false;
-  // per-request state (one request in flight at a time)
-  int64_t req_stream = -1;
-  bool req_done = false;
-  long status = 0;
-  std::string body;
-  std::string resp_headers;                 // response fields as "name\nvalue\n"
-  std::span<const std::uint8_t> req_body;    // borrowed for the in-flight request
+  std::unordered_map<int64_t, Stream> streams;   // live streams by id
 
   ~H3Conn() {
     if (h3) nghttp3_conn_del(h3);
@@ -136,18 +142,21 @@ int on_stream_close(ngtcp2_conn *, std::uint32_t, std::int64_t stream_id,
   return 0;
 }
 
-int on_recv_header(nghttp3_conn *, std::int64_t, std::int32_t, nghttp3_rcbuf *name,
-                   nghttp3_rcbuf *value, std::uint8_t, void *cud, void *) {
+int on_recv_header(nghttp3_conn *, std::int64_t stream_id, std::int32_t,
+                   nghttp3_rcbuf *name, nghttp3_rcbuf *value, std::uint8_t, void *cud,
+                   void *) {
   auto *c = static_cast<H3Conn *>(cud);
+  auto it = c->streams.find(stream_id);
+  if (it == c->streams.end()) return 0;
   nghttp3_vec n = nghttp3_rcbuf_get_buf(name);
   nghttp3_vec v = nghttp3_rcbuf_get_buf(value);
   std::string_view nm{reinterpret_cast<char *>(n.base), n.len};
   std::string_view val{reinterpret_cast<char *>(v.base), v.len};
   try {
     if (nm == ":status") {
-      c->status = std::strtol(std::string(val).c_str(), nullptr, 10);
+      it->second.status = std::strtol(std::string(val).c_str(), nullptr, 10);
     } else if (!nm.empty() && nm.front() != ':') {  // a regular response field
-      c->resp_headers.append(nm).append("\n").append(val).append("\n");
+      it->second.resp_headers.append(nm).append("\n").append(val).append("\n");
     }
   } catch (...) {
     return NGHTTP3_ERR_CALLBACK_FAILURE;
@@ -155,31 +164,36 @@ int on_recv_header(nghttp3_conn *, std::int64_t, std::int32_t, nghttp3_rcbuf *na
   return 0;
 }
 
-int on_recv_data(nghttp3_conn *, std::int64_t, const std::uint8_t *data,
+int on_recv_data(nghttp3_conn *, std::int64_t stream_id, const std::uint8_t *data,
                  std::size_t datalen, void *cud, void *) {
   auto *c = static_cast<H3Conn *>(cud);
+  auto it = c->streams.find(stream_id);
+  if (it == c->streams.end()) return 0;
   try {
-    c->body.append(reinterpret_cast<const char *>(data), datalen);
+    it->second.body.append(reinterpret_cast<const char *>(data), datalen);
   } catch (...) {
     return NGHTTP3_ERR_CALLBACK_FAILURE;
   }
   return 0;
 }
 
-int on_end_stream(nghttp3_conn *, std::int64_t, void *cud, void *) {
-  static_cast<H3Conn *>(cud)->req_done = true;
+int on_end_stream(nghttp3_conn *, std::int64_t stream_id, void *cud, void *) {
+  auto *c = static_cast<H3Conn *>(cud);
+  auto it = c->streams.find(stream_id);
+  if (it != c->streams.end()) it->second.done = true;
   return 0;
 }
 
-// Hand nghttp3 the whole buffered request body in one vec, with EOF, on the
-// first call. The body is borrowed from the caller for the request's duration.
-nghttp3_ssize read_body(nghttp3_conn *, std::int64_t, nghttp3_vec *vec, std::size_t,
-                        std::uint32_t *pflags, void *cud, void *) {
+// Hand nghttp3 the whole buffered request body for `stream_id` in one vec, with
+// EOF, on the first call. The body is borrowed for the request's duration.
+nghttp3_ssize read_body(nghttp3_conn *, std::int64_t stream_id, nghttp3_vec *vec,
+                        std::size_t, std::uint32_t *pflags, void *cud, void *) {
   auto *c = static_cast<H3Conn *>(cud);
   *pflags |= NGHTTP3_DATA_FLAG_EOF;
-  if (c->req_body.empty()) return 0;
-  vec[0].base = const_cast<std::uint8_t *>(c->req_body.data());
-  vec[0].len = c->req_body.size();
+  auto it = c->streams.find(stream_id);
+  if (it == c->streams.end() || it->second.req_body.empty()) return 0;
+  vec[0].base = reinterpret_cast<std::uint8_t *>(it->second.req_body.data());
+  vec[0].len = it->second.req_body.size();
   return 1;
 }
 
@@ -204,6 +218,7 @@ int udp_connect(const char *host, const char *port, H3Conn *c) {
   }
   freeaddrinfo(res);
   if (fd < 0) return -1;
+  fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);  // for the async reader
   socklen_t ll = sizeof c->local_ss;
   getsockname(fd, reinterpret_cast<sockaddr *>(&c->local_ss), &ll);
   c->path.local.addr = reinterpret_cast<ngtcp2_sockaddr *>(&c->local_ss);
@@ -443,21 +458,20 @@ H3Conn *navi_h3_open(const char *host, const char *port, const char *sni,
   return c;
 }
 
-// Submit one request on the connection (non-blocking): reset per-request state,
-// open a bidi stream, and queue the request. The caller then pumps the step
-// functions until navi_h3_request_done, and reads the result with
-// navi_h3_take_response. req_headers: extra fields as "name\nvalue\n..." or
-// nullptr/"" for none; body may be null. Returns 0, or -1 on error.
-int navi_h3_submit(H3Conn *c, const char *method, const char *path_,
-                   const char *req_headers, const char *body, std::size_t body_len) {
+// Submit one request on the connection (non-blocking): open a bidi stream, queue
+// the request, and register the stream. Returns the QUIC stream id (>= 0), or -1
+// on error. Many streams may be in flight at once. The caller pumps the step
+// functions until navi_h3_stream_done(sid), then reads with navi_h3_take_response.
+// req_headers: extra fields as "name\nvalue\n..." or nullptr/"" for none; body may
+// be null (borrowed until the stream completes).
+std::int64_t navi_h3_submit(H3Conn *c, const char *method, const char *path_,
+                            const char *req_headers, const char *body,
+                            std::size_t body_len) {
   try {
-    c->req_done = false;
-    c->status = 0;
-    c->body.clear();
-    c->resp_headers.clear();
-    c->req_body = body && body_len ? std::span<const std::uint8_t>{
-                                         reinterpret_cast<const std::uint8_t *>(body), body_len}
-                                   : std::span<const std::uint8_t>{};
+    std::int64_t sid;
+    if (ngtcp2_conn_open_bidi_stream(c->conn, &sid, nullptr) != 0) return -1;
+    Stream &s = c->streams[sid];
+    if (body && body_len) s.req_body.assign(body, body_len);  // owned copy
 
     std::vector<nghttp3_nv> nva;
     nva.reserve(8);
@@ -478,34 +492,40 @@ int navi_h3_submit(H3Conn *c, const char *method, const char *path_,
         nva.push_back(make_nv(toks[i], toks[i + 1]));
     }
 
-    std::int64_t sid;
-    if (ngtcp2_conn_open_bidi_stream(c->conn, &sid, nullptr) != 0) return -1;
-    c->req_stream = sid;
     nghttp3_data_reader dr{read_body};
-    const nghttp3_data_reader *drp = c->req_body.empty() ? nullptr : &dr;
+    const nghttp3_data_reader *drp = s.req_body.empty() ? nullptr : &dr;
     // nghttp3 copies the header data during submit, so nva may be freed after.
-    if (nghttp3_conn_submit_request(c->h3, sid, nva.data(), nva.size(), drp, nullptr) != 0)
+    if (nghttp3_conn_submit_request(c->h3, sid, nva.data(), nva.size(), drp, nullptr) != 0) {
+      c->streams.erase(sid);
       return -1;
-    return 0;
+    }
+    return sid;
   } catch (...) {
     return -1;
   }
 }
 
-int navi_h3_request_done(H3Conn *c) { return c->req_done ? 1 : 0; }
+int navi_h3_stream_done(H3Conn *c, std::int64_t sid) {
+  auto it = c->streams.find(sid);
+  return (it != c->streams.end() && it->second.done) ? 1 : 0;
+}
 
-// Copy the completed response (status, body, headers) into the caller's buffers.
-int navi_h3_take_response(H3Conn *c, long *out_status, char *out_body,
+// Copy stream `sid`'s completed response into the caller's buffers and drop it.
+int navi_h3_take_response(H3Conn *c, std::int64_t sid, long *out_status, char *out_body,
                           std::size_t out_cap, std::size_t *out_len,
                           char *out_headers, std::size_t hdr_cap, std::size_t *hdr_len) {
   try {
-    *out_status = c->status;
-    std::size_t k = std::min(c->body.size(), out_cap);
-    std::memcpy(out_body, c->body.data(), k);
+    auto it = c->streams.find(sid);
+    if (it == c->streams.end()) return -1;
+    Stream &s = it->second;
+    *out_status = s.status;
+    std::size_t k = std::min(s.body.size(), out_cap);
+    std::memcpy(out_body, s.body.data(), k);
     *out_len = k;
-    std::size_t hk = std::min(c->resp_headers.size(), hdr_cap);
-    std::memcpy(out_headers, c->resp_headers.data(), hk);
+    std::size_t hk = std::min(s.resp_headers.size(), hdr_cap);
+    std::memcpy(out_headers, s.resp_headers.data(), hk);
     *hdr_len = hk;
+    c->streams.erase(it);
     return 0;
   } catch (...) {
     return -1;
@@ -519,10 +539,11 @@ int navi_h3_request(H3Conn *c, const char *method, const char *path_,
                     long *out_status, char *out_body, std::size_t out_cap,
                     std::size_t *out_len, char *out_headers, std::size_t hdr_cap,
                     std::size_t *hdr_len) {
-  if (navi_h3_submit(c, method, path_, req_headers, body, body_len) != 0) return -1;
-  if (drive_until(c, &c->req_done) != 0) return -1;
-  return navi_h3_take_response(c, out_status, out_body, out_cap, out_len, out_headers,
-                               hdr_cap, hdr_len);
+  std::int64_t sid = navi_h3_submit(c, method, path_, req_headers, body, body_len);
+  if (sid < 0) return -1;
+  if (drive_until(c, &c->streams.at(sid).done) != 0) return -1;
+  return navi_h3_take_response(c, sid, out_status, out_body, out_cap, out_len,
+                               out_headers, hdr_cap, hdr_len);
 }
 
 }  // extern "C"

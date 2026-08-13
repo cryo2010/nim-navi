@@ -50,7 +50,8 @@ type
     muxes: TableRef[string, H2Mux]              ## live shared h2 connections
     pendingMux: TableRef[string, Future[H2Mux]] ## in-flight connects (coalescing)
     when defined(naviHttp3):
-      altSvc: AltSvcCache      ## per-origin h3 discovery cache (HTTP/3 builds)
+      altSvc: AltSvcCache                       ## per-origin h3 discovery cache
+      h3conns: TableRef[string, QuicConnAsync]  ## live multiplexed h3 connections
 
 proc initNaviConfig*(): NaviConfig =
   ## The only way to build a config (`NaviConfig` requires every field). Sets the
@@ -68,7 +69,9 @@ proc newNavi*(config = initNaviConfig()): Navi =
        pool: newPool[PooledConn[Conn]](), jar: newCookieJar(),
        muxes: newTable[string, H2Mux](),
        pendingMux: newTable[string, Future[H2Mux]]())
-  when defined(naviHttp3): result.altSvc = newAltSvcCache()
+  when defined(naviHttp3):
+    result.altSvc = newAltSvcCache()
+    result.h3conns = newTable[string, QuicConnAsync]()
 
 proc config*(client: Navi): lent NaviConfig = client.config
   ## Read-only view of the client's config. Config is fixed at construction;
@@ -83,7 +86,9 @@ proc extend*(client: Navi, config: NaviConfig): Navi =
        pool: newPool[PooledConn[Conn]](), jar: newCookieJar(),
        muxes: newTable[string, H2Mux](),
        pendingMux: newTable[string, Future[H2Mux]]())
-  when defined(naviHttp3): result.altSvc = newAltSvcCache()
+  when defined(naviHttp3):
+    result.altSvc = newAltSvcCache()
+    result.h3conns = newTable[string, QuicConnAsync]()
 
 proc close*(client: Navi): Future[void] {.async.} =
   ## Close all pooled connections and shared h2 connections, freeing their TLS
@@ -94,7 +99,15 @@ proc close*(client: Navi): Future[void] {.async.} =
   for mux in client.muxes.values:
     await mux.close()
   client.muxes.clear()
+  when defined(naviHttp3):
+    for qc in client.h3conns.values:
+      await qc.closeConn()
+    client.h3conns.clear()
   closeTlsStore(client.config.tls.sessionCache)
+
+when defined(naviHttp3):
+  proc h3ConnCount*(client: Navi): int = client.h3conns.len
+    ## Live multiplexed HTTP/3 connections; for tests/introspection.
 
 proc muxRequest(client: Navi, mux: H2Mux, req: Request,
                 sink: BodySink): Future[Response] {.async.} =
@@ -181,19 +194,39 @@ when defined(naviHttp3):
   const h3SkipHeaders = ["host", "connection", "keep-alive", "proxy-connection",
                          "transfer-encoding", "upgrade", "content-length"]
 
+  proc getH3Conn(client: Navi, origin: string, ep: AltSvcEndpoint,
+                 req: Request): Future[QuicConnAsync] {.async.} =
+    ## Reuse the origin's live h3 connection, or open one and cache it. A cold
+    ## race (two opens at once) closes the loser rather than leaking it.
+    if client.h3conns.hasKey(origin) and client.h3conns[origin].alive:
+      return client.h3conns[origin]
+    let qc = await openConnAsync(ep.host, ep.port, req.url.host,
+                                 client.config.tls.caFile,
+                                 client.config.tls.wantsVerify)
+    if client.h3conns.hasKey(origin) and client.h3conns[origin].alive:
+      await qc.closeConn()               # someone else won the race
+      return client.h3conns[origin]
+    client.h3conns[origin] = qc
+    return qc
+
   proc h3TransportAsync(client: Navi, req: Request,
                         ep: AltSvcEndpoint): Future[Response] {.async.} =
-    ## Send `req` (any verb with a buffered body) over HTTP/3, building a navi
-    ## Response so the policy layer is reused unchanged. Raises `QuicError`.
+    ## Send `req` (any verb with a buffered body) over a shared HTTP/3 connection
+    ## (multiplexed with concurrent requests), building a navi Response so the
+    ## policy layer is reused unchanged. Raises `QuicError`.
     var fwd: seq[(string, string)]
     for k, v in req.headers:
       let lk = k.toLowerAscii
       if lk notin h3SkipHeaders: fwd.add((lk, v))
-    let r = await h3RequestAsync(ep.host, ep.port, req.url.host,
-                                 client.config.tls.caFile,
-                                 client.config.tls.wantsVerify, $req.verb,
-                                 req.url.requestTarget, fwd, req.body)
-    result = initResponse(r.status, "", "HTTP/3", initHeaders(r.headers), r.body)
+    let origin = originKey(req.url)
+    let qc = await client.getH3Conn(origin, ep, req)
+    try:
+      let r = await qc.requestOnConn($req.verb, req.url.requestTarget, fwd, req.body)
+      result = initResponse(r.status, "", "HTTP/3", initHeaders(r.headers), r.body)
+    except QuicError:
+      if client.h3conns.getOrDefault(origin, nil) == qc:
+        client.h3conns.del(origin)       # drop a dead connection
+      raise
 
 proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
   ## The wire transport `run` calls. In a `-d:naviHttp3` build, a buffered-body
