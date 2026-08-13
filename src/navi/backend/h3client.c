@@ -235,67 +235,101 @@ static nghttp3_ssize read_body(nghttp3_conn *h3, int64_t stream_id,
 }
 
 /* Pump reads and writes until *flag becomes nonzero, or an error occurs. */
-static int run_until(navi_h3_conn *c, int *flag) {
-  uint8_t buf[1500];
-  struct pollfd pfd = {.fd = c->fd, .events = POLLIN};
-  for (int loops = 0; loops < 2000 && !*flag; loops++) {
-    for (;;) {
-      int64_t stream_id = -1;
-      int fin = 0;
-      nghttp3_vec vec[16];
-      nghttp3_ssize sveccnt = 0;
-      if (c->h3) {
-        sveccnt = nghttp3_conn_writev_stream(c->h3, &stream_id, &fin, vec, 16);
-        if (sveccnt < 0) {
-          fprintf(stderr, "nghttp3 writev: %s\n",
-                  nghttp3_strerror((int)sveccnt));
-          return -1;
-        }
-      }
-      ngtcp2_ssize ndatalen = 0;
-      uint32_t flags = NGTCP2_WRITE_STREAM_FLAG_MORE;
-      if (fin)
-        flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
-      ngtcp2_pkt_info pi;
-      ngtcp2_ssize wrote = ngtcp2_conn_writev_stream(
-          c->conn, &c->path, &pi, buf, sizeof buf, &ndatalen, flags, stream_id,
-          (const ngtcp2_vec *)vec, (size_t)sveccnt, now_ns());
-      if (wrote == NGTCP2_ERR_WRITE_MORE) {
-        nghttp3_conn_add_write_offset(c->h3, stream_id, (size_t)ndatalen);
-        continue;
-      }
-      if (wrote < 0) {
-        fprintf(stderr, "writev_stream: %s\n", ngtcp2_strerror((int)wrote));
-        return -1;
-      }
-      if (ndatalen > 0)
-        nghttp3_conn_add_write_offset(c->h3, stream_id, (size_t)ndatalen);
-      if (wrote == 0)
-        break;
-      if (send(c->fd, buf, (size_t)wrote, 0) < 0) {
-        perror("send");
+/* --- Non-blocking step functions. The state machine advances only when the
+ * caller feeds it I/O and time, so it never blocks or sleeps. The sync wrappers
+ * below drive them with a poll loop; the asyncdispatch backend drives them from
+ * its event loop (see docs/http3-async.md). --- */
+
+int navi_h3_fd(navi_h3_conn *c) { return c->fd; }
+
+int navi_h3_handshake_done(navi_h3_conn *c) {
+  return ngtcp2_conn_get_handshake_completed(c->conn);
+}
+
+/* Fill |buf| with the next datagram to send; returns its length, 0 when there is
+ * nothing to send, or <0 on error. Call repeatedly until it returns 0. */
+ngtcp2_ssize navi_h3_send(navi_h3_conn *c, uint8_t *buf, size_t buflen) {
+  for (;;) {
+    int64_t stream_id = -1;
+    int fin = 0;
+    nghttp3_vec vec[16];
+    nghttp3_ssize sveccnt = 0;
+    if (c->h3) {
+      sveccnt = nghttp3_conn_writev_stream(c->h3, &stream_id, &fin, vec, 16);
+      if (sveccnt < 0) {
+        fprintf(stderr, "nghttp3 writev: %s\n", nghttp3_strerror((int)sveccnt));
         return -1;
       }
     }
-    ngtcp2_tstamp expiry = ngtcp2_conn_get_expiry(c->conn);
-    ngtcp2_tstamp t = now_ns();
-    int timeout_ms = 1000;
-    if (expiry != UINT64_MAX)
-      timeout_ms = expiry <= t ? 0 : (int)((expiry - t) / NGTCP2_MILLISECONDS);
-    int pr = poll(&pfd, 1, timeout_ms);
+    ngtcp2_ssize ndatalen = 0;
+    uint32_t flags = NGTCP2_WRITE_STREAM_FLAG_MORE;
+    if (fin)
+      flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
+    ngtcp2_pkt_info pi;
+    ngtcp2_ssize wrote = ngtcp2_conn_writev_stream(
+        c->conn, &c->path, &pi, buf, buflen, &ndatalen, flags, stream_id,
+        (const ngtcp2_vec *)vec, (size_t)sveccnt, now_ns());
+    if (wrote == NGTCP2_ERR_WRITE_MORE) {
+      nghttp3_conn_add_write_offset(c->h3, stream_id, (size_t)ndatalen);
+      continue;
+    }
+    if (wrote < 0) {
+      fprintf(stderr, "writev_stream: %s\n", ngtcp2_strerror((int)wrote));
+      return -1;
+    }
+    if (ndatalen > 0)
+      nghttp3_conn_add_write_offset(c->h3, stream_id, (size_t)ndatalen);
+    return wrote;
+  }
+}
+
+/* Feed one received datagram into the connection. Returns 0 or <0 on error. */
+int navi_h3_recv(navi_h3_conn *c, const uint8_t *pkt, size_t len) {
+  ngtcp2_pkt_info pi = {0};
+  int rv = ngtcp2_conn_read_pkt(c->conn, &c->path, &pi, pkt, len, now_ns());
+  if (rv != 0)
+    fprintf(stderr, "read_pkt: %s\n", ngtcp2_strerror(rv));
+  return rv;
+}
+
+/* Milliseconds until the next timer expiry (capped), for the caller to wait on. */
+uint64_t navi_h3_timeout_ms(navi_h3_conn *c) {
+  ngtcp2_tstamp e = ngtcp2_conn_get_expiry(c->conn);
+  if (e == UINT64_MAX)
+    return 1000;
+  ngtcp2_tstamp t = now_ns();
+  return e <= t ? 0 : (e - t) / NGTCP2_MILLISECONDS;
+}
+
+/* Run loss recovery when the timer expires. Returns 0 or <0 on error. */
+int navi_h3_handle_timeout(navi_h3_conn *c) {
+  if (ngtcp2_conn_handle_expiry(c->conn, now_ns()) != 0) {
+    fprintf(stderr, "handle_expiry failed\n");
+    return -1;
+  }
+  return 0;
+}
+
+/* Blocking driver for the sync wrappers: advance the step functions with a poll
+ * loop until *flag is set (handshake completed / request done). */
+static int drive_until(navi_h3_conn *c, int *flag) {
+  uint8_t buf[1500];
+  struct pollfd pfd = {.fd = c->fd, .events = POLLIN};
+  for (int loops = 0; loops < 2000 && !*flag; loops++) {
+    ngtcp2_ssize n;
+    while ((n = navi_h3_send(c, buf, sizeof buf)) > 0)
+      if (send(c->fd, buf, (size_t)n, 0) < 0) {
+        perror("send");
+        return -1;
+      }
+    if (n < 0)
+      return -1;
+    int pr = poll(&pfd, 1, (int)navi_h3_timeout_ms(c));
     if (pr > 0 && (pfd.revents & POLLIN)) {
       ssize_t r = recv(c->fd, buf, sizeof buf, 0);
-      if (r > 0) {
-        ngtcp2_pkt_info pi = {0};
-        int rv = ngtcp2_conn_read_pkt(c->conn, &c->path, &pi, buf, (size_t)r,
-                                      now_ns());
-        if (rv != 0) {
-          fprintf(stderr, "read_pkt: %s\n", ngtcp2_strerror(rv));
-          return -1;
-        }
-      }
-    } else if (ngtcp2_conn_handle_expiry(c->conn, now_ns()) != 0) {
-      fprintf(stderr, "handle_expiry failed\n");
+      if (r > 0 && navi_h3_recv(c, buf, (size_t)r) != 0)
+        return -1;
+    } else if (navi_h3_handle_timeout(c) != 0) {
       return -1;
     }
   }
@@ -303,7 +337,7 @@ static int run_until(navi_h3_conn *c, int *flag) {
 }
 
 /* Create the nghttp3 client session and bind the control + QPACK streams. */
-static int bind_h3(navi_h3_conn *c) {
+int navi_h3_bind(navi_h3_conn *c) {
   nghttp3_settings settings;
   nghttp3_settings_default(&settings);
   nghttp3_callbacks cb;
@@ -324,8 +358,11 @@ static int bind_h3(navi_h3_conn *c) {
   return 0;
 }
 
-navi_h3_conn *navi_h3_open(const char *host, const char *port, const char *sni,
-                           const char *ca_file, int verify) {
+/* Create a connection and set up ngtcp2/nghttp3 + TLS, but do NOT drive the
+ * handshake (no I/O, non-blocking). The caller pumps the step functions to
+ * complete the handshake, then calls navi_h3_bind. */
+navi_h3_conn *navi_h3_new(const char *host, const char *port, const char *sni,
+                          const char *ca_file, int verify) {
   static int crypto_inited = 0;
   if (!crypto_inited) {
     if (ngtcp2_crypto_ossl_init() != 0) {
@@ -430,16 +467,25 @@ navi_h3_conn *navi_h3_open(const char *host, const char *port, const char *sni,
     goto fail;
   }
   ngtcp2_conn_set_tls_native_handle(c->conn, c->ossl);
-
-  if (run_until(c, &c->handshake_done) != 0)
-    goto fail;
-  if (bind_h3(c) != 0)
-    goto fail;
   return c;
 
 fail:
   navi_h3_close(c);
   return NULL;
+}
+
+/* Sync convenience: create, drive the handshake to completion with a blocking
+ * poll loop, and bind the h3 session. Returns NULL on failure. */
+navi_h3_conn *navi_h3_open(const char *host, const char *port, const char *sni,
+                           const char *ca_file, int verify) {
+  navi_h3_conn *c = navi_h3_new(host, port, sni, ca_file, verify);
+  if (!c)
+    return NULL;
+  if (drive_until(c, &c->handshake_done) != 0 || navi_h3_bind(c) != 0) {
+    navi_h3_close(c);
+    return NULL;
+  }
+  return c;
 }
 
 /* req_headers: extra request fields as "name\nvalue\nname\nvalue\n" (already
@@ -506,7 +552,7 @@ int navi_h3_request(navi_h3_conn *c, const char *method, const char *path_,
     rv = -1;
     goto done;
   }
-  if (run_until(c, &c->req_done) != 0) {
+  if (drive_until(c, &c->req_done) != 0) {
     rv = -1;
     goto done;
   }
