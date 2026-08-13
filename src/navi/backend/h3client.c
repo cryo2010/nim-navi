@@ -3,8 +3,8 @@
  * QPACK). Compiled into navi by backend/quic.nim ({.compile.}) and driven from
  * Nim via navi_h3_get(). Verified against the tests/interop/http3 Caddy origin.
  *
- * Scope: blocking, one request per call, sync path. TODO (phase 2c): server
- * certificate verification (this shim does not yet verify the peer cert), a
+ * Scope: blocking, one request per call, sync path; the server certificate and
+ * hostname are verified by default (a custom CA is supported). TODO: a
  * persistent connection object, async/mux, and streaming bodies. */
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
@@ -12,6 +12,7 @@
 #include <nghttp3/nghttp3.h>
 #include <openssl/ssl.h>
 #include <openssl/rand.h>
+#include <openssl/x509v3.h>
 
 #include <netdb.h>
 #include <poll.h>
@@ -220,8 +221,9 @@ static int setup_h3(client *c, const char *authority, const char *path_) {
 }
 
 int navi_h3_get(const char *host, const char *port, const char *sni,
-                const char *path_, long *out_status, char *out_body,
-                size_t out_cap, size_t *out_len) {
+                const char *path_, const char *ca_file, int verify,
+                long *out_status, char *out_body, size_t out_cap,
+                size_t *out_len) {
   static int crypto_inited = 0;
   char authority[256];
   snprintf(authority, sizeof authority, "%s:%s", sni, port);
@@ -246,7 +248,31 @@ int navi_h3_get(const char *host, const char *port, const char *sni,
   }
 
   SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_method());
+  /* Verify the server certificate by default (secure by default, matching
+   * navi's TlsConfig.verify). A ca_file adds a custom CA (TlsConfig.caFile);
+   * otherwise the system trust store is used. verify=0 disables checking. */
+  if (verify) {
+    SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL);
+    if (ca_file && ca_file[0]) {
+      if (SSL_CTX_load_verify_locations(ssl_ctx, ca_file, NULL) != 1) {
+        fprintf(stderr, "failed to load CA file %s\n", ca_file);
+        return -1;
+      }
+    } else {
+      SSL_CTX_set_default_verify_paths(ssl_ctx);
+    }
+  } else {
+    SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_NONE, NULL);
+  }
   SSL *ssl = SSL_new(ssl_ctx);
+  /* Hostname verification: a cert valid for a different host must fail. */
+  if (verify) {
+    SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+    if (SSL_set1_host(ssl, sni) != 1) {
+      fprintf(stderr, "SSL_set1_host failed\n");
+      return -1;
+    }
+  }
   ngtcp2_crypto_ossl_ctx *ossl;
   if (ngtcp2_crypto_ossl_ctx_new(&ossl, ssl) != 0) {
     fprintf(stderr, "ossl_ctx_new failed\n");

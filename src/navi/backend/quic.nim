@@ -7,9 +7,9 @@
 ## live Caddy h3 origin): navi completes the QUIC handshake, runs nghttp3/QPACK,
 ## and reads back the response.
 ##
-## Scope: blocking, one GET per call (sync path). TODO (phase 2c): server
-## certificate verification, a persistent/multiplexed connection object, async
-## integration, and streaming bodies (see docs/http3.md).
+## Scope: blocking, one GET per call (sync path); the server certificate and
+## hostname are verified (secure by default). TODO: a persistent/multiplexed
+## connection object, async integration, and streaming bodies (see docs/http3.md).
 
 when not defined(naviHttp3):
   {.error: "navi/backend/quic is a -d:naviHttp3-only module (HTTP/3 WIP).".}
@@ -52,24 +52,28 @@ proc nghttp3_version(least: cint): ptr Nghttp3Info
 
 # From h3client.c: a blocking HTTP/3 GET. Returns 0 on success, negative on
 # failure; fills status and up to out_cap body bytes (out_len = bytes written).
-proc navi_h3_get(host, port, sni, path: cstring, outStatus: ptr clong,
-                 outBody: ptr char, outCap: csize_t, outLen: ptr csize_t): cint
-  {.importc, cdecl.}
+# `caFile` may be "" (system trust store); `verify` 0 disables cert checking.
+proc navi_h3_get(host, port, sni, path, caFile: cstring, verify: cint,
+                 outStatus: ptr clong, outBody: ptr char, outCap: csize_t,
+                 outLen: ptr csize_t): cint {.importc, cdecl.}
 
 proc ngtcp2VersionStr*(): string = $ngtcp2_version(0).version_str
 proc nghttp3VersionStr*(): string = $nghttp3_version(0).version_str
 
-proc h3Get*(host: string, port: int, sni = "", path = "/"): Http3Response =
+proc h3Get*(host: string, port: int, sni = "", path = "/", caFile = "",
+            verify = true): Http3Response =
   ## Perform a blocking HTTP/3 GET over QUIC and return the status and body.
-  ## `sni` defaults to `host`. Raises `QuicError` on transport failure. Sync path;
-  ## the server certificate is not yet verified (phase 2c).
+  ## `sni` defaults to `host`. The server certificate and hostname are verified
+  ## by default (secure by default); `caFile` adds a custom CA and `verify=false`
+  ## disables checking. Raises `QuicError` on transport or verification failure.
+  ## Sync path.
   let name = if sni.len > 0: sni else: host
   var status: clong
   var blen: csize_t
   var buf = newString(64 * 1024)
   let rv = navi_h3_get(host.cstring, ($port).cstring, name.cstring, path.cstring,
-                       addr status, cast[ptr char](addr buf[0]),
-                       csize_t(buf.len), addr blen)
+                       caFile.cstring, cint(verify), addr status,
+                       cast[ptr char](addr buf[0]), csize_t(buf.len), addr blen)
   if rv != 0:
     raise newException(QuicError,
       "navi HTTP/3 GET to " & host & ":" & $port & path & " failed")
