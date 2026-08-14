@@ -3,7 +3,7 @@
 [![CI](https://github.com/cryo2010/nim-navi/actions/workflows/ci.yml/badge.svg)](https://github.com/cryo2010/nim-navi/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A fast HTTP/1.1 and HTTP/2 client for Nim, with TLS, streaming and WebSockets. One API with four interchangeable clients for sync, async and JavaScript targets. You select the client type via import.
+A fast HTTP/1.1, HTTP/2, HTTP/3 client for Nim, with streaming, SSE and WebSockets. One API, four interchangeable clients for sync, async, async (chronos) and JavaScript; pick one by import.
 
 ```nim
 # Imports the synchronous client
@@ -47,7 +47,8 @@ discard main()
   - [Capability matrix](#capability-matrix)
   - [The browser backend (`navi/js`)](#the-browser-backend-navijs)
 - [Usage](#usage)
-  - [Clients and options](#clients-and-options)
+  - [Creating a client](#creating-a-client)
+  - [Configuration](#configuration)
   - [Requests](#requests)
   - [Responses](#responses)
   - [Headers](#headers)
@@ -81,6 +82,14 @@ discard main()
   single HTTP/2 connection (automatic on the h2 async backend, asyncdispatch;
   chronos is HTTP/1.1 so it uses separate pooled connections). A `parallel` batch
   API does the same on the sync backend.
+- **HTTP/3** (QUIC), opt-in via `-d:naviHttp3`, which links ngtcp2 + nghttp3 +
+  OpenSSL >= 3.5. Reached transparently: once an origin advertises `Alt-Svc: h3`
+  on an h1/h2 response, navi upgrades subsequent requests (all verbs and buffered
+  bodies), falling back to h2/h1 on any QUIC failure. Multiplexed on the
+  asyncdispatch backend (concurrent streams over one QUIC connection), one request
+  at a time on sync; certificate verification and response decompression apply as
+  elsewhere. Not on chronos (BearSSL has no QUIC) or `navi/js` (the browser/Node
+  runtime speaks h3 itself).
 - **Sync and async** from one API, via mutually exclusive entry modules
 - **Browser and Node** via a JavaScript backend (`import navi/js`) that runs on the runtime's `fetch`
 - **TLS** on all three backends (OpenSSL for sync/asyncdispatch, BearSSL for chronos), with certificate verification on by default
@@ -113,6 +122,7 @@ nimble add navi
 - `checksums` (MD5 and SHA-256 for Digest auth; the former `std/md5`, now maintained by nim-lang as a separate package). This is navi's only required Nim dependency.
 - `chronos` >= 4.0, only if you `import navi/chronos`. Aside from `checksums`, the sync and asyncdispatch backends pull in no third-party Nim packages.
 - `libbrotlidec` and `libzstd` (system libraries) are optional: needed only to decode `br`/`zstd` responses. They load lazily, so navi runs fine without them until a server actually sends those encodings.
+- HTTP/3 is opt-in via `-d:naviHttp3`, which needs **ngtcp2**, **nghttp3**, and **OpenSSL >= 3.5** (system libraries, located at build time via `pkg-config`) plus a C++ compiler. Without the flag none of these are required and h3 is unavailable; it applies to the sync and asyncdispatch backends only.
 - For `import navi/js`: nothing beyond Nim. Compile with `nim js` and run in a browser or on Node 18+ (which provides a global `fetch`); no `-d:ssl`, since the runtime handles TLS.
 
 ## Choosing a backend
@@ -146,6 +156,7 @@ backends differ:
 | Capability | `navi` (sync) | `navi/asyncdispatch` | `navi/chronos` | `navi/js` |
 | --- | :---: | :---: | :---: | :---: |
 | HTTP/2 | ✓ | ✓ | ✗ | runtime |
+| HTTP/3 | opt-in | opt-in | ✗ | runtime |
 | Concurrent multiplexing | `parallel()` | transparent | ✗ | runtime |
 | TLS engine | OpenSSL | OpenSSL | BearSSL | runtime |
 | Custom CA (`caFile`) | ✓ | ✓ | ✓ | runtime |
@@ -157,7 +168,9 @@ backends differ:
 | Cookie jar | ✓ | ✓ | ✓ | ✓ |
 | Proxy configuration | ✓ | ✓ | ✓ | ✗ |
 
-Legend: ✓ supported · ✗ not supported · **runtime** = provided by the
+Legend: ✓ supported · ✗ not supported · **opt-in** = requires a `-d:naviHttp3`
+build (ngtcp2 + nghttp3 + OpenSSL >= 3.5), reached transparently via Alt-Svc ·
+**runtime** = provided by the
 browser/Node platform rather than navi · **buffered** = `bodyStream` is accepted
 but drained and sent as one body (`fetch` cannot reliably stream a request body) ·
 **pull download** = `stream()` returns a headers-first handle consumed with
@@ -187,9 +200,9 @@ Two backends carry caveats:
 import navi/js
 
 proc main() {.async.} =
-  var cfg = initNaviConfig()
-  cfg.prefixUrl = "https://api.example.com"
-  let api = newNavi(cfg)
+  var config = initNaviConfig()
+  config.prefixUrl = "https://api.example.com"
+  let api = newNavi(config)
   let user = await api.get("users/42")
   echo user.data["name"].getStr
 
@@ -198,7 +211,31 @@ discard main()   # a browser or Node runs the returned Promise
 
 ## Usage
 
-### Clients and options
+### Creating a client
+
+`newNavi()` creates a client with the default config. To customize it, pass a
+`NaviConfig` (see [Configuration](#configuration) for building one):
+
+```nim
+let api = newNavi()               # the default config
+
+var config = initNaviConfig()     # or build your own
+config.retry.limit = 5
+config.timeout = 30_000
+let custom = newNavi(config)
+```
+
+Derive a client that layers new defaults over an existing one with `extend`. It
+layers the override's identity fields (prefixUrl, headers, http, auth, proxy) over
+the parent and inherits the rest:
+
+```nim
+var config = initNaviConfig()
+config.headers["x-api-key"] = "..."
+let authed = api.extend(config)
+```
+
+### Configuration
 
 Build a config with `initNaviConfig()`, which sets the safe defaults (verification
 on, decompression on, 2 retries, 20 redirects); then set the fields you want and
@@ -207,24 +244,50 @@ pass it to `newNavi`. `NaviConfig` has `{.requiresInit.}`, so a bare or partial
 to build one, which keeps the defaults from being silently zeroed.
 
 ```nim
-var cfg = initNaviConfig()
-cfg.prefixUrl = "https://api.example.com"
-cfg.headers = initHeaders({"authorization": "Bearer ..."})
-let api = newNavi(cfg)
+var config = initNaviConfig()
+config.prefixUrl = "https://api.example.com"
+config.headers["authorization"] = "Bearer ..."
+let api = newNavi(config)
 
 # Relative targets resolve against prefixUrl.
 let user = api.get("users/42").data
 ```
 
-Derive a client that layers new defaults over an existing one. Build the override
-with `initNaviConfig()` too; `extend` layers its identity fields (prefixUrl,
-headers, http, auth, proxy) over the parent and inherits the rest:
+Every field, and the default `initNaviConfig()` gives it:
 
-```nim
-var ovr = initNaviConfig()
-ovr.headers = initHeaders({"x-api-key": "..."})
-let authed = api.extend(ovr)
-```
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `auth` | `Auth` | `akNone` | Authorization for every request; build via `basicAuth` / `bearerAuth` / `digestAuth`. |
+| `decompress` | `bool` | `true` | Decode `gzip`/`deflate`/`br`/`zstd` response bodies. |
+| `headers` | `Headers` | empty | Headers sent on every request. |
+| `http` | `set[HttpVersion]` | `{H1, H2}` | HTTP versions to negotiate; add `H3` (needs `-d:naviHttp3`). |
+| `maxRedirects` | `int` | `20` | Redirects to follow; `0` disables. |
+| `maxResponseBytes` | `int` | `0` | Max response body size in bytes; `0` is unlimited. |
+| `middleware` | `seq[NaviMiddleware]` | `@[]` | Onion-style steps wrapping each request. |
+| `prefixUrl` | `string` | `""` | Base URL that relative request targets resolve against. |
+| `proxy` | `string` | `""` | Proxy URL; `""` falls back to `HTTP(S)_PROXY` / `NO_PROXY`. |
+| `retry.limit` | `int` | `2` | Retry attempts; `0` disables. |
+| `retry.maxDelay` | `int` | `10000` | Upper bound on the wait between attempts, in ms. |
+| `retry.methods` | `set[HttpVerb]` | `{GET, HEAD, PUT, DELETE, OPTIONS}` | Verbs eligible for retry. |
+| `retry.statuses` | `seq[int]` | `@[408, 413, 429, 500, 502, 503, 504]` | Response statuses that trigger a retry. |
+| `throwHttpErrors` | `bool` | `true` | Raise `HttpError` on a non-2xx response. |
+| `timeout` | `int` | `0` | Overall request timeout in ms; `0` disables. Legacy alias for `timeouts.total`. |
+| `timeouts.connect` | `int` | `0` | TCP connect + TLS handshake deadline (ms); `0` disables. |
+| `timeouts.read` | `int` | `0` | Per-read idle deadline (ms); `0` disables. |
+| `timeouts.total` | `int` | `0` | Whole-request deadline including retries/redirects (ms); `0` disables. |
+| `tls.caFile` | `string` | `""` | Custom CA bundle path; `""` uses the system trust store. |
+| `tls.certFile` | `string` | `""` | Client certificate file (PEM or DER) for mTLS. |
+| `tls.certPem` | `string` | `""` | Client certificate as an in-memory PEM string. |
+| `tls.cipherSuites` | `string` | `""` | TLS 1.3 ciphersuites (colon-separated); `""` = library default. |
+| `tls.ciphers` | `string` | `""` | TLS <=1.2 cipher list (OpenSSL colon format); `""` = library default. |
+| `tls.keyFile` | `string` | `""` | Private key file for `certFile`; `""` reuses `certFile`. |
+| `tls.keyPem` | `string` | `""` | Private key as an in-memory PEM string; `""` reuses `certPem`. |
+| `tls.maxVersion` | `TlsVersion` | `tlsDefault` | Highest TLS version to negotiate (`tlsDefault` = unset). |
+| `tls.minVersion` | `TlsVersion` | `tlsDefault` | Lowest TLS version to negotiate (`tlsDefault` = unset). |
+| `tls.password` | `string` | `""` | Passphrase for an encrypted key, or the PKCS#12 password. |
+| `tls.pkcs12File` | `string` | `""` | PKCS#12/PFX bundle (cert + key + chain); highest precedence. |
+| `tls.resumeSessions` | `bool` | `true` | Reuse TLS sessions across connections (abbreviated handshake). |
+| `tls.verify` | `bool` | `true` | Verify the certificate chain and hostname. |
 
 ### Requests
 
@@ -270,9 +333,9 @@ for (name, value) in h.pairs: discard
 ### TLS
 
 ```nim
-var cfg = initNaviConfig()
-cfg.tls.caFile = "/path/to/ca-bundle.pem"   # verify is already on
-let api = newNavi(cfg)
+var config = initNaviConfig()
+config.tls.caFile = "/path/to/ca-bundle.pem"   # verify is already on
+let api = newNavi(config)
 ```
 
 `verify` defaults to on. `caFile` is honored by all three backends: sync and asyncdispatch through OpenSSL, and chronos through BearSSL (which otherwise verifies against its bundled Mozilla trust anchors). The chronos backend negotiates up to TLS 1.2 and does not support client certificates (mTLS).
@@ -286,7 +349,7 @@ workloads that open many short-lived connections (`Connection: close`, no poolin
 a pooled, kept-alive connection already amortizes the handshake. Disable it with:
 
 ```nim
-cfg.tls.resumeSessions = false
+config.tls.resumeSessions = false
 ```
 
 Supported on the OpenSSL backends (sync, asyncdispatch); the sync backend sees the
@@ -300,8 +363,8 @@ Pin the acceptable TLS protocol range with `minVersion` / `maxVersion` (each a
 default) leaves that bound to the library.
 
 ```nim
-cfg.tls.minVersion = tls12    # refuse anything below TLS 1.2
-cfg.tls.maxVersion = tls13
+config.tls.minVersion = tls12    # refuse anything below TLS 1.2
+config.tls.maxVersion = tls13
 ```
 
 Enforced on the OpenSSL backends (sync, asyncdispatch). chronos (BearSSL) accepts
@@ -319,8 +382,8 @@ versions you allow. Both are colon-separated OpenSSL names; "" (default) leaves 
 library's selection.
 
 ```nim
-cfg.tls.ciphers      = "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256"
-cfg.tls.cipherSuites = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"
+config.tls.ciphers      = "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256"
+config.tls.cipherSuites = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"
 ```
 
 Enforced on the OpenSSL backends (sync, asyncdispatch); a value with no cipher the
@@ -334,24 +397,24 @@ On the OpenSSL backends (sync, asyncdispatch) navi can present a client certific
 
 ```nim
 # PEM cert + key files (a single PEM may hold both; leave keyFile empty)
-cfg.tls.certFile = "client.pem"
-cfg.tls.keyFile  = "client.key"
+config.tls.certFile = "client.pem"
+config.tls.keyFile  = "client.key"
 
 # Encrypted PEM key
-cfg.tls.certFile = "client.pem"
-cfg.tls.keyFile  = "client.enc.key"
-cfg.tls.password = "secret"
+config.tls.certFile = "client.pem"
+config.tls.keyFile  = "client.enc.key"
+config.tls.password = "secret"
 
 # DER-encoded cert and key (encoding auto-detected from content)
-cfg.tls.certFile = "client.crt"; cfg.tls.keyFile = "client.key"
+config.tls.certFile = "client.crt"; config.tls.keyFile = "client.key"
 
 # PKCS#12 / PFX bundle (password is the bundle password)
-cfg.tls.pkcs12File = "client.p12"
-cfg.tls.password   = "secret"
+config.tls.pkcs12File = "client.p12"
+config.tls.password   = "secret"
 
 # In-memory PEM (e.g. from a secrets manager; no files touched)
-cfg.tls.certPem = certString
-cfg.tls.keyPem  = keyString
+config.tls.certPem = certString
+config.tls.keyPem  = keyString
 ```
 
 Key algorithms (RSA, ECDSA, Ed25519) work in any of these as long as OpenSSL supports them. In-memory PEM may carry an intermediate chain; a PKCS#12 bundle's extra chain certs are not installed (only its leaf and key), which is all a client needs to present. chronos (BearSSL) and js do not present client certificates.
@@ -368,9 +431,9 @@ except HttpError as e:
   echo e.response.body
 
 # Opt out to handle status codes yourself:
-var cfg = initNaviConfig()
-cfg.throwHttpErrors = false
-let api = newNavi(cfg)
+var config = initNaviConfig()
+config.throwHttpErrors = false
+let api = newNavi(config)
 ```
 
 ### Retries, redirects, and timeouts
@@ -378,34 +441,34 @@ let api = newNavi(cfg)
 Idempotent requests that hit a transient failure (network error or 408/413/429/500/502/503/504) are retried with capped exponential backoff, honoring `Retry-After` (both the seconds and HTTP-date forms). Redirects are followed by default.
 
 ```nim
-var cfg = initNaviConfig()
-cfg.retry.limit = 3        # default 2; 0 disables retries
-cfg.maxRedirects = 5       # default 20; 0 disables
-cfg.timeout = 5000         # 5s; 0 (default) disables. Raises TimeoutError.
-let api = newNavi(cfg)
+var config = initNaviConfig()
+config.retry.limit = 3        # default 2; 0 disables retries
+config.maxRedirects = 5       # default 20; 0 disables
+config.timeout = 5000         # 5s; 0 (default) disables. Raises TimeoutError.
+let api = newNavi(config)
 ```
 
-The whole retry policy is configurable via `cfg.retry` (a `RetryPolicy`):
+The whole retry policy is configurable via `config.retry` (a `RetryPolicy`):
 
 ```nim
-var cfg = initNaviConfig()
-cfg.retry.limit = 5
-cfg.retry.methods = {GET, HEAD}            # verbs eligible for retry
-cfg.retry.statuses = @[429, 503]           # response statuses that trigger one
-cfg.retry.maxDelay = 30_000                # cap the wait between attempts (ms)
+var config = initNaviConfig()
+config.retry.limit = 5
+config.retry.methods = {GET, HEAD}            # verbs eligible for retry
+config.retry.statuses = @[429, 503]           # response statuses that trigger one
+config.retry.maxDelay = 30_000                # cap the wait between attempts (ms)
 ```
 
 `timeout` bounds the whole request (raising `TimeoutError`): on the async backends (asyncdispatch/chronos/js) it covers all retries; on the sync backend it is per attempt.
 
 #### Per-phase timeouts
 
-For finer control, set `cfg.timeouts` (a `Timeouts`) to bound individual phases instead of just the overall request. Each field is milliseconds; 0 (the default) disables that phase's limit.
+For finer control, set `config.timeouts` (a `Timeouts`) to bound individual phases instead of just the overall request. Each field is milliseconds; 0 (the default) disables that phase's limit.
 
 ```nim
-var cfg = initNaviConfig()
-cfg.timeouts.connect = 2_000   # TCP connect + TLS handshake
-cfg.timeouts.read    = 5_000   # stall waiting for a response chunk
-cfg.timeouts.total   = 30_000  # whole request (overrides/supersedes `timeout`)
+var config = initNaviConfig()
+config.timeouts.connect = 2_000   # TCP connect + TLS handshake
+config.timeouts.read    = 5_000   # stall waiting for a response chunk
+config.timeouts.total   = 30_000  # whole request (overrides/supersedes `timeout`)
 ```
 
 - **connect** and **read** are enforced on the native backends (sync, asyncdispatch, chronos).
@@ -441,18 +504,18 @@ tok.cancel()
 `maxResponseBytes` caps the response body; a larger response raises `ResponseTooLargeError`. Streaming enforces the cap incrementally (per chunk); buffered requests enforce it on the assembled body. On the native backends the cap counts decompressed bytes, so it also guards against decompression bombs.
 
 ```nim
-var cfg = initNaviConfig()
-cfg.maxResponseBytes = 10 * 1024 * 1024   # 10 MiB; 0 (default) is unlimited
-let api = newNavi(cfg)
+var config = initNaviConfig()
+config.maxResponseBytes = 10 * 1024 * 1024   # 10 MiB; 0 (default) is unlimited
+let api = newNavi(config)
 ```
 
 ### Auth and proxy
 
 ```nim
-var cfg = initNaviConfig()
-cfg.auth = bearerAuth("token")      # or basicAuth("user", "pass")
-cfg.proxy = "http://proxy:8080"     # else HTTP(S)_PROXY / NO_PROXY env
-let api = newNavi(cfg)
+var config = initNaviConfig()
+config.auth = bearerAuth("token")      # or basicAuth("user", "pass")
+config.proxy = "http://proxy:8080"     # else HTTP(S)_PROXY / NO_PROXY env
+let api = newNavi(config)
 ```
 
 ### Cookies
@@ -480,9 +543,9 @@ proc trace(prefix: string): NaviMiddleware =       # sync (import navi)
     ctx.next()
     log(prefix, ctx.req.verb, ctx.res.status, epochTime() - t0)  # after
 
-var cfg = initNaviConfig()
-cfg.middleware = @[trace("api")]
-let api = newNavi(cfg)
+var config = initNaviConfig()
+config.middleware = @[trace("api")]
+let api = newNavi(config)
 ```
 
 Short-circuit by setting `ctx.res` and *not* calling `next` (a cache hit or
