@@ -217,8 +217,12 @@ discard main()   # a browser or Node runs the returned Promise
 `NaviConfig` (see [Configuration](#configuration) for building one):
 
 ```nim
-let api = newNavi()             # default config
-let custom = newNavi(config)    # a config you built
+let api = newNavi()               # the default config
+
+var config = initNaviConfig()     # or build your own
+config.retry.limit = 5
+config.timeout = 30_000
+let custom = newNavi(config)
 ```
 
 Derive a client that layers new defaults over an existing one with `extend`. It
