@@ -71,6 +71,7 @@ discard main()
   - [NaviConfig](#naviconfig)
   - [Response](#response)
   - [HttpError](#httperror)
+- [Security](#security)
 - [Thanks](#thanks)
 - [License](#license)
 
@@ -885,6 +886,17 @@ Raised for a non-2xx response when `throwHttpErrors` is on. Carries the full
 response as `.response`. Other request errors: `TimeoutError` (exceeded
 `timeout`), `RequestCancelledError` (a `CancelToken` was cancelled), and
 `ResponseTooLargeError` (body exceeded `maxResponseBytes`).
+
+## Security
+
+navi is secure by default: certificate and hostname verification are on,
+credentials never follow a request across an origin boundary, cookies are
+re-scoped per host, and everything a hostile server can make the client do
+(allocate, wait, retry) is bounded. See the below files for more.
+
+- [SECURITY.md](SECURITY.md) - how to report a vulnerability.
+- [THREAT_MODEL.md](THREAT_MODEL.md) - what navi defends against and how it is verified.
+- [HARDENING.md](HARDENING.md) - configuring navi beyond the secure defaults.
 
 ## Thanks
 
