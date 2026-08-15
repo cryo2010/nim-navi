@@ -68,7 +68,7 @@ proc initNaviConfig*(): NaviConfig =
     prefixUrl: "", headers: initHeaders(), http: {}, tls: defaultTls(),
     decompress: false, throwHttpErrors: true, maxRedirects: 20,
     retry: defaultRetryPolicy(), maxResponseBytes: 0,
-    auth: Auth(), proxy: "", timeout: 0, timeouts: Timeouts(), middleware: @[])
+    auth: Auth(), proxy: "", timeouts: Timeouts(), middleware: @[])
 
 # A browser owns the cookie store (and hides Set-Cookie from fetch); Node, Deno,
 # Bun, and Workers do not, so navi keeps the jar there. `document` exists only in

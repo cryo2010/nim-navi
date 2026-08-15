@@ -7,6 +7,11 @@ onward (pre-1.0, minor versions may include breaking changes).
 
 ## [Unreleased]
 
+### Removed
+- The legacy `NaviConfig.timeout` field. Use `timeouts.total` for the overall
+  request deadline (`timeouts.connect` and `timeouts.read` bound the individual
+  phases). Breaking; pre-1.0.
+
 ## [0.5.0] - 2026-08-10
 
 Theme: Server-Sent Events as a first-class primitive across every backend, plus

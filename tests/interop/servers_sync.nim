@@ -16,7 +16,7 @@ proc client(): Navi =
   # responses (hello.txt is 13 bytes) end well inside one recv buffer. That is
   # the exact shape that made the sync backend's timeout path stall until the
   # deadline; keeping a timeout here guards against that regression.
-  cfg.timeout = 15_000
+  cfg.timeouts.total = 15_000
   newNavi(cfg)
 
 for entry in getEnv("NAVI_SERVERS").splitWhitespace():

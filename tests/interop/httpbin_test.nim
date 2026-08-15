@@ -30,7 +30,7 @@ proc baseCfg(): NaviConfig =
   # GC-safe under chronos's async macro.
   result = initNaviConfig()
   result.tls.caFile = getEnv("NAVI_INTEROP_CERT")
-  result.timeout = 20_000
+  result.timeouts.total = 20_000
   result.headers["user-agent"] = "navi-httpbin/1.0"
 
 proc api(): Navi = newNavi(baseCfg())

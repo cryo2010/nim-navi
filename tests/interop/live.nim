@@ -58,7 +58,7 @@ var skips: seq[string]
 
 proc client(): Navi =
   var cfg = initNaviConfig()
-  cfg.timeout = 20_000            # bound hangs so a stuck target can't wedge CI
+  cfg.timeouts.total = 20_000     # bound hangs so a stuck target can't wedge CI
   cfg.retry.limit = 0            # one attempt/target; flakes become SKIP, not
                                  # three stacked 20s timeouts
   # A descriptive UA with a Mozilla token: the GitHub API 403s a request without

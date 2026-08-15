@@ -60,8 +60,7 @@ type
 
   Timeouts* = object
     ## Per-phase deadlines in milliseconds; 0 (default) disables that phase's
-    ## limit. Additive to the legacy overall `timeout` (which feeds `total`).
-    ## `connect` and `read` are enforced on the native backends (sync,
+    ## limit. `connect` and `read` are enforced on the native backends (sync,
     ## asyncdispatch, chronos); `total` on all four. On `navi/js` only `total` is
     ## enforceable (via `AbortSignal.timeout`), as `fetch` hides the phases.
     connect*: int   ## TCP connect + TLS handshake (establishment)
@@ -85,9 +84,7 @@ type
     maxResponseBytes*: int          ## cap on response body size; 0 (default) unlimited
     auth*: Auth                     ## Authorization applied to every request
     proxy*: string                  ## proxy URL; "" falls back to env vars
-    timeout*: int                   ## overall request timeout in ms; 0 (default) disables.
-                                    ## Legacy convenience for `timeouts.total`.
-    timeouts*: Timeouts             ## per-phase deadlines (connect/headers/read/total)
+    timeouts*: Timeouts             ## per-phase deadlines (connect/read/total)
 
   BodyProducer* = proc(): string {.closure, raises: [CatchableError].}
     ## Pull-based upload source: returns the next chunk, or "" at end of body.
@@ -121,16 +118,13 @@ proc wantsDecompress*(opts: NaviConfigBase): bool = opts.decompress
 proc wantsThrow*(opts: NaviConfigBase): bool = opts.throwHttpErrors
 proc redirectLimit*(opts: NaviConfigBase): int = opts.maxRedirects
 proc retryLimit*(opts: NaviConfigBase): int = opts.retry.limit
-proc timeoutMs*(opts: NaviConfigBase): int = opts.timeout
-  ## Request timeout in milliseconds; 0 means no timeout.
 
 proc connectMs*(opts: NaviConfigBase): int = opts.timeouts.connect
   ## Deadline for TCP connect + TLS handshake, in ms; 0 disables.
 proc readMs*(opts: NaviConfigBase): int = opts.timeouts.read
   ## Per-read stall deadline while waiting for a response chunk, in ms; 0 disables.
-proc totalMs*(opts: NaviConfigBase): int =
-  ## Overall request deadline in ms: `timeouts.total` if set, else legacy `timeout`.
-  if opts.timeouts.total > 0: opts.timeouts.total else: opts.timeout
+proc totalMs*(opts: NaviConfigBase): int = opts.timeouts.total
+  ## Overall request deadline in ms, including retries/redirects; 0 disables.
 proc wantsH2*(opts: NaviConfigBase): bool =
   ## An unset `http` (empty set) means "negotiate h2 where possible".
   opts.http.card == 0 or H2 in opts.http

@@ -470,7 +470,7 @@ suite "sync entry end to end":
     startHang(th, port)  # accepts, reads the request, never replies
 
     var cfg = initNaviConfig()
-    cfg.timeout = 200
+    cfg.timeouts.total = 200
     cfg.retry.limit = 0
     let api = newNavi(cfg)
     var raised = false
@@ -487,7 +487,7 @@ suite "sync entry end to end":
     startHang(th, port)
 
     var cfg = initNaviConfig()
-    cfg.timeout = 200
+    cfg.timeouts.total = 200
     let api = newNavi(cfg)
     var raised = false
     try:
@@ -714,11 +714,9 @@ suite "TLS session resumption config":
       check not (child.config.tls.sessionCache == parent.config.tls.sessionCache)
 
 suite "per-phase timeouts":
-  test "timeout resolvers should read the struct and fall back to the legacy timeout for total":
+  test "timeout resolvers should read the per-phase struct":
     var cfg = initNaviConfig()
     check (cfg.connectMs, cfg.readMs, cfg.totalMs) == (0, 0, 0)
-    cfg.timeout = 500
-    check cfg.totalMs == 500                       # legacy timeout feeds total
     cfg.timeouts = Timeouts(connect: 100, read: 200, total: 300)
     check (cfg.connectMs, cfg.readMs, cfg.totalMs) == (100, 200, 300)
 

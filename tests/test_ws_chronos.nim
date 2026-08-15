@@ -117,7 +117,7 @@ suite "chronos websocket client end to end":
 
     proc run(): Future[string] {.async.} =
       var cfg = initNaviConfig()
-      cfg.timeout = 600
+      cfg.timeouts.total = 600
       let api = newNavi(cfg)
       try:
         discard await api.websocket("ws://127.0.0.1:" & $port & "/")
