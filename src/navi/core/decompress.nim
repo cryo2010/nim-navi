@@ -50,7 +50,15 @@ proc inflate(strm: ptr ZStream, flush: cint): cint
 proc inflateEnd(strm: ptr ZStream): cint
   {.cdecl, importc: "inflateEnd", dynlib: zlibDll.}
 
-proc inflateBytes(src: string, windowBits: cint): string =
+proc checkDecompressLimit(produced, limit: int) =
+  ## Abort a buffered decode the moment its output passes `maxResponseBytes`
+  ## (0 = off), so a compression bomb is never fully materialized. The streaming
+  ## path enforces the same cap per chunk in the engine.
+  if limit > 0 and produced > limit:
+    raise newException(ResponseTooLargeError,
+      "navi: decompressed response exceeds maxResponseBytes (" & $limit & ")")
+
+proc inflateBytes(src: string, windowBits: cint, limit: int): string =
   if src.len == 0: return ""
   var strm = ZStream()
   # zlib only checks the major version character, so "1" is sufficient.
@@ -67,7 +75,9 @@ proc inflateBytes(src: string, windowBits: cint): string =
     if ret != zOk and ret != zStreamEnd:
       raise newException(ValueError, "navi: malformed compressed body")
     let produced = chunk.len - int(strm.availOut)
-    if produced > 0: result.add chunk[0 ..< produced]
+    if produced > 0:
+      result.add chunk[0 ..< produced]
+      checkDecompressLimit(result.len, limit)
     if ret == zStreamEnd: break
     if strm.availIn == 0 and produced == 0: break  # truncated: stop, no progress
 
@@ -126,7 +136,7 @@ const
   brSuccess = cint(1)
   brNeedOutput = cint(3)
 
-proc decodeBrotli(src: string): string =
+proc decodeBrotli(src: string, limit: int): string =
   if src.len == 0: return ""
   loadBrotli()
   let s = brotliCreate(nil, nil, nil)
@@ -140,7 +150,9 @@ proc decodeBrotli(src: string): string =
     var nextOut = cast[ptr uint8](addr chunk[0])
     let r = brotliStream(s, availIn, nextIn, availOut, nextOut, nil)
     let produced = chunk.len - int(availOut)
-    if produced > 0: result.add chunk[0 ..< produced]
+    if produced > 0:
+      result.add chunk[0 ..< produced]
+      checkDecompressLimit(result.len, limit)
     if r == brSuccess: break
     if r == brNeedOutput: continue        # buffer full, keep draining
     if r < brSuccess:                     # BROTLI_DECODER_RESULT_ERROR
@@ -191,7 +203,7 @@ proc loadZstd() =
     if zstdCreate == nil or zstdFree == nil or zstdStream == nil or zstdIsError == nil:
       raise newException(ValueError, "navi: " & zstdDll & " lacks expected symbols")
 
-proc decodeZstd(src: string): string =
+proc decodeZstd(src: string, limit: int): string =
   if src.len == 0: return ""
   loadZstd()
   let s = zstdCreate()
@@ -204,7 +216,9 @@ proc decodeZstd(src: string): string =
     let r = zstdStream(s, output, input)
     if zstdIsError(r) != 0:
       raise newException(ValueError, "navi: malformed zstd body")
-    if output.pos > 0: result.add chunk[0 ..< int(output.pos)]
+    if output.pos > 0:
+      result.add chunk[0 ..< int(output.pos)]
+      checkDecompressLimit(result.len, limit)
     if r == 0 and input.pos >= input.size: break          # all frames decoded
     if output.pos == 0 and input.pos >= input.size: break  # truncated, no progress
 
@@ -332,19 +346,22 @@ proc decodeBody*(resp: var Response, opts: NaviConfigBase) =
     encodings.add e
   if encodings.len == 0: return
   # The header lists encodings in the order they were applied, so undo them from
-  # the last one back to the first.
+  # the last one back to the first. `limit` (maxResponseBytes) is enforced inside
+  # each decoder so a compression bomb is aborted mid-inflate, not after the whole
+  # body is materialized.
+  let limit = opts.maxResponseBytes
   for i in countdown(encodings.high, 0):
     case encodings[i]
     of "gzip", "x-gzip":
-      resp.body = inflateBytes(resp.body, wbAuto)
+      resp.body = inflateBytes(resp.body, wbAuto, limit)
     of "deflate":
       # "deflate" is officially zlib-wrapped, but some servers send raw deflate.
-      try: resp.body = inflateBytes(resp.body, wbAuto)
-      except ValueError: resp.body = inflateBytes(resp.body, wbRaw)
+      try: resp.body = inflateBytes(resp.body, wbAuto, limit)
+      except ValueError: resp.body = inflateBytes(resp.body, wbRaw, limit)
     of "br":
-      resp.body = decodeBrotli(resp.body)
+      resp.body = decodeBrotli(resp.body, limit)
     of "zstd":
-      resp.body = decodeZstd(resp.body)
+      resp.body = decodeZstd(resp.body, limit)
     else: discard
   resp.headers.del("content-encoding")
   resp.headers["content-length"] = $resp.body.len

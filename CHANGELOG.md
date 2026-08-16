@@ -7,6 +7,33 @@ onward (pre-1.0, minor versions may include breaking changes).
 
 ## [Unreleased]
 
+### Security
+- Bound decompression on the buffered path: `maxResponseBytes` is now enforced
+  *during* gzip/deflate/brotli/zstd decode, so a compression bomb is aborted
+  mid-inflate instead of being fully materialized before the cap was checked.
+- HTTP/2: reject a short `WINDOW_UPDATE` / `GOAWAY` frame (was an out-of-bounds
+  read / crash), and treat an oversized `WINDOW_UPDATE` increment or
+  `SETTINGS_INITIAL_WINDOW_SIZE` as a `FLOW_CONTROL_ERROR` (RFC 9113).
+- WebSocket: reject a 64-bit frame length with the high bit set or over a 64 MiB
+  cap, instead of crashing on the negative allocation.
+- Digest auth is now origin-bound: a 401 Digest challenge is only answered on the
+  origin the credentials were configured for, so digest credentials are not sent
+  to a cross-origin redirect target (matching `Authorization` stripping).
+- Reject CR/LF/NUL in request header names/values and the target host (request
+  smuggling / header injection).
+- SSE: bound a single event/line to 16 MiB and ignore an out-of-range `retry:`
+  value, so a hostile stream cannot exhaust memory or crash the parser.
+- Pooled keep-alive reuse no longer replays a non-idempotent request (POST/PATCH)
+  on a fresh connection when the reused connection failed after the request may
+  have been processed.
+
+### Fixed
+- HTTP/2 mux: release a concurrency slot when a streaming download completes (and
+  on GOAWAY), fixing a deadlock where requests queued at `MAX_CONCURRENT_STREAMS`
+  could hang.
+- HTTP/3: a stream reset/abort now completes its waiter (and raises) instead of
+  hanging until the connection closes.
+
 ### Removed
 - The legacy `NaviConfig.timeout` field. Use `timeouts.total` for the overall
   request deadline (`timeouts.connect` and `timeouts.read` bound the individual

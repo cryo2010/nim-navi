@@ -88,6 +88,8 @@ proc navi_h3_bind*(c: pointer): cint {.importc, cdecl.}
 proc navi_h3_submit*(c: pointer, verb, path, reqHeaders: cstring, body: ptr char,
                      bodyLen: csize_t): int64 {.importc, cdecl.}   ## stream id, or -1
 proc navi_h3_stream_done*(c: pointer, sid: int64): cint {.importc, cdecl.}
+proc navi_h3_stream_reset*(c: pointer, sid: int64): cint {.importc, cdecl.}
+  ## 1 if the stream ended by reset/abort rather than a normal response.
 proc navi_h3_take_response*(c: pointer, sid: int64, outStatus: ptr clong,
                             outBody: ptr char, outCap: csize_t, outLen: ptr csize_t,
                             outHeaders: ptr char, hdrCap: csize_t,

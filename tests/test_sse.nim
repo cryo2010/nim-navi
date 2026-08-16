@@ -1,6 +1,6 @@
 ## Sans-io Server-Sent Events parser: fed text, events out. No sockets.
 import unittest
-import std/options
+import std/[options, strutils]
 import navi/proto/sse
 
 proc drain(p: var SseParser): seq[SseEvent] =
@@ -127,3 +127,30 @@ suite "sse parser":
     check p.drain().len == 0
     p.feed("data: after\n\n")
     check p.drain()[0].id == "7"      # id persisted across the reconnect
+
+suite "sse parser DoS hardening":
+  test "an out-of-range retry value is ignored, not a crash":
+    var p = initSseParser()
+    p.feed("retry: 999999999999999999999\ndata: x\n\n")   # digits but overflows int
+    check p.retryMs() == -1                                # ignored, no exception
+    check p.drain()[0].data == "x"
+
+  test "an oversized single event fails instead of buffering unbounded":
+    var p = initSseParser()
+    var raised = false
+    try:
+      # many data: lines with no dispatching blank line
+      let line = "data: " & repeat("x", 100_000) & "\n"
+      for _ in 0 ..< 200: p.feed(line)      # ~20 MB > maxSseEventBytes
+    except ValueError:
+      raised = true
+    check raised
+
+  test "an endless unterminated line fails instead of buffering unbounded":
+    var p = initSseParser()
+    var raised = false
+    try:
+      for _ in 0 ..< 200: p.feed(repeat("x", 100_000))   # no newline ever
+    except ValueError:
+      raised = true
+    check raised

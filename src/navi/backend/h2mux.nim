@@ -88,6 +88,7 @@ proc dispatch(mux: H2Mux) =
     elif mux.h2.goneAway:
       let unprocessed = mux.h2.streamUnprocessed(sid)
       mux.waiters.del(sid)
+      mux.releaseSlot()            # free the slot like the reset/ended branches do
       if unprocessed:              # above GOAWAY's last id: not processed, retryable
         fut.fail(newException(UnprocessedError, "navi: http/2 request not processed"))
       else:
@@ -224,14 +225,18 @@ proc streamBody(mux: H2Mux, sid: uint32, bodyStream: BodyProducer) {.async.} =
         mux.sendReady.del(sid)
 
 proc endStream(mux: H2Mux, sid: uint32) =
-  ## Free a sink stream's per-stream state once it is done (or errored). Idempotent:
-  ## called at the end of `readChunk` and again if a sink error unwinds through the
-  ## drain loop.
+  ## Free a sink stream's per-stream state once it is done (or errored), and
+  ## release its concurrency slot so a request parked on MAX_CONCURRENT_STREAMS
+  ## can proceed. Idempotent: called at the end of `readChunk` and again if a sink
+  ## error unwinds through the drain loop, so the slot is released only on the call
+  ## that actually removes the stream (guarded by `wasActive`) -- never twice.
+  let wasActive = sid in mux.sinkStreams
   mux.recvReady.del(sid)
   mux.recvq.del(sid)
   mux.sinkStreams.excl sid
   mux.decoders.del(sid)
   discard mux.h2.takeResponse(sid)
+  if wasActive: mux.releaseSlot()
 
 proc readChunk*(mux: H2Mux, sid: uint32): Future[string] {.async.} =
   ## Pull one decoded body chunk of the sink stream `sid`, or "" once the stream
@@ -296,9 +301,8 @@ proc drainDownload*(mux: H2Mux, sid: uint32, sink: BodySink): Future[void] {.asy
       # native `string`, moved into the sink's async env with no copy.
       {.cast(gcsafe).}: await sink(c)
   except CatchableError:
-    mux.endStream(sid)                # sink raised: readChunk returned, so clean up here
-    raise
-    mux.releaseSlot()
+    mux.endStream(sid)                # sink raised: readChunk returned, so clean up
+    raise                            # (endStream releases the slot)
 
 proc respSnapshot*(mux: H2Mux, sid: uint32): H2Response =
   ## Status + headers of a stream whose headers are in, without dropping it (the

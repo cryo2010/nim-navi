@@ -48,6 +48,7 @@ struct Stream {
   std::string body;
   std::string resp_headers;                  // response fields as "name\nvalue\n"
   bool done = false;
+  bool reset = false;     // closed without a normal end_stream (server reset/abort)
   std::string req_body;   // owned copy (so the caller need not keep it alive)
 };
 
@@ -139,6 +140,17 @@ int on_stream_close(ngtcp2_conn *, std::uint32_t, std::int64_t stream_id,
                     std::uint64_t app_error_code, void *ud, void *) {
   auto *c = static_cast<H3Conn *>(ud);
   if (c->h3) nghttp3_conn_close_stream(c->h3, stream_id, app_error_code);
+  // A stream that closes without a normal end_stream (server RESET_STREAM/abort or
+  // a connection-level error) would otherwise leave `done == false` forever, so a
+  // waiter polling navi_h3_stream_done blocks until the whole connection dies. Mark
+  // it done and flag it as reset, so the caller unblocks and raises rather than
+  // returning a bogus empty response. A normally-ended stream already has done set
+  // (on_end_stream runs first), so this never mislabels a successful response.
+  auto it = c->streams.find(stream_id);
+  if (it != c->streams.end() && !it->second.done) {
+    it->second.reset = true;
+    it->second.done = true;
+  }
   return 0;
 }
 
@@ -510,6 +522,13 @@ int navi_h3_stream_done(H3Conn *c, std::int64_t sid) {
   return (it != c->streams.end() && it->second.done) ? 1 : 0;
 }
 
+// 1 if stream `sid` finished by a reset/abort rather than a normal response, else
+// 0. Valid once navi_h3_stream_done(sid) is true and before take_response.
+int navi_h3_stream_reset(H3Conn *c, std::int64_t sid) {
+  auto it = c->streams.find(sid);
+  return (it != c->streams.end() && it->second.reset) ? 1 : 0;
+}
+
 // Copy stream `sid`'s completed response into the caller's buffers and drop it.
 int navi_h3_take_response(H3Conn *c, std::int64_t sid, long *out_status, char *out_body,
                           std::size_t out_cap, std::size_t *out_len,
@@ -542,6 +561,10 @@ int navi_h3_request(H3Conn *c, const char *method, const char *path_,
   std::int64_t sid = navi_h3_submit(c, method, path_, req_headers, body, body_len);
   if (sid < 0) return -1;
   if (drive_until(c, &c->streams.at(sid).done) != 0) return -1;
+  if (navi_h3_stream_reset(c, sid)) {   // reset/abort, not a real response
+    c->streams.erase(sid);
+    return -1;
+  }
   return navi_h3_take_response(c, sid, out_status, out_body, out_cap, out_len,
                                out_headers, hdr_cap, hdr_len);
 }

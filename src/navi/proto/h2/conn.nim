@@ -269,6 +269,11 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
         elif id == settingsMaxConcurrentStreams:
           c.maxConcurrent = int(value)
         elif id == settingsInitialWindowSize:
+          # A value above 2^31-1 is a FLOW_CONTROL_ERROR (RFC 9113 6.5.2); reject
+          # it before the delta arithmetic can corrupt every stream's send window.
+          if value > 0x7fffffff'u32:
+            c.connFail(errFlowControlError, "SETTINGS_INITIAL_WINDOW_SIZE too large", outbuf)
+            return
           # Adjust every open stream's send window by the delta (RFC 9113 6.9.2),
           # then release any body the new room allows.
           let delta = int(value) - c.peerInitialWindow
@@ -281,6 +286,12 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
     if (f.flags and flagAck) == 0:
       outbuf.add encodePing(f.payload, ack = true)
   of uint8(ftGoAway):
+    # A GOAWAY carries at least an 8-byte lastStreamId+errorCode (RFC 9113 6.8).
+    # Guard the read: the frame decoder delivers any length, and readU32 on a
+    # short payload would index out of bounds.
+    if f.payload.len < 4:
+      c.connFail(errFrameSizeError, "GOAWAY frame too short", outbuf)
+      return
     c.goneAway = true
     c.goAwayLastId = readU32(f.payload, 0) and 0x7fffffff'u32
   of uint8(ftHeaders), uint8(ftContinuation):
@@ -347,16 +358,30 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
       s.reset = true
       s.ended = true
   of uint8(ftWindowUpdate):
+    # WINDOW_UPDATE is exactly 4 bytes (RFC 9113 6.9); a short frame is a
+    # FRAME_SIZE_ERROR, not an out-of-bounds read.
+    if f.payload.len < 4:
+      c.connFail(errFrameSizeError, "WINDOW_UPDATE frame too short", outbuf)
+      return
     let inc = int(readU32(f.payload, 0) and 0x7fffffff'u32)
     if f.streamId == 0:                        # connection-level: release all streams
+      # A window that would exceed 2^31-1 is a FLOW_CONTROL_ERROR (RFC 9113 6.9.1);
+      # rejecting it also prevents `connSendWindow` from overflowing to a negative.
+      if c.connSendWindow.int64 + inc.int64 > 0x7fffffff'i64:
+        c.connFail(errFlowControlError, "connection send window overflow", outbuf)
+        return
       c.connSendWindow += inc
       for sid, s in c.streams:
         c.flushSend(sid, s, outbuf)
     else:
       let s = c.streams.getOrDefault(f.streamId)
       if s != nil:
-        s.sendWindow += inc
-        c.flushSend(f.streamId, s, outbuf)
+        if s.sendWindow.int64 + inc.int64 > 0x7fffffff'i64:  # stream error: RST it
+          outbuf.add encodeRstStream(f.streamId, errFlowControlError)
+          s.reset = true; s.ended = true
+        else:
+          s.sendWindow += inc
+          c.flushSend(f.streamId, s, outbuf)
   of uint8(ftPushPromise):
     # We advertised SETTINGS_ENABLE_PUSH=0, so a PUSH_PROMISE is a PROTOCOL_ERROR.
     c.connFail(errProtocolError, "unexpected PUSH_PROMISE (push disabled)", outbuf)
