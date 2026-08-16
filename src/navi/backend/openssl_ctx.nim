@@ -61,6 +61,10 @@ when defined(ssl):
                     cert: ptr PX509, ca: ptr PSTACK): cint
     {.cdecl, dynlib: DLLUtilName, importc.}
   proc PKCS12_free(p12: pointer) {.cdecl, dynlib: DLLUtilName, importc.}
+  # Match an IP literal against the certificate's iPAddress SANs. std/openssl
+  # wraps X509_check_host (DNS names) but not this IP variant.
+  proc X509_check_ip_asc(cert: PX509, ipasc: cstring, flags: cuint): cint
+    {.cdecl, dynlib: DLLUtilName, importc.}
 
   proc fail(msg: string) {.noreturn.} =
     raise newException(ValueError, "navi: " & msg)
@@ -329,6 +333,16 @@ when defined(ssl):
     X509_free(cert)
     if match != 1: fail("certificate does not match host " & host)
 
+  proc checkCertIp(ssl: SslPtr, host: string) =
+    ## Match the peer certificate's iPAddress SAN against the IP literal `host`
+    ## with X509_check_ip_asc. X509_check_host only matches DNS names, so without
+    ## this an https-to-IP target would accept any chain-valid certificate.
+    let cert = SSL_get_peer_certificate(ssl)
+    if cert.isNil: fail("server presented no certificate")
+    let match = X509_check_ip_asc(cert, host.cstring, 0)
+    X509_free(cert)
+    if match != 1: fail("certificate does not match IP " & host)
+
   proc newClientSsl*(ctx: SslContext, fd: SocketHandle, host: string,
                      slot: SessionSlot = nil): SslPtr =
     ## Create a client SSL bound to `fd`, set SNI (DNS-name hosts only, as
@@ -345,12 +359,15 @@ when defined(ssl):
   proc verifyPeer*(ssl: SslPtr, host: string, verify: bool) =
     ## After a completed handshake, confirm the chain (SSL_VERIFY_PEER already
     ## aborts the handshake on a bad chain; this is the belt-and-suspenders check)
-    ## and, for DNS-name hosts, the certificate identity. No-op when `verify` is
-    ## off. Raises `ValueError` on mismatch.
+    ## and the certificate identity: the SAN/CN for a DNS host, or the iPAddress
+    ## SAN for an IP literal. No-op when `verify` is off. Raises `ValueError` on
+    ## mismatch.
     if not verify: return
     if SSL_get_verify_result(ssl) != X509_V_OK:
       fail("certificate verification failed for " & host)
-    if host.len > 0 and not isIpAddress(host): checkCertName(ssl, host)
+    if host.len > 0:
+      if isIpAddress(host): checkCertIp(ssl, host)   # match the iPAddress SAN
+      else: checkCertName(ssl, host)
 
   proc startClientTls*(ctx: SslContext, fd: SocketHandle, host: string,
                        verify: bool, slot: SessionSlot = nil): SslPtr =

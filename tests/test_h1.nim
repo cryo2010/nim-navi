@@ -127,3 +127,16 @@ suite "h1 parse":
       p.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\n")
     except ValueError as e: msg = e.msg
     check "chunk size" in msg
+
+suite "url port parsing":
+  test "an explicit port and the scheme defaults parse":
+    check parseUrl("http://h:8080/").port == 8080
+    check parseUrl("http://h/").port == 80
+    check parseUrl("https://h/").port == 443
+
+  test "a non-numeric port raises ValueError, not a cryptic parse error":
+    expect ValueError: discard parseUrl("http://h:80x/").port
+
+  test "an out-of-range port raises ValueError":
+    expect ValueError: discard parseUrl("http://h:99999/").port
+    expect ValueError: discard parseUrl("http://h:99999999999999999999/").port
