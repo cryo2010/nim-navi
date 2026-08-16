@@ -158,6 +158,25 @@ proc toQuery*(t: Table[string, string]): seq[(string, string)] =
   ## use an `OrderedTable` or the pairs / `@{}` form when query order matters.
   for k, v in t: result.add (k, v)
 
+proc validateRequest*(req: Request) =
+  ## Reject CR, LF, or NUL in the target host or any header name/value. On
+  ## HTTP/1.1 such a character would let an attacker-influenced header value (or a
+  ## crafted redirect Location whose host carries CRLF) split the request into
+  ## extra headers or a smuggled request; on h2/h3 the field is simply invalid.
+  ## Called on every dispatch, so both the initial request and each redirect hop
+  ## are checked.
+  proc hasCtl(s: string): bool =
+    for c in s:
+      if c in {'\r', '\n', '\0'}: return true
+    false
+  if hasCtl(req.url.host):
+    raise newException(ValueError,
+      "navi: invalid request host (contains CR, LF, or NUL)")
+  for (k, v) in req.headers.pairs:
+    if hasCtl(k) or hasCtl(v):
+      raise newException(ValueError,
+        "navi: invalid header '" & k & "' (name or value contains CR, LF, or NUL)")
+
 proc buildRequest*(opts: NaviConfigBase, verb: HttpVerb, target: string,
                    headers: Headers = initHeaders(), body = "",
                    json: JsonNode = nil, form: seq[(string, string)] = @[],

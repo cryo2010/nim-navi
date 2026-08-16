@@ -34,6 +34,10 @@ const
   closeNormal* = 1000'u16
   closeGoingAway* = 1001'u16
   closeProtocolError* = 1002'u16
+  maxFramePayload* = 64 * 1024 * 1024
+    ## Reject a single incoming frame larger than this (64 MiB). A 64-bit length
+    ## with its high bit set (RFC 6455 5.2 forbids it) would otherwise become a
+    ## negative `int` that slips past the bounds check and crashes `newString`.
 
 var rng = initRand(getTime().toUnix xor getTime().nanosecond)
 
@@ -106,6 +110,12 @@ proc next*(d: var WsDecoder, f: var Frame): bool =
     length = 0
     for i in 2 ..< 10: length = (length shl 8) or ord(d.buf[i])
     pos = 10
+  # A negative length (64-bit high bit set) or an oversized one must fail the
+  # connection, not reach `newString(length)` (a RangeDefect / huge allocation).
+  if length < 0 or length > maxFramePayload:
+    raise newException(ValueError,
+      "navi: WebSocket frame length is invalid or exceeds the " &
+      $maxFramePayload & "-byte limit")
   var key: array[4, int]
   if masked:
     if d.buf.len < pos + 4: return false

@@ -796,3 +796,32 @@ suite "TLS cipher selection config":
       except ValueError as e: msg = e.msg
       check "ciphersuite" in msg   # OpenSSL: "no usable ciphersuite"; LibreSSL: "does not support ... ciphersuites"
       api.close()
+
+suite "request header injection (CRLF)":
+  test "a header value containing CRLF is rejected before any dispatch":
+    let api = newNavi()
+    var raised = false
+    try:
+      # If the guard works this raises ValueError before opening a socket; if it
+      # did not, the request would attempt to connect and fail differently.
+      discard api.get("http://127.0.0.1:9/",
+                      headers = initHeaders({"x-evil": "a\r\nInjected: 1"}))
+    except ValueError:
+      raised = true
+    except CatchableError:
+      discard
+    check raised
+    api.close()
+
+  test "a header name containing a newline is rejected":
+    let api = newNavi()
+    var raised = false
+    try:
+      discard api.get("http://127.0.0.1:9/",
+                      headers = initHeaders({"x\r\nSmuggled": "1"}))
+    except ValueError:
+      raised = true
+    except CatchableError:
+      discard
+    check raised
+    api.close()

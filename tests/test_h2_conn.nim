@@ -542,3 +542,30 @@ suite "h2 gated receive window (sink backpressure)":
     c.respond200(sid)
     let out1 = c.feedBody(sid, overThreshold)
     check hasStreamWindowUpdate(out1, sid)          # eager: emitted during feed, no ack needed
+
+proc hasGoAway(s: string): bool =
+  for f in allFrames(s):
+    if f.typ == uint8(ftGoAway): return true
+
+suite "h2 malformed control frames (DoS hardening)":
+  test "a short WINDOW_UPDATE fails the connection instead of crashing":
+    # A <4-byte payload used to reach readU32 and raise IndexDefect.
+    let c = newServerConn()
+    let outp = c.feed(encodeFrame(ftWindowUpdate, 0'u8, 1'u32, ""))
+    check hasGoAway(outp)
+
+  test "a short GOAWAY fails the connection instead of crashing":
+    let c = newServerConn()
+    let outp = c.feed(encodeFrame(ftGoAway, 0'u8, 0'u32, "ab"))  # 2-byte payload
+    check hasGoAway(outp)
+
+  test "a WINDOW_UPDATE overflowing the connection window is a FLOW_CONTROL_ERROR":
+    let c = newServerConn()
+    var outp = c.feed(encodeWindowUpdate(0, 0x7fffffff'u32))
+    outp.add c.feed(encodeWindowUpdate(0, 0x7fffffff'u32))  # second push overflows 2^31-1
+    check hasGoAway(outp)
+
+  test "a SETTINGS_INITIAL_WINDOW_SIZE above 2^31-1 is a FLOW_CONTROL_ERROR":
+    let c = newServerConn()
+    let outp = c.feed(encodeSettings(@[(settingsInitialWindowSize, 0xffffffff'u32)]))
+    check hasGoAway(outp)

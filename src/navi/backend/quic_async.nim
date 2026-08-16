@@ -140,6 +140,19 @@ proc requestOnConn*(qc: QuicConnAsync, verb, path: string,
   finally:
     qc.waiters.del(sid)
 
+  if navi_h3_stream_reset(qc.c, sid) != 0:
+    # The stream was reset/aborted, not answered. Free its C-side entry (take
+    # erases it), then raise so the engine falls back to h2/h1 for this request
+    # instead of returning a bogus empty response.
+    var s: clong
+    var bl, hl: csize_t
+    var rb = newString(1)
+    var hb = newString(1)
+    discard navi_h3_take_response(qc.c, sid, addr s, cast[ptr char](addr rb[0]),
+                                  csize_t(rb.len), addr bl,
+                                  cast[ptr char](addr hb[0]), csize_t(hb.len), addr hl)
+    raise newException(QuicError, "navi HTTP/3 stream was reset")
+
   var status: clong
   var blen, hlen: csize_t
   var rbody = newString(64 * 1024)

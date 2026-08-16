@@ -75,6 +75,19 @@ suite "websocket frame codec":
     except ValueError as e: msg = e.msg
     check "reserved WebSocket opcode" in msg
 
+  test "the frame codec should reject a 64-bit length with the high bit set (DoS)":
+    # opcode 0x2 (binary), 127 length marker, then an 8-byte length 0x8000...0000.
+    # This became a negative int that slipped past the bounds check and crashed
+    # newString; it must now raise instead.
+    var d: WsDecoder
+    d.feed("\x82\x7f\x80\x00\x00\x00\x00\x00\x00\x00")
+    var f: Frame
+    var msg = ""
+    try:
+      discard d.next(f)
+    except ValueError as e: msg = e.msg
+    check "invalid or exceeds" in msg
+
 suite "websocket close":
   test "the close payload should carry the big-endian code then the reason":
     let p = closePayload(closeNormal, "bye")

@@ -389,8 +389,15 @@ template poolTransport*(client, req, sink: typed): Response =
           if not (keep and pushIdle(client.pool, key, pc)):
             await close(pc.transport)
         served = true
-      except CatchableError:
-        await close(pc.transport)  # pooled connection was stale; fall through
+      except CatchableError as e:
+        await close(pc.transport)  # pooled connection was stale
+        # Fall through to a fresh connection only when replaying is safe: an
+        # idempotent method, or the peer proved the request was unprocessed
+        # (h2 REFUSED_STREAM / above GOAWAY). A non-idempotent request (POST/PATCH)
+        # that failed on a reused connection must NOT be silently replayed -- the
+        # server may already have processed it -- so propagate the error instead.
+        if not (isIdempotent(req.verb) or (e of UnprocessedError)):
+          raise
 
     if not served:
       let transport = await connect(rq.url.host, rq.url.port, rq.url.isTls,
@@ -419,18 +426,25 @@ template run(client, req, sink: typed): Response =
   mixin transport, await
   block:
     var rq = req
+    validateRequest(rq)                # reject header/host CR-LF injection
     applyCookies(client.jar, rq)
     var resp = await transport(client, rq, sink)
     storeCookies(client.jar, rq.url, resp)
     resp
 
-template maybeDigest(client, rreq, resp: typed) =
-  ## On a 401 Digest challenge, when digest auth is configured and the request
-  ## carries no Authorization yet, compute the response and retry once. Expands
-  ## inline so the retry's `await`s run in the caller's async proc.
+template maybeDigest(client, rreq, resp, digestOrigin: typed) =
+  ## On a 401 Digest challenge, when digest auth is configured, the request
+  ## carries no Authorization yet, and it is still on the origin the credentials
+  ## were configured for, compute the response and retry once. The origin check
+  ## keeps digest credentials from being answered to a cross-origin redirect
+  ## target (mirroring the Authorization stripping in `redirectRequest`; without
+  ## it, digest would bypass that protection since the strip clears the header the
+  ## first condition tests). Expands inline so the retry's `await`s run in the
+  ## caller's async proc.
   mixin BodySink
   if resp.status == 401 and client.config.auth.kind == akDigest and
-     not rreq.headers.contains("authorization"):
+     not rreq.headers.contains("authorization") and
+     originKey(rreq.url) == digestOrigin:
     let chal = bestChallenge(resp.headers.getAll("www-authenticate"))
     if chal.isSome:
       let auth = digestAuthHeader(
@@ -445,11 +459,12 @@ template followRedirects(client, startReq, resp: typed) =
   ## `await`s run in the caller's async proc.
   mixin BodySink
   var rreq = startReq
+  let digestOrigin = originKey(startReq.url)   # digest creds only for this origin
   var hops = 0
   let limit = client.config.redirectLimit
   while true:
     resp = run(client, rreq, BodySink(nil))
-    maybeDigest(client, rreq, resp)
+    maybeDigest(client, rreq, resp, digestOrigin)
     decodeBody(resp, client.config)
     let location = resp.headers.get("location")
     if limit > 0 and hops < limit and isRedirect(resp.status) and location.len > 0:

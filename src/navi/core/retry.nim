@@ -7,6 +7,12 @@ proc isRetryableVerb*(verb: HttpVerb, policy: RetryPolicy): bool =
   ## Whether `verb` is eligible for retry under `policy` (idempotent by default).
   verb in policy.methods
 
+proc isIdempotent*(verb: HttpVerb): bool =
+  ## HTTP idempotent methods (RFC 9110 9.2.2): intrinsically safe to auto-replay
+  ## on a stale reused connection, independent of the user's retry policy. POST and
+  ## PATCH are excluded, so they are never silently replayed.
+  verb in {GET, HEAD, PUT, DELETE, OPTIONS}
+
 proc isRetryableStatus*(status: int, policy: RetryPolicy): bool =
   ## Whether `status` should trigger a retry under `policy`.
   status in policy.statuses

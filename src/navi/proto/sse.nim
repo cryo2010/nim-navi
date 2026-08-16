@@ -13,6 +13,12 @@
 
 import std/[deques, strutils, options]
 
+const maxSseEventBytes* = 16 * 1024 * 1024
+  ## A single event's accumulated data (or one unterminated line) may not exceed
+  ## this. SSE streams run with `maxResponseBytes` off (they are long-lived), so
+  ## without this bound a server that never sends a newline, or an endless run of
+  ## `data:` lines, would grow the parser's buffers without limit (memory DoS).
+
 type
   SseEvent* = object
     event*: string     ## event type; "message" if the stream did not set one
@@ -25,6 +31,7 @@ type
     ready: Deque[SseEvent]   ## dispatched events awaiting `next`
     evType: string           ## current event's type buffer
     dataLines: seq[string]   ## current event's data buffer
+    dataBytes: int           ## running size of `dataLines`, to bound one event
     lastId: string           ## persistent last event id (survives dispatch)
     retry: int               ## last `retry:` value seen, or -1
     atStart: bool            ## until the first byte, to strip a leading BOM
@@ -45,6 +52,7 @@ proc dispatch(p: var SseParser) =
     data: p.dataLines.join("\n"), id: p.lastId, retry: p.retry)
   p.evType.setLen(0)
   p.dataLines.setLen(0)
+  p.dataBytes = 0
 
 proc processLine(p: var SseParser, line: string) =
   if line.len == 0:
@@ -57,11 +65,20 @@ proc processLine(p: var SseParser, line: string) =
   if val.len > 0 and val[0] == ' ': val = val[1 .. ^1]   # strip one leading space
   case field
   of "event": p.evType = val
-  of "data":  p.dataLines.add val
+  of "data":
+    p.dataLines.add val
+    p.dataBytes += val.len + 1               # +1 for the "\n" join separator
+    if p.dataBytes > maxSseEventBytes:
+      raise newException(ValueError,
+        "navi: SSE event exceeds the " & $maxSseEventBytes & "-byte limit")
   of "id":
     if '\0' notin val: p.lastId = val        # an id containing NUL is ignored
   of "retry":
-    if val.len > 0 and val.allCharsInSet({'0' .. '9'}): p.retry = parseInt(val)
+    # All-digit but possibly out of int range; ignore an unparseable value rather
+    # than crash the stream.
+    if val.len > 0 and val.allCharsInSet({'0' .. '9'}):
+      try: p.retry = parseInt(val)
+      except ValueError: discard
   else: discard                              # unknown field: ignored
 
 proc feed*(p: var SseParser, text: string) =
@@ -86,6 +103,9 @@ proc feed*(p: var SseParser, text: string) =
     else: inc i
   if lineStart > 0:
     p.buf = p.buf[lineStart .. ^1]            # keep only the unterminated tail
+  if p.buf.len > maxSseEventBytes:            # a single line with no terminator
+    raise newException(ValueError,
+      "navi: SSE line exceeds the " & $maxSseEventBytes & "-byte limit")
 
 proc next*(p: var SseParser): Option[SseEvent] =
   ## The next dispatched event, or none if none are ready yet.
@@ -104,5 +124,6 @@ proc reset*(p: var SseParser) =
   p.buf.setLen(0)
   p.evType.setLen(0)
   p.dataLines.setLen(0)
+  p.dataBytes = 0
   p.ready.clear()
   p.atStart = true
