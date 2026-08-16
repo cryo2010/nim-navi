@@ -43,9 +43,9 @@ discard main()
 - [Features](#features)
 - [Install](#install)
 - [Requirements](#requirements)
-- [Choosing a backend](#choosing-a-backend)
+- [Choosing a client](#choosing-a-client)
   - [Capability matrix](#capability-matrix)
-  - [The browser backend (`navi/js`)](#the-browser-backend-navijs)
+  - [The browser client (`navi/js`)](#the-browser-client-navijs)
 - [Usage](#usage)
   - [Creating a client](#creating-a-client)
   - [Configuration](#configuration)
@@ -80,32 +80,32 @@ discard main()
 - **HTTP/1.1 and HTTP/2** over http and https, IPv4 and IPv6. h2 is native (own
   frames + HPACK + Huffman), ALPN-negotiated with automatic h1 fallback.
 - **HTTP/2 multiplexing**: concurrent async requests to one origin share a
-  single HTTP/2 connection (automatic on the h2 async backend, asyncdispatch;
+  single HTTP/2 connection (automatic on the h2 async client, asyncdispatch;
   chronos is HTTP/1.1 so it uses separate pooled connections). A `parallel` batch
-  API does the same on the sync backend.
+  API does the same on the sync client.
 - **HTTP/3** (QUIC), opt-in via `-d:naviHttp3`, which links ngtcp2 + nghttp3 +
   OpenSSL >= 3.5. Reached transparently: once an origin advertises `Alt-Svc: h3`
   on an h1/h2 response, navi upgrades subsequent requests (all verbs and buffered
   bodies), falling back to h2/h1 on any QUIC failure. Multiplexed on the
-  asyncdispatch backend (concurrent streams over one QUIC connection), one request
+  asyncdispatch client (concurrent streams over one QUIC connection), one request
   at a time on sync; certificate verification and response decompression apply as
   elsewhere. Not on chronos (BearSSL has no QUIC) or `navi/js` (the browser/Node
   runtime speaks h3 itself).
 - **Sync and async** from one API, via mutually exclusive entry modules
-- **Browser and Node** via a JavaScript backend (`import navi/js`) that runs on the runtime's `fetch`
-- **TLS** on all three backends (OpenSSL for sync/asyncdispatch, BearSSL for chronos), with certificate verification on by default
+- **Browser and Node** via a JavaScript client (`import navi/js`) that runs on the runtime's `fetch`
+- **TLS** on all three clients (OpenSSL for sync/asyncdispatch, BearSSL for chronos), with certificate verification on by default
 - **Connection pooling / keep-alive**, with automatic retry on a stale pooled connection
-- **Happy Eyeballs** (RFC 8305) address racing on the sync backend, so a slow/blackholed address doesn't stall the connect
+- **Happy Eyeballs** (RFC 8305) address racing on the sync client, so a slow/blackholed address doesn't stall the connect
 - **Streaming** uploads (chunked) and downloads (headers-first pull handle with backpressure)
 - **Server-Sent Events** (`sse()`) with transparent reconnection (Last-Event-ID + `retry:`), any method/headers
 - **Retries** with capped exponential backoff, honoring `Retry-After`
 - **Redirect following** with method rewrites and cross-origin `Authorization` stripping
 - **Throw-on-non-2xx** by default (`HttpError`), opt-out available
 - **Automatic decompression**: gzip/deflate (zlib), plus brotli and zstd when `libbrotlidec`/`libzstd` are present
-- **Request timeouts**, overall or per-phase (connect / read / total) via `timeout` / `timeouts` (`TimeoutError`)
+- **Request timeouts**, per-phase (connect / read / total) via `timeouts` (`TimeoutError`)
 - **Middleware**: onion-style `proc(ctx)` steps that modify, observe, or short-circuit a request
 - **Cookie jar**, **basic/bearer/digest auth** (Digest: MD5 and SHA-256, RFC 7616), **proxy** (http absolute-URI and https CONNECT)
-- **WebSockets** (RFC 6455) on all four backends, text and binary messages, fragmentation reassembly, and automatic ping/pong
+- **WebSockets** (RFC 6455) on all four clients, text and binary messages, fragmentation reassembly, and automatic ping/pong
 
 ## Install
 
@@ -121,14 +121,14 @@ nimble add navi
   nim c -r -d:ssl yourapp.nim
   ```
 - `checksums` (MD5 and SHA-256 for Digest auth; the former `std/md5`, now maintained by nim-lang as a separate package). This is navi's only required Nim dependency.
-- `chronos` >= 4.0, only if you `import navi/chronos`. Aside from `checksums`, the sync and asyncdispatch backends pull in no third-party Nim packages.
+- `chronos` >= 4.0, only if you `import navi/chronos`. Aside from `checksums`, the sync and asyncdispatch clients pull in no third-party Nim packages.
 - `libbrotlidec` and `libzstd` (system libraries) are optional: needed only to decode `br`/`zstd` responses. They load lazily, so navi runs fine without them until a server actually sends those encodings.
-- HTTP/3 is opt-in via `-d:naviHttp3`, which needs **ngtcp2**, **nghttp3**, and **OpenSSL >= 3.5** (system libraries, located at build time via `pkg-config`) plus a C++ compiler. Without the flag none of these are required and h3 is unavailable; it applies to the sync and asyncdispatch backends only.
+- HTTP/3 is opt-in via `-d:naviHttp3`, which needs **ngtcp2**, **nghttp3**, and **OpenSSL >= 3.5** (system libraries, located at build time via `pkg-config`) plus a C++ compiler. Without the flag none of these are required and h3 is unavailable; it applies to the sync and asyncdispatch clients only.
 - For `import navi/js`: nothing beyond Nim. Compile with `nim js` and run in a browser or on Node 18+ (which provides a global `fetch`); no `-d:ssl`, since the runtime handles TLS.
 
-## Choosing a backend
+## Choosing a client
 
-Import exactly one entry module. Each exports the same `newNavi`/`get`/`post`/... surface; only the return type differs.
+Use one of the below import statements to get started.
 
 | Import | Style | Call site | Engine |
 | --- | --- | --- | --- |
@@ -137,22 +137,12 @@ Import exactly one entry module. Each exports the same `newNavi`/`get`/`post`/..
 | `import navi/chronos` | async | `let r = await api.get(url)` | `chronos` |
 | `import navi/js` | async | `let r = await api.get(url)` | `fetch` (browser / Node) |
 
-The async entry modules re-export their event loop, so `await` and `waitFor` are available without a separate import. Importing more than one entry module is a compile-time error:
-
-```
-navi: import only one entry module, but both 'navi' and 'navi/asyncdispatch'
-were imported. Choose one of navi (sync), navi/asyncdispatch, navi/chronos,
-or navi/js.
-```
-
-**Cross-target:** under `nim js`, `import navi/asyncdispatch` and `import navi/chronos` transparently fall back to `navi/js` (neither `std/asyncdispatch` nor `chronos` has a JavaScript backend). So a **library** written on either -- request code, plus middleware as a plain `{.async.}` closure -- compiles for native *and* the browser/Node from one source. The one target-specific line is at the **application** entry point: `waitFor main()` natively vs `discard main()` under js (JS cannot block). js capability limits still apply (streaming upload is buffered, `res.httpVersion` empty, TLS/proxy are the runtime's; see the matrix below).
+> [!NOTE]
+> When compiled using `nim js`, the `navi/asyncdispatch` and `navi/chronos` clients transparently fall back to using the `navi/js` client.
 
 ### Capability matrix
 
-Every backend shares the same request surface: HTTP/1.1, WebSocket (`ws`/`wss`),
-TLS certificate verification, retries, redirects, middleware, throw-on-non-2xx,
-streaming download, and response decompression all work everywhere. Where the
-backends differ:
+Every client shares the same API, and the below table details where they differ.
 
 | Capability | `navi` (sync) | `navi/asyncdispatch` | `navi/chronos` | `navi/js` |
 | --- | :---: | :---: | :---: | :---: |
@@ -176,11 +166,11 @@ browser/Node platform rather than navi · **buffered** = `bodyStream` is accepte
 but drained and sent as one body (`fetch` cannot reliably stream a request body) ·
 **pull download** = `stream()` returns a headers-first handle consumed with
 `each`/`drain`, which back-pressures the peer per chunk (see
-[Streaming](#streaming)); `chunk` is a `string` on the native backends and
+[Streaming](#streaming)); `chunk` is a `string` on the native clients and
 `seq[byte]` on `navi/js`. (`navi/js` keeps its own cookie jar off a browser, and
 defers to the browser store on one; see below.)
 
-Two backends carry caveats:
+Two clients carry caveats:
 
 - **chronos is HTTP/1.1 only.** Its bundled BearSSL exposes no client ALPN (so
   no h2 negotiation) and no client-certificate hook (so no mTLS), and negotiates
@@ -193,9 +183,9 @@ Two backends carry caveats:
   cookie jar automatically so cookies persist across requests; in a browser the
   store handles that. Either way it needs no configuration.
 
-### The browser backend (`navi/js`)
+### The browser client (`navi/js`)
 
-`import navi/js` compiles with `nim js` and runs over the runtime's `fetch`, so the platform handles TLS, HTTP-version negotiation, redirects, cookies, and decompression. navi keeps the request building, retries, throw-on-non-2xx, and (async) middleware. It has no connection pool, streaming uploads are unavailable, and `res.httpVersion` is empty because `fetch` does not expose it. Cookies persist automatically with no configuration: in a browser the store handles them, and on a runtime without one (Node, Deno, Bun, Workers) navi keeps its own jar. Middleware is async, as on the other async backends.
+`import navi/js` compiles with `nim js` and runs over the runtime's `fetch`, so the platform handles TLS, HTTP-version negotiation, redirects, cookies, and decompression. navi keeps the request building, retries, throw-on-non-2xx, and (async) middleware. It has no connection pool, streaming uploads are unavailable, and `res.httpVersion` is empty because `fetch` does not expose it. Cookies persist automatically with no configuration: in a browser the store handles them, and on a runtime without one (Node, Deno, Bun, Workers) navi keeps its own jar. Middleware is async, as on the other async clients.
 
 ```nim
 import navi/js
@@ -222,7 +212,7 @@ let api = newNavi()               # the default config
 
 var config = initNaviConfig()     # or build your own
 config.retry.limit = 5
-config.timeout = 30_000
+config.timeouts.total = 30_000
 let custom = newNavi(config)
 ```
 
@@ -272,7 +262,6 @@ Every field, and the default `initNaviConfig()` gives it:
 | `retry.methods` | `set[HttpVerb]` | `{GET, HEAD, PUT, DELETE, OPTIONS}` | Verbs eligible for retry. |
 | `retry.statuses` | `seq[int]` | `@[408, 413, 429, 500, 502, 503, 504]` | Response statuses that trigger a retry. |
 | `throwHttpErrors` | `bool` | `true` | Raise `HttpError` on a non-2xx response. |
-| `timeout` | `int` | `0` | Overall request timeout in ms; `0` disables. Legacy alias for `timeouts.total`. |
 | `timeouts.connect` | `int` | `0` | TCP connect + TLS handshake deadline (ms); `0` disables. |
 | `timeouts.read` | `int` | `0` | Per-read idle deadline (ms); `0` disables. |
 | `timeouts.total` | `int` | `0` | Whole-request deadline including retries/redirects (ms); `0` disables. |
@@ -339,7 +328,7 @@ config.tls.caFile = "/path/to/ca-bundle.pem"   # verify is already on
 let api = newNavi(config)
 ```
 
-`verify` defaults to on. `caFile` is honored by all three backends: sync and asyncdispatch through OpenSSL, and chronos through BearSSL (which otherwise verifies against its bundled Mozilla trust anchors). The chronos backend negotiates up to TLS 1.2 and does not support client certificates (mTLS).
+`verify` defaults to on. `caFile` is honored by all three clients: sync and asyncdispatch through OpenSSL, and chronos through BearSSL (which otherwise verifies against its bundled Mozilla trust anchors). The chronos client negotiates up to TLS 1.2 and does not support client certificates (mTLS).
 
 #### Session resumption
 
@@ -353,7 +342,7 @@ a pooled, kept-alive connection already amortizes the handshake. Disable it with
 config.tls.resumeSessions = false
 ```
 
-Supported on the OpenSSL backends (sync, asyncdispatch); the sync backend sees the
+Supported on the OpenSSL clients (sync, asyncdispatch); the sync client sees the
 largest gain. Not available on chronos (BearSSL exposes no client session cache in
 the chronos versions navi targets), which always does a full handshake.
 
@@ -368,7 +357,7 @@ config.tls.minVersion = tls12    # refuse anything below TLS 1.2
 config.tls.maxVersion = tls13
 ```
 
-Enforced on the OpenSSL backends (sync, asyncdispatch). chronos (BearSSL) accepts
+Enforced on the OpenSSL clients (sync, asyncdispatch). chronos (BearSSL) accepts
 `tls10`–`tls12` — requesting `tls13` there raises, since that build tops out at
 TLS 1.2. On `navi/js` the runtime controls the TLS version, so these are ignored.
 A negotiation outside the pinned range fails the handshake (`ValueError`). If the
@@ -387,14 +376,14 @@ config.tls.ciphers      = "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SH
 config.tls.cipherSuites = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"
 ```
 
-Enforced on the OpenSSL backends (sync, asyncdispatch); a value with no cipher the
+Enforced on the OpenSSL clients (sync, asyncdispatch); a value with no cipher the
 peer accepts fails the handshake, and an all-invalid list raises. chronos (BearSSL,
 a fixed cipher profile) raises if either is set; on `navi/js` the runtime controls
 ciphers, so they are ignored.
 
 #### Client certificates (mTLS)
 
-On the OpenSSL backends (sync, asyncdispatch) navi can present a client certificate for mutual TLS, from several sources. Precedence is `pkcs12File`, then in-memory (`certPem`/`keyPem`), then the `certFile`/`keyFile` pair.
+On the OpenSSL clients (sync, asyncdispatch) navi can present a client certificate for mutual TLS, from several sources. Precedence is `pkcs12File`, then in-memory (`certPem`/`keyPem`), then the `certFile`/`keyFile` pair.
 
 ```nim
 # PEM cert + key files (a single PEM may hold both; leave keyFile empty)
@@ -445,7 +434,7 @@ Idempotent requests that hit a transient failure (network error or 408/413/429/5
 var config = initNaviConfig()
 config.retry.limit = 3        # default 2; 0 disables retries
 config.maxRedirects = 5       # default 20; 0 disables
-config.timeout = 5000         # 5s; 0 (default) disables. Raises TimeoutError.
+config.timeouts.total = 5000  # 5s; 0 (default) disables. Raises TimeoutError.
 let api = newNavi(config)
 ```
 
@@ -459,7 +448,7 @@ config.retry.statuses = @[429, 503]           # response statuses that trigger o
 config.retry.maxDelay = 30_000                # cap the wait between attempts (ms)
 ```
 
-`timeout` bounds the whole request (raising `TimeoutError`): on the async backends (asyncdispatch/chronos/js) it covers all retries; on the sync backend it is per attempt.
+`timeouts.total` bounds the whole request (raising `TimeoutError`): on the async clients (asyncdispatch/chronos/js) it covers all retries; on the sync client it is per attempt.
 
 #### Per-phase timeouts
 
@@ -469,14 +458,14 @@ For finer control, set `config.timeouts` (a `Timeouts`) to bound individual phas
 var config = initNaviConfig()
 config.timeouts.connect = 2_000   # TCP connect + TLS handshake
 config.timeouts.read    = 5_000   # stall waiting for a response chunk
-config.timeouts.total   = 30_000  # whole request (overrides/supersedes `timeout`)
+config.timeouts.total   = 30_000  # whole request, including retries/redirects
 ```
 
-- **connect** and **read** are enforced on the native backends (sync, asyncdispatch, chronos).
-- **total** is enforced on all four backends; `timeout` is the legacy alias for it.
+- **connect** and **read** are enforced on the native clients (sync, asyncdispatch, chronos).
+- **total** is enforced on all four clients.
 - On `navi/js` only **total** applies (via `AbortSignal.timeout` — `fetch` hides the connect/read phases).
 
-All raise `TimeoutError`. A timed-out phase on the async backends abandons the in-flight operation (asyncdispatch drains it in the background; chronos cancels it).
+All raise `TimeoutError`. A timed-out phase on the async clients abandons the in-flight operation (asyncdispatch drains it in the background; chronos cancels it).
 
 ### Query parameters
 
@@ -491,7 +480,7 @@ Pairs preserve order and allow duplicate keys (`@{"tag": "a", "tag": "b"}` gives
 
 ### Cancellation
 
-Pass a `CancelToken` to abort a request. On the async backends (asyncdispatch/chronos/js) `cancel()` aborts the in-flight request; on the sync backend it is cooperative (checked between attempts, so it cannot interrupt a socket read already blocked in a syscall -- use `timeout` for that). A cancelled request raises `RequestCancelledError`.
+Pass a `CancelToken` to abort a request. On the async clients (asyncdispatch/chronos/js) `cancel()` aborts the in-flight request; on the sync client it is cooperative (checked between attempts, so it cannot interrupt a socket read already blocked in a syscall -- use `timeouts.read` for that). A cancelled request raises `RequestCancelledError`.
 
 ```nim
 let tok = newCancelToken()
@@ -502,7 +491,7 @@ tok.cancel()
 
 ### Response size limits
 
-`maxResponseBytes` caps the response body; a larger response raises `ResponseTooLargeError`. Streaming enforces the cap incrementally (per chunk); buffered requests enforce it on the assembled body. On the native backends the cap counts decompressed bytes, so it also guards against decompression bombs.
+`maxResponseBytes` caps the response body; a larger response raises `ResponseTooLargeError`. Streaming enforces the cap incrementally (per chunk); buffered requests enforce it on the assembled body. On the native clients the cap counts decompressed bytes, so it also guards against decompression bombs.
 
 ```nim
 var config = initNaviConfig()
@@ -574,9 +563,9 @@ so it runs once per call; to act on each retry, implement the retry loop in a
 middleware. It does not apply to `websocket()`.
 
 Per-instance config is captured by a middleware factory (or kept on the
-`NaviContext`). Write middleware the same way on every async backend
+`NaviContext`). Write middleware the same way on every async client
 (`navi/asyncdispatch`, `navi/chronos`, `navi/js`): a plain `{.async.}` closure
-returning `Future[void]`. navi handles the per-backend details itself (chronos's
+returning `Future[void]`. navi handles the per-client details itself (chronos's
 strict-raises obligation is discharged inside navi, not stamped into the public
 type), so the same middleware source compiles on all of them.
 
@@ -613,7 +602,7 @@ proc main() {.async.} =
 waitFor main()
 ```
 
-On the sync backend (which can't have requests in flight at once), the same
+On the sync client (which can't have requests in flight at once), the same
 multiplexing is available through a batch call:
 
 ```nim
@@ -630,7 +619,7 @@ let results = api.parallel(@[
 `parallel` collects every response (it does not raise on non-2xx); inspect
 `.ok` per result.
 
-HTTP/2 runs on the sync and asyncdispatch backends. To disable it and force
+HTTP/2 runs on the sync and asyncdispatch clients. To disable it and force
 HTTP/1.1, set `http: {H1}` in `NaviConfig`.
 
 ### Keep-alive
@@ -639,7 +628,7 @@ Connection reuse is automatic. Each client keeps an idle-connection pool keyed b
 
 ### Happy Eyeballs
 
-When a host resolves to several addresses (typical of dual-stack IPv4/IPv6 hosts and CDN pools), the sync backend follows [RFC 8305](https://www.rfc-editor.org/rfc/rfc8305): it interleaves the address families and **races** the connection attempts, staggered by ~250ms, using whichever completes first. A slow or blackholed address no longer stalls the whole connect for the full timeout before the next is tried. If the TLS handshake then fails on the winning address, the remaining addresses are re-raced (handshake-aware fallback). This is automatic and needs no configuration.
+When a host resolves to several addresses (typical of dual-stack IPv4/IPv6 hosts and CDN pools), the sync client follows [RFC 8305](https://www.rfc-editor.org/rfc/rfc8305): it interleaves the address families and **races** the connection attempts, staggered by ~250ms, using whichever completes first. A slow or blackholed address no longer stalls the whole connect for the full timeout before the next is tried. If the TLS handshake then fails on the winning address, the remaining addresses are re-raced (handshake-aware fallback). This is automatic and needs no configuration.
 
 ### Streaming
 
@@ -657,7 +646,7 @@ if res.status == 200:
 file.close()
 ```
 
-On the **async** backends (`navi/asyncdispatch`, `navi/chronos`, `navi/js`) the
+On the **async** clients (`navi/asyncdispatch`, `navi/chronos`, `navi/js`) the
 same code awaits the open, and the `each` body may await (the `await` is baked into
 `each`, so there is none on the `each` line itself):
 
@@ -667,7 +656,7 @@ res.each(chunk):
   await sink.write(chunk)
 ```
 
-`chunk` is an owned `string` on the native backends, moved out of navi's read
+`chunk` is an owned `string` on the native clients, moved out of navi's read
 buffer with no copy; on `navi/js` it is `seq[byte]` (the bytes come from a JS
 `Uint8Array`). Because `each`'s body runs as a proc, `break`/`continue`/`return`
 cannot escape it: to stop early, don't call `each` and `close` the handle, or raise
@@ -720,15 +709,15 @@ must be `200 text/event-stream`, or `sse()` raises.
 
 The stream runs with the size cap and read/total timeouts off (SSE is long-lived)
 and shares the client's cookie jar. **Call `close()` when done** so the connection
-is disposed (on the native backends it also joins the h2 mux reader). On `navi/js`
+is disposed (on the native clients it also joins the h2 mux reader). On `navi/js`
 events go through `fetch`, so any method/headers work and chunks are decoded as
 UTF-8 text.
 
 ### WebSocket
 
 Open a WebSocket with `websocket()`, then `send`, `receive`, and `close`. It works
-on all four backends and accepts `ws://` / `wss://` (or `http` / `https`, which are
-mapped). The calls block on the sync backend and are `await`ed on the async ones.
+on all four clients and accepts `ws://` / `wss://` (or `http` / `https`, which are
+mapped). The calls block on the sync client and are `await`ed on the async ones.
 
 ```nim
 let ws = api.websocket("wss://example.com/socket")   # sync
@@ -777,7 +766,7 @@ Make a request with that verb. A relative `target` resolves against `prefixUrl`.
 supplied one. `params` appends an url-encoded query string and accepts pairs
 (`@[...]` / `@{...}` / `{...}`) or a `Table` / `OrderedTable`;
 `cancel: CancelToken` aborts the request (raising `RequestCancelledError`).
-Returns a `Response` on the sync backend, or a `Future[Response]` on
+Returns a `Response` on the sync client, or a `Future[Response]` on
 `navi/asyncdispatch`, `navi/chronos`, and `navi/js`.
 
 ### client.request(verb, target, headers = initHeaders(), body = "", json = nil, form = @[], bodyStream = nil, params = @[], cancel = nil)
@@ -790,9 +779,9 @@ transfer-encoding (return `""` to end). Not available on `navi/js`.
 Open a streaming response and return a `StreamResponse` handle: `status`,
 `reason`, `httpVersion`, `headers`, and `ok` are available immediately (this call
 does not throw on a non-2xx status), while the body is pulled on demand. Consume it
-with `res.each(chunk): ...` (async backends await; the `await` is baked into `each`)
+with `res.each(chunk): ...` (async clients await; the `await` is baked into `each`)
 or an explicit `res.drain(sink)`, and `res.close()` a handle you will not fully
-read. `chunk` is a `string` on the native backends and `seq[byte]` on `navi/js`.
+read. `chunk` is a `string` on the native clients and `seq[byte]` on `navi/js`.
 Awaiting each chunk back-pressures the peer (see [Streaming](#streaming)).
 
 ### client.sse(target, verb = GET, headers = initHeaders(), body = "", params = @[], lastEventId = "", reconnect = true, retryMs = 3000, maxRetryMs = 30000, cancel = nil)
@@ -808,13 +797,13 @@ response must be `200 text/event-stream` or it raises. `close()` when done. See
 ### client.websocket(url, headers = initHeaders())
 
 Open a WebSocket (RFC 6455). Accepts `ws://` / `wss://` (or `http` / `https`, mapped);
-`wss` uses TLS. Returns a `WebSocket` on the sync backend, or a `Future[WebSocket]` on
+`wss` uses TLS. Returns a `WebSocket` on the sync client, or a `Future[WebSocket]` on
 the async ones. Then use `ws.send(data, binary = false)`, `ws.receive(): WsMessage`,
-`ws.close(code = closeNormal, reason = "")`, and `ws.ping(data = "")` (native backends;
+`ws.close(code = closeNormal, reason = "")`, and `ws.ping(data = "")` (native clients;
 `navi/js` leaves ping/pong to the runtime). On `navi/js` it wraps the runtime's native
 `WebSocket`, so `headers` are ignored.
 
-### client.parallel(targets) (sync backend)
+### client.parallel(targets) (sync client)
 
 Fetch many URLs concurrently, multiplexed over one HTTP/2 connection when the
 server supports it. Returns `seq[Response]`; non-2xx responses are returned, not
@@ -838,7 +827,7 @@ fields you want. `NaviConfig` has `{.requiresInit.}`, so a bare or partial
 - **http** `set[HttpVersion]`: protocol preference. Default `{H1, H2}` negotiates
   h2 via ALPN with h1 fallback; set `{H1}` to force HTTP/1.1. Ignored by `navi/js`.
 - **tls** `TlsConfig`: `verify` (`bool`, default `true`) and `caFile` (custom CA
-  bundle, honored on all backends), `certFile`/`keyFile` for mTLS, `resumeSessions`
+  bundle, honored on all clients), `certFile`/`keyFile` for mTLS, `resumeSessions`
   (session resumption, on by default), `minVersion`/`maxVersion` (`TlsVersion`,
   version pinning), and `ciphers`/`cipherSuites` (cipher selection for TLS ≤1.2 /
   TLS 1.3).
@@ -850,12 +839,11 @@ fields you want. `NaviConfig` has `{.requiresInit.}`, so a bare or partial
   trigger a retry), and `maxDelay` (ms ceiling on the wait between attempts).
 - **maxResponseBytes** `int`: cap on the response body size. A larger response
   raises `ResponseTooLargeError`. 0 (default) is unlimited. Enforced incrementally
-  when streaming; counts decompressed bytes on the native backends.
-- **timeout** `int`: overall request timeout in milliseconds; 0 (default) disables.
-  A stalled request raises `TimeoutError`. Legacy alias for `timeouts.total`.
+  when streaming; counts decompressed bytes on the native clients.
 - **timeouts** `Timeouts`: per-phase deadlines (`connect`, `read`, `total`, ms; 0
-  disables each). `connect`/`read` apply to the native backends; `total` to all
-  four. See [Per-phase timeouts](#retries-redirects-and-timeouts).
+  disables each). `connect`/`read` apply to the native clients; `total` to all
+  four. A stalled request raises `TimeoutError`. See
+  [Per-phase timeouts](#retries-redirects-and-timeouts).
 - **auth** `Auth`: `basicAuth(user, pass)`, `bearerAuth(token)`, or
   `digestAuth(user, pass)`. Basic/bearer set `Authorization` on every request;
   digest answers the server's 401 challenge (MD5 or SHA-256) on a one-shot retry.
@@ -883,8 +871,8 @@ fields you want. `NaviConfig` has `{.requiresInit.}`, so a bare or partial
 ### HttpError
 
 Raised for a non-2xx response when `throwHttpErrors` is on. Carries the full
-response as `.response`. Other request errors: `TimeoutError` (exceeded
-`timeout`), `RequestCancelledError` (a `CancelToken` was cancelled), and
+response as `.response`. Other request errors: `TimeoutError` (a configured
+`timeouts` deadline elapsed), `RequestCancelledError` (a `CancelToken` was cancelled), and
 `ResponseTooLargeError` (body exceeded `maxResponseBytes`).
 
 ## Security

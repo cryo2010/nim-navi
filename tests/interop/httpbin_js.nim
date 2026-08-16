@@ -17,7 +17,7 @@ const base = "https://127.0.0.1:8447"
 
 proc baseCfg(): NaviConfig =
   result = initNaviConfig()
-  result.timeout = 20_000
+  result.timeouts.total = 20_000
   result.headers["user-agent"] = "navi-httpbin/1.0"
 
 proc api(): Navi = newNavi(baseCfg())

@@ -60,7 +60,7 @@ proc initNaviConfig*(): NaviConfig =
     prefixUrl: "", headers: initHeaders(), http: {H1, H2}, tls: defaultTls(),
     decompress: true, throwHttpErrors: true, maxRedirects: 20,
     retry: defaultRetryPolicy(), maxResponseBytes: 0,
-    auth: Auth(), proxy: "", timeout: 0, timeouts: Timeouts(), middleware: @[])
+    auth: Auth(), proxy: "", timeouts: Timeouts(), middleware: @[])
 
 proc newNavi*(config = initNaviConfig()): Navi =
   var cfg = config
@@ -620,7 +620,6 @@ proc sse*(client: Navi, target: string, verb = GET,
   ## size cap and read/total timeouts off and shares the client's cookie jar.
   var cfg = client.config
   cfg.maxResponseBytes = 0
-  cfg.timeout = 0
   cfg.timeouts.read = 0
   cfg.timeouts.total = 0
   var h = headers
