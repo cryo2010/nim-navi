@@ -485,6 +485,11 @@ template performRequest*(client, req0: typed; cancel: CancelToken = nil): Respon
     var resp: Response
     var attempt = 0
     let policy = client.config.retry
+    # A streamed request body (`bodyStream`) can't be rewound once its producer has
+    # advanced, so replaying it would send a truncated body. Such a request is never
+    # retried -- not even a provably-unprocessed one, since the producer may already
+    # have been pulled during the attempt.
+    let bodyReplayable = req.bodyStream == nil
     while true:
       throwIfCancelled(cancel)
       var gotResp = false
@@ -494,11 +499,13 @@ template performRequest*(client, req0: typed; cancel: CancelToken = nil): Respon
       except CatchableError as e:
         # A provably-unprocessed request (h2 REFUSED_STREAM / above GOAWAY) is
         # safe to retry even when non-idempotent.
-        let retryable = isRetryableVerb(req.verb, policy) or (e of UnprocessedError)
+        let retryable = bodyReplayable and
+          (isRetryableVerb(req.verb, policy) or (e of UnprocessedError))
         if not (attempt < policy.limit and retryable):
           raise # not retryable: propagate the transport error
       if gotResp and
-         not (attempt < policy.limit and isRetryableVerb(req.verb, policy) and
+         not (attempt < policy.limit and bodyReplayable and
+              isRetryableVerb(req.verb, policy) and
               isRetryableStatus(resp.status, policy)):
         break
       inc attempt

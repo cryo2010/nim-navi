@@ -16,9 +16,18 @@ proc host*(u: Url): string = u.raw.hostname
 proc isTls*(u: Url): bool = cmpIgnoreCase(u.raw.scheme, "https") == 0
 
 proc port*(u: Url): int =
-  ## Explicit port, or the scheme default (443 for https, else 80).
+  ## Explicit port, or the scheme default (443 for https, else 80). A malformed or
+  ## out-of-range port (e.g. from a crafted redirect Location) raises a clear
+  ## `ValueError` rather than the cryptic overflow/parse error `parseInt` would.
   if u.raw.port.len > 0:
-    return parseInt(u.raw.port)
+    var p: int
+    try:
+      p = parseInt(u.raw.port)
+    except ValueError:
+      raise newException(ValueError, "navi: invalid URL port '" & u.raw.port & "'")
+    if p < 1 or p > 65535:
+      raise newException(ValueError, "navi: URL port out of range '" & u.raw.port & "'")
+    return p
   if u.isTls: 443 else: 80
 
 proc originKey*(u: Url): string =

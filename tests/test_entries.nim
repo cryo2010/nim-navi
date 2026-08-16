@@ -825,3 +825,23 @@ suite "request header injection (CRLF)":
       discard
     check raised
     api.close()
+
+suite "streamed request body is not retried":
+  test "a bodyStream PUT is not retried on 503 (non-rewindable body)":
+    # startRetry answers one 503 then 200. A buffered idempotent request would be
+    # retried and see 200; a streamed body can't be rewound, so it must not retry
+    # and the 503 is returned as-is.
+    const port = 8996
+    var th: Thread[ServerCtx]
+    startRetry(th, port, failures = 1)
+
+    var cfg = initNaviConfig()
+    cfg.throwHttpErrors = false
+    let api = newNavi(cfg)
+    var sent = false
+    proc producer(): string =
+      if sent: "" else: (sent = true; "streamed-body")
+    let res = api.request(PUT, "http://127.0.0.1:" & $port & "/",
+                          bodyStream = producer)
+    check res.status == 503        # not retried
+    joinThread(th)

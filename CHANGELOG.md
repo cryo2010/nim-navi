@@ -26,6 +26,11 @@ onward (pre-1.0, minor versions may include breaking changes).
 - Pooled keep-alive reuse no longer replays a non-idempotent request (POST/PATCH)
   on a fresh connection when the reused connection failed after the request may
   have been processed.
+- A request with a streamed body (`bodyStream`) is no longer retried: its producer
+  cannot be rewound, so a replay would have sent a truncated body.
+- TLS to an IP-literal host now verifies the certificate's iPAddress SAN
+  (`X509_check_ip`) instead of skipping the identity check, so a chain-valid
+  certificate for a different name is no longer accepted for an IP target.
 
 ### Fixed
 - HTTP/2 mux: release a concurrency slot when a streaming download completes (and
@@ -33,6 +38,8 @@ onward (pre-1.0, minor versions may include breaking changes).
   could hang.
 - HTTP/3: a stream reset/abort now completes its waiter (and raises) instead of
   hanging until the connection closes.
+- A malformed or out-of-range URL port (e.g. from a crafted redirect `Location`)
+  now raises a clear `ValueError` instead of a cryptic integer-parse crash.
 
 ### Removed
 - The legacy `NaviConfig.timeout` field. Use `timeouts.total` for the overall
