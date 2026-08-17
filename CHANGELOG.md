@@ -7,6 +7,11 @@ onward (pre-1.0, minor versions may include breaking changes).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-16
+
+Theme: security and robustness hardening from a package-wide review, plus the
+removal of the last pre-1.0 legacy field.
+
 ### Security
 - Bound decompression on the buffered path: `maxResponseBytes` is now enforced
   *during* gzip/deflate/brotli/zstd decode, so a compression bomb is aborted
