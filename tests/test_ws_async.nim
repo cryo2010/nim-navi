@@ -62,6 +62,7 @@ proc wsEcho(port: int) {.thread.} =
 suite "async websocket client end to end":
   test "the WebSocket client should handshake, echo text and binary, reassemble fragments, and close":
     const port = 8997
+    wsReady = false   # reset so a looped run waits for THIS server, not a stale flag
     var th: Thread[int]
     createThread(th, wsEcho, port)
     while not wsReady: os.sleep(5)
