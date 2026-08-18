@@ -175,6 +175,10 @@ jobs:
       - name: Install nghttpd
         run: sudo apt-get update && sudo apt-get install -y nghttp2-server
 
+      # Only the chronos leg of the Happy Eyeballs test needs the chronos package.
+      - name: Install chronos
+        run: nimble install -y "chronos@>= 4.0.0"
+
       # Scripts run directly (not `nimble interop`/`nimble mtls`): nimble does not
       # propagate a task's exit code (nim-lang/nimble#1802). Both use `set -e`.
       - name: Run the interop suite
