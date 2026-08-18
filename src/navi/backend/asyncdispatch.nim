@@ -47,7 +47,8 @@ type
     readMs: int         ## per-read stall timeout in ms; 0 blocks indefinitely
     when defined(ssl):
       ssl: SslPtr       ## the TLS connection; nil for plain http
-      ctx: SslContext   ## kept so `close` can free the SSL_CTX (destroyContext)
+      ctx: SslContext   ## the (usually shared) SSL_CTX this connection used
+      ownsCtx: bool     ## true only for an unshared ctx `close` must destroy
       slot: SessionSlot ## keeps the resumption link alive for the SSL's lifetime
 
 var openedConnections*: int  ## diagnostic: TCP connections opened by this backend
@@ -73,13 +74,12 @@ proc waitWrite(fd: AsyncFD): owned(Future[void]) =
 # --- TLS over the owned fd (ssl only) ----------------------------------
 
 when defined(ssl):
-  proc resumeSlot(cfg: TlsConfig, ctx: SslContext, origin: string): SessionSlot =
-    ## When resumption is on and the client has a session cache, arm `ctx` to feed
-    ## it and return a slot keyed by `origin`; otherwise nil (no resumption).
+  proc resumeSlot(cfg: TlsConfig, origin: string): SessionSlot =
+    ## When resumption is on and the client has a session cache, return a slot keyed
+    ## by `origin`; otherwise nil. The context is armed once in `obtainContext`, so
+    ## this only mints the per-connection link.
     if cfg.wantsResume and not cfg.sessionCache.isNil:
-      let cache = cast[TlsSessionCache](cfg.sessionCache)
-      enableResumption(ctx, cache)
-      result = newSlot(cache, origin)
+      result = newSlot(cast[TlsSessionCache](cfg.sessionCache), origin)
 
   proc driveHandshake(ssl: SslPtr, fd: AsyncFD, host: string) {.async.} =
     ## Non-blocking SSL_connect, awaiting readiness only when OpenSSL asks.
@@ -152,10 +152,10 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
       if tls:
         when defined(ssl):
           # No ALPN over a proxy tunnel (the old path negotiated it lazily).
-          let ctx = newTlsContext(cfg, if proxy.isSet: @[] else: alpn)
-          conn.ctx = ctx
-          conn.slot = resumeSlot(cfg, ctx, host & ":" & $port)
-          conn.ssl = newClientSsl(ctx, fd.SocketHandle, host, conn.slot)
+          (conn.ctx, conn.ownsCtx) = obtainContext(
+            cfg.contextStore, cfg, if proxy.isSet: @[] else: alpn)
+          conn.slot = resumeSlot(cfg, host & ":" & $port)
+          conn.ssl = newClientSsl(conn.ctx, fd.SocketHandle, host, conn.slot)
           await driveHandshake(conn.ssl, fd, host)
           verifyPeer(conn.ssl, host, cfg.wantsVerify)
           conn.protocol = negotiatedProtocol(conn.ssl)
@@ -164,7 +164,9 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     except CatchableError:
       when defined(ssl):
         if not conn.ssl.isNil: SSL_free(conn.ssl); conn.ssl = nil
-        if not conn.ctx.isNil: conn.ctx.destroyContext(); conn.ctx = nil
+        # Only an unshared ctx is freed here; a shared one belongs to the store.
+        if conn.ownsCtx and not conn.ctx.isNil: conn.ctx.destroyContext()
+        conn.ctx = nil
       if conn.fd != invalidFd: closeSocket(conn.fd); conn.fd = invalidFd
       raise
 
@@ -207,9 +209,9 @@ proc closeSync*(c: Conn) =
       SSL_free(c.ssl)
   if c.fd != invalidFd: closeSocket(c.fd)
   when defined(ssl):
-    # newContext leaves the SSL_CTX without a destructor; free it so a long-lived
-    # client does not leak one context per connection.
-    if not c.ctx.isNil: c.ctx.destroyContext()
+    # A shared ctx is freed with the client's context store, not here; only an
+    # unshared one (bare TlsConfig, e.g. interop tests) is destroyed per connection.
+    if c.ownsCtx and not c.ctx.isNil: c.ctx.destroyContext()
 
 proc shutdownConn*(c: Conn) =
   ## Shut the socket down in both directions so a pending read or write unblocks
@@ -240,5 +242,21 @@ proc closeTlsStore*(store: RootRef) =
   ## Free the sessions held by a `newTlsStore` cache. The entry calls this in `close`.
   when defined(ssl):
     if not store.isNil: close(cast[TlsSessionCache](store))
+  else:
+    discard store
+
+proc newTlsCtxStore*(cfg: TlsConfig): RootRef =
+  ## The per-client shared TLS-context store (empty until the first TLS connect),
+  ## or nil on a non-`-d:ssl` build. The entry puts it on `config.tls.contextStore`.
+  when defined(ssl):
+    result = newTlsContextStore()
+  else:
+    discard cfg
+
+proc closeTlsCtxStore*(store: RootRef) =
+  ## Free the shared contexts held by a `newTlsCtxStore`. The entry calls this in
+  ## `close`, after `closeIdle` has shut the pooled connections.
+  when defined(ssl):
+    if not store.isNil: close(cast[TlsContextStore](store))
   else:
     discard store

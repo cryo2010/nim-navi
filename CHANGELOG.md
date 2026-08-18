@@ -7,6 +7,14 @@ onward (pre-1.0, minor versions may include breaking changes).
 
 ## [Unreleased]
 
+### Changed
+- Performance: the OpenSSL backends (sync, asyncdispatch) build one shared
+  `SSL_CTX` per client and reuse it for every connection, instead of constructing
+  and freeing a fresh context (parsing the trust store, wiring verification, ALPN,
+  and version/cipher bounds) on each one. Cold, unpooled requests are ~14 to 20%
+  faster since that setup is no longer repeated per handshake; the pooled path is
+  unchanged. Session resumption is now armed once when the context is built.
+
 ## [0.6.0] - 2026-08-16
 
 Theme: security and robustness hardening from a package-wide review, plus the

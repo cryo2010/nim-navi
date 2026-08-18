@@ -69,7 +69,8 @@ type
     bounded: bool       ## whether `deadline` is active (total timeout set)
     when defined(ssl):
       ssl: SslPtr       ## the TLS connection; nil for plain http
-      ctx: SslContext   ## kept so `close` can free the SSL_CTX (destroyContext)
+      ctx: SslContext   ## the (usually shared) SSL_CTX this connection used
+      ownsCtx: bool     ## true only for an unshared ctx `close` must destroy
       slot: SessionSlot ## keeps the resumption link alive for the SSL's lifetime
 
 template await*(x: untyped): untyped = x
@@ -232,13 +233,12 @@ proc happyConnect(ips: seq[string], port: int,
   raise newException(IOError, "navi: could not connect: " & lastErr)
 
 when defined(ssl):
-  proc resumeSlot(cfg: TlsConfig, ctx: SslContext, origin: string): SessionSlot =
-    ## When resumption is on and the client has a session cache, arm `ctx` to feed
-    ## it and return a slot keyed by `origin`; otherwise nil (no resumption).
+  proc resumeSlot(cfg: TlsConfig, origin: string): SessionSlot =
+    ## When resumption is on and the client has a session cache, return a slot keyed
+    ## by `origin`; otherwise nil. The context itself is armed once in
+    ## `obtainContext`, so this only mints the per-connection link.
     if cfg.wantsResume and not cfg.sessionCache.isNil:
-      let cache = cast[TlsSessionCache](cfg.sessionCache)
-      enableResumption(ctx, cache)
-      result = newSlot(cache, origin)
+      result = newSlot(cast[TlsSessionCache](cfg.sessionCache), origin)
 
   proc connectAcross*(ctx: SslContext, ips: openArray[string], sni: string,
                       port: int, verify: bool, slot: SessionSlot = nil,
@@ -286,14 +286,15 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     result.deadline = getMonoTime() + initDuration(milliseconds = totalMs)
     result.bounded = true
   # Release the socket and TLS context if we don't finish connecting -- a failed
-  # proxy CONNECT or TLS handshake would otherwise leak the fd and the SSL_CTX
-  # (which has no destructor).
+  # proxy CONNECT or TLS handshake would otherwise leak the fd (and an unshared
+  # SSL_CTX, which has no destructor). A shared ctx is owned by the client's store,
+  # so it is not freed here.
   var established = false
   defer:
     if not established:
       when defined(ssl):
         if not result.ssl.isNil: SSL_free(result.ssl)
-        if not result.ctx.isNil: result.ctx.destroyContext()
+        if result.ownsCtx and not result.ctx.isNil: result.ctx.destroyContext()
       if result.fd != osInvalidSocket:
         close(result.fd)
   if proxy.isSet:
@@ -302,8 +303,8 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
       if establishMs > 0: setIoTimeout(result.fd, establishMs)
       proxyConnect(result.fd, host, port)
       when defined(ssl):
-        result.ctx = newTlsContext(cfg, alpn)   # verify/CA + ALPN + any client cert
-        result.slot = resumeSlot(cfg, result.ctx, host & ":" & $port)
+        (result.ctx, result.ownsCtx) = obtainContext(cfg.contextStore, cfg, alpn)
+        result.slot = resumeSlot(cfg, host & ":" & $port)
         result.ssl = startClientTls(result.ctx, result.fd, host, cfg.wantsVerify,
                                     result.slot)
         if establishMs > 0: setIoTimeout(result.fd, 0)
@@ -312,21 +313,22 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
         raise newException(ValueError, "navi: https requires compiling with -d:ssl")
   elif tls:
     when defined(ssl):
-      let ctx = newTlsContext(cfg, alpn)   # verify/CA + ALPN + any client cert
-      let slot = resumeSlot(cfg, ctx, host & ":" & $port)
+      let (ctx, owned) = obtainContext(cfg.contextStore, cfg, alpn)
+      let slot = resumeSlot(cfg, host & ":" & $port)
       let dl = result.deadline
       let bd = result.bounded
       # Handshake-aware fallback across the resolved addresses (see connectAcross).
       # connectAcross returns a fresh Conn, so `result.ctx` is nil until we set it
-      # below; free `ctx` here if the handshake fails, before `result` is assigned
-      # (the connect-cleanup defer cannot see it yet).
+      # below; free `ctx` here (only if we own it) on failure, before `result` is
+      # assigned (the connect-cleanup defer cannot see it yet).
       try:
         result = connectAcross(ctx, resolveAddrs(host, port), host, port,
                                cfg.wantsVerify, slot, establishMs)
       except CatchableError:
-        ctx.destroyContext()
+        if owned: ctx.destroyContext()
         raise
       result.ctx = ctx
+      result.ownsCtx = owned
       result.readMs = readMs
       result.deadline = dl
       result.bounded = bd
@@ -395,9 +397,9 @@ proc close*(c: Conn) =
   if c.fd != osInvalidSocket:
     close(c.fd)
   when defined(ssl):
-    # newContext leaves the SSL_CTX without a destructor; free it so a long-lived
-    # client does not leak one context (~85 KB) per connection.
-    if not c.ctx.isNil: c.ctx.destroyContext()
+    # A shared ctx is freed with the client's context store, not here; only an
+    # unshared one (bare TlsConfig, e.g. interop tests) is destroyed per connection.
+    if c.ownsCtx and not c.ctx.isNil: c.ctx.destroyContext()
 
 proc newTlsStore*(cfg: TlsConfig): RootRef =
   ## The per-client TLS session cache for this backend, or nil when resumption is
@@ -412,5 +414,21 @@ proc closeTlsStore*(store: RootRef) =
   ## Free the sessions held by a `newTlsStore` cache. Entries call this in `close`.
   when defined(ssl):
     if not store.isNil: close(cast[TlsSessionCache](store))
+  else:
+    discard store
+
+proc newTlsCtxStore*(cfg: TlsConfig): RootRef =
+  ## The per-client shared TLS-context store (empty until the first TLS connect),
+  ## or nil on a non-`-d:ssl` build. Entries put it on `config.tls.contextStore`.
+  when defined(ssl):
+    result = newTlsContextStore()
+  else:
+    discard cfg
+
+proc closeTlsCtxStore*(store: RootRef) =
+  ## Free the shared contexts held by a `newTlsCtxStore`. Entries call this in
+  ## `close`, after `closeIdle` has shut the pooled connections.
+  when defined(ssl):
+    if not store.isNil: close(cast[TlsContextStore](store))
   else:
     discard store

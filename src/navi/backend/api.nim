@@ -38,6 +38,9 @@ type
                            ## (abbreviated handshake); on by default via `defaultTls()`
     sessionCache*: RootRef ## per-client session store, set by `newNavi`; the TLS
                            ## backend owns the concrete type. Not user-configurable.
+    contextStore*: RootRef ## per-client shared TLS-context store, set by `newNavi`;
+                           ## lets every connection reuse one SSL_CTX instead of
+                           ## rebuilding it. Backend-owned type; not user-configurable.
     minVersion*: TlsVersion ## lowest TLS version to negotiate (`tlsDefault` = unset)
     maxVersion*: TlsVersion ## highest TLS version to negotiate (`tlsDefault` = unset)
     ciphers*: string       ## TLS <=1.2 cipher list, OpenSSL format (colon-separated,

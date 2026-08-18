@@ -98,6 +98,7 @@ proc newNavi*(config = initNaviConfig()): Navi =
   ## middleware, …).
   var cfg = config
   if cfg.tls.sessionCache.isNil: cfg.tls.sessionCache = newTlsStore(cfg.tls)
+  cfg.tls.contextStore = newTlsCtxStore(cfg.tls)
   result = Navi(config: cfg, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
   when defined(naviHttp3): result.altSvc = newAltSvcCache()
 
@@ -112,6 +113,7 @@ proc extend*(client: Navi, config: NaviConfig): Navi =
   var merged = mergeBase(client.config, config)
   merged.middleware = client.config.middleware & config.middleware
   merged.tls.sessionCache = newTlsStore(merged.tls)  # its own cache, not the parent's
+  merged.tls.contextStore = newTlsCtxStore(merged.tls)  # its own contexts too
   result = Navi(config: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
   when defined(naviHttp3): result.altSvc = newAltSvcCache()
 
@@ -122,6 +124,7 @@ proc close*(client: Navi) =
   ## only at process exit (and their OpenSSL contexts leak until then).
   closeIdle(client.pool)
   closeTlsStore(client.config.tls.sessionCache)
+  closeTlsCtxStore(client.config.tls.contextStore)
 
 when defined(naviHttp3):
   # Request fields that must not cross to HTTP/3: pseudo-header sources and

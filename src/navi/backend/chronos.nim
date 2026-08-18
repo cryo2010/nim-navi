@@ -56,6 +56,15 @@ proc newTlsStore*(cfg: TlsConfig): RootRef =
 proc closeTlsStore*(store: RootRef) =
   discard store
 
+proc newTlsCtxStore*(cfg: TlsConfig): RootRef =
+  ## No-op for chronos: BearSSL does not build a shared OpenSSL `SSL_CTX`, so there
+  ## is nothing to cache per client. Kept for a uniform interface across backends;
+  ## the shared-context optimization applies to the OpenSSL backends. Always nil.
+  discard cfg
+
+proc closeTlsCtxStore*(store: RootRef) =
+  discard store
+
 proc proxyConnect(transport: StreamTransport, host: string, port: int) {.async.} =
   let target = host & ":" & $port
   discard await transport.write(

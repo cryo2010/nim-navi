@@ -14,7 +14,7 @@
 import ./api
 
 when defined(ssl):
-  import std/[net, openssl, nativesockets, tables]
+  import std/[net, openssl, nativesockets, tables, strutils]
   # Re-export the context type + destructor so backends can own the socket and
   # handshake while still building the (verified) context through newContext.
   export net.SslContext, net.destroyContext
@@ -318,6 +318,55 @@ when defined(ssl):
     discard SSL_set_ex_data(ssl, slotExIdx, cast[pointer](slot))
     let s = slot.cache.sessions.getOrDefault(slot.origin, nil)
     if not s.isNil: discard SSL_set_session(ssl, s)
+
+  # --- shared per-client context store -----------------------------------
+  #
+  # Building an SSL_CTX -- parsing the trust store, wiring up verification, ALPN,
+  # version bounds, ciphers -- is the dominant per-connection cost on a cold
+  # (unpooled) request. The context is immutable once built and safe to share, so
+  # a client builds one per ALPN offer and every connection reuses it; only the
+  # SSL is per-connection (cheap). The store is freed with the client, not per
+  # connection.
+
+  type
+    TlsContextStore* = ref object of RootObj
+      ## Per-client cache of shared TLS contexts, keyed by the ALPN offered (a
+      ## client dials at most a couple of ALPN shapes: h2+http/1.1, or none over a
+      ## proxy tunnel). Held through `TlsConfig.contextStore`; freed with `close`.
+      contexts: Table[string, SslContext]
+
+  proc newTlsContextStore*(): TlsContextStore =
+    TlsContextStore(contexts: initTable[string, SslContext]())
+
+  proc close*(store: TlsContextStore) =
+    ## Free every shared context. Call when the client is closed, after its pooled
+    ## connections have been closed (so no live SSL still references a context).
+    if store.isNil: return
+    for ctx in store.contexts.values: ctx.destroyContext()
+    store.contexts.clear()
+
+  proc buildContext(cfg: TlsConfig, alpn: openArray[string]): SslContext =
+    ## A verified context with resumption armed (when enabled). Arming happens once
+    ## here, not per connection, since the context is shared.
+    result = newTlsContext(cfg, alpn)
+    if cfg.wantsResume and not cfg.sessionCache.isNil:
+      enableResumption(result, cast[TlsSessionCache](cfg.sessionCache))
+
+  proc obtainContext*(store: RootRef, cfg: TlsConfig,
+                      alpn: openArray[string]): tuple[ctx: SslContext, owned: bool] =
+    ## The client's shared context for `alpn`, built once and cached. `owned` is
+    ## true only when there is no store (a bare `TlsConfig`, e.g. in the interop
+    ## tests): then the caller owns the context and must destroy it on close. With a
+    ## store the context lives until the client is closed.
+    if store.isNil:
+      return (buildContext(cfg, alpn), true)
+    let s = cast[TlsContextStore](store)
+    let key = alpn.join("\x00")
+    var ctx = s.contexts.getOrDefault(key, nil)
+    if ctx.isNil:
+      ctx = buildContext(cfg, alpn)
+      s.contexts[key] = ctx
+    (ctx, false)
 
   # --- per-connection handshake ------------------------------------------
 
