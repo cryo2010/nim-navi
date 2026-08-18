@@ -35,3 +35,11 @@ done
 export NAVI_HE_CERT="$work/cert.pem" NAVI_HE_PORT="$port" NAVI_HE_BLACKHOLE="$blackhole"
 echo "== Happy Eyeballs: blackhole $blackhole + good 127.0.0.1:$port =="
 nim c -r --path:"$root/src" -d:ssl --hints:off "$root/tests/interop/happy_eyeballs.nim"
+nim c -r --path:"$root/src" -d:ssl --hints:off "$root/tests/interop/happy_eyeballs_async.nim"
+# The chronos leg needs the chronos package. Run it strictly when installed (so a
+# real regression fails CI); skip with a note where chronos is absent.
+if nimble path chronos >/dev/null 2>&1; then
+  nim c -r --path:"$root/src" --hints:off "$root/tests/interop/happy_eyeballs_chronos.nim"
+else
+  echo "note: chronos not installed; skipping the chronos Happy Eyeballs leg"
+fi

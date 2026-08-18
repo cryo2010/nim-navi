@@ -10,6 +10,7 @@ import pkg/chronos, pkg/chronos/transports/stream
 import pkg/chronos/streams/[asyncstream, tlsstream]
 import ./api, ./chronos_castore
 import ../core/response  # for navi's TimeoutError
+from ./happyeyeballs import heAttemptDelayMs
 
 export api, chronos
 
@@ -75,6 +76,86 @@ proc proxyConnect(transport: StreamTransport, host: string, port: int) {.async.}
   if not (buf.startsWith("HTTP/1.1 200") or buf.startsWith("HTTP/1.0 200")):
     raise newException(ValueError, "navi: proxy CONNECT failed: " & buf.splitLines()[0])
 
+proc interleaveTAddr(addrs: seq[TransportAddress]): seq[TransportAddress] =
+  ## RFC 8305 §4 family interleaving over resolved transport addresses, leading
+  ## with the family the resolver put first.
+  var v6, v4: seq[TransportAddress]
+  for a in addrs:
+    if a.family == AddressFamily.IPv6: v6.add a else: v4.add a
+  let (x, y) =
+    if addrs.len > 0 and addrs[0].family == AddressFamily.IPv6: (v6, v4) else: (v4, v6)
+  var i = 0
+  while i < x.len or i < y.len:
+    if i < x.len: result.add x[i]
+    if i < y.len: result.add y[i]
+    inc i
+
+proc discardLoser(f: Future[StreamTransport]) {.async.} =
+  ## Cancel a losing Happy Eyeballs attempt; if it had already connected, close the
+  ## transport so a late winner-loser tie does not leak it.
+  try: await f.cancelAndWait()
+  except CatchableError: discard
+  if f.completed:
+    try: await f.read().closeWait()
+    except CatchableError: discard
+
+proc happyConnect*(addrs: seq[TransportAddress]):
+    Future[tuple[transport: StreamTransport, idx: int]] {.async.} =
+  ## Happy Eyeballs (RFC 8305): start chronos connects to `addrs` (interleaved by
+  ## family) staggered by ~250ms and return the (transport, index) of the first to
+  ## complete, so a slow or blackholed address does not stall the others. Losing
+  ## attempts are cancelled (chronos structured cancellation reclaims them cleanly).
+  if addrs.len == 0:
+    raise newException(IOError, "navi: no address to connect to")
+  var
+    inflight: seq[tuple[fut: Future[StreamTransport], idx: int]]
+    nextIdx = 0
+    lastStart = Moment.now()
+    lastErr: ref CatchableError
+  try:
+    while true:
+      # Start the next attempt: the first at once; the rest when nothing is in
+      # flight or the stagger window has elapsed.
+      if nextIdx < addrs.len and
+         (inflight.len == 0 or Moment.now() - lastStart >= heAttemptDelayMs.milliseconds):
+        let f: Future[StreamTransport] = connect(addrs[nextIdx])
+        inflight.add (f, nextIdx)
+        inc nextIdx
+        lastStart = Moment.now()
+        continue
+      if inflight.len == 0:
+        break                       # nothing pending and nothing left to start
+      # Wait for any attempt to finish, or -- if attempts remain -- the stagger
+      # window, whichever is first.
+      var cands: seq[FutureBase]
+      for e in inflight: cands.add FutureBase(e.fut)
+      var timer: Future[void] = nil
+      if nextIdx < addrs.len:
+        timer = sleepAsync(heAttemptDelayMs.milliseconds)
+        cands.add FutureBase(timer)
+      discard await race(cands)
+      if timer != nil and not timer.finished: await timer.cancelAndWait()
+      # Harvest finished attempts: first success wins; failures are dropped.
+      var i = 0
+      while i < inflight.len:
+        let e = inflight[i]
+        if e.fut.finished:
+          if e.fut.completed:
+            let t = e.fut.read()
+            inflight.delete(i)
+            for other in inflight: asyncSpawn discardLoser(other.fut)  # cancel losers
+            return (t, e.idx)
+          else:                       # failed or cancelled
+            lastErr = e.fut.error
+            inflight.delete(i)
+        else:
+          inc i
+  except CatchableError:
+    for e in inflight: asyncSpawn discardLoser(e.fut)
+    raise
+  if lastErr != nil: raise lastErr
+  raise newException(IOError, "navi: could not connect")
+
 proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
               proxy: ProxyTarget, alpn: seq[string] = @[],
               connectMs = 0, readMs = 0, totalMs = 0): Future[Conn] {.async.} =
@@ -91,52 +172,62 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   conn.readMs = readMs
 
   proc establish() {.async.} =
-    let dialAddr =
-      if proxy.isSet: resolveTAddress(proxy.host, Port(proxy.port))[0]
-      else: resolveTAddress(host, Port(port))[0]
-    let transport = await connect(dialAddr)
-    conn.transport = transport
-    # Close the transport if the CONNECT tunnel or TLS setup fails (or the connect
-    # times out -- withTimeout cancels this future, raising CancelledError here).
-    try:
-      if proxy.isSet and tls:
-        await proxyConnect(transport, host, port)
-      if tls:
-        # Client certificates are not honored here (BearSSL client presents none).
-        let flags =
-          if cfg.wantsVerify: {} else: {TLSFlags.NoVerifyHost, TLSFlags.NoVerifyServerName}
-        if cfg.wantsVerify and cfg.caFile.len > 0:
-          if not fileExists(cfg.caFile):
-            raise newException(IOError, "navi: CA file not found: " & cfg.caFile)
-          conn.caStore = loadCaTrustStore(readFile(cfg.caFile))
-        let rdr = newAsyncStreamReader(transport)
-        let wtr = newAsyncStreamWriter(transport)
-        # BearSSL tops out at TLS 1.2. Unpinned, keep chronos's 1.2-only default;
-        # when the user pins a bound, widen the other end to the extremes so the
-        # requested range is honored. No client session resumption here.
-        let pinned = cfg.minVersion != tlsDefault or cfg.maxVersion != tlsDefault
-        let vmin = if pinned: chronosVer(cfg.minVersion, TLS10) else: TLS12
-        let vmax = if pinned: chronosVer(cfg.maxVersion, TLS12) else: TLS12
-        let stream =
-          if conn.caStore != nil:
-            newTLSClientAsyncStream(rdr, wtr, host, flags = flags,
-                                    minVersion = vmin, maxVersion = vmax,
-                                    trustAnchors = conn.caStore.store)
-          else:
-            newTLSClientAsyncStream(rdr, wtr, host, flags = flags,
-                                    minVersion = vmin, maxVersion = vmax)
-        conn.tls = stream
-        conn.reader = stream.reader
-        conn.writer = stream.writer
-        # Drive the handshake now so a verification failure raises here, not mid-read.
-        await stream.handshake()
-      else:
-        conn.reader = newAsyncStreamReader(transport)
-        conn.writer = newAsyncStreamWriter(transport)
-    except CatchableError:
-      try: await transport.closeWait()
-      except CatchableError: discard
-      raise
+    let dialHost = if proxy.isSet: proxy.host else: host
+    let dialPort = if proxy.isSet: proxy.port else: port
+    var pool = interleaveTAddr(resolveTAddress(dialHost, Port(dialPort)))
+    if pool.len == 0:
+      raise newException(IOError, "navi: could not resolve " & dialHost)
+    var lastErr: ref CatchableError
+    # Happy-Eyeballs TCP race, then proxy/TLS on the winner; on a *handshake*
+    # failure drop that address and re-race the rest (handshake-aware fallback).
+    while pool.len > 0:
+      let (transport, idx) = await happyConnect(pool)
+      conn.transport = transport
+      # Close the transport if the CONNECT tunnel or TLS setup fails (or the connect
+      # times out -- withTimeout cancels this future, raising CancelledError here).
+      try:
+        if proxy.isSet and tls:
+          await proxyConnect(transport, host, port)
+        if tls:
+          # Client certificates are not honored here (BearSSL client presents none).
+          let flags =
+            if cfg.wantsVerify: {} else: {TLSFlags.NoVerifyHost, TLSFlags.NoVerifyServerName}
+          if cfg.wantsVerify and cfg.caFile.len > 0:
+            if not fileExists(cfg.caFile):
+              raise newException(IOError, "navi: CA file not found: " & cfg.caFile)
+            conn.caStore = loadCaTrustStore(readFile(cfg.caFile))
+          let rdr = newAsyncStreamReader(transport)
+          let wtr = newAsyncStreamWriter(transport)
+          # BearSSL tops out at TLS 1.2. Unpinned, keep chronos's 1.2-only default;
+          # when the user pins a bound, widen the other end to the extremes so the
+          # requested range is honored. No client session resumption here.
+          let pinned = cfg.minVersion != tlsDefault or cfg.maxVersion != tlsDefault
+          let vmin = if pinned: chronosVer(cfg.minVersion, TLS10) else: TLS12
+          let vmax = if pinned: chronosVer(cfg.maxVersion, TLS12) else: TLS12
+          let stream =
+            if conn.caStore != nil:
+              newTLSClientAsyncStream(rdr, wtr, host, flags = flags,
+                                      minVersion = vmin, maxVersion = vmax,
+                                      trustAnchors = conn.caStore.store)
+            else:
+              newTLSClientAsyncStream(rdr, wtr, host, flags = flags,
+                                      minVersion = vmin, maxVersion = vmax)
+          conn.tls = stream
+          conn.reader = stream.reader
+          conn.writer = stream.writer
+          # Drive the handshake now so a verification failure raises here, not mid-read.
+          await stream.handshake()
+        else:
+          conn.reader = newAsyncStreamReader(transport)
+          conn.writer = newAsyncStreamWriter(transport)
+        return                                     # established
+      except CatchableError as e:
+        try: await transport.closeWait()
+        except CatchableError: discard
+        conn.tls = nil; conn.reader = nil; conn.writer = nil; conn.caStore = nil
+        pool.delete(idx)
+        lastErr = e
+    raise lastErr
 
   if connectMs > 0:
     if not await withTimeout(establish(), connectMs.milliseconds):

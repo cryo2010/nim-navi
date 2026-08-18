@@ -95,7 +95,7 @@ discard main()
 - **Browser and Node** via a JavaScript client (`import navi/js`) that runs on the runtime's `fetch`
 - **TLS** on all three clients (OpenSSL for sync/asyncdispatch, BearSSL for chronos), with certificate verification on by default
 - **Connection pooling / keep-alive**, with automatic retry on a stale pooled connection
-- **Happy Eyeballs** (RFC 8305) address racing on the sync client, so a slow/blackholed address doesn't stall the connect
+- **Happy Eyeballs** (RFC 8305) address racing on every native backend (sync, asyncdispatch, chronos), so a slow/blackholed address doesn't stall the connect
 - **Streaming** uploads (chunked) and downloads (headers-first pull handle with backpressure)
 - **Server-Sent Events** (`sse()`) with transparent reconnection (Last-Event-ID + `retry:`), any method/headers
 - **Retries** with capped exponential backoff, honoring `Retry-After`
@@ -628,7 +628,7 @@ Connection reuse is automatic. Each client keeps an idle-connection pool keyed b
 
 ### Happy Eyeballs
 
-When a host resolves to several addresses (typical of dual-stack IPv4/IPv6 hosts and CDN pools), the sync client follows [RFC 8305](https://www.rfc-editor.org/rfc/rfc8305): it interleaves the address families and **races** the connection attempts, staggered by ~250ms, using whichever completes first. A slow or blackholed address no longer stalls the whole connect for the full timeout before the next is tried. If the TLS handshake then fails on the winning address, the remaining addresses are re-raced (handshake-aware fallback). This is automatic and needs no configuration.
+When a host resolves to several addresses (typical of dual-stack IPv4/IPv6 hosts and CDN pools), navi follows [RFC 8305](https://www.rfc-editor.org/rfc/rfc8305): it interleaves the address families and **races** the connection attempts, staggered by ~250ms, using whichever completes first. A slow or blackholed address no longer stalls the whole connect for the full timeout before the next is tried. If the TLS handshake then fails on the winning address, the remaining addresses are re-raced (handshake-aware fallback). This is automatic and needs no configuration, and works the same on all connecting backends (sync, asyncdispatch, chronos); `navi/js` delegates connection setup to the host runtime's `fetch`.
 
 ### Streaming
 

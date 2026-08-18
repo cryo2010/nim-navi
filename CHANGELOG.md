@@ -7,6 +7,14 @@ onward (pre-1.0, minor versions may include breaking changes).
 
 ## [Unreleased]
 
+### Added
+- Happy Eyeballs (RFC 8305) address racing now runs on the asyncdispatch and
+  chronos backends too, not just sync. A client interleaves the resolved address
+  families and races the connection attempts staggered by ~250ms, so a slow or
+  blackholed address no longer stalls the connect until it times out. Handshake-
+  aware fallback (drop a TLS-failing address and re-race the rest) is included on
+  all three native backends.
+
 ### Changed
 - Performance: the OpenSSL backends (sync, asyncdispatch) build one shared
   `SSL_CTX` per client and reuse it for every connection, instead of constructing

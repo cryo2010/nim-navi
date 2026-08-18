@@ -8,7 +8,7 @@
 ## `await`-shaped body compiles to straight-line blocking code.
 
 import std/[os, strutils, nativesockets, monotimes, times]
-import ./api, ./openssl_ctx
+import ./api, ./openssl_ctx, ./happyeyeballs
 import ../core/response  # for navi's TimeoutError
 when defined(ssl):
   import std/openssl
@@ -136,35 +136,8 @@ proc proxyConnect(fd: SocketHandle, host: string, port: int) =
     raise newException(ValueError, "navi: proxy CONNECT failed: " & resp.splitLines()[0])
 
 # --- Happy Eyeballs (RFC 8305) -----------------------------------------
-
-const heAttemptDelayMs = 250   ## RFC 8305 Connection Attempt Delay
-
-proc interleaveFamilies(ips: seq[string]): seq[string] =
-  ## Alternate address families (RFC 8305 §4) so a down family (e.g. every IPv6
-  ## address) is not exhausted before the other is tried. Leads with the family
-  ## the resolver put first.
-  var v6, v4: seq[string]
-  for ip in ips:
-    if ':' in ip: v6.add ip else: v4.add ip
-  let (a, b) = if ips.len > 0 and ':' in ips[0]: (v6, v4) else: (v4, v6)
-  var i = 0
-  while i < a.len or i < b.len:
-    if i < a.len: result.add a[i]
-    if i < b.len: result.add b[i]
-    inc i
-
-proc resolveAddrs(host: string, port: int): seq[string] =
-  ## Numeric addresses for `host` in the resolver's order (RFC 6724), interleaved
-  ## by family for Happy Eyeballs. We resolve ourselves so the racer can iterate
-  ## them one at a time.
-  var ai = getAddrInfo(host, Port(port), AF_UNSPEC, SOCK_STREAM, IPPROTO_TCP)
-  var it = ai
-  var raw: seq[string]
-  while it != nil:
-    raw.add getAddrString(it.ai_addr)
-    it = it.ai_next
-  freeAddrInfo(ai)
-  interleaveFamilies(raw)
+# `heAttemptDelayMs`, `interleaveFamilies`, and `resolveAddrs` are shared with the
+# async backends in ./happyeyeballs; `happyConnect` below is the sync racer.
 
 proc happyConnect(ips: seq[string], port: int,
                   connectMs = 0): (SocketHandle, int) =
