@@ -7,6 +7,11 @@ onward (pre-1.0, minor versions may include breaking changes).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-18
+
+Theme: faster and more resilient connection setup: one shared TLS context per
+client, and Happy Eyeballs address racing on every native backend.
+
 ### Added
 - Happy Eyeballs (RFC 8305) address racing now runs on the asyncdispatch and
   chronos backends too, not just sync. A client interleaves the resolved address
@@ -229,7 +234,9 @@ across four backends.
 - TLS certificates verified by default; HPACK bounds, negative `Content-Length`
   rejection, chunk-size bounds, and malformed-input rejection instead of crashes.
 
-[Unreleased]: https://github.com/cryo2010/nim-navi/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/cryo2010/nim-navi/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/cryo2010/nim-navi/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/cryo2010/nim-navi/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/cryo2010/nim-navi/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/cryo2010/nim-navi/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/cryo2010/nim-navi/compare/v0.2.0...v0.3.0
