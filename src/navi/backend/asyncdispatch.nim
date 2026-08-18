@@ -9,8 +9,8 @@
 ## (WANT_READ / WANT_WRITE). That is the same lean loop as the sync backend, made
 ## async: the per-connection cost drops to roughly the sync backend's.
 
-import std/[asyncdispatch, nativesockets, strutils]
-import ./api, ./openssl_ctx
+import std/[asyncdispatch, nativesockets, strutils, monotimes, times]
+import ./api, ./openssl_ctx, ./happyeyeballs
 import ../core/response  # for navi's TimeoutError
 when defined(ssl):
   import std/openssl
@@ -126,6 +126,95 @@ proc proxyConnect(fd: AsyncFD, host: string, port: int) {.async.} =
   if not resp.startsWith("HTTP/1.1 200") and not resp.startsWith("HTTP/1.0 200"):
     raise newException(ValueError, "navi: proxy CONNECT failed: " & resp.splitLines()[0])
 
+proc happyConnect*(ips: seq[string], port: int):
+    Future[tuple[fd: AsyncFD, idx: int]] {.async.} =
+  ## Happy Eyeballs (RFC 8305): start non-blocking connects to `ips` (already
+  ## interleaved by family) staggered by ~250ms, and return the (fd, index) of the
+  ## first to complete, so a slow or blackholed address does not stall the others.
+  ## Losing attempts are closed. The overall bound is applied by the caller
+  ## (`withTimeout` on `establish`). asyncdispatch has no cancellation, so a loser's
+  ## connect future drains in the background once its fd is closed.
+  if ips.len == 0:
+    raise newException(IOError, "navi: no address to connect to")
+  var
+    inflight: seq[tuple[fd: AsyncFD, fut: Future[void], idx: int]]
+    nextIdx = 0
+    lastStart: MonoTime
+    lastErr = "no address"
+
+  proc reap(fd: AsyncFD, fut: Future[void]) =
+    ## Release a losing attempt's socket. Closing an fd that still has an in-flight
+    ## asyncdispatch connect from outside its callback corrupts the dispatcher
+    ## ("File descriptor not registered"), so if the connect is still pending we
+    ## defer the close to its own completion (a true blackhole resolves when the OS
+    ## connect times out); an already-finished attempt is closed at once.
+    if fut.finished:
+      closeSocket(fd)
+    else:
+      fut.callback = proc() = closeSocket(fd)
+
+  proc launch() =
+    let ip = ips[nextIdx]
+    let domain = if ':' in ip: Domain.AF_INET6 else: Domain.AF_INET
+    let idx = nextIdx
+    inc nextIdx
+    lastStart = getMonoTime()
+    let fd = createAsyncNativeSocket(domain, SOCK_STREAM, IPPROTO_TCP)
+    if fd == osInvalidSocket.AsyncFD:
+      lastErr = "could not create socket"; return
+    setNoDelay(fd.SocketHandle)
+    inflight.add (fd, connect(fd, ip, Port(port), domain), idx)
+
+  try:
+    while true:
+      # Start the next attempt: the first at once; the rest when nothing is in
+      # flight or the stagger window has elapsed.
+      if nextIdx < ips.len and
+         (inflight.len == 0 or
+          (getMonoTime() - lastStart).inMilliseconds >= heAttemptDelayMs):
+        launch()
+        continue
+      if inflight.len == 0:
+        break                       # nothing pending and nothing left to start
+      # Wake on any inflight connect finishing, or -- if attempts remain -- the
+      # stagger window, whichever is first.
+      let waker = newFuture[void]("navi.he.wake")
+      for e in inflight:
+        e.fut.callback = proc() =
+          if not waker.finished: waker.complete()
+      var timer: Future[void] = nil
+      if nextIdx < ips.len:
+        timer = sleepAsync(heAttemptDelayMs)
+        timer.callback = proc() =
+          if not waker.finished: waker.complete()
+      await waker
+      if timer != nil: timer.clearCallbacks()
+      # Harvest finished attempts: first success wins; failures are dropped.
+      var i = 0
+      while i < inflight.len:
+        let e = inflight[i]
+        if e.fut.finished:
+          e.fut.clearCallbacks()
+          if e.fut.failed:
+            lastErr = e.fut.error.msg
+            closeSocket(e.fd)                        # finished: safe to close now
+            inflight.delete(i)
+          else:
+            for j in 0 ..< inflight.len:             # release the losing attempts
+              if j != i:
+                inflight[j].fut.clearCallbacks()
+                reap(inflight[j].fd, inflight[j].fut)
+            return (e.fd, e.idx)
+        else:
+          e.fut.clearCallbacks()                     # re-armed next iteration
+          inc i
+  except CatchableError:
+    for e in inflight:
+      e.fut.clearCallbacks()
+      reap(e.fd, e.fut)
+    raise
+  raise newException(IOError, "navi: could not connect: " & lastErr)
+
 proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
               proxy: ProxyTarget, alpn: seq[string] = @[],
               connectMs = 0, readMs = 0): Future[Conn] {.async.} =
@@ -139,36 +228,44 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   conn.readMs = readMs
 
   proc establish() {.async.} =
-    # Self-contained cleanup on failure: the SSL_CTX has no destructor, so a
-    # failed handshake would otherwise leak it.
-    try:
-      let dialHost = if proxy.isSet: proxy.host else: host
-      let dialPort = if proxy.isSet: proxy.port else: port
-      let fd = await dial(dialHost, Port(dialPort), IPPROTO_TCP)
+    let dialHost = if proxy.isSet: proxy.host else: host
+    let dialPort = if proxy.isSet: proxy.port else: port
+    var pool = resolveAddrs(dialHost, dialPort)
+    if pool.len == 0:
+      raise newException(IOError, "navi: could not resolve " & dialHost)
+    var lastErr: ref CatchableError
+    # Happy-Eyeballs TCP race, then proxy/TLS on the winner; on a *handshake*
+    # failure drop that address and re-race the rest (as sync's connectAcross does).
+    while pool.len > 0:
+      let (fd, idx) = await happyConnect(pool, dialPort)
       conn.fd = fd
-      setNoDelay(fd.SocketHandle)
-      if proxy.isSet and tls:
-        await proxyConnect(fd, host, port)
-      if tls:
+      try:
+        if proxy.isSet and tls:
+          await proxyConnect(fd, host, port)
+        if tls:
+          when defined(ssl):
+            # No ALPN over a proxy tunnel (the old path negotiated it lazily).
+            (conn.ctx, conn.ownsCtx) = obtainContext(
+              cfg.contextStore, cfg, if proxy.isSet: @[] else: alpn)
+            conn.slot = resumeSlot(cfg, host & ":" & $port)
+            conn.ssl = newClientSsl(conn.ctx, fd.SocketHandle, host, conn.slot)
+            await driveHandshake(conn.ssl, fd, host)
+            verifyPeer(conn.ssl, host, cfg.wantsVerify)
+            conn.protocol = negotiatedProtocol(conn.ssl)
+          else:
+            raise newException(ValueError, "navi: https requires compiling with -d:ssl")
+        return                                   # established
+      except CatchableError as e:
+        # Tear down this attempt (the SSL_CTX has no destructor, so a failed
+        # handshake would leak an unshared one), then try the remaining addresses.
         when defined(ssl):
-          # No ALPN over a proxy tunnel (the old path negotiated it lazily).
-          (conn.ctx, conn.ownsCtx) = obtainContext(
-            cfg.contextStore, cfg, if proxy.isSet: @[] else: alpn)
-          conn.slot = resumeSlot(cfg, host & ":" & $port)
-          conn.ssl = newClientSsl(conn.ctx, fd.SocketHandle, host, conn.slot)
-          await driveHandshake(conn.ssl, fd, host)
-          verifyPeer(conn.ssl, host, cfg.wantsVerify)
-          conn.protocol = negotiatedProtocol(conn.ssl)
-        else:
-          raise newException(ValueError, "navi: https requires compiling with -d:ssl")
-    except CatchableError:
-      when defined(ssl):
-        if not conn.ssl.isNil: SSL_free(conn.ssl); conn.ssl = nil
-        # Only an unshared ctx is freed here; a shared one belongs to the store.
-        if conn.ownsCtx and not conn.ctx.isNil: conn.ctx.destroyContext()
-        conn.ctx = nil
-      if conn.fd != invalidFd: closeSocket(conn.fd); conn.fd = invalidFd
-      raise
+          if not conn.ssl.isNil: SSL_free(conn.ssl); conn.ssl = nil
+          if conn.ownsCtx and not conn.ctx.isNil: conn.ctx.destroyContext()
+          conn.ctx = nil
+        closeSocket(fd); conn.fd = invalidFd
+        pool.delete(idx)
+        lastErr = e
+    raise lastErr
 
   # On a connect timeout the establish future is abandoned (asyncdispatch has no
   # cancellation): it drains in the background and its socket is reclaimed later,

@@ -35,3 +35,5 @@ done
 export NAVI_HE_CERT="$work/cert.pem" NAVI_HE_PORT="$port" NAVI_HE_BLACKHOLE="$blackhole"
 echo "== Happy Eyeballs: blackhole $blackhole + good 127.0.0.1:$port =="
 nim c -r --path:"$root/src" -d:ssl --hints:off "$root/tests/interop/happy_eyeballs.nim"
+nim c -r --path:"$root/src" -d:ssl --hints:off "$root/tests/interop/happy_eyeballs_async.nim"
+nim c -r --path:"$root/src" --hints:off "$root/tests/interop/happy_eyeballs_chronos.nim"
