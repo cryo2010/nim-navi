@@ -82,6 +82,7 @@ proc wsEcho(port: int) {.thread.} =
 suite "chronos websocket client end to end":
   test "the WebSocket client should handshake, echo text and binary, reassemble fragments, and close":
     const port = 8998
+    wsReady = false   # reset so a looped run waits for THIS server, not a stale flag
     var th: Thread[int]
     createThread(th, wsEcho, port)
     while not wsReady: os.sleep(5)
@@ -111,6 +112,7 @@ suite "chronos websocket client end to end":
 
   test "the WebSocket client should time out on open when the server never completes the handshake":
     const port = 8997
+    stallReady = false   # reset so a looped run waits for THIS server, not a stale flag
     var th: Thread[int]
     createThread(th, wsStall, port)
     while not stallReady: os.sleep(5)
