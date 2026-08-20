@@ -83,6 +83,7 @@ proc tcpConnect(host: string, port: int, connectMs = 0): SocketHandle =
   ## connect is bounded (non-blocking connect + select); otherwise it blocks (the
   ## OS default). Raises `TimeoutError` on a connect timeout, else `IOError`.
   var ai = getAddrInfo(host, Port(port), AF_UNSPEC, SOCK_STREAM, IPPROTO_TCP)
+  defer: freeAddrInfo(ai)   # freed on every exit, including a raise mid-loop
   var it = ai
   var lastErr = "no address"
   var timedOut = false
@@ -112,7 +113,6 @@ proc tcpConnect(host: string, port: int, connectMs = 0): SocketHandle =
         else:
           fd.setBlocking(true); result = fd; break     # async connect succeeded
     it = it.ai_next
-  freeAddrInfo(ai)
   if result == osInvalidSocket:
     if timedOut:
       raise newException(response.TimeoutError, "navi: " & lastErr)
@@ -157,6 +157,7 @@ proc happyConnect(ips: seq[string], port: int,
   proc begin() =
     let ip = ips[nextIdx]
     var ai = getAddrInfo(ip, Port(port), AF_UNSPEC, SOCK_STREAM, IPPROTO_TCP)
+    defer: freeAddrInfo(ai)   # freed even if setNoDelay/setBlocking raises
     let fd = createNativeSocket(ai.ai_family, ai.ai_socktype, ai.ai_protocol)
     if fd != osInvalidSocket:
       setNoDelay(fd); fd.setBlocking(false)
@@ -164,7 +165,6 @@ proc happyConnect(ips: seq[string], port: int,
         inflight.add (fd, nextIdx)       # completes now or is in progress
       else:
         lastErr = osErrorMsg(osLastError()); close(fd)
-    freeAddrInfo(ai)
     inc nextIdx
     lastStart = getMonoTime()
     began = true

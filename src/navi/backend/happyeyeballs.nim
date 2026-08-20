@@ -28,10 +28,10 @@ proc resolveAddrs*(host: string, port: int): seq[string] =
   ## by family for Happy Eyeballs. We resolve ourselves so the racer can iterate
   ## them one at a time.
   var ai = getAddrInfo(host, Port(port), AF_UNSPEC, SOCK_STREAM, IPPROTO_TCP)
+  defer: freeAddrInfo(ai)   # freed even if getAddrString raises mid-walk
   var it = ai
   var raw: seq[string]
   while it != nil:
     raw.add getAddrString(it.ai_addr)
     it = it.ai_next
-  freeAddrInfo(ai)
   interleaveFamilies(raw)
