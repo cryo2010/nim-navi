@@ -164,7 +164,5 @@ proc h3Get*(host: string, port: int, sni = "", path = "/", caFile = "",
   ## One-shot convenience: open a connection, issue one GET, and close. For
   ## several requests to one origin, use `h3Open` + `get` + `close`.
   let c = h3Open(host, port, sni, caFile, verify)
-  try:
-    result = c.get(path)
-  finally:
-    c.close()
+  defer: c.close()
+  result = c.get(path)
