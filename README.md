@@ -3,7 +3,7 @@
 [![CI](https://github.com/cryo2010/nim-navi/actions/workflows/ci.yml/badge.svg)](https://github.com/cryo2010/nim-navi/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A fast HTTP/1.1, HTTP/2, HTTP/3 client for Nim, with streaming, SSE and WebSockets. One API, four interchangeable clients for sync, async, async (chronos) and JavaScript; pick one by import.
+A fast HTTP/1.1-3 client for Nim with TLS, streaming, SSE and WebSockets. One API, four interchangeable clients for sync, async, async (chronos) and JavaScript; pick one via import.
 
 ```nim
 # Imports the synchronous client
@@ -67,45 +67,32 @@ discard main()
   - [Happy Eyeballs](#happy-eyeballs)
   - [Streaming](#streaming)
   - [WebSocket](#websocket)
-- [API](#api)
-  - [NaviConfig](#naviconfig)
-  - [Response](#response)
-  - [HttpError](#httperror)
 - [Security](#security)
 - [Thanks](#thanks)
 - [License](#license)
 
 ## Features
 
-- **HTTP/1.1 and HTTP/2** over http and https, IPv4 and IPv6. h2 is native (own
-  frames + HPACK + Huffman), ALPN-negotiated with automatic h1 fallback.
-- **HTTP/2 multiplexing**: concurrent async requests to one origin share a
-  single HTTP/2 connection (automatic on the h2 async client, asyncdispatch;
-  chronos is HTTP/1.1 so it uses separate pooled connections). A `parallel` batch
-  API does the same on the sync client.
-- **HTTP/3** (QUIC), opt-in via `-d:naviHttp3`, which links ngtcp2 + nghttp3 +
-  OpenSSL >= 3.5. Reached transparently: once an origin advertises `Alt-Svc: h3`
-  on an h1/h2 response, navi upgrades subsequent requests (all verbs and buffered
-  bodies), falling back to h2/h1 on any QUIC failure. Multiplexed on the
-  asyncdispatch client (concurrent streams over one QUIC connection), one request
-  at a time on sync; certificate verification and response decompression apply as
-  elsewhere. Not on chronos (BearSSL has no QUIC) or `navi/js` (the browser/Node
-  runtime speaks h3 itself).
-- **Sync and async** from one API, via mutually exclusive entry modules
-- **Browser and Node** via a JavaScript client (`import navi/js`) that runs on the runtime's `fetch`
-- **TLS** on all three clients (OpenSSL for sync/asyncdispatch, BearSSL for chronos), with certificate verification on by default
-- **Connection pooling / keep-alive**, with automatic retry on a stale pooled connection
-- **Happy Eyeballs** (RFC 8305) address racing on every native backend (sync, asyncdispatch, chronos), so a slow/blackholed address doesn't stall the connect
-- **Streaming** uploads (chunked) and downloads (headers-first pull handle with backpressure)
-- **Server-Sent Events** (`sse()`) with transparent reconnection (Last-Event-ID + `retry:`), any method/headers
+- **HTTP/1.1 and HTTP/2:** IPv4 and IPv6 and ALPN-negotiated with h1 fallback.
+- **HTTP/2 multiplexing:** concurrent async requests on a single HTTP/2 connection
+- **HTTP/3:** (QUIC), opt-in via `-d:naviHttp3`, automatic `Alt-Svc: h3` upgrades
+- **Sync and async** from a common API
+- **Browser and Node** via a JavaScript client
+- **TLS** on all clients with certificate verification
+- **Connection pooling / keep-alive** with automatic retry on a stale pooled connection
+- **Happy Eyeballs:** (RFC 8305) address racing for fast connections
+- **Streaming** uploads (chunked) and downloads (with backpressure)
+- **Server-Sent Events** with transparent reconnection
 - **Retries** with capped exponential backoff, honoring `Retry-After`
 - **Redirect following** with method rewrites and cross-origin `Authorization` stripping
-- **Throw-on-non-2xx** by default (`HttpError`), opt-out available
-- **Automatic decompression**: gzip/deflate (zlib), plus brotli and zstd when `libbrotlidec`/`libzstd` are present
-- **Request timeouts**, per-phase (connect / read / total) via `timeouts` (`TimeoutError`)
-- **Middleware**: onion-style `proc(ctx)` steps that modify, observe, or short-circuit a request
-- **Cookie jar**, **basic/bearer/digest auth** (Digest: MD5 and SHA-256, RFC 7616), **proxy** (http absolute-URI and https CONNECT)
-- **WebSockets** (RFC 6455) on all four clients, text and binary messages, fragmentation reassembly, and automatic ping/pong
+- **Throw-on-non-2xx** by default, opt-out available
+- **Automatic decompression**: gzip, deflate, brotli and zstd
+- **Request timeouts** per-phase (connect / read / total)
+- **Middleware**: onion-style functions that modify, observe, or short-circuit requests
+- **Cookie jar:** (RFC 6265) automatic and per-client; per-domain with expiration
+- **Basic/bearer/digest auth:** digest: MD5 and SHA-256, RFC 7616
+- **Proxy:** http absolute-URI and https CONNECT
+- **WebSockets** (RFC 6455) text and binary messages, fragmentation reassembly, and automatic ping/pong
 
 ## Install
 
@@ -748,132 +735,6 @@ yields a whole message. Middleware does not apply to `websocket()`.
 On `navi/js` the WebSocket wraps the runtime's native one, so custom handshake
 `headers` are ignored and the runtime handles ping/pong; the send/receive/close
 surface is otherwise the same.
-
-## API
-
-### newNavi(config = initNaviConfig())
-
-Create a client. `config` supplies the defaults applied to every request and
-inherited via `extend`. Returns a `Navi`. Read it back (read-only) via
-`client.config`; the config is fixed at construction, so build a fresh client or
-`extend` to change it rather than mutating a live one.
-
-### client.get / head / delete / options (target, headers = initHeaders(), params = @[], cancel = nil)
-### client.post / put / patch (target, body = "", json = nil, form = @[], headers = initHeaders(), params = @[], cancel = nil)
-
-Make a request with that verb. A relative `target` resolves against `prefixUrl`.
-`json` and `form` encode the body and set a matching `Content-Type` unless you
-supplied one. `params` appends an url-encoded query string and accepts pairs
-(`@[...]` / `@{...}` / `{...}`) or a `Table` / `OrderedTable`;
-`cancel: CancelToken` aborts the request (raising `RequestCancelledError`).
-Returns a `Response` on the sync client, or a `Future[Response]` on
-`navi/asyncdispatch`, `navi/chronos`, and `navi/js`.
-
-### client.request(verb, target, headers = initHeaders(), body = "", json = nil, form = @[], bodyStream = nil, params = @[], cancel = nil)
-
-Any verb explicitly. `bodyStream: proc(): string` streams an upload as chunked
-transfer-encoding (return `""` to end). Not available on `navi/js`.
-
-### client.stream(verb, target, headers = initHeaders(), params = @[], cancel = nil)
-
-Open a streaming response and return a `StreamResponse` handle: `status`,
-`reason`, `httpVersion`, `headers`, and `ok` are available immediately (this call
-does not throw on a non-2xx status), while the body is pulled on demand. Consume it
-with `res.each(chunk): ...` (async clients await; the `await` is baked into `each`)
-or an explicit `res.drain(sink)`, and `res.close()` a handle you will not fully
-read. `chunk` is a `string` on the native clients and `seq[byte]` on `navi/js`.
-Awaiting each chunk back-pressures the peer (see [Streaming](#streaming)).
-
-### client.sse(target, verb = GET, headers = initHeaders(), body = "", params = @[], lastEventId = "", reconnect = true, retryMs = 3000, maxRetryMs = 30000, cancel = nil)
-
-Open a Server-Sent Events stream and return an `SseStream`. Consume it with pull
-`next()` (returns `Option[SseEvent]`, `none` at end) or `res.each(ev): ...` (a real
-loop, so `break`/`return` work). `SseEvent` has `event`, `data`, `id`, `retry`. It
-reconnects transparently on a drop (resending `Last-Event-ID`, honoring the server's
-`retry:` with backoff to `maxRetryMs`) unless `reconnect = false`. The initial
-response must be `200 text/event-stream` or it raises. `close()` when done. See
-[Server-Sent Events](#server-sent-events).
-
-### client.websocket(url, headers = initHeaders())
-
-Open a WebSocket (RFC 6455). Accepts `ws://` / `wss://` (or `http` / `https`, mapped);
-`wss` uses TLS. Returns a `WebSocket` on the sync client, or a `Future[WebSocket]` on
-the async ones. Then use `ws.send(data, binary = false)`, `ws.receive(): WsMessage`,
-`ws.close(code = closeNormal, reason = "")`, and `ws.ping(data = "")` (native clients;
-`navi/js` leaves ping/pong to the runtime). On `navi/js` it wraps the runtime's native
-`WebSocket`, so `headers` are ignored.
-
-### client.parallel(targets) (sync client)
-
-Fetch many URLs concurrently, multiplexed over one HTTP/2 connection when the
-server supports it. Returns `seq[Response]`; non-2xx responses are returned, not
-raised, so inspect `.ok` per result. On `navi/asyncdispatch`, awaiting concurrent
-requests together with `all(@[...])` multiplexes them the same way.
-
-### client.extend(options)
-
-Derive a new client, layering `options` over this one: headers are merged, middleware
-is appended, and other set fields override. The derived client gets its own
-connection pool and cookie jar.
-
-### NaviConfig
-
-Build one with `initNaviConfig()`, which sets the defaults below, then assign the
-fields you want. `NaviConfig` has `{.requiresInit.}`, so a bare or partial
-`NaviConfig(...)` is a compile error; `initNaviConfig()` is the only builder.
-
-- **prefixUrl** `string`: prepended to relative request targets.
-- **headers** `Headers`: sent on every request (merged with per-call headers).
-- **http** `set[HttpVersion]`: protocol preference. Default `{H1, H2}` negotiates
-  h2 via ALPN with h1 fallback; set `{H1}` to force HTTP/1.1. Ignored by `navi/js`.
-- **tls** `TlsConfig`: `verify` (`bool`, default `true`) and `caFile` (custom CA
-  bundle, honored on all clients), `certFile`/`keyFile` for mTLS, `resumeSessions`
-  (session resumption, on by default), `minVersion`/`maxVersion` (`TlsVersion`,
-  version pinning), and `ciphers`/`cipherSuites` (cipher selection for TLS ≤1.2 /
-  TLS 1.3).
-- **decompress** `bool`: decode gzip/deflate response bodies. Default on.
-- **throwHttpErrors** `bool`: raise `HttpError` on a non-2xx response. Default on.
-- **maxRedirects** `int`: redirects to follow. Default 20; 0 disables.
-- **retry** `RetryPolicy`: `limit` (attempts, default 2, 0 disables), `methods`
-  (verbs eligible, default the idempotent ones), `statuses` (response codes that
-  trigger a retry), and `maxDelay` (ms ceiling on the wait between attempts).
-- **maxResponseBytes** `int`: cap on the response body size. A larger response
-  raises `ResponseTooLargeError`. 0 (default) is unlimited. Enforced incrementally
-  when streaming; counts decompressed bytes on the native clients.
-- **timeouts** `Timeouts`: per-phase deadlines (`connect`, `read`, `total`, ms; 0
-  disables each). `connect`/`read` apply to the native clients; `total` to all
-  four. A stalled request raises `TimeoutError`. See
-  [Per-phase timeouts](#retries-redirects-and-timeouts).
-- **auth** `Auth`: `basicAuth(user, pass)`, `bearerAuth(token)`, or
-  `digestAuth(user, pass)`. Basic/bearer set `Authorization` on every request;
-  digest answers the server's 401 challenge (MD5 or SHA-256) on a one-shot retry.
-- **proxy** `string`: proxy URL. `""` (default) falls back to `HTTP(S)_PROXY` /
-  `NO_PROXY`.
-- **middleware** `seq[NaviMiddleware]`: onion-style steps run in order, with
-  `middleware[0]` outermost. Each is a closure `proc(ctx: NaviContext)` (sync) or
-  `proc(ctx: NaviContext): Future[void]` (async): modify `ctx.req`, call
-  `ctx.next()` to proceed, then inspect or replace `ctx.res`, or skip
-  `next` to short-circuit without sending. A factory `proc(...): NaviMiddleware` can
-  capture per-instance config. See [Middleware](#middleware).
-
-### Response
-
-- **status** `int`, e.g. 200.
-- **ok** `bool`: true for a 2xx status.
-- **reason** `string`: the status text.
-- **httpVersion** `string`: `"HTTP/1.1"` or `"HTTP/2"` (empty on `navi/js`).
-- **headers** `Headers`.
-- **body** `string`: the raw body. A Nim string is a byte buffer, so this is also
-  your bytes (`res.body.toOpenArrayByte(...)` for a view).
-- **data** `JsonNode`: the body parsed as JSON, cached; raises `JsonParsingError`
-  on invalid input.
-
-### HttpError
-
-Raised for a non-2xx response when `throwHttpErrors` is on. Carries the full
-response as `.response`. Other request errors: `TimeoutError` (a configured
-`timeouts` deadline elapsed), `RequestCancelledError` (a `CancelToken` was cancelled), and
-`ResponseTooLargeError` (body exceeded `maxResponseBytes`).
 
 ## Security
 
