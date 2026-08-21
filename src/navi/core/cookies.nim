@@ -3,11 +3,12 @@
 ## Stores cookies from Set-Cookie and replays matching ones. Honors Max-Age and
 ## Expires (Max-Age wins), host-only vs Domain matching, path matching with
 ## default-path derivation, and the Secure attribute; it rejects a Set-Cookie
-## whose Domain the request host is not within. The jar is in-memory and
+## whose Domain the request host is not within. Replayed cookies are ordered per
+## RFC 6265 5.4 (longer paths first). The jar is in-memory and
 ## per-client -- persistence across process restarts is a separate feature,
 ## intentionally not implemented here.
 
-import std/[strutils, sequtils, times, options]
+import std/[strutils, sequtils, algorithm, times, options]
 import ./headers, ./url, ./request, ./response
 
 type
@@ -122,11 +123,18 @@ proc applyCookies*(jar: CookieJar, req: var Request) =
   if req.headers.contains("cookie"): return # caller set cookies explicitly
   let now = getTime()
   jar.cookies.keepItIf(it.live(now))   # drop cookies whose expiry has passed
-  var pairs: seq[string]
+  var matched: seq[Cookie]
   for c in jar.cookies:
     if c.matchesHost(req.url.host) and
        pathMatches(req.url.path, c.path) and
        (not c.secure or req.url.isTls):
-      pairs.add(c.name & "=" & c.value)
+      matched.add c
+  # RFC 6265 5.4: longer paths (more specific) first; equal paths keep their
+  # existing (creation) order. Nim's sort is stable, so the seq order already in
+  # place is the creation-time tie-break the RFC calls for.
+  matched.sort(proc (a, b: Cookie): int = cmp(b.path.len, a.path.len))
+  var pairs: seq[string]
+  for c in matched:
+    pairs.add(c.name & "=" & c.value)
   if pairs.len > 0:
     req.headers.add("cookie", pairs.join("; "))

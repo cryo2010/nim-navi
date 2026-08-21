@@ -83,3 +83,23 @@ suite "cookie domain and path matching (RFC 6265)":
     # an unparseable date would be kept as a session cookie).
     let jar = stored("a=1; Expires=Sun Nov  6 08:49:37 1994", "http://x.test/")
     check jar.replayed("http://x.test/") == ""
+
+suite "cookie replay ordering (RFC 6265 5.4)":
+  test "cookies with longer paths should be sent before shorter ones":
+    # Store shortest-path first so insertion order is the opposite of the wanted
+    # output; only path-length sorting can produce the expected order.
+    let jar = newCookieJar()
+    storeCookies(jar, parseUrl("http://x.test/"), setCookieResp("a=1; Path=/"))
+    storeCookies(jar, parseUrl("http://x.test/foo/bar"),
+                 setCookieResp("c=3; Path=/foo/bar"))
+    storeCookies(jar, parseUrl("http://x.test/foo"),
+                 setCookieResp("b=2; Path=/foo"))
+    check jar.replayed("http://x.test/foo/bar/baz") == "c=3; b=2; a=1"
+
+  test "cookies with equal-length paths should keep their creation order":
+    # Two distinct names at the same path: the RFC tie-break is creation order,
+    # which a stable sort preserves from insertion order.
+    let jar = newCookieJar()
+    storeCookies(jar, parseUrl("http://x.test/"), setCookieResp("a=1; Path=/"))
+    storeCookies(jar, parseUrl("http://x.test/"), setCookieResp("b=2; Path=/"))
+    check jar.replayed("http://x.test/") == "a=1; b=2"

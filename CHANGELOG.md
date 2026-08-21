@@ -7,6 +7,12 @@ onward (pre-1.0, minor versions may include breaking changes).
 
 ## [Unreleased]
 
+### Fixed
+- Cookie jar: replayed cookies are now ordered per RFC 6265 5.4 (cookies with
+  longer, more specific paths are sent before shorter ones; cookies with
+  equal-length paths keep their creation order). Previously they were emitted in
+  storage order, which could send a less-specific duplicate first.
+
 ## [0.7.0] - 2026-08-18
 
 Theme: faster and more resilient connection setup: one shared TLS context per
