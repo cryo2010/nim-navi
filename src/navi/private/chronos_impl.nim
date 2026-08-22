@@ -2,16 +2,18 @@
 # targets. Kept separate so the entry can fall back to navi/js under `nim js`
 # without pulling in the chronos package (which has no JavaScript backend).
 
-import std/options
+import std/[options, tables]
 import navi/private/[entryguard, streamguard]
 import navi/proto/sse
 import navi/core/public
 export sse.SseEvent
-import navi/core/[engine, pool, session, proxy, redirect, cookies, digest, cancel]
+import navi/core/[engine, pool, session, proxy, h2glue]
+import navi/core/[redirect, cookies, digest, cancel]
 import navi/core/decompress   # StreamDecoder, for the readChunk decode state
 import navi/proto/h1
+import navi/proto/h2/conn
 import navi/proto/ws
-import navi/backend/chronos
+import navi/backend/[chronos, h2mux_chronos]
 from std/strutils import startsWith, find, splitLines, contains, toLowerAscii
 
 claimEntry("navi/chronos")
@@ -41,6 +43,8 @@ type
     config: NaviConfig
     pool*: Pool[PooledConn[Conn]]
     jar*: CookieJar
+    muxes: TableRef[string, H2Mux]              ## live shared h2 connections
+    pendingMux: TableRef[string, Future[H2Mux]] ## in-flight connects (coalescing)
 
 proc initNaviConfig*(): NaviConfig =
   ## The only way to build a config (`NaviConfig` requires every field). Sets the
@@ -55,7 +59,9 @@ proc newNavi*(config = initNaviConfig()): Navi =
   var cfg = config
   if cfg.tls.sessionCache.isNil: cfg.tls.sessionCache = newTlsStore(cfg.tls)
   cfg.tls.contextStore = newTlsCtxStore(cfg.tls)
-  Navi(config: cfg, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
+  Navi(config: cfg, pool: newPool[PooledConn[Conn]](), jar: newCookieJar(),
+       muxes: newTable[string, H2Mux](),
+       pendingMux: newTable[string, Future[H2Mux]]())
 
 proc config*(client: Navi): lent NaviConfig = client.config
   ## Read-only view of the client's config. Config is fixed at construction;
@@ -67,19 +73,100 @@ proc extend*(client: Navi, config: NaviConfig): Navi =
   merged.middleware = client.config.middleware & config.middleware
   merged.tls.sessionCache = newTlsStore(merged.tls)  # its own cache, not the parent's
   merged.tls.contextStore = newTlsCtxStore(merged.tls)  # its own contexts too
-  Navi(config: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
+  Navi(config: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar(),
+       muxes: newTable[string, H2Mux](),
+       pendingMux: newTable[string, Future[H2Mux]]())
 
 proc close*(client: Navi): Future[void] {.async.} =
-  ## Close all idle pooled connections. Optional but recommended when done with
-  ## the client (a later request opens fresh connections).
+  ## Close all pooled connections and shared h2 connections, freeing their TLS
+  ## contexts. Any in-flight request on a shared connection fails with IOError.
+  ## Optional but recommended when done with the client.
   for pc in client.pool.drain():
     await close(pc.transport)
+  for mux in client.muxes.values:
+    await mux.close()
+  client.muxes.clear()
   closeTlsStore(client.config.tls.sessionCache)
   closeTlsCtxStore(client.config.tls.contextStore)
 
+proc muxRequest(client: Navi, mux: H2Mux, req: Request,
+                sink: BodySink): Future[Response] {.async.} =
+  # The mux delivers a streaming request's body to `sink` incrementally (decoding
+  # content-encoding as it arrives), so the returned response's body is empty.
+  # A non-streaming request (sink == nil) still buffers into r.body as before.
+  result = toResponse(await mux.request(h2HeaderList(req), req.body, req.bodyStream, sink))
+
+proc h1OnConn(client: Navi, conn: Conn, origin: string, req: Request,
+              sink: BodySink): Future[Response] {.async.} =
+  var keep = false
+  result = h1Exchange(conn, req, sink, keep,
+                      client.config.wantsDecompress, client.config.maxResponseBytes)
+  let pc = PooledConn[Conn](transport: conn)
+  if not (keep and pushIdle(client.pool, origin, pc)):
+    await close(conn)
+
 proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
-  ## Pool-based transport (http/1.1; chronos has no h2).
-  result = poolTransport(client, req, sink)
+  ## Multiplex over a shared h2 connection when available/negotiable; otherwise
+  ## pool http/1.1. Concurrent connects to the same new origin are coalesced so a
+  ## cold burst still ends up on one h2 connection.
+  let origin = originKey(req.url)
+  let wantH2 = client.config.wantsH2 and req.url.isTls
+
+  if wantH2:
+    # 1. A live shared connection, or one currently being established.
+    if client.muxes.hasKey(origin) and client.muxes[origin].canReuse:
+      return await client.muxRequest(client.muxes[origin], req, sink)
+    if client.pendingMux.hasKey(origin):
+      let mux = await client.pendingMux[origin]
+      if mux != nil and mux.canReuse:
+        return await client.muxRequest(mux, req, sink)
+      # else: turned out http/1.1, fall through
+
+  # 2. A pooled http/1.1 connection.
+  var (found, pc) = popIdle(client.pool, origin)
+  if found:
+    try:
+      var keep = false
+      result = h1Exchange(pc.transport, req, sink,
+                          keep, client.config.wantsDecompress, client.config.maxResponseBytes)
+      if not (keep and pushIdle(client.pool, origin, pc)): await close(pc.transport)
+      return
+    except CatchableError:
+      await close(pc.transport)  # stale; fall through
+
+  # 3. Open a fresh connection.
+  var rq = req
+  let proxyTarget = resolveProxy(client.config, rq.url)
+  rq.absoluteForm = proxyTarget.isSet and not rq.url.isTls
+  let alpn = if wantH2: @["h2", "http/1.1"] else: @[]
+
+  if wantH2:
+    let pending = newFuture[H2Mux]("navi.pendingMux")
+    client.pendingMux[origin] = pending
+    try:
+      let conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
+                               client.config.tls, proxyTarget, alpn,
+                               client.config.connectMs, client.config.readMs)
+      if conn.protocol == "h2":
+        let mux = await newH2Mux(conn, client.config.maxResponseBytes,
+                                 client.config.wantsDecompress)
+        client.muxes[origin] = mux
+        client.pendingMux.del(origin)
+        pending.complete(mux)
+        return await client.muxRequest(mux, rq, sink)
+      else:
+        client.pendingMux.del(origin)
+        pending.complete(nil)  # this origin is http/1.1
+        return await client.h1OnConn(conn, origin, rq, sink)
+    except CatchableError as e:
+      client.pendingMux.del(origin)
+      pending.fail(e)
+      raise
+
+  let conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
+                           client.config.tls, proxyTarget, alpn,
+                           client.config.connectMs, client.config.readMs)
+  result = await client.h1OnConn(conn, origin, rq, sink)
 
 proc doRequest(client: Navi, req: Request): Future[Response] {.async.} =
   result = performRequest(client, req)
@@ -152,37 +239,44 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
 # --- Streaming downloads (pull-based handle) ---
 
 type
+  StreamKind = enum skH1, skH2
   StreamResponseObj = object
     ## The response of a streaming request: status/headers are available
-    ## immediately while the body is drained on demand. Holds the checked-out
-    ## http/1.1 connection (removed from the pool) until `drain` returns it or
-    ## `close` disposes it. chronos is http/1.1 only (BearSSL has no client ALPN),
-    ## so there is no h2 variant.
+    ## immediately while the body is drained on demand. Holds either a checked-out
+    ## http/1.1 connection (removed from the pool) or an open stream on the shared
+    ## h2 mux, until `drain` finishes it or `close` disposes it.
     resp: Response             ## header snapshot (status/headers; empty body)
     client: Navi
-    key: string                ## origin key, for returning the connection to the pool
-    transport: Conn            ## the checked-out http/1.1 connection
-    parser: H1Parser
+    key: string                ## origin key, for returning an h1 connection to the pool
     decompress: bool
     cap: int
     cancel: CancelToken
-    drained: bool              ## body fully read; connection returned/closed
+    drained: bool              ## body fully read; connection returned/finished
     closed: bool               ## disposed without draining
-    guard: StreamGuard         ## closes the connection if the handle is dropped
-                               ## before drain/close (see navi/private/streamguard)
-    dec: StreamDecoder         ## decode + size-cap state carried across readChunk
-    decReady: bool             ## calls (chosen once the response headers are in)
+    guard: StreamGuard         ## closes/resets if the handle is dropped before
+                               ## drain/close (see navi/private/streamguard)
+    dec: StreamDecoder         ## h1 decode + size-cap state carried across readChunk
+    decReady: bool             ## calls (h2 keeps its decoder in the mux)
     seen: int
+    case kind: StreamKind
+    of skH1:
+      transport: Conn          ## the checked-out http/1.1 connection
+      parser: H1Parser
+    of skH2:
+      mux: H2Mux               ## the shared connection (stays live for reuse)
+      sid: uint32              ## our stream on it
   StreamResponse* = ref StreamResponseObj
 
 proc close*(sr: StreamResponse): Future[void] {.async.} =
   ## Dispose a streaming handle whose body will not be fully drained: closes the
-  ## connection (a partially-read response cannot be pooled). Idempotent; a no-op
-  ## once the body has been drained.
+  ## http/1.1 connection (a partially-read response cannot be pooled) or resets the
+  ## h2 stream (the shared connection stays up). Idempotent; a no-op once drained.
   if sr.drained or sr.closed: return
   sr.closed = true
   disarm(sr.guard)                    # we do the awaitable teardown ourselves
-  await close(sr.transport)
+  case sr.kind
+  of skH1: await close(sr.transport)
+  of skH2: await sr.mux.abandon(sr.sid)
 
 proc status*(sr: StreamResponse): int = sr.resp.status
   ## The response status code, available before the body is drained.
@@ -194,17 +288,34 @@ proc ok*(sr: StreamResponse): bool = sr.resp.ok
 
 proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.} =
   ## Send one request and read its headers, returning a handle with the body
-  ## pending over a pooled http/1.1 connection. A stale pooled connection is
-  ## retried once on a fresh one. Does not throw on non-2xx.
+  ## pending: multiplexed over a shared h2 connection when available/negotiable,
+  ## otherwise a pooled http/1.1 connection. Mirrors `transport`, but stops at the
+  ## response headers. Does not throw on non-2xx.
   let origin = originKey(req.url)
+  let wantH2 = client.config.wantsH2 and req.url.isTls
   let decompress = client.config.wantsDecompress
   let cap = client.config.maxResponseBytes
+
+  if wantH2:
+    if client.muxes.hasKey(origin) and client.muxes[origin].canReuse:
+      let mux = client.muxes[origin]
+      let sid = await mux.sendAndReadHeaders(h2HeaderList(req), req.body, req.bodyStream)
+      return StreamResponse(kind: skH2, mux: mux, sid: sid,
+        resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
+        decompress: decompress, cap: cap)
+    if client.pendingMux.hasKey(origin):
+      let mux = await client.pendingMux[origin]
+      if mux != nil and mux.canReuse:
+        let sid = await mux.sendAndReadHeaders(h2HeaderList(req), req.body, req.bodyStream)
+        return StreamResponse(kind: skH2, mux: mux, sid: sid,
+          resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
+          decompress: decompress, cap: cap)
 
   var (found, pc) = popIdle(client.pool, origin)
   if found:
     try:
       let parser = h1SendAndReadHeaders(pc.transport, req, true)
-      return StreamResponse(transport: pc.transport, parser: parser,
+      return StreamResponse(kind: skH1, transport: pc.transport, parser: parser,
         resp: parser.toResponse(), client: client, key: origin,
         decompress: decompress, cap: cap)
     except CatchableError:
@@ -213,11 +324,41 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
   var rq = req
   let proxyTarget = resolveProxy(client.config, rq.url)
   rq.absoluteForm = proxyTarget.isSet and not rq.url.isTls
+  let alpn = if wantH2: @["h2", "http/1.1"] else: @[]
+
+  if wantH2:
+    let pending = newFuture[H2Mux]("navi.pendingMux")
+    client.pendingMux[origin] = pending
+    try:
+      let conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
+                               client.config.tls, proxyTarget, alpn,
+                               client.config.connectMs, client.config.readMs)
+      if conn.protocol == "h2":
+        let mux = await newH2Mux(conn, client.config.maxResponseBytes, decompress)
+        client.muxes[origin] = mux
+        client.pendingMux.del(origin)
+        pending.complete(mux)
+        let sid = await mux.sendAndReadHeaders(h2HeaderList(rq), rq.body, rq.bodyStream)
+        return StreamResponse(kind: skH2, mux: mux, sid: sid,
+          resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
+          decompress: decompress, cap: cap)
+      else:
+        client.pendingMux.del(origin)
+        pending.complete(nil)
+        let parser = h1SendAndReadHeaders(conn, rq, true)
+        return StreamResponse(kind: skH1, transport: conn, parser: parser,
+          resp: parser.toResponse(), client: client, key: origin,
+          decompress: decompress, cap: cap)
+    except CatchableError as e:
+      client.pendingMux.del(origin)
+      pending.fail(e)
+      raise
+
   let conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
-                           client.config.tls, proxyTarget, @[],
+                           client.config.tls, proxyTarget, alpn,
                            client.config.connectMs, client.config.readMs)
   let parser = h1SendAndReadHeaders(conn, rq, true)
-  return StreamResponse(transport: conn, parser: parser,
+  return StreamResponse(kind: skH1, transport: conn, parser: parser,
     resp: parser.toResponse(), client: client, key: origin,
     decompress: decompress, cap: cap)
 
@@ -240,12 +381,22 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
     let handle = await openStreamConn(client, rreq)
     handle.cancel = cancel
     # Arm the leak-guard for the synchronous fallback teardown if the handle is
-    # dropped without drain/close. Captures only `transport` (not `handle`, cycle).
-    let t = handle.transport
-    handle.guard = newStreamGuard(proc() {.gcsafe, raises: [].} =
-      {.cast(gcsafe).}:
-        try: t.closeSync()
-        except Exception: discard)     # best-effort finalizer: never propagate
+    # dropped without drain/close. Captures only the connection essentials (never
+    # `handle`, which would cycle): the h1 transport, or the mux + stream id.
+    case handle.kind
+    of skH1:
+      let t = handle.transport
+      handle.guard = newStreamGuard(proc() {.gcsafe, raises: [].} =
+        {.cast(gcsafe).}:
+          try: t.closeSync()
+          except Exception: discard)     # best-effort finalizer: never propagate
+    of skH2:
+      let mux = handle.mux
+      let sid = handle.sid
+      handle.guard = newStreamGuard(proc() {.gcsafe, raises: [].} =
+        {.cast(gcsafe).}:
+          try: (if mux != nil: mux.dropStream(sid))
+          except Exception: discard)
     storeCookies(client.jar, rreq.url, handle.resp)
     if handle.status == 401 and client.config.auth.kind == akDigest and
        not rreq.headers.contains("authorization"):
@@ -266,47 +417,68 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
       return handle
 
 proc readChunk*(sr: StreamResponse): Future[string] {.async.} =
-  ## Pull the next decoded body chunk, or "" once the body is fully read. Like
-  ## `drain`, the terminal returns the connection to the pool or closes it and
-  ## disarms the guard; a cap breach closes and reraises. Call until it returns "".
-  ## The guard stays armed across the incremental reads, so a handle dropped before
-  ## EOF is still closed by it.
+  ## Pull the next decoded body chunk, or "" once the body is fully read. At end an
+  ## h1 connection is returned to the pool (or closed) and an h2 stream is dropped
+  ## on the shared connection, and the guard is disarmed; a cap breach or h2 reset
+  ## closes/drops and reraises. The guard stays armed across the incremental reads,
+  ## so a handle dropped before EOF is still cleaned up by it.
   if sr.drained or sr.closed: return ""
-  try:
-    result = h1ReadChunk(sr.transport, sr.parser,
-                         sr.dec, sr.decReady, sr.seen, sr.decompress, sr.cap)
-    if result.len == 0:                        # end of body: we own the teardown now
-      sr.drained = true
+  case sr.kind
+  of skH2:
+    try:
+      result = await sr.mux.readChunk(sr.sid)
+      if result.len == 0:                 # stream ended; readChunk dropped it
+        sr.drained = true
+        disarm(sr.guard)
+    except CatchableError:
+      if not sr.drained: sr.drained = true
+      disarm(sr.guard)                    # readChunk dropped the stream; mux stays up
+      raise
+  of skH1:
+    try:
+      result = h1ReadChunk(sr.transport, sr.parser,
+                           sr.dec, sr.decReady, sr.seen, sr.decompress, sr.cap)
+      if result.len == 0:                 # end of body: we own the teardown now
+        sr.drained = true
+        disarm(sr.guard)
+        if not (sr.parser.keepAliveAfter() and
+                pushIdle(sr.client.pool, sr.key, PooledConn[Conn](transport: sr.transport))):
+          await close(sr.transport)
+    except CatchableError:
+      if not sr.drained: sr.drained = true
       disarm(sr.guard)
-      if not (sr.parser.keepAliveAfter() and
-              pushIdle(sr.client.pool, sr.key, PooledConn[Conn](transport: sr.transport))):
-        await close(sr.transport)
-  except CatchableError:
-    if not sr.drained: sr.drained = true
-    disarm(sr.guard)
-    await close(sr.transport)
-    raise
+      await close(sr.transport)
+      raise
 
 proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
   ## Deliver the response body to `sink` as it arrives (decoded and size-capped),
-  ## awaiting it per chunk so a slow sink backpressures the peer. Then return the
-  ## connection to the pool (or close it if it cannot be reused). Consumes the
-  ## handle: call once. On error the connection is closed and the error re-raised.
-  ## Prefer the `each` template for the common case.
+  ## awaiting it per chunk so a slow sink backpressures the peer. Then return an
+  ## http/1.1 connection to the pool (or close it if it cannot be reused); an h2
+  ## stream just finishes on the shared connection. Consumes the handle: call once.
+  ## On error the connection is closed/reset and the error re-raised. Prefer `each`.
   if sr.drained or sr.closed:
     raise newException(IOError, "navi: stream already drained or closed")
   throwIfCancelled(sr.cancel)
   disarm(sr.guard)                         # from here `drain` owns the teardown
-  try:
-    var keep = false
-    h1DrainBody(sr.transport, sr.parser, sink, keep, sr.decompress, sr.cap)
-    sr.drained = true
-    if not (keep and pushIdle(sr.client.pool, sr.key, PooledConn[Conn](transport: sr.transport))):
+  case sr.kind
+  of skH2:
+    try:
+      await sr.mux.drainDownload(sr.sid, sink)
+      sr.drained = true                    # drainDownload freed the stream
+    except CatchableError:
+      sr.drained = true                    # ...on error too, so the guard won't double-free
+      raise
+  of skH1:
+    try:
+      var keep = false
+      h1DrainBody(sr.transport, sr.parser, sink, keep, sr.decompress, sr.cap)
+      sr.drained = true
+      if not (keep and pushIdle(sr.client.pool, sr.key, PooledConn[Conn](transport: sr.transport))):
+        await close(sr.transport)
+    except CatchableError:
+      if not sr.drained: sr.drained = true   # mark consumed for the "call once" guard
       await close(sr.transport)
-  except CatchableError:
-    if not sr.drained: sr.drained = true   # mark consumed for the "call once" guard
-    await close(sr.transport)
-    raise
+      raise
 
 template each*(sr: StreamResponse; chunk, body: untyped): untyped =
   ## Drain the streaming body, running `body` for each decoded chunk with `chunk`
