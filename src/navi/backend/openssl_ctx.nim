@@ -405,6 +405,28 @@ when defined(ssl):
     if host.len > 0 and not isIpAddress(host):
       discard SSL_set_tlsext_host_name(result, host.cstring)   # SNI
 
+  proc newClientSslMem*(ctx: SslContext, host: string,
+                        slot: SessionSlot = nil): tuple[ssl: SslPtr, rbio, wbio: BIO] =
+    ## Create a client SSL driven through a pair of memory BIOs instead of a
+    ## socket fd, for an async backend that owns the ciphertext transport itself
+    ## (chronos over a `StreamTransport`). Sets SNI, presents any cached session,
+    ## and puts the SSL in connect state. The caller drives the handshake by
+    ## feeding `rbio` (ciphertext in) and draining `wbio` (ciphertext out), then
+    ## runs `verifyPeer`. `SSL_set_bio` transfers BIO ownership to the SSL, so the
+    ## returned `rbio`/`wbio` are for pumping only -- freeing the SSL frees them.
+    let ssl = SSL_new(ctx.context)
+    if ssl.isNil: fail("SSL_new failed")
+    let rbio = bioNew(bioSMem())
+    let wbio = bioNew(bioSMem())
+    if rbio.isNil or wbio.isNil:
+      SSL_free(ssl); fail("could not allocate TLS memory BIOs")
+    sslSetBio(ssl, rbio, wbio)   # SSL now owns both BIOs (freed by SSL_free)
+    applySession(ssl, slot)      # present a cached session before the handshake
+    if host.len > 0 and not isIpAddress(host):
+      discard SSL_set_tlsext_host_name(ssl, host.cstring)   # SNI
+    sslSetConnectState(ssl)
+    (ssl, rbio, wbio)
+
   proc verifyPeer*(ssl: SslPtr, host: string, verify: bool) =
     ## After a completed handshake, confirm the chain (SSL_VERIFY_PEER already
     ## aborts the handshake on a bad chain; this is the belt-and-suspenders check)

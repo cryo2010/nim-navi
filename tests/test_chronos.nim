@@ -111,24 +111,26 @@ suite "chronos entry end to end":
     joinThread(th)
 
 suite "chronos TLS config":
-  # BearSSL has a fixed cipher profile, so cipher selection cannot be honored.
-  # The backend rejects it up front (before dialing), so no server is needed.
-  test "the chronos backend should reject cipher selection rather than ignore it":
+  # chronos now runs OpenSSL, so cipher selection and TLS 1.3 are honored rather
+  # than rejected as they were under BearSSL. (Real negotiation is covered by the
+  # TLS parity tests against a live server.)
+  test "the chronos backend should surface an invalid cipher from OpenSSL":
     var cfg = initNaviConfig()
-    cfg.tls.ciphers = "ECDHE-RSA-AES128-GCM-SHA256"
+    cfg.tls.ciphers = "NO-SUCH-CIPHER"
     let api = newNavi(cfg)
     var msg = ""
     try:
       discard waitFor api.get("https://127.0.0.1:1/")
-    except ValueError as e: msg = e.msg
-    check "cipher selection" in msg
+    except CatchableError as e: msg = e.msg
+    check "cipher" in msg   # reached OpenSSL's cipher-list check, not a blanket reject
 
-  test "the chronos backend should reject cipherSuites selection rather than ignore it":
+  test "the chronos backend should no longer reject tls13":
     var cfg = initNaviConfig()
-    cfg.tls.cipherSuites = "TLS_AES_128_GCM_SHA256"
+    cfg.tls.minVersion = tls13
     let api = newNavi(cfg)
     var msg = ""
     try:
       discard waitFor api.get("https://127.0.0.1:1/")
-    except ValueError as e: msg = e.msg
-    check "cipher selection" in msg
+    except CatchableError as e: msg = e.msg
+    # a refused connection to :1, not the old "tls13 is unavailable" rejection
+    check "tls13 is unavailable" notin msg
