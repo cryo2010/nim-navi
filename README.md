@@ -61,6 +61,7 @@ discard main()
   - [Auth and proxy](#auth-and-proxy)
   - [Cookies](#cookies)
   - [Middleware](#middleware)
+    - [Batteries-included middleware](#batteries-included-middleware)
   - [Decompression](#decompression)
   - [HTTP/2](#http2)
   - [Keep-alive](#keep-alive)
@@ -556,6 +557,52 @@ Per-instance config is captured by a middleware factory (or kept on the
 returning `Future[void]`. navi handles the per-client details itself (chronos's
 strict-raises obligation is discharged inside navi, not stamped into the public
 type), so the same middleware source compiles on all of them.
+
+#### Batteries-included middleware
+
+Ready-made middleware ships under `mw`, imported to **mirror your client import**
+(the middleware type is per-backend, so there is no single universal import):
+
+| Your client | Middleware import |
+| --- | --- |
+| `import navi` | `import navi/mw` |
+| `import navi/asyncdispatch` | `import navi/asyncdispatch/mw` |
+| `import navi/chronos` | `import navi/chronos/mw` |
+| `import navi/js` | `import navi/js/mw` |
+
+The factories return `NaviMiddleware`; add them to `config.middleware`. `mw` is
+also the call qualifier (`mw.cache`, `mw.rateLimit`, ...).
+
+```nim
+import navi
+import navi/mw
+
+var config = initNaviConfig()
+config.middleware = @[
+  mw.rateLimit(perSec = 10),        # token-bucket throttle
+  mw.cache(),                       # RFC 9111 response cache (in-memory)
+  mw.logging()]                     # "GET url -> 200 (12ms)" via echo
+let api = newNavi(config)
+```
+
+- **`cache(store = newCacheStore())`** — serves fresh GET/HEAD responses from an
+  in-memory store, revalidates stale ones with `If-None-Match`/`If-Modified-Since`
+  (refreshing on `304`), and stores cacheable responses. Honors `Cache-Control`
+  (`max-age`, `no-store`, `no-cache`, `private`), `Expires`, and `Vary`. Pass a
+  shared `store` to reuse a cache across clients.
+- **`rateLimit(perSec, burst = 0)`** — token bucket; over budget, a request waits
+  its turn (async: awaits; sync: blocks). `burst` defaults to `ceil(perSec)`.
+- **`concurrency(maxInFlight)`** — caps concurrent in-flight requests (native
+  async backends; a no-op on the serial sync client, and omitted on `navi/js`
+  where the runtime manages fetch concurrency).
+- **`bearer(token)`**, **`basic(user, pass)`** — set the `Authorization` header.
+- **`logging(sink = nil)`** — logs `VERB url -> status (Nms)` after each request
+  (defaults to `echo`; pass a sink to route elsewhere).
+
+Because middleware wraps `request()` only (not `stream()`/`sse()`), the cache
+serves and stores buffered responses; streamed responses are not cached. Order
+matters (outermost first): put `rateLimit` before `cache` so cache hits are not
+counted against the budget.
 
 ### Decompression
 

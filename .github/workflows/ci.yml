@@ -71,7 +71,8 @@ jobs:
       # that the (plain-TCP) test suite never builds, under both memory managers.
       - name: Compile entry modules
         run: |
-          for entry in navi navi/asyncdispatch navi/chronos; do
+          for entry in navi navi/asyncdispatch navi/chronos \
+                       navi/mw navi/asyncdispatch/mw navi/chronos/mw; do
             echo "== $entry =="
             nim check --mm:${{ matrix.mm }} -d:ssl --path:src --hints:off "src/$entry.nim"
           done
@@ -108,6 +109,14 @@ jobs:
           nim js --path:src --hints:off -o:js_fallback_async.js  tests/js_fallback_async.nim
           nim js --path:src --hints:off -o:js_fallback_chronos.js tests/js_fallback_chronos.nim
 
+      # The batteries middleware ships a per-client entry; the js one and the
+      # asyncdispatch/chronos ones (which fall back to navi/js) must build for js.
+      - name: Compile the js middleware entries
+        run: |
+          nim js --path:src --hints:off -o:js_mw.js          src/navi/js/mw.nim
+          nim js --path:src --hints:off -o:js_mw_async.js     src/navi/asyncdispatch/mw.nim
+          nim js --path:src --hints:off -o:js_mw_chronos.js   src/navi/chronos/mw.nim
+
       # Run the script directly (not `nimble wsjs`): nimble does not propagate a
       # task's exit code (nim-lang/nimble#1802). jsws.sh uses `set -e`.
       - name: navi/js WebSocket runtime test
@@ -117,6 +126,32 @@ jobs:
       # path (a value-object client miscompiled via unsafeAddr under nim js).
       - name: navi/js cookie jar + middleware runtime test
         run: bash tests/interop/js_cookiejar.sh
+
+  middleware-timetravel:
+    runs-on: ubuntu-latest
+    name: middleware timing (checkmate time-travel)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install checksums
+        run: nimble install -y checksums
+
+      # checkmate provides both the `import checkmate` time-travel API and the
+      # runner binary; `tests/tt_mw_timing.nim` is named so the plain `nimble test`
+      # glob (test_*.nim) skips it -- only this job runs it, under a virtual clock.
+      - name: Install checkmate
+        run: nimble install -y "https://github.com/cryo2010/nim-checkmate"
+
+      # Deterministically validate rateLimit pacing and the concurrency cap: under
+      # --time-travel the async sleeps are instant but the virtual clock advances,
+      # so the asserted millisecond timings are exact and fast (no flakiness).
+      - name: Run the middleware timing tests under time travel
+        run: checkmate --timeTravel tt_mw_timing
 
   sanitize:
     runs-on: ubuntu-latest
