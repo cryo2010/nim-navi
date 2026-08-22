@@ -14,7 +14,8 @@ installExt    = @["nim", "cpp"]   # ship the HTTP/3 driver (h3client.cpp) so a
 requires "nim >= 2.2.10"
 requires "checksums >= 0.2.2"   # MD5 + SHA-256 (sha2 API) for Digest auth; 0.2.2 is the tested floor
 
-# Optional: only needed when you `import navi/chronos`.
+# Optional: only needed when you `import navi/chronos`. That client runs OpenSSL
+# for TLS (like sync/asyncdispatch), so an https build needs `-d:ssl`.
 # requires "chronos >= 4.0.0"
 
 task test, "Run the test suite (delegates to tests/run.sh)":

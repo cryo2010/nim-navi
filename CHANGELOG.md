@@ -7,6 +7,21 @@ onward (pre-1.0, minor versions may include breaking changes).
 
 ## [Unreleased]
 
+### Added
+- The chronos client reaches full TLS parity with the sync and asyncdispatch
+  clients: **HTTP/2** (ALPN-negotiated, with transparent stream multiplexing),
+  **TLS 1.3**, **cipher selection**, **mutual TLS** (client certificates in every
+  format: PEM, encrypted PEM, PKCS#12, DER, in-memory), and **TLS session
+  resumption**. It now runs OpenSSL over its chronos transport instead of the
+  bundled BearSSL.
+
+### Changed
+- The chronos client's TLS is now OpenSSL (previously BearSSL). As a result,
+  `https` on `navi/chronos` requires a `-d:ssl` build (it links OpenSSL, like the
+  sync and asyncdispatch clients); plaintext `http` is unaffected. Setting
+  `tls.ciphers`/`tls.cipherSuites` or `minVersion = tls13` on chronos is now
+  honored rather than rejected.
+
 ### Fixed
 - Cookie jar: replayed cookies are now ordered per RFC 6265 5.4 (cookies with
   longer, more specific paths are sent before shorter ones; cookies with

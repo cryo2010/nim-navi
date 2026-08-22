@@ -72,3 +72,9 @@ export NAVI_INTEROP_CERT="$work/cert.pem"
 
 nim c -r --hints:off -o:"$work/sync"  "$root/tests/interop/nghttpd_sync.nim"
 nim c -r --hints:off -o:"$work/async" "$root/tests/interop/nghttpd_async.nim"
+# chronos now negotiates h2 over ALPN (OpenSSL), so it runs the same mux interop.
+if nimble path chronos >/dev/null 2>&1; then
+  nim c -r --hints:off -o:"$work/chronos" "$root/tests/interop/nghttpd_chronos.nim"
+else
+  echo "note: chronos not installed; skipping the chronos h2 interop leg"
+fi

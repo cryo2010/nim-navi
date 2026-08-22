@@ -108,7 +108,7 @@ nimble add navi
   nim c -r -d:ssl yourapp.nim
   ```
 - `checksums` (MD5 and SHA-256 for Digest auth; the former `std/md5`, now maintained by nim-lang as a separate package). This is navi's only required Nim dependency.
-- `chronos` >= 4.0, only if you `import navi/chronos`. Aside from `checksums`, the sync and asyncdispatch clients pull in no third-party Nim packages.
+- `chronos` >= 4.0, only if you `import navi/chronos`. The chronos client runs OpenSSL for TLS (like sync/asyncdispatch), so `https` needs a `-d:ssl` build. Aside from `checksums`, the sync and asyncdispatch clients pull in no third-party Nim packages.
 - `libbrotlidec` and `libzstd` (system libraries) are optional: needed only to decode `br`/`zstd` responses. They load lazily, so navi runs fine without them until a server actually sends those encodings.
 - HTTP/3 is opt-in via `-d:naviHttp3`, which needs **ngtcp2**, **nghttp3**, and **OpenSSL >= 3.5** (system libraries, located at build time via `pkg-config`) plus a C++ compiler. Without the flag none of these are required and h3 is unavailable; it applies to the sync and asyncdispatch clients only.
 - For `import navi/js`: nothing beyond Nim. Compile with `nim js` and run in a browser or on Node 18+ (which provides a global `fetch`); no `-d:ssl`, since the runtime handles TLS.
@@ -133,13 +133,13 @@ Every client shares the same API, and the below table details where they differ.
 
 | Capability | `navi` (sync) | `navi/asyncdispatch` | `navi/chronos` | `navi/js` |
 | --- | :---: | :---: | :---: | :---: |
-| HTTP/2 | ✓ | ✓ | ✗ | runtime |
+| HTTP/2 | ✓ | ✓ | ✓ | runtime |
 | HTTP/3 | opt-in | opt-in | ✗ | runtime |
-| Concurrent multiplexing | `parallel()` | transparent | ✗ | runtime |
-| TLS engine | OpenSSL | OpenSSL | BearSSL | runtime |
+| Concurrent multiplexing | `parallel()` | transparent | transparent | runtime |
+| TLS engine | OpenSSL | OpenSSL | OpenSSL | runtime |
 | Custom CA (`caFile`) | ✓ | ✓ | ✓ | runtime |
-| Client cert / mTLS | ✓ | ✓ | ✗ | ✗ |
-| Max TLS version | system | system | 1.2 | runtime |
+| Client cert / mTLS | ✓ | ✓ | ✓ | ✗ |
+| Max TLS version | system | system | system | runtime |
 | Keep-alive / connection pool | ✓ | ✓ | ✓ | ✗ |
 | Streaming upload | ✓ | ✓ | ✓ | buffered |
 | Streaming download (pull) | ✓ | ✓ | ✓ | ✓ |
@@ -159,9 +159,11 @@ defers to the browser store on one; see below.)
 
 Two clients carry caveats:
 
-- **chronos is HTTP/1.1 only.** Its bundled BearSSL exposes no client ALPN (so
-  no h2 negotiation) and no client-certificate hook (so no mTLS), and negotiates
-  up to TLS 1.2. Custom-CA verification via `caFile` does work.
+- **chronos runs OpenSSL over its transport, so `https` needs `-d:ssl`.** It runs
+  OpenSSL (like the sync and asyncdispatch clients) rather than its bundled
+  BearSSL, reaching full TLS parity: ALPN + HTTP/2, TLS 1.3, cipher selection,
+  mTLS, and session resumption. TLS therefore links OpenSSL and requires a
+  `-d:ssl` build (plaintext `http` does not). HTTP/3 is still OpenSSL-backends-only.
 - **`navi/js` runs on `fetch`/`WebSocket`,** so the platform owns connections,
   cookies, redirects, decompression, and TLS; navi keeps request building,
   retries, throw-on-non-2xx, and middleware. Its WebSocket wraps the native one, so
@@ -315,7 +317,7 @@ config.tls.caFile = "/path/to/ca-bundle.pem"   # verify is already on
 let api = newNavi(config)
 ```
 
-`verify` defaults to on. `caFile` is honored by all three clients: sync and asyncdispatch through OpenSSL, and chronos through BearSSL (which otherwise verifies against its bundled Mozilla trust anchors). The chronos client negotiates up to TLS 1.2 and does not support client certificates (mTLS).
+`verify` defaults to on. `caFile` is honored by all three native clients, each through OpenSSL (chronos included; without a `caFile` they verify against the system trust store). All three negotiate modern TLS (up to the library's maximum, typically TLS 1.3) and support client certificates (mTLS).
 
 #### Session resumption
 
@@ -329,9 +331,8 @@ a pooled, kept-alive connection already amortizes the handshake. Disable it with
 config.tls.resumeSessions = false
 ```
 
-Supported on the OpenSSL clients (sync, asyncdispatch); the sync client sees the
-largest gain. Not available on chronos (BearSSL exposes no client session cache in
-the chronos versions navi targets), which always does a full handshake.
+Supported on all three native clients (sync, asyncdispatch, chronos), which now
+share the same OpenSSL session cache; the sync client sees the largest gain.
 
 #### TLS version pinning
 
@@ -344,12 +345,12 @@ config.tls.minVersion = tls12    # refuse anything below TLS 1.2
 config.tls.maxVersion = tls13
 ```
 
-Enforced on the OpenSSL clients (sync, asyncdispatch). chronos (BearSSL) accepts
-`tls10`–`tls12` — requesting `tls13` there raises, since that build tops out at
-TLS 1.2. On `navi/js` the runtime controls the TLS version, so these are ignored.
-A negotiation outside the pinned range fails the handshake (`ValueError`). If the
-loaded OpenSSL/LibreSSL is too old to support version pinning (e.g. the LibreSSL
-some macOS builds link), setting a bound raises rather than silently ignoring it.
+Enforced on all three native clients (sync, asyncdispatch, chronos), which run
+OpenSSL, so `tls13` is honored on chronos too. On `navi/js` the runtime controls
+the TLS version, so these are ignored. A negotiation outside the pinned range
+fails the handshake (`ValueError`). If the loaded OpenSSL/LibreSSL is too old to
+support version pinning (e.g. the LibreSSL some macOS builds link), setting a
+bound raises rather than silently ignoring it.
 
 #### Cipher selection
 
@@ -363,10 +364,10 @@ config.tls.ciphers      = "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SH
 config.tls.cipherSuites = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"
 ```
 
-Enforced on the OpenSSL clients (sync, asyncdispatch); a value with no cipher the
-peer accepts fails the handshake, and an all-invalid list raises. chronos (BearSSL,
-a fixed cipher profile) raises if either is set; on `navi/js` the runtime controls
-ciphers, so they are ignored.
+Enforced on all three native clients (sync, asyncdispatch, chronos), which run
+OpenSSL; a value with no cipher the peer accepts fails the handshake, and an
+all-invalid list raises. On `navi/js` the runtime controls ciphers, so they are
+ignored.
 
 #### Client certificates (mTLS)
 
@@ -394,7 +395,7 @@ config.tls.certPem = certString
 config.tls.keyPem  = keyString
 ```
 
-Key algorithms (RSA, ECDSA, Ed25519) work in any of these as long as OpenSSL supports them. In-memory PEM may carry an intermediate chain; a PKCS#12 bundle's extra chain certs are not installed (only its leaf and key), which is all a client needs to present. chronos (BearSSL) and js do not present client certificates.
+Key algorithms (RSA, ECDSA, Ed25519) work in any of these as long as OpenSSL supports them. In-memory PEM may carry an intermediate chain; a PKCS#12 bundle's extra chain certs are not installed (only its leaf and key), which is all a client needs to present. Supported on all three native clients (sync, asyncdispatch, chronos), which run OpenSSL; `navi/js` does not present client certificates.
 
 ### Errors
 
