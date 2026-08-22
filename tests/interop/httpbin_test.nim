@@ -2,7 +2,7 @@
 ## Built three ways by httpbin.sh:
 ##   nim c ...                -> navi (sync, h2)
 ##   nim c -d:useAsync ...    -> navi/asyncdispatch (h2)
-##   nim c -d:useChronos ...  -> navi/chronos (HTTP/1.1: BearSSL has no client ALPN)
+##   nim c -d:useChronos ...  -> navi/chronos (h2: now runs OpenSSL, so ALPN negotiates)
 ## The assertions are identical for all three: they live in one `checks` template
 ## and use `await`, which is an identity template on the sync backend so the body
 ## reads the same. (The js backend differs enough -- fetch runtime, cert trust via
@@ -14,7 +14,7 @@ import std/[os, strutils, json]
 when defined(useChronos):
   import navi/chronos
   const backend = "chronos"
-  const wantVersion = "HTTP/1.1"
+  const wantVersion = "HTTP/2"
 elif defined(useAsync):
   import navi/asyncdispatch
   const backend = "asyncdispatch"

@@ -47,8 +47,8 @@ common="--path:$root/src -d:ssl --hints:off"
 test="$root/tests/interop/httpbin_test.nim"
 echo "== httpbin functionality: methods, bodies, auth, redirects, decompression, cookies, streaming =="
 
-# Native backends: one shared test compiled three ways (chronos is h1 -- BearSSL
-# has no client ALPN -- the others negotiate h2 with Caddy).
+# Native backends: one shared test compiled three ways (all negotiate h2 with
+# Caddy now that chronos runs OpenSSL and ALPN too).
 nim c -r $common               "$test"
 nim c -r $common -d:useAsync   "$test"
 nim c -r $common -d:useChronos "$test"
