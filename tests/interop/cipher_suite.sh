@@ -45,3 +45,9 @@ done
 export NAVI_CS_PORT12="$p12" NAVI_CS_PORT13="$p13"
 echo "== cipher selection: TLS 1.2/AES256 on $p12, TLS 1.3/AES256 on $p13 =="
 nim c -r --path:"$root/src" -d:ssl --hints:off "$root/tests/interop/cipher_suite.nim"
+# chronos now runs OpenSSL, so it honors cipher selection too.
+if nimble path chronos >/dev/null 2>&1; then
+  nim c -r --path:"$root/src" -d:ssl --hints:off "$root/tests/interop/cipher_suite_chronos.nim"
+else
+  echo "note: chronos not installed; skipping the chronos cipher-suite leg"
+fi

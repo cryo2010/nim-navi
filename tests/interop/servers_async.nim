@@ -1,15 +1,15 @@
 ## Multi-server interop (async). Built twice:
 ##   nim c ...                 -> navi/asyncdispatch (expects HTTP/2)
-##   nim c -d:useChronos ...   -> navi/chronos       (HTTP/1.1: BearSSL has no ALPN,
-##                                                     so this exercises the h1 + TLS
-##                                                     path against real servers)
+##   nim c -d:useChronos ...   -> navi/chronos       (expects HTTP/2: it now runs
+##                                                     OpenSSL, so ALPN negotiates h2
+##                                                     against real servers)
 ## Driven by servers.sh (NAVI_SERVERS / NAVI_INTEROP_CERT).
 
 import std/[os, strutils]
 when defined(useChronos):
   import navi/chronos
   const backend = "chronos"
-  const wantVersion = "HTTP/1.1"
+  const wantVersion = "HTTP/2"
 else:
   import navi/asyncdispatch
   const backend = "asyncdispatch"
