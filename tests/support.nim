@@ -375,3 +375,53 @@ proc startKeepAlive*(th: var Thread[KeepAliveCtx], port, requests: int,
   createThread(th, serveKeepAlive,
     KeepAliveCtx(port: port, requests: requests, ready: addr ready, accepts: accepts))
   while not ready: discard
+
+# --- cache-aware server for the middleware tests ------------------------------
+# Serves `requests` connections (Connection: close each). Replies 200 with
+# Cache-Control (max-age or no-store) and optional ETag; when a conditional
+# request carries a matching If-None-Match it replies 304. `count` tallies
+# requests actually received, so a test can prove a cache hit skipped the network.
+
+type CacheSrv* = object
+  port*: int
+  ready*: ptr bool
+  count*: ptr int
+  requests*, maxAge*: int
+  etag*: string
+  noStore*: bool
+
+proc serveCache(ctx: CacheSrv) {.thread.} =
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.listen()
+  ctx.ready[] = true
+  for _ in 0 ..< ctx.requests:
+    var client: Socket
+    server.accept(client)
+    var reqData = ""
+    while not reqData.endsWith("\r\n\r\n"):
+      let c = client.recv(1)
+      if c.len == 0: break
+      reqData.add c
+    inc ctx.count[]
+    if ctx.etag.len > 0 and
+       ("if-none-match: " & ctx.etag).toLowerAscii in reqData.toLowerAscii:
+      client.send("HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n")
+    else:
+      const body = "payload"
+      var h = "HTTP/1.1 200 OK\r\nContent-Length: " & $body.len &
+              "\r\nConnection: close\r\n"
+      if ctx.noStore: h.add "Cache-Control: no-store\r\n"
+      else: h.add "Cache-Control: max-age=" & $ctx.maxAge & "\r\n"
+      if ctx.etag.len > 0: h.add "ETag: " & ctx.etag & "\r\n"
+      client.send(h & "\r\n" & body)
+    client.close()
+  server.close()
+
+proc startCache*(th: var Thread[CacheSrv], c: var CacheSrv) =
+  ## Launch the cache server (fills `c.ready`) and block until it is listening.
+  var ready = false
+  c.ready = addr ready
+  createThread(th, serveCache, c)
+  while not ready: sleep(5)

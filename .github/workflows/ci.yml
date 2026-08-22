@@ -71,7 +71,8 @@ jobs:
       # that the (plain-TCP) test suite never builds, under both memory managers.
       - name: Compile entry modules
         run: |
-          for entry in navi navi/asyncdispatch navi/chronos; do
+          for entry in navi navi/asyncdispatch navi/chronos \
+                       navi/mw navi/asyncdispatch/mw navi/chronos/mw; do
             echo "== $entry =="
             nim check --mm:${{ matrix.mm }} -d:ssl --path:src --hints:off "src/$entry.nim"
           done
@@ -107,6 +108,14 @@ jobs:
         run: |
           nim js --path:src --hints:off -o:js_fallback_async.js  tests/js_fallback_async.nim
           nim js --path:src --hints:off -o:js_fallback_chronos.js tests/js_fallback_chronos.nim
+
+      # The batteries middleware ships a per-client entry; the js one and the
+      # asyncdispatch/chronos ones (which fall back to navi/js) must build for js.
+      - name: Compile the js middleware entries
+        run: |
+          nim js --path:src --hints:off -o:js_mw.js          src/navi/js/mw.nim
+          nim js --path:src --hints:off -o:js_mw_async.js     src/navi/asyncdispatch/mw.nim
+          nim js --path:src --hints:off -o:js_mw_chronos.js   src/navi/chronos/mw.nim
 
       # Run the script directly (not `nimble wsjs`): nimble does not propagate a
       # task's exit code (nim-lang/nimble#1802). jsws.sh uses `set -e`.
