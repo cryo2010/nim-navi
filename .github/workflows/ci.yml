@@ -127,6 +127,32 @@ jobs:
       - name: navi/js cookie jar + middleware runtime test
         run: bash tests/interop/js_cookiejar.sh
 
+  middleware-timetravel:
+    runs-on: ubuntu-latest
+    name: middleware timing (checkmate time-travel)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install checksums
+        run: nimble install -y checksums
+
+      # checkmate provides both the `import checkmate` time-travel API and the
+      # runner binary; `tests/tt_mw_timing.nim` is named so the plain `nimble test`
+      # glob (test_*.nim) skips it -- only this job runs it, under a virtual clock.
+      - name: Install checkmate
+        run: nimble install -y "https://github.com/cryo2010/nim-checkmate"
+
+      # Deterministically validate rateLimit pacing and the concurrency cap: under
+      # --time-travel the async sleeps are instant but the virtual clock advances,
+      # so the asserted millisecond timings are exact and fast (no flakiness).
+      - name: Run the middleware timing tests under time travel
+        run: checkmate --timeTravel tt_mw_timing
+
   sanitize:
     runs-on: ubuntu-latest
     name: sanitizers (asan + ubsan)

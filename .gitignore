@@ -66,3 +66,6 @@ examples/websocket/.certs/
 # bench build artifacts
 bench/clients/rust_client/target/
 bench/clients/rust_client/Cargo.lock
+
+# checkmate test-runner cache (disposable)
+.checkmate/
