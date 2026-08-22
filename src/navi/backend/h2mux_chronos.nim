@@ -42,8 +42,12 @@ type
     decompress: bool                   ## decode content-encoding before the sink
     sendTail: Future[void]   ## tail of the serialized send chain
     alive: bool
-    readerDone: Future[void] ## completed when the background reader has exited and
-                             ## closed the transport, so `close` can join it
+    readerDone: Future[void] ## completed once the reader has exited and the
+                             ## transport is closed, so `close` can join it
+    readerFut: Future[void]  ## the reader task itself, held so `close` can
+                             ## `cancelAndWait` it (reaping its parked read cleanly)
+    closing: bool            ## set by `close`, so the reader defers the transport
+                             ## teardown to it rather than racing on a cancelled await
 
 proc activeStreams(mux: H2Mux): int =
   ## Streams counting against the peer's MAX_CONCURRENT_STREAMS: buffered
@@ -172,10 +176,15 @@ proc reader(mux: H2Mux) {.async.} =
       if mux.h2.goneAway and mux.activeStreams == 0: break
   except CatchableError:
     discard
-  mux.failAll("navi: http/2 connection closed")
-  try: await be.close(mux.transport)   # the reader owns the transport close
-  except CatchableError: discard
-  if not mux.readerDone.finished: mux.readerDone.complete()
+  # When `close` is tearing us down it cancels this task (reaping the parked read)
+  # and owns the transport close + readerDone itself, so awaiting here after
+  # cancellation would just abort. Only self-exit (peer close / GOAWAY / error)
+  # runs the teardown here.
+  if not mux.closing:
+    mux.failAll("navi: http/2 connection closed")
+    try: await be.close(mux.transport)   # the reader owns the transport close
+    except CatchableError: discard
+    if not mux.readerDone.finished: mux.readerDone.complete()
 
 proc newH2Mux*(transport: be.Conn, maxBody = 0, decompress = false): Future[H2Mux] {.async.} =
   ## Take ownership of a freshly connected h2 transport, send the preface, and
@@ -191,21 +200,28 @@ proc newH2Mux*(transport: be.Conn, maxBody = 0, decompress = false): Future[H2Mu
                   decoders: initTable[uint32, StreamDecoder](),
                   pendingSlots: initDeque[Future[void]]())
   await be.sendAll(transport, mux.h2.preamble())
-  asyncSpawn reader(mux)
+  mux.readerFut = reader(mux)   # held (not asyncSpawn'd) so close can cancelAndWait it
   result = mux
 
 proc canReuse*(mux: H2Mux): bool = mux.alive and mux.h2.canReuse
 
 proc close*(mux: H2Mux) {.async.} =
-  ## Shut the shared connection down: fail any in-flight streams, wake the
-  ## background reader (transport shutdown), and wait for it to exit and close the
-  ## transport. Joining the reader (rather than closing the transport out from
-  ## under it) avoids leaving it suspended on a dead transport at teardown.
+  ## Shut the shared connection down: fail any in-flight streams, close the
+  ## transport so the reader's parked read completes with EOF, then let the reader
+  ## unwind on its own. We deliberately do NOT cancel the reader: cancelling a
+  ## chronos StreamTransport read in flight leaks the read's future/buffers, so we
+  ## EOF it via `closeWait` instead. `closing` tells the reader to leave the
+  ## transport teardown to us.
   if mux.readerDone.finished: return   # reader already exited (e.g. peer closed)
+  mux.closing = true
   mux.alive = false
   mux.failAll("navi: client closed")
-  be.shutdownConn(mux.transport)       # unblock the reader's pending read/write
-  await mux.readerDone                  # it observes EOF, closes the transport, exits
+  try: await be.close(mux.transport)   # EOFs the reader's parked read (no cancel)
+  except CatchableError: discard
+  if mux.readerFut != nil and not mux.readerFut.finished:
+    try: await mux.readerFut           # it observes EOF and returns; no cancellation
+    except CatchableError: discard
+  if not mux.readerDone.finished: mux.readerDone.complete()
 
 proc streamBody(mux: H2Mux, sid: uint32, bodyStream: BodyProducer) {.async.} =
   ## Send DATA frames pulled from `bodyStream`, pulling the next chunk only once the

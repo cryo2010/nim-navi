@@ -64,9 +64,16 @@ when defined(ssl):
 
   proc feedIn(t: ChronosTls): Future[bool] {.async.} =
     ## Read one chunk of ciphertext from the transport into the read-BIO. Returns
-    ## false on a clean EOF (peer closed), so callers can end rather than spin.
+    ## false on EOF -- a clean peer close, or the transport being closed under us
+    ## during teardown. Swallowing the closed/errored-transport exception (rather
+    ## than letting it propagate up through readSome/recvSome) lets chronos retire
+    ## the in-flight read cleanly instead of leaking its future + our stack trace.
     var buf = newString(tlsBufSize)
-    let n = await t.transport.readOnce(addr buf[0], buf.len)
+    var n = 0
+    try:
+      n = await t.transport.readOnce(addr buf[0], buf.len)
+    except CatchableError:
+      return false
     if n <= 0: return false
     discard bioWrite(t.rbio, cast[cstring](addr buf[0]), n.cint)
     return true
@@ -141,11 +148,14 @@ when defined(ssl):
         return ""                            # SYSCALL/unexpected EOF: EOF for the parser
 
   proc close*(t: ChronosTls) {.async.} =
-    ## Free the SSL (which frees its BIOs) and close the transport. Idempotent.
-    if not t.sslp.isNil:
-      SSL_free(t.sslp); t.sslp = nil
+    ## Close the transport, then free the SSL (which frees its BIOs). Idempotent.
+    ## Order matters: closing the transport first lets a background reader parked
+    ## in `readOnce` complete with a clean EOF and unwind, rather than racing a
+    ## freed SSL; it also avoids leaking the reader's in-flight read future.
     try: await t.transport.closeWait()
     except CatchableError: discard
+    if not t.sslp.isNil:
+      SSL_free(t.sslp); t.sslp = nil
 
   proc closeSync*(t: ChronosTls) =
     ## Non-awaiting teardown for a GC-reclaimed handle: free the SSL and initiate

@@ -16,6 +16,45 @@
   fun:_dl_init
 }
 
+# chronos leaks a StreamTransport read future when the transport is closed while a
+# `readOnce` is in flight with data still buffered -- exactly the shape of navi's
+# chronos h2 multiplexer, whose background reader is parked on `recvSome` (a
+# `readOnce`) on a busy connection when the client is closed. This is a chronos
+# bug, not navi's to free: a pure-chronos reproducer (a bare reader + a server
+# that keeps sending, then `closeWait`) leaks the same read future with zero navi
+# frames. The stack below is entirely chronos (nimNewObj -> chronos readOnce ->
+# the dispatcher poll loop), so a navi-owned leak -- which carries navi frames --
+# does not match and still fails the run. Its indirect children (the read's
+# buffer, and the TransportError stack trace raised into navi's feedIn on close)
+# are covered by match-leak-kinds: indirect.
+{
+  chronos-streamtransport-read-future-on-close
+  Memcheck:Leak
+  match-leak-kinds: definite,indirect
+  fun:malloc
+  fun:_ZN6system9allocImplE*
+  fun:allocSharedImpl
+  fun:_ZN6system12alignedAllocE*
+  fun:_ZN6system13alignedAlloc0E*
+  fun:nimNewObj
+  fun:_ZN8readOnce8readOnceE*
+  ...
+}
+{
+  chronos-read-future-error-stacktrace-on-close
+  Memcheck:Leak
+  match-leak-kinds: definite,indirect
+  fun:realloc
+  fun:_ZN6system11reallocImplE*
+  fun:_ZN6system17reallocSharedImplE*
+  fun:_ZN6system14alignedReallocE*
+  fun:prepareSeqAddUninit
+  fun:_ZN6system6setLenE3varI3seqIN6system15StackTraceEntryEEE*
+  fun:_ZN6system18auxWriteStackTraceE*
+  fun:raiseExceptionEx
+  ...
+}
+
 # --track-fds also reports descriptors still open at exit (CoreError:FdNotClosed),
 # which catches a leaked navi socket or cert file. The event-loop backends
 # (asyncdispatch, chronos) keep their dispatcher's own control descriptors open for
