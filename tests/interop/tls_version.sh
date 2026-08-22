@@ -45,3 +45,9 @@ done
 export NAVI_TV_PORT12="$p12" NAVI_TV_PORT13="$p13"
 echo "== TLS version pinning: TLS 1.2 server on $p12, TLS 1.3 server on $p13 =="
 nim c -r --path:"$root/src" -d:ssl --hints:off "$root/tests/interop/tls_version.nim"
+# chronos now runs OpenSSL, so it honors the version pins (incl. TLS 1.3) too.
+if nimble path chronos >/dev/null 2>&1; then
+  nim c -r --path:"$root/src" -d:ssl --hints:off "$root/tests/interop/tls_version_chronos.nim"
+else
+  echo "note: chronos not installed; skipping the chronos TLS version leg"
+fi

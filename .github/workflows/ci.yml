@@ -175,7 +175,8 @@ jobs:
       - name: Install nghttpd
         run: sudo apt-get update && sudo apt-get install -y nghttp2-server
 
-      # Only the chronos leg of the Happy Eyeballs test needs the chronos package.
+      # The chronos legs of the interop suite (h2 mux, mTLS, TLS version pinning,
+      # Happy Eyeballs) need the chronos package; chronos now runs OpenSSL.
       - name: Install chronos
         run: nimble install -y "chronos@>= 4.0.0"
 

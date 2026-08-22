@@ -23,9 +23,9 @@ type
     ## TLS options, including the client certificate for mTLS. The client
     ## credential can come from several sources; precedence is `pkcs12File`, then
     ## in-memory (`certPem`/`keyPem`), then the `certFile`/`keyFile` pair. Files
-    ## may be PEM or DER (detected by content). All are honored only on the
-    ## OpenSSL backends (sync, asyncdispatch); chronos (BearSSL) and js do not
-    ## present client certificates.
+    ## may be PEM or DER (detected by content). Honored on all three native
+    ## backends (sync, asyncdispatch, chronos), which run OpenSSL; `navi/js` does
+    ## not present client certificates.
     verify*: bool          ## verify the cert chain and hostname (default on)
     caFile*: string        ## custom CA bundle path; "" uses the system trust store
     certFile*: string      ## client certificate file (PEM or DER) for mTLS

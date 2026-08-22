@@ -1,16 +1,20 @@
 ## Asynchronous transport backend built on chronos stream transports.
 ##
-## Both plaintext and TLS connections read/write through AsyncStream
-## reader/writer pairs, so the send/recv paths are identical. TLS uses
-## chronos's BearSSL streams, which verify against the bundled Mozilla trust
-## anchors by default, or a custom CA when TlsConfig.caFile is set.
+## Plaintext connections read/write through an AsyncStream reader/writer pair; TLS
+## connections run OpenSSL over the raw chronos `StreamTransport` via the
+## memory-BIO pump in `chronos_tls` (so the backend reaches full parity with the
+## sync/asyncdispatch OpenSSL backends: ALPN + HTTP/2, TLS 1.3, cipher selection,
+## mTLS, and session resumption). TLS therefore requires compiling with `-d:ssl`
+## (it links OpenSSL, exactly as the other native backends do).
 
-import std/[strutils, os]
+import std/strutils
 import pkg/chronos, pkg/chronos/transports/stream
-import pkg/chronos/streams/[asyncstream, tlsstream]
-import ./api, ./chronos_castore
+import pkg/chronos/streams/asyncstream
+import ./api
 import ../core/response  # for navi's TimeoutError
 from ./happyeyeballs import heAttemptDelayMs
+when defined(ssl):
+  import ./openssl_ctx, ./chronos_tls
 
 export api, chronos
 
@@ -23,48 +27,70 @@ type
     ## crosses an `await` so it must be owned, not a borrowed view; being navi's own
     ## body type lets the engine move each chunk in with no copy.
 
-proc chronosVer(v: api.TlsVersion,
-                whenDefault: tlsstream.TLSVersion): tlsstream.TLSVersion =
-  ## Map a navi `TlsVersion` to chronos's (`TLSVersion` collides by name, so both
-  ## are qualified); BearSSL here tops out at TLS 1.2.
-  case v
-  of tlsDefault: whenDefault
-  of tls10: TLS10
-  of tls11: TLS11
-  of tls12: TLS12
-  of tls13:
-    raise newException(ValueError,
-      "navi: the chronos backend (BearSSL) supports up to TLS 1.2; tls13 is unavailable")
-
 type
   Conn* = object
     transport: StreamTransport
-    reader: AsyncStreamReader
-    writer: AsyncStreamWriter
-    tls: TLSAsyncStream  ## kept alive for the connection's lifetime; nil if plaintext
-    caStore: CaTrustStore  ## keeps custom-CA anchors alive; BearSSL holds raw pointers into it
-    protocol*: string    ## ALPN protocol; always "" here (this backend is http/1.1)
+    reader: AsyncStreamReader  ## plaintext only; nil for TLS
+    writer: AsyncStreamWriter  ## plaintext only; nil for TLS
+    when defined(ssl):
+      tls: ChronosTls          ## OpenSSL pump; nil if plaintext
+      ctx: SslContext          ## the (usually shared) context this connection used
+      ownsCtx: bool            ## true only for an unshared ctx `close` must destroy
+    protocol*: string    ## negotiated ALPN protocol ("h2" / "http/1.1" / "")
     readMs: int          ## per-read stall timeout in ms; 0 blocks indefinitely
 
 proc newTlsStore*(cfg: TlsConfig): RootRef =
-  ## No-op for chronos: BearSSL client-side session resumption is not available in
-  ## the chronos versions navi targets (the session-cache API is server-only, and
-  ## `TLSSessionCache.init` does not compile on some releases). Kept for a uniform
-  ## client interface across backends; TLS resumption applies to the OpenSSL
-  ## backends (sync, asyncdispatch). Always nil.
-  discard cfg
+  ## The per-client TLS session cache, or nil when resumption is off or on a
+  ## non-`-d:ssl` build. The entry puts it on `config.tls.sessionCache`.
+  when defined(ssl):
+    if cfg.wantsResume: result = newTlsSessionCache()
+  else:
+    discard cfg
 
 proc closeTlsStore*(store: RootRef) =
-  discard store
+  when defined(ssl):
+    if not store.isNil: close(cast[TlsSessionCache](store))
+  else:
+    discard store
 
 proc newTlsCtxStore*(cfg: TlsConfig): RootRef =
-  ## No-op for chronos: BearSSL does not build a shared OpenSSL `SSL_CTX`, so there
-  ## is nothing to cache per client. Kept for a uniform interface across backends;
-  ## the shared-context optimization applies to the OpenSSL backends. Always nil.
-  discard cfg
+  ## The per-client shared TLS-context store (empty until the first TLS connect),
+  ## or nil on a non-`-d:ssl` build. The entry puts it on `config.tls.contextStore`.
+  when defined(ssl):
+    result = newTlsContextStore()
+  else:
+    discard cfg
 
 proc closeTlsCtxStore*(store: RootRef) =
-  discard store
+  when defined(ssl):
+    if not store.isNil: close(cast[TlsContextStore](store))
+  else:
+    discard store
+
+when defined(ssl):
+  proc resumeSlot(cfg: TlsConfig, origin: string): SessionSlot =
+    ## When resumption is on and the client has a session cache, return a slot keyed
+    ## by `origin`; otherwise nil. The context is armed once in `obtainContext`, so
+    ## this only mints the per-connection link.
+    if cfg.wantsResume and not cfg.sessionCache.isNil:
+      result = newSlot(cast[TlsSessionCache](cfg.sessionCache), origin)
+
+  # openssl_ctx builds contexts through std/net, whose procs are declared
+  # `raises: [Exception]`. chronos's `{.async.}` tracks effects strictly and
+  # forbids a bare `Exception`, so these thin wrappers narrow it to navi's
+  # CatchableError contract at the backend boundary.
+  proc obtainCtx(cfg: TlsConfig, alpn: seq[string]): tuple[ctx: SslContext, owned: bool] =
+    try:
+      result = obtainContext(cfg.contextStore, cfg, alpn)
+    except CatchableError as e:
+      raise e
+    except Exception as e:
+      raise newException(IOError, "navi: TLS context setup failed: " & e.msg)
+
+  proc destroyCtx(ctx: SslContext) =
+    try: ctx.destroyContext()
+    except CatchableError: discard
+    except Exception: discard
 
 proc proxyConnect(transport: StreamTransport, host: string, port: int) {.async.} =
   let target = host & ":" & $port
@@ -161,13 +187,10 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
               connectMs = 0, readMs = 0, totalMs = 0): Future[Conn] {.async.} =
   ## `connectMs` bounds establishment (TCP connect + TLS handshake); `readMs` is
   ## stored for per-read timeouts. `totalMs` is enforced by the chronos entry's
-  ## guard (structured cancellation), so it is unused here.
+  ## guard (structured cancellation), so it is unused here. `alpn` (e.g.
+  ## @["h2","http/1.1"]) is offered on the TLS handshake; the negotiated protocol
+  ## lands in `Conn.protocol`. TLS requires `-d:ssl`.
   discard totalMs
-  # BearSSL uses a fixed cipher profile; reject cipher selection up front rather
-  # than after dialing.
-  if tls and (cfg.ciphers.len > 0 or cfg.cipherSuites.len > 0):
-    raise newException(ValueError,
-      "navi: the chronos backend (BearSSL) does not support cipher selection")
   var conn: Conn
   conn.readMs = readMs
 
@@ -177,57 +200,69 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     var pool = interleaveTAddr(resolveTAddress(dialHost, Port(dialPort)))
     if pool.len == 0:
       raise newException(IOError, "navi: could not resolve " & dialHost)
-    var lastErr: ref CatchableError
-    # Happy-Eyeballs TCP race, then proxy/TLS on the winner; on a *handshake*
-    # failure drop that address and re-race the rest (handshake-aware fallback).
-    while pool.len > 0:
-      let (transport, idx) = await happyConnect(pool)
-      conn.transport = transport
-      # Close the transport if the CONNECT tunnel or TLS setup fails (or the connect
-      # times out -- withTimeout cancels this future, raising CancelledError here).
-      try:
-        if proxy.isSet and tls:
-          await proxyConnect(transport, host, port)
-        if tls:
-          # Client certificates are not honored here (BearSSL client presents none).
-          let flags =
-            if cfg.wantsVerify: {} else: {TLSFlags.NoVerifyHost, TLSFlags.NoVerifyServerName}
-          if cfg.wantsVerify and cfg.caFile.len > 0:
-            if not fileExists(cfg.caFile):
-              raise newException(IOError, "navi: CA file not found: " & cfg.caFile)
-            conn.caStore = loadCaTrustStore(readFile(cfg.caFile))
-          let rdr = newAsyncStreamReader(transport)
-          let wtr = newAsyncStreamWriter(transport)
-          # BearSSL tops out at TLS 1.2. Unpinned, keep chronos's 1.2-only default;
-          # when the user pins a bound, widen the other end to the extremes so the
-          # requested range is honored. No client session resumption here.
-          let pinned = cfg.minVersion != tlsDefault or cfg.maxVersion != tlsDefault
-          let vmin = if pinned: chronosVer(cfg.minVersion, TLS10) else: TLS12
-          let vmax = if pinned: chronosVer(cfg.maxVersion, TLS12) else: TLS12
-          let stream =
-            if conn.caStore != nil:
-              newTLSClientAsyncStream(rdr, wtr, host, flags = flags,
-                                      minVersion = vmin, maxVersion = vmax,
-                                      trustAnchors = conn.caStore.store)
-            else:
-              newTLSClientAsyncStream(rdr, wtr, host, flags = flags,
-                                      minVersion = vmin, maxVersion = vmax)
-          conn.tls = stream
-          conn.reader = stream.reader
-          conn.writer = stream.writer
-          # Drive the handshake now so a verification failure raises here, not mid-read.
-          await stream.handshake()
-        else:
+
+    when not defined(ssl):
+      if tls:
+        raise newException(ValueError,
+          "navi: the chronos backend requires -d:ssl for https")
+      var lastErr: ref CatchableError
+      while pool.len > 0:
+        let (transport, idx) = await happyConnect(pool)
+        conn.transport = transport
+        try:
           conn.reader = newAsyncStreamReader(transport)
           conn.writer = newAsyncStreamWriter(transport)
-        return                                     # established
-      except CatchableError as e:
-        try: await transport.closeWait()
-        except CatchableError: discard
-        conn.tls = nil; conn.reader = nil; conn.writer = nil; conn.caStore = nil
-        pool.delete(idx)
-        lastErr = e
-    raise lastErr
+          return
+        except CatchableError as e:
+          (try: await transport.closeWait() except CatchableError: discard)
+          conn.reader = nil; conn.writer = nil
+          pool.delete(idx); lastErr = e
+      raise lastErr
+    else:
+      # Build the shared TLS context once (reused across address attempts); free it
+      # only if we own it (a bare TlsConfig) and never handed it to a live conn.
+      var ctx: SslContext
+      var owned = false
+      if tls: (ctx, owned) = obtainCtx(cfg, alpn)
+      var keepCtx = false
+      try:
+        var lastErr: ref CatchableError
+        # Happy-Eyeballs TCP race, then proxy/TLS on the winner; on a handshake
+        # failure drop that address and re-race the rest (handshake-aware fallback).
+        while pool.len > 0:
+          let (transport, idx) = await happyConnect(pool)
+          conn.transport = transport
+          try:
+            if proxy.isSet and tls:
+              await proxyConnect(transport, host, port)
+            if tls:
+              let slot = resumeSlot(cfg, host & ":" & $port)
+              let tlsc = newChronosTls(transport, ctx, host, slot)
+              conn.tls = tlsc
+              # Drive the handshake now so a verification failure raises here, not
+              # mid-read; verifyPeer re-checks the chain + hostname/IP identity.
+              await tlsc.handshake()
+              verifyPeer(tlsc.sslPtr, host, cfg.wantsVerify)
+              conn.protocol = negotiatedProtocol(tlsc.sslPtr)
+              conn.ctx = ctx
+              conn.ownsCtx = owned
+              keepCtx = owned          # the conn owns it now; don't free below
+            else:
+              conn.reader = newAsyncStreamReader(transport)
+              conn.writer = newAsyncStreamWriter(transport)
+            return                                   # established
+          except CatchableError as e:
+            if not conn.tls.isNil:
+              await conn.tls.close()                 # frees ssl + transport
+              conn.tls = nil
+            else:
+              (try: await transport.closeWait() except CatchableError: discard)
+            conn.reader = nil; conn.writer = nil
+            pool.delete(idx); lastErr = e
+        raise lastErr
+      finally:
+        if tls and owned and not keepCtx and not ctx.isNil:
+          destroyCtx(ctx)
 
   if connectMs > 0:
     if not await withTimeout(establish(), connectMs.milliseconds):
@@ -238,42 +273,66 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   return conn
 
 proc sendAll*(c: Conn, data: string): Future[void] {.async.} =
+  when defined(ssl):
+    if not c.tls.isNil:
+      await c.tls.write(data)
+      return
   await c.writer.write(data)
 
-proc recvSome*(c: Conn): Future[string] {.async.} =
-  ## One chunk of up to 4096 bytes; "" means the peer closed. Bounded by `readMs`
-  ## (the per-read stall timeout) when set; on expiry the read is cancelled and
-  ## TimeoutError is raised.
+proc plaintextRead(c: Conn): Future[string] {.async.} =
   var buf = newString(4096)
   var n = 0
   try:
-    if c.readMs > 0:
-      let fut = c.reader.readOnce(addr buf[0], buf.len)
-      if not await withTimeout(fut, c.readMs.milliseconds):
-        raise newException(response.TimeoutError,
-                           "navi: read timed out after " & $c.readMs & " ms")
-      n = await fut
-    else:
-      n = await c.reader.readOnce(addr buf[0], buf.len)
-  except TLSStreamError:
-    raise  # a real TLS/handshake failure is not an EOF -- surface it, don't spin
+    n = await c.reader.readOnce(addr buf[0], buf.len)
   except AsyncStreamError:
     n = 0  # remote closed mid-stream; treat as EOF for the parser
   buf.setLen(n)
   result = buf
 
+proc recvSome*(c: Conn): Future[string] {.async.} =
+  ## One chunk; "" means the peer closed. Bounded by `readMs` (the per-read stall
+  ## timeout) when set; on expiry the read is cancelled and TimeoutError is raised.
+  var readFut: Future[string]
+  when defined(ssl):
+    if not c.tls.isNil:
+      readFut = c.tls.readSome()
+  if readFut.isNil:
+    readFut = plaintextRead(c)
+  if c.readMs > 0:
+    if not await withTimeout(readFut, c.readMs.milliseconds):
+      raise newException(response.TimeoutError,
+                         "navi: read timed out after " & $c.readMs & " ms")
+  result = await readFut
+
 proc close*(c: Conn): Future[void] {.async.} =
-  await c.writer.closeWait()
-  await c.reader.closeWait()
-  await c.transport.closeWait()
+  when defined(ssl):
+    if not c.tls.isNil:
+      await c.tls.close()   # frees the SSL (and its BIOs) and the transport
+      if c.ownsCtx and not c.ctx.isNil: destroyCtx(c.ctx)
+      return
+  if not c.writer.isNil: await c.writer.closeWait()
+  if not c.reader.isNil: await c.reader.closeWait()
+  if not c.transport.isNil: await c.transport.closeWait()
 
 proc closeSync*(c: Conn) =
   ## Synchronous close, for a destructor that cannot `await` (an abandoned
   ## streaming handle reclaimed by GC). chronos's non-`Wait` `close` initiates
-  ## teardown and returns; the event loop frees the resources afterwards. Same
-  ## teardown as `close`, minus the awaits.
+  ## teardown and returns; the event loop frees the resources afterwards.
+  when defined(ssl):
+    if not c.tls.isNil:
+      c.tls.closeSync()
+      if c.ownsCtx and not c.ctx.isNil: destroyCtx(c.ctx)
+      return
   if not c.writer.isNil: c.writer.close()
   if not c.reader.isNil: c.reader.close()
+  if not c.transport.isNil: c.transport.close()
+
+proc shutdownConn*(c: Conn) =
+  ## Initiate transport close without awaiting, to unblock a reader parked on a
+  ## pending read (used by the h2 mux's `close`); the reader then observes EOF.
+  when defined(ssl):
+    if not c.tls.isNil:
+      c.tls.shutdownTransport(); return
   if not c.transport.isNil: c.transport.close()
 
 proc sleep*(ms: int): Future[void] {.async.} =

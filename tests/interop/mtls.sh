@@ -69,6 +69,13 @@ export NAVI_MTLS_DERCERT="$work/client.der.crt"
 export NAVI_MTLS_DERKEY="$work/client.der.key"
 export NAVI_MTLS_PASS="$pass"
 
-# Same test on both OpenSSL backends (chronos/js do not present client certs).
+# Same test on every native backend (js does not present client certs). chronos
+# now runs OpenSSL, so it presents client certificates like sync/asyncdispatch.
 nim c -r --hints:off -d:ssl -o:"$work/mtls_sync"  "$root/tests/interop/mtls.nim"
 nim c -r --hints:off -d:ssl -d:useAsync -o:"$work/mtls_async" "$root/tests/interop/mtls.nim"
+if nimble path chronos >/dev/null 2>&1; then
+  nim c -r --hints:off -d:ssl -d:useChronos -o:"$work/mtls_chronos" \
+    "$root/tests/interop/mtls.nim"
+else
+  echo "note: chronos not installed; skipping the chronos mTLS leg"
+fi
