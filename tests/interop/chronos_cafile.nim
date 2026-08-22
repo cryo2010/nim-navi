@@ -1,10 +1,10 @@
-## Custom-CA (TlsConfig.caFile) interop for the chronos/BearSSL backend.
+## Custom-CA (TlsConfig.caFile) interop for the chronos backend.
 ##
 ## Driven by tests/interop/chronos_cafile.sh, which generates a CA, signs a
 ## server cert with it, starts an OpenSSL HTTPS server, and exports
 ## NAVI_CAFILE_URL / NAVI_CAFILE_CA. Validates that navi/chronos verifies the
 ## server against the supplied CA, and that the same server is rejected when it
-## falls back to BearSSL's bundled Mozilla anchors.
+## falls back to the default system trust store (chronos now runs OpenSSL).
 
 import unittest
 import std/os
@@ -23,8 +23,8 @@ proc statusWithCa(url, caFile: string): Future[int] {.async.} =
   (await api.get(url)).status
 
 proc rejectedWithoutCa(url: string): Future[bool] {.async.} =
-  ## verify:true with no custom CA: our CA is not among BearSSL's Mozilla anchors,
-  ## so the handshake is rejected at connect.
+  ## verify:true with no custom CA: our test CA is not in the default system trust
+  ## store, so the handshake is rejected at connect.
   let api = newNavi(initNaviConfig())   # verify on (default), no caFile
   try:
     discard await api.get(url)

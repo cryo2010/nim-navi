@@ -2,16 +2,19 @@
 ## accepts, on the OpenSSL backends. Driven by mtls.sh, which stands up an
 ## `openssl s_server -Verify 1` that *requires* a client certificate and exports
 ## the same credential as PEM files, an encrypted PEM key, a PKCS#12 bundle, DER
-## files, and (read here) in-memory PEM. Built two ways:
-##   nim c ...              -> navi (sync)
-##   nim c -d:useAsync ...  -> navi/asyncdispatch
-## chronos (BearSSL) and js do not present client certificates, so they are out
-## of scope here.
+## files, and (read here) in-memory PEM. Built three ways:
+##   nim c ...                -> navi (sync)
+##   nim c -d:useAsync ...    -> navi/asyncdispatch
+##   nim c -d:useChronos ...  -> navi/chronos (now OpenSSL, so it presents certs)
+## js does not present client certificates, so it is out of scope here.
 
 import std/[os, strutils]
 when defined(useAsync):
   import navi/asyncdispatch
   const backend = "asyncdispatch"
+elif defined(useChronos):
+  import navi/chronos
+  const backend = "chronos"
 else:
   import navi
   template await(x: untyped): untyped = x
@@ -95,7 +98,7 @@ template runAll() =
     for f in failures: echo "  - ", f
     quit(1)
 
-when defined(useAsync):
+when defined(useAsync) or defined(useChronos):
   proc main() {.async.} = runAll()
   waitFor main()
 else:
