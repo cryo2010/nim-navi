@@ -160,7 +160,10 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
         return await client.h1OnConn(conn, origin, rq, sink)
     except CatchableError as e:
       client.pendingMux.del(origin)
-      pending.fail(e)
+      # In TLS 1.3 a post-handshake failure (e.g. a rejected client cert) can raise
+      # after the http/1.1 branch already completed `pending` with nil, so only fail
+      # it when it is still pending -- otherwise we'd complete the future twice.
+      if not pending.finished: pending.fail(e)
       raise
 
   let conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
@@ -351,7 +354,10 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
           decompress: decompress, cap: cap)
     except CatchableError as e:
       client.pendingMux.del(origin)
-      pending.fail(e)
+      # In TLS 1.3 a post-handshake failure (e.g. a rejected client cert) can raise
+      # after the http/1.1 branch already completed `pending` with nil, so only fail
+      # it when it is still pending -- otherwise we'd complete the future twice.
+      if not pending.finished: pending.fail(e)
       raise
 
   let conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,

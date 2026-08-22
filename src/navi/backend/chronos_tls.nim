@@ -24,6 +24,10 @@ when defined(ssl):
       transport: StreamTransport
       sslp: SslPtr
       rbio, wbio: BIO       ## owned by `sslp` (freed by SSL_free); handles for pumping
+      slot: SessionSlot     ## resumption slot, retained for the ssl's lifetime: its
+                            ## address lives in the SSL's ex_data, and the new-session
+                            ## callback (TLS 1.3 tickets arrive post-handshake, during
+                            ## reads) dereferences it -- so it must outlive the ssl
       writeLock: AsyncLock  ## serialize SSL_write + wbio drains so concurrent streams
                             ## (and post-handshake output) never interleave on the wire
 
@@ -39,7 +43,7 @@ when defined(ssl):
     ## are set here; the caller then `await`s `handshake`.
     let (ssl, rbio, wbio) = newClientSslMem(ctx, host, slot)
     ChronosTls(transport: transport, sslp: ssl, rbio: rbio, wbio: wbio,
-               writeLock: newAsyncLock())
+               slot: slot, writeLock: newAsyncLock())
 
   proc drainOut(t: ChronosTls) {.async.} =
     ## Push any ciphertext OpenSSL queued in the write-BIO onto the transport.
