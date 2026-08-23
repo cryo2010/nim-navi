@@ -60,7 +60,8 @@ jobs:
       - name: Compile entry modules
         shell: bash
         run: |
-          for entry in navi navi/asyncdispatch navi/chronos; do
+          for entry in navi navi/asyncdispatch navi/chronos \
+                       navi/mw navi/asyncdispatch/mw navi/chronos/mw; do
             echo "== $entry =="
             nim check --mm:${{ matrix.mm }} -d:ssl --path:src --hints:off "src/$entry.nim"
           done
