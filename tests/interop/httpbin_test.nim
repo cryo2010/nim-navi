@@ -13,14 +13,17 @@ import std/[os, strutils, json]
 
 when defined(useChronos):
   import navi/chronos
+  import navi/chronos/mw
   const backend = "chronos"
   const wantVersion = "HTTP/2"
 elif defined(useAsync):
   import navi/asyncdispatch
+  import navi/asyncdispatch/mw
   const backend = "asyncdispatch"
   const wantVersion = "HTTP/2"
 else:
   import navi
+  import navi/mw
   template await(x: untyped): untyped = x   # identity: the sync body reads the same
   const backend = "sync"
   const wantVersion = "HTTP/2"
@@ -34,6 +37,12 @@ proc baseCfg(): NaviConfig =
   result.headers["user-agent"] = "navi-httpbin/1.0"
 
 proc api(): Navi = newNavi(baseCfg())
+
+proc apiMw(mws: seq[NaviMiddleware]): Navi =
+  ## A client with the batteries middleware attached (for the middleware checks).
+  var cfg = baseCfg()
+  cfg.middleware = mws
+  newNavi(cfg)
 
 template runAll() =
   # State and env reads live here (locals of `main`), so the chronos async proc
@@ -239,6 +248,37 @@ template runAll() =
   check "/anything echoes method and JSON":
     let r = await api().post(base & "/anything", json = %*{"k": "v"})
     r.data["method"].getStr == "POST" and r.data["json"]["k"].getStr == "v"
+
+  # --- batteries middleware (navi/mw), end to end over real h2+TLS ----------
+  check "mw.bearer sets Authorization on the wire":
+    let c = apiMw(@[bearer("tok-123")])
+    (await c.get(base & "/headers")).data["headers"]["Authorization"].getStr == "Bearer tok-123"
+
+  check "mw.basic sets a base64 Authorization on the wire":
+    let c = apiMw(@[basic("user", "pass")])
+    # base64("user:pass") = dXNlcjpwYXNz
+    (await c.get(base & "/headers")).data["headers"]["Authorization"].getStr == "Basic dXNlcjpwYXNz"
+
+  check "mw.logging records a line for the request":
+    let logged = new(seq[string])
+    let c = apiMw(@[logging(proc(line: string) {.gcsafe, raises: [CatchableError].} =
+      logged[].add line)])
+    discard await c.get(base & "/get")
+    logged[].len == 1 and "200" in logged[][0]
+
+  check "mw.cache revalidates and serves on a 304 without erroring":
+    # httpbin /cache returns 200 + ETag/Last-Modified, and 304 when the request
+    # carries a conditional header. The cache stores the first response (stale, but
+    # revalidatable), then the second request revalidates -> 304 -> the cache serves
+    # the stored 200. A broken 304 path would throw on the non-2xx instead.
+    let c = apiMw(@[cache()])
+    let r1 = await c.get(base & "/cache")
+    let r2 = await c.get(base & "/cache")
+    r1.status == 200 and r2.status == 200
+
+  check "mw.rateLimit does not break the request pipeline":
+    let c = apiMw(@[rateLimit(perSec = 1000)])   # generous: timing is proven elsewhere
+    (await c.get(base & "/get")).status == 200
 
   # --- summary -------------------------------------------------------------
   echo ""
