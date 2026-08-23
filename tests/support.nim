@@ -3,6 +3,26 @@
 
 import std/[net, strutils, os]
 
+when defined(windows):
+  import std/nativesockets
+  from std/winlean import accept   # selectively: winlean's AF_* ints would
+                                   # shadow nativesockets' Domain enum values
+
+  proc acceptClient(server: Socket): Socket =
+    ## std/net's accept hands Winsock a 16-byte SockAddr, but an inbound IPv6
+    ## peer address needs 28: Windows fails that call with WSAEFAULT where POSIX
+    ## just truncates. (nativesockets then closes the invalid handle, so the code
+    ## that finally surfaces is a misleading WSAENOTSOCK.) Accept through a
+    ## storage-sized buffer instead, so the IPv6 servers here work on Windows.
+    var storage: array[128, byte]
+    var slen = sizeof(storage).SockLen
+    let fd = accept(server.getFd, cast[ptr SockAddr](addr storage), addr slen)
+    if fd == osInvalidSocket: raiseOSError(osLastError())
+    newSocket(fd, getSockDomain(fd), SOCK_STREAM, IPPROTO_TCP)
+else:
+  proc acceptClient(server: Socket): Socket =
+    server.accept(result)
+
 type ServerCtx* = object
   port: int
   ready: ptr bool
@@ -21,8 +41,7 @@ proc serveRaw(ctx: ServerCtx) {.thread.} =
   server.bindAddr(Port(ctx.port), "127.0.0.1")
   server.listen()
   ctx.ready[] = true
-  var client: Socket
-  server.accept(client)
+  var client = acceptClient(server)
   var req = ""
   while true:
     let c = client.recv(1)
@@ -47,8 +66,7 @@ proc serveEchoLine(ctx: ServerCtx) {.thread.} =
   server.bindAddr(Port(ctx.port), "127.0.0.1")
   server.listen()
   ctx.ready[] = true
-  var client: Socket
-  server.accept(client)
+  var client = acceptClient(server)
   var req = ""
   while true:
     let c = client.recv(1)
@@ -74,8 +92,7 @@ proc serveHang(ctx: ServerCtx) {.thread.} =
   server.bindAddr(Port(ctx.port), "127.0.0.1")
   server.listen()
   ctx.ready[] = true
-  var client: Socket
-  server.accept(client)
+  var client = acceptClient(server)
   var req = ""
   while true:
     let c = client.recv(1)
@@ -106,8 +123,7 @@ proc serveBodyEcho(ctx: ServerCtx) {.thread.} =
   server.bindAddr(Port(ctx.port), "127.0.0.1")
   server.listen()
   ctx.ready[] = true
-  var client: Socket
-  server.accept(client)
+  var client = acceptClient(server)
   var head = ""
   while true:
     let c = client.recv(1)
@@ -143,8 +159,7 @@ proc serveProxy(ctx: ServerCtx) {.thread.} =
   server.bindAddr(Port(ctx.port), "127.0.0.1")
   server.listen()
   ctx.ready[] = true
-  var client: Socket
-  server.accept(client)
+  var client = acceptClient(server)
   var head = ""
   while true:
     let c = client.recv(1)
@@ -170,8 +185,7 @@ proc serveCookies(ctx: ServerCtx) {.thread.} =
   server.bindAddr(Port(ctx.port), "127.0.0.1")
   server.listen()
   ctx.ready[] = true
-  var client: Socket
-  server.accept(client)
+  var client = acceptClient(server)
   for i in 0 .. 1:
     var head = ""
     while true:
@@ -204,8 +218,7 @@ proc serveRetry(ctx: ServerCtx) {.thread.} =
   server.bindAddr(Port(ctx.port), "127.0.0.1")
   server.listen()
   ctx.ready[] = true
-  var client: Socket
-  server.accept(client)
+  var client = acceptClient(server)
   var i = 0
   while true:
     var req = ""
@@ -240,8 +253,7 @@ proc serveRedirect(ctx: ServerCtx) {.thread.} =
   server.bindAddr(Port(ctx.port), "127.0.0.1")
   server.listen()
   ctx.ready[] = true
-  var client: Socket
-  server.accept(client)
+  var client = acceptClient(server)
   for i in 0 .. 1:
     var req = ""
     while true:
@@ -271,8 +283,7 @@ proc serveOnce(ctx: ServerCtx) {.thread.} =
   server.bindAddr(Port(ctx.port), if ctx.ipv6: "::1" else: "127.0.0.1")
   server.listen()
   ctx.ready[] = true
-  var client: Socket
-  server.accept(client)
+  var client = acceptClient(server)
   var req = ""
   while true:
     let c = client.recv(1)
@@ -307,8 +318,7 @@ proc serveKeepAlive(ctx: KeepAliveCtx) {.thread.} =
   server.bindAddr(Port(ctx.port), "127.0.0.1")
   server.listen()
   ctx.ready[] = true
-  var client: Socket
-  server.accept(client)
+  var client = acceptClient(server)
   ctx.accepts[] = 1
   for i in 0 ..< ctx.requests:
     var req = ""
@@ -339,8 +349,7 @@ proc serveUploadEcho(ctx: ServerCtx) {.thread.} =
   server.bindAddr(Port(ctx.port), "127.0.0.1")
   server.listen()
   ctx.ready[] = true
-  var client: Socket
-  server.accept(client)
+  var client = acceptClient(server)
   discard client.recvUntil("\r\n\r\n") # request head
   var body = ""
   while true:

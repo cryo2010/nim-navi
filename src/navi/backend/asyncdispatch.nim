@@ -32,7 +32,7 @@ type
 when defined(windows):
   import std/winlean
   proc setNoDelay(fd: SocketHandle) =
-    setSockOptInt(fd, winlean.IPPROTO_TCP.int, winlean.TCP_NODELAY.int, 1)
+    setSockOptInt(fd, nativesockets.IPPROTO_TCP.int, winlean.TCP_NODELAY.int, 1)
 else:
   import std/posix
   proc setNoDelay(fd: SocketHandle) =

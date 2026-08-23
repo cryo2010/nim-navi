@@ -66,6 +66,26 @@ when defined(ssl):
   proc X509_check_ip_asc(cert: PX509, ipasc: cstring, flags: cuint): cint
     {.cdecl, dynlib: DLLUtilName, importc.}
 
+  when defined(windows):
+    # std/openssl hides its whole X509 block behind `not defined(windows)`, so on
+    # Windows we declare the three entry points navi's verification path needs.
+    # They live in libcrypto (std/openssl asks libssl for them, which only works
+    # where libssl re-exports libcrypto); the peer-certificate getter is libssl's,
+    # and it was renamed in OpenSSL 3.0 -- `useOpenssl3` follows the -d:sslVersion
+    # used to pick the DLL names, so both eras resolve to the name they export.
+    proc X509_free(cert: PX509) {.cdecl, dynlib: DLLUtilName, importc.}
+    proc X509_check_host(cert: PX509, name: cstring, namelen: cint, flags: cuint,
+                         peername: cstring): cint
+      {.cdecl, dynlib: DLLUtilName, importc.}
+    when useOpenssl3:
+      proc SSL_get1_peer_certificate(ssl: SslCtx): PX509
+        {.cdecl, dynlib: DLLSSLName, importc.}
+      proc SSL_get_peer_certificate(ssl: SslCtx): PX509 =
+        SSL_get1_peer_certificate(ssl)
+    else:
+      proc SSL_get_peer_certificate(ssl: SslCtx): PX509
+        {.cdecl, dynlib: DLLSSLName, importc.}
+
   proc fail(msg: string) {.noreturn.} =
     raise newException(ValueError, "navi: " & msg)
 

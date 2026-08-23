@@ -25,14 +25,19 @@ type
 
 when defined(windows):
   import std/winlean
+  # winlean exports SOL_SOCKET/TCP_NODELAY but not the timeout options; pull them
+  # from winsock2.h the same way, so the values come from the platform headers.
+  var
+    SO_RCVTIMEO {.importc, header: "winsock2.h".}: cint
+    SO_SNDTIMEO {.importc, header: "winsock2.h".}: cint
   proc sysConnect(fd: SocketHandle, sa: ptr SockAddr, sl: SockLen): cint =
-    winlean.connect(fd, sa, cint(sl))
+    winlean.connect(fd, sa, sl)
   proc sysSend(fd: SocketHandle, buf: pointer, n: int): int =
     winlean.send(fd, cast[cstring](buf), cint(n), 0'i32).int
   proc sysRecv(fd: SocketHandle, buf: pointer, n: int): int =
     winlean.recv(fd, cast[cstring](buf), cint(n), 0'i32).int
   proc setNoDelay(fd: SocketHandle) =
-    setSockOptInt(fd, winlean.IPPROTO_TCP.int, winlean.TCP_NODELAY.int, 1)
+    setSockOptInt(fd, nativesockets.IPPROTO_TCP.int, winlean.TCP_NODELAY.int, 1)
   proc connectInProgress(): bool = osLastError().int32 == WSAEWOULDBLOCK
   proc setIoTimeout(fd: SocketHandle, ms: int) =
     setSockOptInt(fd, SOL_SOCKET.int, SO_RCVTIMEO.int, ms)  # win: DWORD ms
@@ -96,12 +101,12 @@ proc tcpConnect(host: string, port: int, connectMs = 0): SocketHandle =
       # delayed ACK -- paid on every fresh (unpooled) connection.
       setNoDelay(fd)
       if connectMs <= 0:
-        if sysConnect(fd, it.ai_addr, it.ai_addrlen) == 0'i32:
+        if sysConnect(fd, it.ai_addr, SockLen(it.ai_addrlen)) == 0'i32:
           result = fd; break
         lastErr = osErrorMsg(osLastError()); close(fd)
       else:
         fd.setBlocking(false)
-        if sysConnect(fd, it.ai_addr, it.ai_addrlen) == 0'i32:
+        if sysConnect(fd, it.ai_addr, SockLen(it.ai_addrlen)) == 0'i32:
           fd.setBlocking(true); result = fd; break     # connected immediately
         elif not connectInProgress():
           lastErr = osErrorMsg(osLastError()); close(fd)
@@ -161,7 +166,7 @@ proc happyConnect(ips: seq[string], port: int,
     let fd = createNativeSocket(ai.ai_family, ai.ai_socktype, ai.ai_protocol)
     if fd != osInvalidSocket:
       setNoDelay(fd); fd.setBlocking(false)
-      if sysConnect(fd, ai.ai_addr, ai.ai_addrlen) == 0'i32 or connectInProgress():
+      if sysConnect(fd, ai.ai_addr, SockLen(ai.ai_addrlen)) == 0'i32 or connectInProgress():
         inflight.add (fd, nextIdx)       # completes now or is in progress
       else:
         lastErr = osErrorMsg(osLastError()); close(fd)
