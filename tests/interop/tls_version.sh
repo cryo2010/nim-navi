@@ -6,6 +6,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$root/tests/interop/_win.sh"
 command -v openssl >/dev/null || { echo "openssl required"; exit 127; }
 
 work="$(mktemp -d)"
@@ -13,13 +14,13 @@ s12=""; s13=""
 cleanup() {
   [ -n "$s12" ] && kill "$s12" 2>/dev/null || true
   [ -n "$s13" ] && kill "$s13" 2>/dev/null || true
-  rm -rf "$work"
+  navi_rmtree "$work"
 }
 trap cleanup EXIT
 
 p12=9470; p13=9471
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-  -keyout "$work/key.pem" -out "$work/cert.pem" -subj "/CN=127.0.0.1" \
+  -keyout "$work/key.pem" -out "$work/cert.pem" -subj "$(navi_subj CN=127.0.0.1)" \
   -addext "subjectAltName=IP:127.0.0.1" >/dev/null 2>&1
 
 # -www answers a GET with a status page; -tls1_2 / -tls1_3 pin the server version.

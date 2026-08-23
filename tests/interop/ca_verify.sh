@@ -8,23 +8,31 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$root/tests/interop/_win.sh"
 command -v openssl >/dev/null || { echo "openssl not found"; exit 127; }
 
 work="$(mktemp -d)"
 srv=""
-cleanup() { [ -n "$srv" ] && kill "$srv" 2>/dev/null || true; rm -rf "$work"; }
+cleanup() {
+  [ -n "$srv" ] && kill "$srv" 2>/dev/null || true
+  cd "$root"          # Windows cannot remove the shell's own cwd
+  navi_rmtree "$work"
+}
 trap cleanup EXIT
 cd "$work"
 
 port=9458
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-  -keyout ca.key -out ca.pem -subj "/CN=navi-test-CA" >/dev/null 2>&1
+  -keyout ca.key -out ca.pem -subj "$(navi_subj CN=navi-test-CA)" >/dev/null 2>&1
 
 openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr \
-  -subj "/CN=127.0.0.1" >/dev/null 2>&1
+  -subj "$(navi_subj CN=127.0.0.1)" >/dev/null 2>&1
+# A real file rather than <(...): the process substitution's /dev/fd path is
+# meaningless to the native openssl.exe used under Git Bash.
+printf "subjectAltName=DNS:127.0.0.1,DNS:localhost,IP:127.0.0.1" > san.ext
 openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 1 \
-  -extfile <(printf "subjectAltName=DNS:127.0.0.1,DNS:localhost,IP:127.0.0.1") \
+  -extfile san.ext \
   -out server.pem >/dev/null 2>&1
 
 # -www answers a 200 HTML page on each connection.
@@ -43,7 +51,7 @@ done
 [ -n "$ready" ] || { echo "s_server did not become ready on :$port"; cat "$work/s_server.log"; exit 1; }
 
 export NAVI_CAFILE_URL="https://127.0.0.1:$port"
-export NAVI_CAFILE_CA="$work/ca.pem"
+export NAVI_CAFILE_CA="$(navi_path "$work/ca.pem")"
 
 echo "== private-CA verification: server signed by a private CA on 127.0.0.1:$port =="
 nim c -r --hints:off -d:ssl --path:"$root/src" -o:"$work/ca_verify" "$root/tests/interop/ca_verify.nim"

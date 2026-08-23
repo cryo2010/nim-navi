@@ -115,6 +115,13 @@ proc loadCodec(dll: string): LibHandle =
   when defined(macosx):
     if result == nil: result = loadLib("/opt/homebrew/lib/" & dll)
     if result == nil: result = loadLib("/usr/local/lib/" & dll)
+  when defined(windows):
+    # Windows builds disagree on the `lib` prefix: vcpkg ships brotlidec.dll and
+    # zstd.dll, MSYS2/mingw ships libbrotlidec.dll and libzstd.dll. Try the other
+    # spelling so either toolchain's DLLs are found under one build.
+    if result == nil:
+      let alt = if dll.startsWith("lib"): dll[3 .. ^1] else: "lib" & dll
+      result = loadLib(alt)
 
 proc loadBrotli() =
   ## Resolve libbrotlidec's decode symbols on first use. Raises a clear error if

@@ -112,6 +112,15 @@ nimble add navi
 - `chronos` >= 4.0, only if you `import navi/chronos`. The chronos client runs OpenSSL for TLS (like sync/asyncdispatch), so `https` needs a `-d:ssl` build. Aside from `checksums`, the sync and asyncdispatch clients pull in no third-party Nim packages.
 - `libbrotlidec` and `libzstd` (system libraries) are optional: needed only to decode `br`/`zstd` responses. They load lazily, so navi runs fine without them until a server actually sends those encodings.
 - HTTP/3 is opt-in via `-d:naviHttp3`, which needs **ngtcp2**, **nghttp3**, and **OpenSSL >= 3.5** (system libraries, located at build time via `pkg-config`) plus a C++ compiler. Without the flag none of these are required and h3 is unavailable; it applies to the sync and asyncdispatch clients only.
+- **On Windows**, the DLL names decide which OpenSSL is loaded. Nim's default 64-bit
+  list names only the (EOL) 1.1 pair, so navi targets 3.x via `-d:sslVersion=3-x64`
+  -- already set for this repo in `nim.cfg`; set it in your own app too. Nim's
+  Windows distribution bundles OpenSSL 1.1 and a **32-bit** `zlib1.dll`, neither of
+  which serves an x64 build, so install 64-bit `libssl-3-x64`/`libcrypto-3-x64`,
+  `zlib1`, and (optionally) `libbrotlidec`/`libzstd` -- from MSYS2 (`mingw-w64-x86_64-*`)
+  or vcpkg -- and put them on `PATH`. `std/net` also finds CA certificates there only
+  by locating a file named `cacert.pem` beside the executable or on `PATH`; there is no
+  system trust-store fallback.
 - For `import navi/js`: nothing beyond Nim. Compile with `nim js` and run in a browser or on Node 18+ (which provides a global `fetch`); no `-d:ssl`, since the runtime handles TLS.
 
 ## Choosing a client

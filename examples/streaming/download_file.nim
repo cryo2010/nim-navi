@@ -1,5 +1,6 @@
 ## Stream an HTTP response body straight to a file -- constant memory, whatever the
-## size -- and verify it arrived intact. `stream` hands each chunk to a sink as it
+## size -- and verify it arrived intact. `stream` returns a handle whose status and
+## headers are ready immediately; `each` then pulls the body a chunk at a time as it
 ## comes off the socket (decompressing on the way if the server encoded the body).
 ## A local server serves a known payload, so we SHA-1 the downloaded file against
 ## the original.
@@ -25,13 +26,13 @@ proc main() =
   let api = newNavi()
   var f = open(outPath, fmWrite)
   var written = 0
-  # The sink receives the body incrementally; write each chunk as it lands. The
-  # returned Response carries status and headers, but an empty `body`.
-  let res = api.stream(GET, "http://127.0.0.1:" & $port & "/",
-    sink = proc(chunk: openArray[byte]) =
-      if chunk.len > 0:
-        discard f.writeBuffer(unsafeAddr chunk[0], chunk.len)
-        written += chunk.len)
+  # Status and headers land first; the body is pulled on demand. Write each chunk
+  # as it arrives, so memory stays flat no matter how large the response is.
+  let res = api.stream(GET, "http://127.0.0.1:" & $port & "/")
+  res.each(chunk):
+    if chunk.len > 0:
+      discard f.writeBuffer(unsafeAddr chunk[0], chunk.len)
+      written += chunk.len
   f.close()                                          # flush before hashing
 
   echo "downloaded: ", written, " bytes -> ", outPath

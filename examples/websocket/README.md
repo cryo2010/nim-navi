@@ -95,7 +95,7 @@ nimble demoWssChronos    # navi/chronos (needs the chronos package)
 The only difference from the plain clients is the URL and:
 
 ```nim
-var cfg = newNaviConfig()
+var cfg = initNaviConfig()
 cfg.tls.verify = false
 let api = newNavi(cfg)
 ```
