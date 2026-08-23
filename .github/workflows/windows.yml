@@ -1,0 +1,175 @@
+name: windows
+
+# Windows regressions, on the same PR gate as ci.yml.
+#
+# navi has Windows-specific branches in the sync and asyncdispatch backends, in
+# openssl_ctx (std/openssl hides its whole X509 block behind `not defined(windows)`,
+# so navi declares those entry points itself) and in the codec loader. None of that
+# is compiled by ci.yml, which is ubuntu-only. Docker-based, nghttpd-based and
+# sanitizer/Valgrind jobs stay there: GitHub's Windows runners cannot run Linux
+# containers, and `jobs.<id>.container` / `services:` require a Linux runner.
+#
+# Every job builds against MSYS2's OpenSSL 3 -- see the `@if windows` block in
+# nim.cfg, which pins the 3.x DLL names repo-wide so the suite, the examples and
+# the interop scripts all agree on one library.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # The suite is plain-TCP, so this is what catches the socket-layer branches
+  # (winlean connect/setsockopt signatures, the IPv6 accept path in
+  # tests/support.nim) and the codec DLL naming.
+  test:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mm: [orc, arc]
+    name: tests (--mm:${{ matrix.mm }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-navi-windows
+        with:
+          chronos: "true"
+      # Run the suite directly, not via `nimble test`: nimble does not propagate a
+      # task's exit code (nim-lang/nimble#1802), so a failing suite would pass CI.
+      - name: Run tests
+        shell: bash
+        run: bash tests/run.sh
+        env:
+          NAVI_MM: ${{ matrix.mm }}
+
+  # `nim check` only type-checks -- no linking, no execution, so no runtime libs.
+  # This is the cheapest guard on the openssl_ctx.nim X509 declarations.
+  compile:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mm: [orc, arc]
+    name: compile entries (--mm:${{ matrix.mm }}, -d:ssl)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-navi-windows
+        with:
+          chronos: "true"
+          runtime-libs: "false"
+      - name: Compile entry modules
+        shell: bash
+        run: |
+          for entry in navi navi/asyncdispatch navi/chronos; do
+            echo "== $entry =="
+            nim check --mm:${{ matrix.mm }} -d:ssl --path:src --hints:off "src/$entry.nim"
+          done
+
+  # Self-contained end-to-end: a 3 MiB payload streamed against an in-process
+  # thread server and verified by SHA-1. No shell, no external binaries.
+  examples:
+    runs-on: windows-latest
+    name: streaming examples (end to end)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-navi-windows
+      - name: Streaming upload round trip
+        shell: bash
+        run: nim c -r --hints:off examples/streaming/upload_file.nim
+      - name: Streaming download round trip
+        shell: bash
+        run: nim c -r --hints:off examples/streaming/download_file.nim
+
+  leak:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mm: [orc, arc]
+    name: leak check (--mm:${{ matrix.mm }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-navi-windows
+      - name: Memory growth over every verb
+        shell: bash
+        run: nim c -r -d:release --hints:off --mm:${{ matrix.mm }} tests/leak.nim
+        env:
+          NAVI_LEAK_ITERS: "20000"
+
+  # Real TLS handshake plus WebSocket framing, on each native backend. The server
+  # self-signs in-process via execProcess, so no shell-level openssl is involved.
+  wss:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [sync, asyncdispatch, chronos]
+    name: wss echo (${{ matrix.backend }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-navi-windows
+        with:
+          chronos: "true"
+      - name: wss echo round trip
+        shell: bash
+        run: bash examples/websocket/wss_demo.sh ${{ matrix.backend }}
+
+  # The only jobs that reach navi's certificate-verification path. verifyPeer is a
+  # no-op when verify is off, and the unit suite is plain-TCP, so without these the
+  # X509_check_host / SSL_get_peer_certificate / X509_free declarations in
+  # openssl_ctx.nim would never execute on Windows.
+  interop-tls:
+    runs-on: windows-latest
+    name: TLS interop (private CA, mTLS, version + cipher pinning)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-navi-windows
+        with:
+          chronos: "true"
+      - name: Private-CA verification (sync)
+        shell: bash
+        run: bash tests/interop/ca_verify.sh
+      - name: Private-CA verification (chronos)
+        shell: bash
+        run: bash tests/interop/chronos_cafile.sh
+      - name: Mutual TLS (client certificates)
+        shell: bash
+        run: bash tests/interop/mtls.sh
+      - name: TLS version pinning
+        shell: bash
+        run: bash tests/interop/tls_version.sh
+      - name: Cipher-suite selection
+        shell: bash
+        run: bash tests/interop/cipher_suite.sh
+
+  # http1 only: the http2 half of this script needs nghttpd, which has no Windows
+  # build. h2 stays covered by ci.yml.
+  streaming:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: [upload, download]
+    name: file streaming (http1 ${{ matrix.dir }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-navi-windows
+      - name: Stream a 3 MiB file
+        shell: bash
+        run: bash tests/interop/streaming.sh http1 ${{ matrix.dir }}
+
+  js:
+    runs-on: windows-latest
+    name: navi/js runtime (Node)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-navi-windows
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: WebSocket client against a native server
+        shell: bash
+        run: bash tests/interop/jsws.sh
+      - name: Opt-in cookie jar
+        shell: bash
+        run: bash tests/interop/js_cookiejar.sh

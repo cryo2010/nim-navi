@@ -55,6 +55,51 @@ nimble bench              # client benchmark: navi vs std/httpclient, Go, Rust
 
 ---
 
+## Windows
+
+CI runs a Windows leg (`.github/workflows/windows.yml`) alongside the Linux one,
+because navi has Windows-only branches -- the socket layer in the sync and
+asyncdispatch backends, the X509 declarations in `openssl_ctx` (`std/openssl` hides
+its whole X509 block behind `not defined(windows)`), and the codec DLL names -- that
+`ci.yml` never compiles.
+
+Everything runs under Git Bash. To run it locally you need, on `PATH`:
+
+- 64-bit `libssl-3-x64.dll` + `libcrypto-3-x64.dll`. `nim.cfg` pins the 3.x DLL
+  names on Windows (`-d:sslVersion=3-x64`), so the whole repo -- suite, examples and
+  interop scripts -- agrees on one library. The OpenSSL 1.1 pair Nim bundles is EOL
+  and will not be found.
+- 64-bit `zlib1.dll`. The one in Nim's Windows distribution is 32-bit, so an x64
+  build cannot load it. `libbrotlidec.dll` and `libzstd.dll` are needed for the
+  `br`/`zstd` cases (either the vcpkg or the MSYS2 spelling; navi tries both).
+- `cacert.pem`, beside the executable or on `PATH` -- the only way `std/net` finds
+  CA certificates on Windows. MSYS2's `mingw64/etc/ssl/certs/ca-bundle.crt` works.
+
+MSYS2 supplies all of these:
+
+```sh
+pacman -S mingw-w64-x86_64-{openssl,zlib,brotli,zstd,ca-certificates}
+```
+
+What the Windows leg covers, and why each part is there:
+
+| Job | Covers |
+| --- | --- |
+| `test`, `compile` | The Windows-only branches. The suite is plain-TCP, but `openssl_ctx` resolves its dynlib symbols at module init, so a missing or misplaced declaration fails every binary that links it -- at startup, not on first call. |
+| `examples`, `streaming`, `leak` | Real 3 MiB streamed round trips, hash-verified, and heap growth. |
+| `wss` | TLS handshake plus WebSocket framing on each native backend. |
+| `interop-tls`, `badssl` | The **certificate-verification** path. `verifyPeer` returns early when verify is off, so nothing else reaches `X509_check_host` / `SSL_get_peer_certificate`. Verified by sabotage: a host check hard-wired to "match" leaves the 350-test suite fully green and is caught only by badssl's wrong-host case. |
+
+Not runnable on a Windows runner, and staying on Linux CI: everything Docker-based
+(GitHub's Windows runners cannot run Linux containers, and `jobs.<id>.container` /
+`services:` require a Linux runner), everything needing nghttpd (no Windows build),
+and Valgrind/ASan/LSan. `tls_fallback.sh` needs python3 and *exits 127 silently* when
+it is missing, so it is deliberately excluded rather than allowed to pass vacuously;
+`happy_eyeballs.sh` assumes a blackhole address hangs, which Windows may instead fail
+fast as "network unreachable".
+
+---
+
 ## Default suite (`nimble test`)
 
 Compiles and runs every `tests/test_*.nim`. `nimble test` delegates to

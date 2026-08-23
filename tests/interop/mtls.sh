@@ -8,11 +8,16 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$root/tests/interop/_win.sh"
 command -v openssl >/dev/null || { echo "openssl not found"; exit 127; }
 
 work="$(mktemp -d)"
 srv=""
-cleanup() { [ -n "$srv" ] && kill "$srv" 2>/dev/null || true; rm -rf "$work"; }
+cleanup() {
+  [ -n "$srv" ] && kill "$srv" 2>/dev/null || true
+  cd "$root"          # Windows cannot remove the shell's own cwd
+  navi_rmtree "$work"
+}
 trap cleanup EXIT
 cd "$work"
 
@@ -20,16 +25,19 @@ port=9455
 
 # A CA that signs both the server and the client certificate.
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-  -keyout ca.key -out ca.pem -subj "/CN=navi-test-CA" >/dev/null 2>&1
+  -keyout ca.key -out ca.pem -subj "$(navi_subj CN=navi-test-CA)" >/dev/null 2>&1
 
 openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr \
-  -subj "/CN=localhost" >/dev/null 2>&1
+  -subj "$(navi_subj CN=localhost)" >/dev/null 2>&1
+# A real file rather than <(...): the process substitution's /dev/fd path is
+# meaningless to the native openssl.exe used under Git Bash.
+printf "subjectAltName=DNS:localhost,IP:127.0.0.1" > san.ext
 openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 1 \
-  -extfile <(printf "subjectAltName=DNS:localhost,IP:127.0.0.1") \
+  -extfile san.ext \
   -out server.pem >/dev/null 2>&1
 
 openssl req -newkey rsa:2048 -nodes -keyout client.key -out client.csr \
-  -subj "/CN=navi-client" >/dev/null 2>&1
+  -subj "$(navi_subj CN=navi-client)" >/dev/null 2>&1
 openssl x509 -req -in client.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 1 \
   -out client.pem >/dev/null 2>&1
 
@@ -60,13 +68,13 @@ done
 [ -n "$ready" ] || { echo "s_server did not become ready on :$port"; cat "$work/s_server.log"; exit 1; }
 
 export NAVI_MTLS_URL="https://localhost:$port"
-export NAVI_MTLS_CA="$work/ca.pem"
-export NAVI_MTLS_CERT="$work/client.pem"
-export NAVI_MTLS_KEY="$work/client.key"
-export NAVI_MTLS_ENCKEY="$work/client.enc.key"
-export NAVI_MTLS_P12="$work/client.p12"
-export NAVI_MTLS_DERCERT="$work/client.der.crt"
-export NAVI_MTLS_DERKEY="$work/client.der.key"
+export NAVI_MTLS_CA="$(navi_path "$work/ca.pem")"
+export NAVI_MTLS_CERT="$(navi_path "$work/client.pem")"
+export NAVI_MTLS_KEY="$(navi_path "$work/client.key")"
+export NAVI_MTLS_ENCKEY="$(navi_path "$work/client.enc.key")"
+export NAVI_MTLS_P12="$(navi_path "$work/client.p12")"
+export NAVI_MTLS_DERCERT="$(navi_path "$work/client.der.crt")"
+export NAVI_MTLS_DERKEY="$(navi_path "$work/client.der.key")"
 export NAVI_MTLS_PASS="$pass"
 
 # Same test on every native backend (js does not present client certs). chronos

@@ -6,21 +6,38 @@ on:
 
 jobs:
   badssl:
-    runs-on: ubuntu-latest
-    name: badssl TLS conformance
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    name: badssl TLS conformance (${{ matrix.os }})
     steps:
       - uses: actions/checkout@v4
-      - uses: jiro4989/setup-nim-action@v2
+
+      # Windows needs its own setup: MSYS2's OpenSSL 3 (Nim bundles only the EOL
+      # 1.1 pair) and a cacert.pem, which is the only way std/net finds CA
+      # certificates there. Linux gets both from the system.
+      - if: runner.os == 'Windows'
+        uses: ./.github/actions/setup-navi-windows
+
+      - if: runner.os != 'Windows'
+        uses: jiro4989/setup-nim-action@v2
         with:
           nim-version: "2.2.10"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       # navi's only required Nim dep (MD5 for Digest auth); this job builds with
       # raw `nim`, so it isn't resolved automatically.
-      - name: Install checksums
+      - if: runner.os != 'Windows'
+        name: Install checksums
         run: nimble install -y checksums
 
       # Asserts navi rejects invalid server certificates (expired, self-signed,
       # wrong-host, untrusted-root) with verification on, and accepts a valid one.
       # Run directly (not via nimble) so a failing check fails the job.
+      #
+      # On Windows this is also the only job that exercises the verify path against
+      # real-world chains rather than a private CA.
       - name: Run badssl TLS checks
+        shell: bash
         run: nim c -r --hints:off tests/interop/badssl.nim

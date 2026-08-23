@@ -1,0 +1,69 @@
+name: Set up navi on Windows
+description: >-
+  Nim toolchain, nimble dependencies, and the native libraries navi dlopens at
+  run time. Shared by every job in windows.yml.
+
+inputs:
+  chronos:
+    description: Also install the optional chronos package.
+    required: false
+    default: "false"
+  runtime-libs:
+    description: >-
+      Install the DLLs navi loads at run time. Not needed by jobs that only run
+      `nim check`, which never links or executes anything.
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - uses: jiro4989/setup-nim-action@v2
+      with:
+        nim-version: "2.2.10"
+        repo-token: ${{ github.token }}
+
+    # navi's only required Nim dependency (MD5 + SHA-256 for Digest auth).
+    - name: Install checksums
+      shell: bash
+      run: nimble install -y checksums
+
+    - name: Install chronos
+      if: inputs.chronos == 'true'
+      shell: bash
+      run: nimble install -y "chronos@>= 4.0.0"
+
+    # The Windows counterpart of Linux CI's `apt-get install libbrotli1 libzstd1`.
+    # It has to cover more ground: Linux gets zlib and OpenSSL from the system,
+    # whereas on Windows the only OpenSSL that ships with Nim is the EOL 1.1 pair,
+    # and the zlib it bundles is 32-bit, so unusable from an x64 build.
+    #
+    # Copy the specific DLLs rather than putting C:\msys64\mingw64\bin on PATH:
+    # GITHUB_PATH *prepends*, which would shadow the C compiler Nim expects with
+    # MSYS2's gcc.
+    - name: Install runtime libraries (OpenSSL 3, zlib, brotli, zstd)
+      if: inputs.runtime-libs == 'true'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        C:\msys64\usr\bin\pacman -Sy --noconfirm --needed `
+          mingw-w64-x86_64-openssl mingw-w64-x86_64-zlib `
+          mingw-w64-x86_64-brotli mingw-w64-x86_64-zstd `
+          mingw-w64-x86_64-ca-certificates
+        New-Item -ItemType Directory -Force C:\navi-runtime | Out-Null
+        foreach ($dll in 'libssl-3-x64','libcrypto-3-x64','zlib1',
+                         'libbrotlidec','libbrotlicommon','libzstd') {
+          Copy-Item "C:\msys64\mingw64\bin\$dll.dll" C:\navi-runtime
+        }
+        # Nim's std/net finds CA certificates on Windows by looking for a file
+        # literally named cacert.pem next to the executable or on PATH -- there is
+        # no system trust-store fallback, and SSL_CERT_FILE is only consulted in
+        # CVerifyPeerUseEnvVars mode, which navi does not use.
+        Copy-Item C:\msys64\mingw64\etc\ssl\certs\ca-bundle.crt C:\navi-runtime\cacert.pem
+        "C:\navi-runtime" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+    - name: Show the resolved toolchain
+      shell: bash
+      run: |
+        nim --version | head -1
+        openssl version
