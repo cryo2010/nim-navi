@@ -10,8 +10,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-    name: badssl TLS conformance (${{ matrix.os }})
+        # `label` keeps the Linux cell's check context byte-identical to the
+        # name main's ruleset requires -- renaming it leaves the required check
+        # stuck on "Expected -- Waiting for status to be reported" forever.
+        include:
+          - os: ubuntu-latest
+            label: ""
+          - os: windows-latest
+            label: " (windows)"
+    name: badssl TLS conformance${{ matrix.label }}
     steps:
       - uses: actions/checkout@v4
 

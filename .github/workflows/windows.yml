@@ -28,7 +28,7 @@ jobs:
       fail-fast: false
       matrix:
         mm: [orc, arc]
-    name: tests (--mm:${{ matrix.mm }})
+    name: "windows: tests (--mm:${{ matrix.mm }})"
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-navi-windows
@@ -50,7 +50,7 @@ jobs:
       fail-fast: false
       matrix:
         mm: [orc, arc]
-    name: compile entries (--mm:${{ matrix.mm }}, -d:ssl)
+    name: "windows: compile entries (--mm:${{ matrix.mm }}, -d:ssl)"
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-navi-windows
@@ -70,7 +70,7 @@ jobs:
   # thread server and verified by SHA-1. No shell, no external binaries.
   examples:
     runs-on: windows-latest
-    name: streaming examples (end to end)
+    name: "windows: streaming examples (end to end)"
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-navi-windows
@@ -87,7 +87,7 @@ jobs:
       fail-fast: false
       matrix:
         mm: [orc, arc]
-    name: leak check (--mm:${{ matrix.mm }})
+    name: "windows: leak check (--mm:${{ matrix.mm }})"
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-navi-windows
@@ -105,7 +105,7 @@ jobs:
       fail-fast: false
       matrix:
         backend: [sync, asyncdispatch, chronos]
-    name: wss echo (${{ matrix.backend }})
+    name: "windows: wss echo (${{ matrix.backend }})"
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-navi-windows
@@ -121,7 +121,7 @@ jobs:
   # openssl_ctx.nim would never execute on Windows.
   interop-tls:
     runs-on: windows-latest
-    name: TLS interop (private CA, mTLS, version + cipher pinning)
+    name: "windows: TLS interop (private CA, mTLS, version + cipher pinning)"
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-navi-windows
@@ -151,7 +151,7 @@ jobs:
       fail-fast: false
       matrix:
         dir: [upload, download]
-    name: file streaming (http1 ${{ matrix.dir }})
+    name: "windows: file streaming (http1 ${{ matrix.dir }})"
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-navi-windows
@@ -161,7 +161,7 @@ jobs:
 
   js:
     runs-on: windows-latest
-    name: navi/js runtime (Node)
+    name: "windows: navi/js runtime (Node)"
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-navi-windows
