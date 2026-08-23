@@ -8,6 +8,13 @@ onward (pre-1.0, minor versions may include breaking changes).
 ## [Unreleased]
 
 ### Added
+- Batteries-included middleware, imported to match your client: `navi/mw` (sync),
+  `navi/asyncdispatch/mw`, `navi/chronos/mw`, `navi/js/mw`. Factories:
+  `cache` (an RFC 9111 response-cache subset -- freshness + ETag/Last-Modified
+  revalidation over an in-memory `CacheStore`), `rateLimit` (token bucket) and
+  `concurrency` (in-flight cap; native async backends), and `bearer` / `basic` /
+  `logging` helpers. Add them to `config.middleware`; they wrap buffered
+  `request()` calls (not `stream()`/`sse()`).
 - The chronos client reaches full TLS parity with the sync and asyncdispatch
   clients: **HTTP/2** (ALPN-negotiated, with transparent stream multiplexing),
   **TLS 1.3**, **cipher selection**, **mutual TLS** (client certificates in every
