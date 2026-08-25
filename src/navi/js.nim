@@ -56,7 +56,11 @@ type
     middleware*: seq[NaviMiddleware]
 
   Navi* = ref object
-    config: NaviConfig   ## the runtime owns connections
+    config*: NaviConfig
+      ## The client's live configuration. Mutate it to reconfigure between
+      ## requests, e.g. `client.config.headers["authorization"] = "Bearer " & tok`;
+      ## the change applies from the next request on. (The runtime owns
+      ## connections, so `tls`/`http`/`proxy` are handled by `fetch`.)
     jar: CookieJar          ## kept off-browser; nil in a browser (its store owns cookies)
 
 proc initNaviConfig*(): NaviConfig =
@@ -78,12 +82,6 @@ proc inBrowser(): bool {.importjs: "(typeof document !== 'undefined')".}
 proc newNavi*(config = initNaviConfig()): Navi =
   result = Navi(config: config)
   if not inBrowser(): result.jar = newCookieJar()
-
-proc config*(client: Navi): lent NaviConfig = client.config
-  ## Read-only view of the client's config. Config is fixed at construction;
-  ## build a fresh client (or `extend`) to change it rather than mutating a live
-  ## one. The runtime owns connections, so there is nothing to reconcile, but the
-  ## contract matches the native backends.
 
 proc extend*(client: Navi, config: NaviConfig): Navi =
   var merged = mergeBase(client.config, config)

@@ -20,6 +20,9 @@ tests/test_cookies
 tests/test_digest
 tests/test_stream_decompress
 tests/test_ws
+tests/test_mw
+tests/test_mw_async
+tests/test_mw_chronos
 tests/leak
 tests/leak_sanitize
 
@@ -49,6 +52,12 @@ examples/concurrency/async_multiplex
 examples/concurrency/parallel
 examples/streaming/upload_file
 examples/streaming/download_file
+# Compiled middleware example binaries (sources are .nim)
+examples/middleware/caching
+examples/middleware/rateLimit
+examples/middleware/concurrencyLimit
+examples/middleware/bearer
+examples/middleware/basicAuth
 # Compiled streaming-demo client binaries (sources are .nim)
 demos/streaming/upload
 demos/streaming/download

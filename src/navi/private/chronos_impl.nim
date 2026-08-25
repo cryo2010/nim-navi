@@ -40,7 +40,13 @@ type
     middleware*: seq[NaviMiddleware]
 
   Navi* = ref object
-    config: NaviConfig
+    config*: NaviConfig
+      ## The client's live configuration. Mutate it to reconfigure between
+      ## requests, e.g. `client.config.headers["authorization"] = "Bearer " & tok`;
+      ## the change applies from the next request on (the request path reads these
+      ## fields live). Exceptions: `tls`, `http`, and `proxy` are bound when
+      ## connections are opened, so change those by building a new client (or
+      ## `extend`), not in place.
     pool*: Pool[PooledConn[Conn]]
     jar*: CookieJar
     muxes: TableRef[string, H2Mux]              ## live shared h2 connections
@@ -57,16 +63,12 @@ proc initNaviConfig*(): NaviConfig =
 
 proc newNavi*(config = initNaviConfig()): Navi =
   var cfg = config
-  if cfg.tls.sessionCache.isNil: cfg.tls.sessionCache = newTlsStore(cfg.tls)
-  cfg.tls.contextStore = newTlsCtxStore(cfg.tls)
+  cfg.tls.sessionCache = newTlsStore(cfg.tls)   # always its own cache, so a config
+  cfg.tls.contextStore = newTlsCtxStore(cfg.tls) # cloned from another client (e.g.
+                                                 # newNavi(other.config)) is isolated
   Navi(config: cfg, pool: newPool[PooledConn[Conn]](), jar: newCookieJar(),
        muxes: newTable[string, H2Mux](),
        pendingMux: newTable[string, Future[H2Mux]]())
-
-proc config*(client: Navi): lent NaviConfig = client.config
-  ## Read-only view of the client's config. Config is fixed at construction;
-  ## build a fresh client (or `extend`) to change it rather than mutating a live
-  ## one, so its pooled connections stay consistent with its settings.
 
 proc extend*(client: Navi, config: NaviConfig): Navi =
   var merged = mergeBase(client.config, config)

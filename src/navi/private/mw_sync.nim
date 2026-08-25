@@ -5,7 +5,7 @@
 #
 # Not a standalone module -- compiled as part of navi/mw.nim.
 
-import std/[base64, times, os]
+import std/[base64, os]
 import navi/private/mw/[httpcache, ratelimit]
 export httpcache.CacheStore, httpcache.newCacheStore
 
@@ -44,7 +44,7 @@ proc rateLimit*(perSec: float, burst = 0): NaviMiddleware =
     if delayMs > 0: os.sleep(delayMs)   # blocking; the sync client is serial
     ctx.next()
 
-proc concurrency*(maxInFlight: int): NaviMiddleware =
+proc concurrencyLimit*(maxInFlight: int): NaviMiddleware =
   ## No-op on the sync client: requests are already serial, so there is nothing to
   ## limit. Provided for source-compatibility with the async backends.
   discard maxInFlight
@@ -62,14 +62,3 @@ proc basic*(user, pass: string): NaviMiddleware =
   result = proc(ctx: NaviContext) =
     ctx.req.headers["authorization"] = cred
     ctx.next()
-
-proc logging*(sink: proc(line: string) {.gcsafe, raises: [CatchableError].} = nil):
-    NaviMiddleware =
-  ## Log `VERB url -> status (Nms)` after each request. Defaults to `echo`.
-  result = proc(ctx: NaviContext) =
-    let t0 = epochTime()
-    ctx.next()
-    let ms = int((epochTime() - t0) * 1000)
-    let line = $ctx.req.verb & " " & $ctx.req.url & " -> " & $ctx.res.status &
-               " (" & $ms & "ms)"
-    if sink != nil: sink(line) else: echo line

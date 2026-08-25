@@ -128,6 +128,6 @@ suite "sync factory instantiation":
   test "every sync factory builds a NaviMiddleware":
     var cfg = initNaviConfig()
     cfg.middleware = @[
-      cache(), rateLimit(10), concurrency(4),
-      bearer("t"), basic("u", "p"), logging()]
-    check cfg.middleware.len == 6
+      cache(), rateLimit(10), concurrencyLimit(4),
+      bearer("t"), basic("u", "p")]
+    check cfg.middleware.len == 5

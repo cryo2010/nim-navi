@@ -37,7 +37,7 @@ suite "incremental decoder across chunk boundaries":
 
 suite "stream() decompresses the response body":
   test "stream should deliver a gzip body to the sink decoded":
-    const port = 8965
+    const port = 9230
     let gz = hexToBytes("1f8b0800000000000003ab56cacf56b22a292a4dad0500905fd4a70b000000")
     let payload = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n" &
                   "Content-Length: " & $gz.len & "\r\nConnection: close\r\n\r\n" & gz
@@ -53,7 +53,7 @@ suite "stream() decompresses the response body":
     joinThread(th)
 
   test "stream should leave the body compressed when decompress is false":
-    const port = 8966
+    const port = 9231
     let gz = hexToBytes("1f8b0800000000000003ab56cacf56b22a292a4dad0500905fd4a70b000000")
     let payload = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n" &
                   "Content-Length: " & $gz.len & "\r\nConnection: close\r\n\r\n" & gz
@@ -72,7 +72,7 @@ suite "stream() decompresses the response body":
 
 suite "stacked content-encoding":
   test "a buffered get should decode a doubly-encoded body (gzip, gzip)":
-    const port = 8968
+    const port = 9232
     # {"ok":true} gzipped twice; Content-Encoding lists them in applied order.
     let body = hexToBytes(
       "1f8b08000000000002ff93efe6600001a6ffabc34e9d0fdba4a5a9e5bb9" &

@@ -9,7 +9,7 @@ import ./support
 
 suite "chronos entry end to end":
   test "the chronos client should return a parsed response for a GET to localhost":
-    const port = 8973
+    const port = 9212
     var th: Thread[ServerCtx]
     startServer(th, port)
 
@@ -21,7 +21,7 @@ suite "chronos entry end to end":
     joinThread(th)
 
   test "stream should expose headers before the body and deliver it via each":
-    const port = 9010
+    const port = 9213
     var th: Thread[ServerCtx]
     startServer(th, port)  # responds with {"ok":true}
 
@@ -38,7 +38,7 @@ suite "chronos entry end to end":
     joinThread(th)
 
   test "stream should return the connection to the pool after a full drain":
-    const port = 9011
+    const port = 9214
     var accepts = 0
     var th: Thread[KeepAliveCtx]
     startKeepAlive(th, port, requests = 2, accepts = addr accepts)
@@ -58,7 +58,7 @@ suite "chronos entry end to end":
     check accepts == 1                            # both requests used the one connection
 
   test "stream should close (not pool) the connection when the drain fails":
-    const port = 9012
+    const port = 9215
     var accepts = 0
     var th: Thread[KeepAliveCtx]
     startKeepAlive(th, port, requests = 1, accepts = addr accepts)
@@ -76,7 +76,7 @@ suite "chronos entry end to end":
     joinThread(th)
 
   test "cancel should abort an in-flight request":
-    const port = 8969
+    const port = 9211
     var th: Thread[ServerCtx]
     startHang(th, port)  # accepts, reads the request, never replies
 
@@ -94,7 +94,7 @@ suite "chronos entry end to end":
     joinThread(th)
 
   test "closure middleware should capture config and modify the request":
-    const port = 8967
+    const port = 9210
     var th: Thread[ServerCtx]
     startBodyEcho(th, port)  # echoes each request header back as x-echo-<name>
 
