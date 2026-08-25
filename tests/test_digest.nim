@@ -158,7 +158,7 @@ proc serveDigestMulti(port: int) {.thread.} =
 
 suite "digest auth end to end":
   test "the client should answer a 401 Digest challenge and retry with credentials":
-    const port = 8992
+    const port = 9220
     var th: Thread[int]
     createThread(th, serveDigest, port)
     while not chReady: sleep(5)
@@ -172,7 +172,7 @@ suite "digest auth end to end":
     joinThread(th)
 
   test "the client should answer the SHA-256 challenge when the server also offers MD5":
-    const port = 8993
+    const port = 9221
     var th: Thread[int]
     createThread(th, serveDigestMulti, port)
     while not multiReady: sleep(5)

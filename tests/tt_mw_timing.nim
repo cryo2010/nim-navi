@@ -64,7 +64,7 @@ suite "concurrency cap (time travel)":
       let peak = new(int)
       let cur = new(int)
       var cfg = initNaviConfig()
-      cfg.middleware = @[concurrency(2), workSim(peak, cur, 50), canned(200)]
+      cfg.middleware = @[concurrencyLimit(2), workSim(peak, cur, 50), canned(200)]
       let api = newNavi(cfg)
       let t0 = epochTime()
       waitFor fireN(api, 6)

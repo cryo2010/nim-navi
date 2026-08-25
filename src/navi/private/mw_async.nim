@@ -7,7 +7,7 @@
 # Not a standalone module -- do not `nim check` this file directly; it is compiled
 # as part of each navi/<backend>/mw.nim.
 
-import std/[base64, times]
+import std/base64
 when not defined(js):
   import std/deques         # the concurrency limiter's waiter queue (native only)
 import navi/private/mw/[httpcache, ratelimit]
@@ -51,7 +51,7 @@ proc rateLimit*(perSec: float, burst = 0): NaviMiddleware =
     await ctx.next()
 
 when not defined(js):
-  proc concurrency*(maxInFlight: int): NaviMiddleware =
+  proc concurrencyLimit*(maxInFlight: int): NaviMiddleware =
     ## Cap concurrent in-flight requests at `maxInFlight`; excess requests park on
     ## a FIFO queue until a slot frees. (Native async backends only -- on js the
     ## platform manages fetch concurrency.)
@@ -59,7 +59,7 @@ when not defined(js):
     var waiters = initDeque[Future[void]]()
     result = proc(ctx: NaviContext) {.async.} =
       if maxInFlight > 0 and inFlight >= maxInFlight:
-        let w = newFuture[void]("navi.mw.concurrency")
+        let w = newFuture[void]("navi.mw.concurrencyLimit")
         waiters.addLast(w)
         await w
       inc inFlight
@@ -83,16 +83,3 @@ proc basic*(user, pass: string): NaviMiddleware =
   result = proc(ctx: NaviContext) {.async.} =
     ctx.req.headers["authorization"] = cred
     await ctx.next()
-
-proc logging*(sink: proc(line: string) {.gcsafe, raises: [CatchableError].} = nil):
-    NaviMiddleware =
-  ## Log `VERB url -> status (Nms)` after each request. Defaults to `echo`; pass a
-  ## `sink` to route elsewhere. The sink may raise at most CatchableError (navi's
-  ## error contract; required by chronos's strict effect tracking).
-  result = proc(ctx: NaviContext) {.async.} =
-    let t0 = epochTime()
-    await ctx.next()
-    let ms = int((epochTime() - t0) * 1000)
-    let line = $ctx.req.verb & " " & $ctx.req.url & " -> " & $ctx.res.status &
-               " (" & $ms & "ms)"
-    if sink != nil: sink(line) else: echo line

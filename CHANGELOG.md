@@ -12,8 +12,8 @@ onward (pre-1.0, minor versions may include breaking changes).
   `navi/asyncdispatch/mw`, `navi/chronos/mw`, `navi/js/mw`. Factories:
   `cache` (an RFC 9111 response-cache subset -- freshness + ETag/Last-Modified
   revalidation over an in-memory `CacheStore`), `rateLimit` (token bucket) and
-  `concurrency` (in-flight cap; native async backends), and `bearer` / `basic` /
-  `logging` helpers. Add them to `config.middleware`; they wrap buffered
+  `concurrencyLimit` (in-flight cap; native async backends), and `bearer` / `basic`
+  auth helpers. Add them to `config.middleware`; they wrap buffered
   `request()` calls (not `stream()`/`sse()`).
 - The chronos client reaches full TLS parity with the sync and asyncdispatch
   clients: **HTTP/2** (ALPN-negotiated, with transparent stream multiplexing),
@@ -23,6 +23,14 @@ onward (pre-1.0, minor versions may include breaking changes).
   bundled BearSSL.
 
 ### Changed
+- `client.config` is now a mutable, live view of the client's configuration
+  (previously read-only). Reconfigure a running client in place, e.g.
+  `client.config.headers["authorization"] = "Bearer " & tok`; changes apply from
+  the next request on. Exceptions: `tls`, `http`, and `proxy` are bound when
+  connections open, so change those before the first request, via a new client,
+  or `extend`. `newNavi` now always builds a fresh TLS session cache, so cloning a
+  client's config (`newNavi(other.config)`) yields a fully independent client
+  rather than one silently sharing the original's session cache.
 - The chronos client's TLS is now OpenSSL (previously BearSSL). As a result,
   `https` on `navi/chronos` requires a `-d:ssl` build (it links OpenSSL, like the
   sync and asyncdispatch clients); plaintext `http` is unaffected. Setting

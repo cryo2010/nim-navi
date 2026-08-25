@@ -259,13 +259,6 @@ template runAll() =
     # base64("user:pass") = dXNlcjpwYXNz
     (await c.get(base & "/headers")).data["headers"]["Authorization"].getStr == "Basic dXNlcjpwYXNz"
 
-  check "mw.logging records a line for the request":
-    let logged = new(seq[string])
-    let c = apiMw(@[logging(proc(line: string) {.gcsafe, raises: [CatchableError].} =
-      logged[].add line)])
-    discard await c.get(base & "/get")
-    logged[].len == 1 and "200" in logged[][0]
-
   check "mw.cache revalidates and serves on a 304 without erroring":
     # httpbin /cache returns 200 + ETag/Last-Modified, and 304 when the request
     # carries a conditional header. The cache stores the first response (stale, but

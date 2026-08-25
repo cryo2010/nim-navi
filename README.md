@@ -190,9 +190,8 @@ Two clients carry caveats:
 import navi/js
 
 proc main() {.async.} =
-  var config = initNaviConfig()
-  config.prefixUrl = "https://api.example.com"
-  let api = newNavi(config)
+  let api = newNavi()
+  api.config.prefixUrl = "https://api.example.com"
   let user = await api.get("users/42")
   echo user.data["name"].getStr
 
@@ -203,14 +202,35 @@ discard main()   # a browser or Node runs the returned Promise
 
 ### Creating a client
 
-`newNavi()` creates a client with the default config. To customize it, pass a
-`NaviConfig` (see [Configuration](#configuration) for building one):
+`newNavi()` creates a client with the default config, then you configure it in
+place through `api.config`:
 
 ```nim
-let api = newNavi()               # the default config
+let api = newNavi()
+api.config.prefixUrl = "https://api.example.com"
+api.config.headers["authorization"] = "Bearer ..."
+api.config.retry.limit = 5
 
-var config = initNaviConfig()     # or build your own
-config.retry.limit = 5
+# Relative targets resolve against prefixUrl.
+let user = api.get("users/42").data
+```
+
+`api.config` is the client's **live** configuration: mutate it any time and the
+change takes effect from the next request on (auth, headers, timeouts, retries,
+redirects, decompression, middleware, and so on). This is the simplest way to
+adjust a running client, e.g. refresh a token with
+`api.config.headers["authorization"] = "Bearer " & newToken`.
+
+Three fields are the exception: `tls`, `http`, and `proxy` are bound when
+connections are opened, so changing them on a live client does not affect its
+existing pooled connections. Set those before the first request, or build a new
+client (or `extend`).
+
+To start from a prepared config instead of mutating after construction, pass one
+to `newNavi`:
+
+```nim
+var config = initNaviConfig()
 config.timeouts.total = 30_000
 let custom = newNavi(config)
 ```
@@ -227,17 +247,17 @@ let authed = api.extend(config)
 
 ### Configuration
 
-Build a config with `initNaviConfig()`, which sets the safe defaults (verification
-on, decompression on, 2 retries, 20 redirects); then set the fields you want and
-pass it to `newNavi`. `NaviConfig` has `{.requiresInit.}`, so a bare or partial
-`NaviConfig(...)` literal is a compile error; `initNaviConfig()` is the only way
-to build one, which keeps the defaults from being silently zeroed.
+The fastest path is to mutate `api.config` on a live client (above). To build a
+config up front, use `initNaviConfig()`, which sets the safe defaults
+(verification on, decompression on, 2 retries, 20 redirects); then set the fields
+you want and pass it to `newNavi`. `NaviConfig` has `{.requiresInit.}`, so a bare
+or partial `NaviConfig(...)` literal is a compile error; `initNaviConfig()` is the
+only way to build one, which keeps the defaults from being silently zeroed.
 
 ```nim
-var config = initNaviConfig()
-config.prefixUrl = "https://api.example.com"
-config.headers["authorization"] = "Bearer ..."
-let api = newNavi(config)
+let api = newNavi()
+api.config.prefixUrl = "https://api.example.com"
+api.config.headers["authorization"] = "Bearer ..."
 
 # Relative targets resolve against prefixUrl.
 let user = api.get("users/42").data
@@ -419,9 +439,8 @@ except HttpError as e:
   echo e.response.body
 
 # Opt out to handle status codes yourself:
-var config = initNaviConfig()
-config.throwHttpErrors = false
-let api = newNavi(config)
+let api = newNavi()
+api.config.throwHttpErrors = false
 ```
 
 ### Retries, redirects, and timeouts
@@ -429,21 +448,20 @@ let api = newNavi(config)
 Idempotent requests that hit a transient failure (network error or 408/413/429/500/502/503/504) are retried with capped exponential backoff, honoring `Retry-After` (both the seconds and HTTP-date forms). Redirects are followed by default.
 
 ```nim
-var config = initNaviConfig()
-config.retry.limit = 3        # default 2; 0 disables retries
-config.maxRedirects = 5       # default 20; 0 disables
-config.timeouts.total = 5000  # 5s; 0 (default) disables. Raises TimeoutError.
-let api = newNavi(config)
+let api = newNavi()
+api.config.retry.limit = 3        # default 2; 0 disables retries
+api.config.maxRedirects = 5       # default 20; 0 disables
+api.config.timeouts.total = 5000  # 5s; 0 (default) disables. Raises TimeoutError.
 ```
 
 The whole retry policy is configurable via `config.retry` (a `RetryPolicy`):
 
 ```nim
-var config = initNaviConfig()
-config.retry.limit = 5
-config.retry.methods = {GET, HEAD}            # verbs eligible for retry
-config.retry.statuses = @[429, 503]           # response statuses that trigger one
-config.retry.maxDelay = 30_000                # cap the wait between attempts (ms)
+let api = newNavi()
+api.config.retry.limit = 5
+api.config.retry.methods = {GET, HEAD}            # verbs eligible for retry
+api.config.retry.statuses = @[429, 503]           # response statuses that trigger one
+api.config.retry.maxDelay = 30_000                # cap the wait between attempts (ms)
 ```
 
 `timeouts.total` bounds the whole request (raising `TimeoutError`): on the async clients (asyncdispatch/chronos/js) it covers all retries; on the sync client it is per attempt.
@@ -453,10 +471,10 @@ config.retry.maxDelay = 30_000                # cap the wait between attempts (m
 For finer control, set `config.timeouts` (a `Timeouts`) to bound individual phases instead of just the overall request. Each field is milliseconds; 0 (the default) disables that phase's limit.
 
 ```nim
-var config = initNaviConfig()
-config.timeouts.connect = 2_000   # TCP connect + TLS handshake
-config.timeouts.read    = 5_000   # stall waiting for a response chunk
-config.timeouts.total   = 30_000  # whole request, including retries/redirects
+let api = newNavi()
+api.config.timeouts.connect = 2_000   # TCP connect + TLS handshake
+api.config.timeouts.read    = 5_000   # stall waiting for a response chunk
+api.config.timeouts.total   = 30_000  # whole request, including retries/redirects
 ```
 
 - **connect** and **read** are enforced on the native clients (sync, asyncdispatch, chronos).
@@ -492,18 +510,21 @@ tok.cancel()
 `maxResponseBytes` caps the response body; a larger response raises `ResponseTooLargeError`. Streaming enforces the cap incrementally (per chunk); buffered requests enforce it on the assembled body. On the native clients the cap counts decompressed bytes, so it also guards against decompression bombs.
 
 ```nim
-var config = initNaviConfig()
-config.maxResponseBytes = 10 * 1024 * 1024   # 10 MiB; 0 (default) is unlimited
-let api = newNavi(config)
+let api = newNavi()
+api.config.maxResponseBytes = 10 * 1024 * 1024   # 10 MiB; 0 (default) is unlimited
 ```
 
 ### Auth and proxy
 
+`auth` can be changed on a live client (it applies per request); `proxy` is bound
+when connections open, so set it before the first request or build a new client.
+
 ```nim
 var config = initNaviConfig()
-config.auth = bearerAuth("token")      # or basicAuth("user", "pass")
 config.proxy = "http://proxy:8080"     # else HTTP(S)_PROXY / NO_PROXY env
 let api = newNavi(config)
+
+api.config.auth = bearerAuth("token")  # or basicAuth("user", "pass"); safe any time
 ```
 
 ### Cookies
@@ -531,9 +552,8 @@ proc trace(prefix: string): NaviMiddleware =       # sync (import navi)
     ctx.next()
     log(prefix, ctx.req.verb, ctx.res.status, epochTime() - t0)  # after
 
-var config = initNaviConfig()
-config.middleware = @[trace("api")]
-let api = newNavi(config)
+let api = newNavi()
+api.config.middleware = @[trace("api")]
 ```
 
 Short-circuit by setting `ctx.res` and *not* calling `next` (a cache hit or
@@ -586,12 +606,10 @@ also the call qualifier (`mw.cache`, `mw.rateLimit`, ...).
 import navi
 import navi/mw
 
-var config = initNaviConfig()
-config.middleware = @[
+let api = newNavi()
+api.config.middleware = @[
   mw.rateLimit(perSec = 10),        # token-bucket throttle
-  mw.cache(),                       # RFC 9111 response cache (in-memory)
-  mw.logging()]                     # "GET url -> 200 (12ms)" via echo
-let api = newNavi(config)
+  mw.cache()]                       # RFC 9111 response cache (in-memory)
 ```
 
 - **`cache(store = newCacheStore())`** — serves fresh GET/HEAD responses from an
@@ -601,12 +619,10 @@ let api = newNavi(config)
   shared `store` to reuse a cache across clients.
 - **`rateLimit(perSec, burst = 0)`** — token bucket; over budget, a request waits
   its turn (async: awaits; sync: blocks). `burst` defaults to `ceil(perSec)`.
-- **`concurrency(maxInFlight)`** — caps concurrent in-flight requests (native
+- **`concurrencyLimit(maxInFlight)`** — caps concurrent in-flight requests (native
   async backends; a no-op on the serial sync client, and omitted on `navi/js`
   where the runtime manages fetch concurrency).
 - **`bearer(token)`**, **`basic(user, pass)`** — set the `Authorization` header.
-- **`logging(sink = nil)`** — logs `VERB url -> status (Nms)` after each request
-  (defaults to `echo`; pass a sink to route elsewhere).
 
 Because middleware wraps `request()` only (not `stream()`/`sse()`), the cache
 serves and stores buffered responses; streamed responses are not cached. Order
