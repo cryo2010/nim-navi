@@ -25,6 +25,7 @@ else:
 
 type ServerCtx* = object
   port: int
+  portOut: ptr int      ## when set, bind an ephemeral port and report it here
   ready: ptr bool
   ipv6: bool
   payload: string
@@ -89,8 +90,9 @@ proc serveHang(ctx: ServerCtx) {.thread.} =
   ## Accept a connection, read the request, then never reply (for timeout tests).
   var server = newSocket()
   server.setSockOpt(OptReuseAddr, true)
-  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.bindAddr(Port(0), "127.0.0.1")     # ephemeral: no cross-iteration collision
   server.listen()
+  ctx.portOut[] = server.getLocalAddr()[1].int
   ctx.ready[] = true
   var client = acceptClient(server)
   var req = ""
@@ -103,10 +105,12 @@ proc serveHang(ctx: ServerCtx) {.thread.} =
   client.close()
   server.close()
 
-proc startHang*(th: var Thread[ServerCtx], port: int) =
-  ## Serve a single connection that accepts but never responds.
+proc startHang*(th: var Thread[ServerCtx], port: var int) =
+  ## Serve a single connection that accepts but never responds. Binds an
+  ## ephemeral port (so a leaked thread never collides on a re-run) and writes it
+  ## to `port`, which must be a mutable `var`.
   var ready = false
-  createThread(th, serveHang, ServerCtx(port: port, ready: addr ready))
+  createThread(th, serveHang, ServerCtx(portOut: addr port, ready: addr ready))
   while not ready: discard
 
 proc headerValue(head, name: string): string =
@@ -304,7 +308,7 @@ proc startServer*(th: var Thread[ServerCtx], port: int, ipv6 = false) =
   while not ready: discard
 
 type KeepAliveCtx* = object
-  port: int
+  portOut: ptr int      ## bind an ephemeral port and report it here
   requests: int
   ready: ptr bool
   accepts: ptr int
@@ -315,8 +319,9 @@ proc serveKeepAlive(ctx: KeepAliveCtx) {.thread.} =
   ## here and `accepts` stays 1.
   var server = newSocket()
   server.setSockOpt(OptReuseAddr, true)
-  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.bindAddr(Port(0), "127.0.0.1")     # ephemeral: no cross-iteration collision
   server.listen()
+  ctx.portOut[] = server.getLocalAddr()[1].int
   ctx.ready[] = true
   var client = acceptClient(server)
   ctx.accepts[] = 1
@@ -377,12 +382,14 @@ proc startUploadEcho*(th: var Thread[ServerCtx], port: int) =
   createThread(th, serveUploadEcho, ServerCtx(port: port, ready: addr ready))
   while not ready: discard
 
-proc startKeepAlive*(th: var Thread[KeepAliveCtx], port, requests: int,
+proc startKeepAlive*(th: var Thread[KeepAliveCtx], port: var int, requests: int,
                      accepts: ptr int) =
-  ## Launch the keep-alive server and block until it is listening.
+  ## Launch the keep-alive server and block until it is listening. Binds an
+  ## ephemeral port (so looped runs never collide) and writes it to `port`.
   var ready = false
   createThread(th, serveKeepAlive,
-    KeepAliveCtx(port: port, requests: requests, ready: addr ready, accepts: accepts))
+    KeepAliveCtx(portOut: addr port, requests: requests, ready: addr ready,
+                 accepts: accepts))
   while not ready: discard
 
 # --- cache-aware server for the middleware tests ------------------------------

@@ -9,14 +9,16 @@ import navi/proto/ws        # server-side codec helpers
 
 var wsReady: bool
 var stallReady: bool
+var stallPort: int      # ephemeral port the stall server bound, for the client URL
 
-proc wsStall(port: int) {.thread.} =
+proc wsStall() {.thread.} =
   ## Accept the connection and read the upgrade request, but never send the 101
   ## response, so the client's open blocks until its timeout fires.
   var server = newSocket(buffered = false)
   server.setSockOpt(OptReuseAddr, true)
-  server.bindAddr(Port(port), "127.0.0.1")
+  server.bindAddr(Port(0), "127.0.0.1")     # ephemeral: no cross-iteration collision
   server.listen()
+  stallPort = server.getLocalAddr()[1].int
   stallReady = true
   var c: Socket
   server.accept(c)
@@ -111,10 +113,9 @@ suite "chronos websocket client end to end":
     check m[3].kind == wmClose and m[3].closeCode == closeNormal
 
   test "the WebSocket client should time out on open when the server never completes the handshake":
-    const port = 9242
     stallReady = false   # reset so a looped run waits for THIS server, not a stale flag
-    var th: Thread[int]
-    createThread(th, wsStall, port)
+    var th: Thread[void]
+    createThread(th, wsStall)
     while not stallReady: os.sleep(5)
 
     proc run(): Future[string] {.async.} =
@@ -122,7 +123,7 @@ suite "chronos websocket client end to end":
       cfg.timeouts.total = 600
       let api = newNavi(cfg)
       try:
-        discard await api.websocket("ws://127.0.0.1:" & $port & "/")
+        discard await api.websocket("ws://127.0.0.1:" & $stallPort & "/")
         return "opened"
       except CatchableError as e:
         # navi raises its own TimeoutError; match by name to avoid the

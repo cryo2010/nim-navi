@@ -33,14 +33,19 @@ jobs:
       - name: Install brotli/zstd
         run: sudo apt-get update && sudo apt-get install -y libbrotli1 libzstd1
 
-      # Run the suite directly (not `nimble test`): nimble does not reliably
-      # propagate a task's exit code (nim-lang/nimble#1802), so a failing suite
-      # under `nimble test` can pass CI. tests/run.sh runs `nim c -r` per suite
-      # under `set -e`, so a failure fails the job.
+      # checkmate runs the unit suite and, unlike `nimble test`, propagates a
+      # proper exit code (nim-lang/nimble#1802). It also provides the `import
+      # checkmate` time-travel API that tt_mw_timing needs.
+      - name: Install checkmate
+        run: nimble install -y "https://github.com/cryo2010/nim-checkmate"
+
+      # --loop-in-process re-runs each file's tests 20x in one process to surface
+      # flakiness (shared state, port reuse); --bail stops at the first failure.
+      # `-d:ssl` and `--path:src` come from nim.cfg; the memory manager is matrixed
+      # via --nimflags. Discovery and excludes (e.g. tests/interop) live in
+      # .checkmate.toml.
       - name: Run tests
-        run: bash tests/run.sh
-        env:
-          NAVI_MM: ${{ matrix.mm }}
+        run: checkmate --loop=20 --loop-in-process --bail --nimflags:"--mm:${{ matrix.mm }}"
 
   compile:
     runs-on: ubuntu-latest

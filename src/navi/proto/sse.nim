@@ -28,6 +28,9 @@ type
 
   SseParser* = object
     buf: string              ## text past the last processed line terminator
+    scanned: int             ## bytes of `buf` already scanned for a terminator, so
+                             ## a long unterminated line is not rescanned per feed
+                             ## (bounds streamed input to O(n), not O(n^2))
     ready: Deque[SseEvent]   ## dispatched events awaiting `next`
     evType: string           ## current event's type buffer
     dataLines: seq[string]   ## current event's data buffer
@@ -88,7 +91,7 @@ proc feed*(p: var SseParser, text: string) =
     s = s[3 .. ^1]                            # strip a single leading UTF-8 BOM
   p.atStart = false
   p.buf.add s
-  var i = 0
+  var i = p.scanned                           # resume; earlier bytes had no terminator
   var lineStart = 0
   while i < p.buf.len:
     case p.buf[i]
@@ -103,6 +106,9 @@ proc feed*(p: var SseParser, text: string) =
     else: inc i
   if lineStart > 0:
     p.buf = p.buf[lineStart .. ^1]            # keep only the unterminated tail
+    p.scanned = 0                             # the small tail is rescanned next feed
+  else:
+    p.scanned = i                             # no terminator yet; don't rescan this run
   if p.buf.len > maxSseEventBytes:            # a single line with no terminator
     raise newException(ValueError,
       "navi: SSE line exceeds the " & $maxSseEventBytes & "-byte limit")
@@ -122,6 +128,7 @@ proc reset*(p: var SseParser) =
   ## retry. A partially-received event at disconnect is discarded (not dispatched),
   ## per the spec.
   p.buf.setLen(0)
+  p.scanned = 0
   p.evType.setLen(0)
   p.dataLines.setLen(0)
   p.dataBytes = 0

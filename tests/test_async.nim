@@ -31,7 +31,7 @@ suite "asyncdispatch entry end to end":
     joinThread(th)
 
   test "cancel should abort an in-flight request":
-    const port = 9201
+    var port = 0
     var th: Thread[ServerCtx]
     startHang(th, port)  # accepts, reads the request, never replies
 
@@ -83,7 +83,7 @@ suite "asyncdispatch entry end to end":
     joinThread(th)
 
   test "stream should return the connection to the pool after a full drain":
-    const port = 9205
+    var port = 0
     var accepts = 0
     var th: Thread[KeepAliveCtx]
     startKeepAlive(th, port, requests = 2, accepts = addr accepts)
@@ -105,7 +105,7 @@ suite "asyncdispatch entry end to end":
     check accepts == 1                            # both requests used the one connection
 
   test "readChunk should deliver the body in order and end by pooling the connection":
-    const port = 9207
+    var port = 0
     var accepts = 0
     var th: Thread[KeepAliveCtx]
     startKeepAlive(th, port, requests = 2, accepts = addr accepts)
@@ -147,7 +147,7 @@ suite "asyncdispatch entry end to end":
     check events[1].data == "b" and events[1].id == "3"
 
   test "stream should close (not pool) the connection when the drain fails":
-    const port = 9206
+    var port = 0
     var accepts = 0
     var th: Thread[KeepAliveCtx]
     startKeepAlive(th, port, requests = 1, accepts = addr accepts)
