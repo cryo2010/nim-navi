@@ -1,0 +1,46 @@
+# Per-workload stress image WITH HTTP/3. Adds the client QUIC toolchain that a
+# -d:naviHttp3 build links (OpenSSL 3.5 + nghttp3 + ngtcp2, same layers as
+# tests/interop/http3/Dockerfile) and Caddy as the h1/h2/h3 origin, on top of the
+# Python (FastAPI/hypercorn) + Node stack. Heavier build than the plain image, so
+# it is only used for h3 cells (run.sh sets -d:naviHttp3 when PROTO includes h3).
+#
+#   docker build -f tests/stress/Dockerfile.h3 -t navi-stress-h3 .
+#   docker run --rm -e NAVI_WORKLOAD=requests -e NAVI_PROTO=h3 navi-stress-h3
+FROM nimlang/nim:2.2.10
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential git ca-certificates pkg-config curl \
+      autoconf automake libtool openssl python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && rm -rf /var/lib/apt/lists/*
+
+ENV OSSL=/opt/ossl NGHTTP3=/opt/nghttp3 NGTCP2=/opt/ngtcp2
+
+RUN git clone --depth 1 -b openssl-3.5 https://github.com/openssl/openssl /src/openssl \
+ && cd /src/openssl && ./Configure --prefix=$OSSL --libdir=lib \
+ && make -j"$(nproc)" && make install_sw && rm -rf /src/openssl
+
+RUN git clone --depth 1 --recursive https://github.com/ngtcp2/nghttp3 /src/nghttp3 \
+ && cd /src/nghttp3 && autoreconf -i && ./configure --prefix=$NGHTTP3 --enable-lib-only \
+ && make -j"$(nproc)" && make install && rm -rf /src/nghttp3
+
+RUN git clone --depth 1 --recursive https://github.com/ngtcp2/ngtcp2 /src/ngtcp2 \
+ && cd /src/ngtcp2 && autoreconf -i \
+ && PKG_CONFIG_PATH=$OSSL/lib/pkgconfig ./configure --prefix=$NGTCP2 --enable-lib-only --with-openssl \
+ && make -j"$(nproc)" && make install && rm -rf /src/ngtcp2
+
+# Caddy: the h1/h2/h3 origin the h3 cells reverse-proxy FastAPI through.
+COPY --from=caddy:2 /usr/bin/caddy /usr/bin/caddy
+
+ENV PKG_CONFIG_PATH=$OSSL/lib/pkgconfig:$NGHTTP3/lib/pkgconfig:$NGTCP2/lib/pkgconfig
+ENV LD_LIBRARY_PATH=$OSSL/lib:$NGHTTP3/lib:$NGTCP2/lib
+
+WORKDIR /navi
+COPY . .
+RUN nimble install -y checksums "chronos@>= 4.0.0"
+RUN pip3 install --no-cache-dir --break-system-packages \
+      -r tests/stress/server/requirements.txt
+
+ENTRYPOINT ["bash", "tests/stress/run.sh"]

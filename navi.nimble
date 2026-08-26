@@ -72,21 +72,43 @@ task fuzz, "Coverage-guided libFuzzer run of a sans-io fuzz target (Docker; Linu
        "-w /navi/tests/fuzz/corpus/" & target & " " &
        "navi-fuzz " & target & " " & mode
 
-task stress, "Dockerized backend stress test (all backends, TLS, WS, middleware, multi-client)":
-  # Runs every backend (sync, asyncdispatch, chronos, js) against a TLS test
-  # server for NAVI_STRESS_SECONDS (default 20), each with NAVI_STRESS_CLIENTS
-  # navi clients (default 3; concurrent on the async backends), all HTTP verbs,
-  # and a persistent WebSocket, through a middleware. Dockerized so chronos and
-  # Node (for navi/js) are available anywhere.
-  # NB: nimble does not propagate a task's exit code (nim-lang/nimble#1802), so
-  # this exits 0 even on failure; for a reliable pass/fail, run the docker
-  # command directly (its exit code is honest) or read the final "all backends
-  # passed" line.
-  let secs = getEnv("NAVI_STRESS_SECONDS", "20")
-  let clients = getEnv("NAVI_STRESS_CLIENTS", "3")
-  exec "docker build -f tests/stress/Dockerfile -t navi-stress ."
-  exec "docker run --rm -e NAVI_STRESS_SECONDS=" & secs &
-       " -e NAVI_STRESS_CLIENTS=" & clients & " navi-stress"
+proc runStress(workload: string) =
+  # Build the stress image and run one workload, passing every NAVI_* knob
+  # through. The h3 image (with the ngtcp2/nghttp3/OpenSSL-3.5 client toolchain +
+  # Caddy) is only used when NAVI_PROTO is h3; h1/h2 use the light image.
+  # Backend x protocol are iterated inside the container (run.sh). NB: nimble does
+  # not propagate a task's exit code (nim-lang/nimble#1802), so a failure shows in
+  # the output but this exits 0 -- run the docker command directly, or read the
+  # final "== <workload>: all cells passed ==" banner, for CI-grade pass/fail.
+  let h3 = getEnv("NAVI_PROTO", "h2") == "h3"
+  let dockerfile = if h3: "tests/stress/Dockerfile.h3" else: "tests/stress/Dockerfile"
+  let image = if h3: "navi-stress-h3" else: "navi-stress"
+  exec "docker build -f " & dockerfile & " -t " & image & " ."
+  exec "docker run --rm -e NAVI_WORKLOAD=" & workload &
+       " -e NAVI_PROTO -e NAVI_BACKEND -e NAVI_SERVERS" &
+       " -e NAVI_SECONDS -e NAVI_CLIENTS -e NAVI_CONCURRENCY" &
+       " -e NAVI_REQ_COMPRESSION -e NAVI_RESP_COMPRESSION" &
+       " -e NAVI_STREAM_BYTES -e NAVI_REPORT_SECONDS " & image
+
+task stressRequests, "Stress: buffered request/response soak (verbs, compression, auth, mw, pool/mux)":
+  runStress("requests")
+task stressWs, "Stress: persistent WebSocket text+binary under load":
+  runStress("ws")
+task stressSse, "Stress: SSE subscribe under load with reconnect / Last-Event-ID resume":
+  runStress("sse")
+task stressStreamUpload, "Stress: stream 1 GiB up, server verifies checksum (hard-fail on mismatch)":
+  runStress("streamUpload")
+task stressStreamDownload, "Stress: stream 1 GiB down, client verifies checksum (hard-fail on mismatch)":
+  runStress("streamDownload")
+
+task stress, "Stress smoke: all five workloads, short + small (a quick everything-works check)":
+  # Discoverability + a fast smoke of the whole set. Defaults to 20s cells and a
+  # 64 MiB stream unless overridden; set the NAVI_* knobs for a real soak,
+  # or run a single stress<Workload> task.
+  if not existsEnv("NAVI_SECONDS"): putEnv("NAVI_SECONDS", "20")
+  if not existsEnv("NAVI_STREAM_BYTES"): putEnv("NAVI_STREAM_BYTES", "67108864")
+  for w in ["requests", "ws", "sse", "streamUpload", "streamDownload"]:
+    runStress(w)
 
 task badssl, "TLS client conformance against badssl.com (network; nightly)":
   exec "nim c -r --hints:off tests/interop/badssl.nim"

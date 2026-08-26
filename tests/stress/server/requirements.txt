@@ -1,0 +1,6 @@
+fastapi>=0.110
+hypercorn>=0.16
+websockets>=12          # Starlette WebSocket support under hypercorn
+# Optional response-compression codecs (RESP_COMPRESSION=br|zstd); harmless if unused.
+brotli>=1.1
+zstandard>=0.22

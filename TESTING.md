@@ -11,7 +11,7 @@ fall into six groups:
 3. [Interop suites](#interop-suites) (live servers: openssl / nghttpd / Docker)
 4. [Memory-safety checks](#memory-safety-checks) (leak / valgrind / sanitizers)
 5. [Fuzzing](#fuzzing)
-6. [Benchmarks](#benchmarks) (performance, not correctness)
+6. [Benchmarks and stress](#benchmarks-and-stress) (performance / soak; local, not per-PR)
 
 The **CI** column says which check runs it on every PR (see
 `.github/workflows/`). "local" means it is not wired into per-PR CI and is run on
@@ -48,9 +48,15 @@ nimble leak               # 800k-request heap-growth check (per mm)
 nimble valgrind           # Valgrind memcheck of the TLS client path (Docker)
 nimble leakSanitize       # codec-FFI (zlib/brotli/zstd) leaks under LeakSanitizer
 
-# Fuzzing (Docker libFuzzer) and benchmarks:
+# Fuzzing (Docker libFuzzer), benchmarks, and stress soaks:
 nimble fuzz               # coverage-guided libFuzzer over a sans-io target
 nimble bench              # client benchmark: navi vs std/httpclient, Go, Rust
+nimble stressRequests     # soak: buffered request/response (verbs, compression, mw, pool/mux)
+nimble stressWs           # soak: persistent WebSocket, text+binary
+nimble stressSse          # soak: SSE subscribe with reconnect / Last-Event-ID resume
+nimble stressStreamUpload # soak: stream 1 GiB up, server verifies checksum (hard-fail)
+nimble stressStreamDownload # soak: stream 1 GiB down, client verifies checksum (hard-fail)
+nimble stress             # short smoke of all five stress workloads
 ```
 
 ---
@@ -309,11 +315,75 @@ per PR, each a matrix over five targets (`hpack`, `h1`, `frame`, `huffman`,
 
 ---
 
-## Benchmarks
+## Benchmarks and stress
+
+Performance and soak, run on demand (never a per-PR gate — Docker, long runtimes,
+and 1 GiB transfers are too heavy for CI).
+
+### Benchmarks
 
 Performance measurement, not pass/fail (CI does not gate on throughput).
 
 | Task | Verifies |
 |------|----------|
 | `nimble bench` | Dockerized HTTP-client benchmark: navi vs `std/httpclient`, Go, and Rust |
-| `nimble stress` | Dockerized backend stress test exercising every backend (sync, asyncdispatch, chronos, js) over TLS + WebSockets with middleware and multiple clients |
+
+### Stress tests
+
+Focused, Dockerized soak tests under `tests/stress/`, split by **workload** (what
+the client does) rather than protocol. Each runs many navi clients against **N TLS
+servers** (FastAPI/hypercorn for h1/h2; a Caddy front for h3), distributes requests
+across them, and prints a status-code + RSS report every interval. Responses are
+tallied into a counter and **discarded** (never retained), so memory stays flat over
+a multi-hour soak; the two streaming workloads verify a 1 GiB checksum and **fail
+hard** on any mismatch. The async backends fan out many parallel requests.
+
+| Task | Workload |
+|------|----------|
+| `nimble stressRequests` | Buffered GET/POST/PUT at `/echo`: bodies, req/resp compression, an `x-stress` middleware, connection pooling/mux |
+| `nimble stressWs` | Persistent WebSocket echo, text + binary frames under sustained load |
+| `nimble stressSse` | SSE subscribe under load; the server drops mid-stream, exercising navi's reconnect + Last-Event-ID resume |
+| `nimble stressStreamUpload` | Stream 1 GiB up (pull-based `bodyStream`, constant memory); the **server** verifies the SHA-1 and the client hard-fails on mismatch |
+| `nimble stressStreamDownload` | Stream 1 GiB down (`stream()`/`each`, hashed and discarded); the **client** verifies against `x-sha1` and hard-fails on mismatch |
+| `nimble stress` | Short smoke of all five (20 s cells, 64 MiB streams) |
+
+Each task builds one image and runs the **backend × protocol** matrix inside the
+container. The four backends map to `sync` / `asyncdispatch` / `chronos` (one async
+source, built twice) / `js` (Node); a cell whose backend can't do the workload is
+**skipped with a printed reason** (see gaps below), not silently. `nimble` does not
+propagate a task's exit code (nim-lang/nimble#1802): read the final
+`== <workload>: all cells passed ==` banner, or run the `docker run` directly for an
+honest exit code.
+
+**Configuration** — every knob is a `NAVI_*` env var:
+
+| Var | Default | Meaning |
+|------|---------|---------|
+| `NAVI_PROTO` | `h2` | `h1` \| `h2` \| `h3` \| `all`. `all` iterates h1+h2 (h3 is opt-in). `h3` builds the heavier `Dockerfile.h3` (ngtcp2/nghttp3/OpenSSL-3.5 + Caddy) and a `-d:naviHttp3` client |
+| `NAVI_BACKEND` | `all` | `sync` \| `asyncdispatch` \| `chronos` \| `js` \| `all` |
+| `NAVI_SERVERS` | `5` | Number of server instances; requests round-robin across them |
+| `NAVI_SECONDS` | `60` | Runtime per (backend × protocol) cell |
+| `NAVI_CLIENTS` | `3` | navi clients per backend |
+| `NAVI_CONCURRENCY` | `32` | In-flight requests per client (async fan-out width) |
+| `NAVI_REQ_COMPRESSION` | `gzip` | Request body encoding: `none` \| `gzip` \| `deflate` (native only) |
+| `NAVI_RESP_COMPRESSION` | `gzip` | Response encoding requested via `x-want-encoding`: `none` \| `gzip` \| `deflate` \| `br` \| `zstd` |
+| `NAVI_REPORT_SECONDS` | `60` | Report cadence |
+| `NAVI_STREAM_BYTES` | `1073741824` | Streaming transfer size in bytes (1 GiB); lower for a local smoke |
+
+(`NAVI_WORKLOAD` is set by each task; `NAVI_HOST` / `NAVI_BASE_PORT`
+/ `NAVI_CERT` / `NAVI_KEY` are set internally by `run.sh`.)
+
+Example — a 10-minute h1/h2/h3 requests soak on chronos, reporting each minute:
+
+```sh
+NAVI_SECONDS=600 NAVI_PROTO=all NAVI_BACKEND=chronos \
+  nimble stressRequests
+```
+
+**Backend/protocol gaps** (skipped with a reason, not run):
+
+- `js` + `streamUpload` — `fetch` cannot stream a request body (navi/js buffers it,
+  which would defeat a 1 GiB soak), so there is no js upload client.
+- `h3` on `chronos` or `js` — HTTP/3 is sync + asyncdispatch only.
+- `h3` without a `-d:naviHttp3` build — use the h3 image (selected automatically when
+  `NAVI_PROTO=h3`).

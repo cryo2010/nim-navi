@@ -1,0 +1,17 @@
+# Caddy front for the h3 stress cells: terminates TLS and serves h1/h2/h3,
+# advertising h3 via Alt-Svc, and reverse-proxies every route to a plaintext
+# FastAPI instance. `envsubst` fills PUBLIC_PORT / BACKEND_PORT / CERT / KEY per
+# instance (run.sh renders one Caddyfile per server). WebSocket and streaming
+# (SSE, 1 GiB up/down) pass through reverse_proxy transparently.
+{
+	auto_https off
+	servers {
+		protocols h1 h2 h3
+	}
+}
+
+https://${HOST}:${PUBLIC_PORT} {
+	tls ${CERT} ${KEY}
+	header Alt-Svc `h3=":${PUBLIC_PORT}"; ma=86400`
+	reverse_proxy 127.0.0.1:${BACKEND_PORT}
+}
