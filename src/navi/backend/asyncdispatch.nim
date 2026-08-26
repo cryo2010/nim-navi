@@ -45,6 +45,9 @@ type
     fd: AsyncFD
     protocol*: string   ## ALPN-negotiated protocol ("h2" or "", meaning http/1.1)
     readMs: int         ## per-read stall timeout in ms; 0 blocks indefinitely
+    closed: ref bool    ## shared across value copies: set by `close`, checked by a
+                        ## parked `sslRead` so closing under an in-flight read yields
+                        ## EOF instead of dereferencing the freed SSL (a UAF crash)
     when defined(ssl):
       ssl: SslPtr       ## the TLS connection; nil for plain http
       ctx: SslContext   ## the (usually shared) SSL_CTX this connection used
@@ -110,6 +113,13 @@ when defined(ssl):
     ## One chunk of up to 4096 bytes; "" means the peer closed.
     result = newString(4096)
     while true:
+      # If `close` ran while we were parked on waitRead, the SSL is already freed.
+      # Raise rather than reading through the dangling pointer (a UAF crash) -- and
+      # rather than returning "" (a clean peer-EOF), which the h1 body reader would
+      # take as "read more" on an unfinished stream and spin. The stream layer
+      # treats this as a drop.
+      if not c.closed.isNil and c.closed[]:
+        raise newException(IOError, "navi: connection closed")
       let n = SSL_read(c.ssl, addr result[0], result.len.cint).int
       if n > 0:
         result.setLen(n); return
@@ -226,6 +236,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   var conn: Conn
   conn.fd = invalidFd
   conn.readMs = readMs
+  conn.closed = new(bool)   # shared teardown flag (see Conn.closed)
 
   proc establish() {.async.} =
     let dialHost = if proxy.isSet: proxy.host else: host
@@ -297,19 +308,6 @@ proc recvSome*(c: Conn): Future[string] {.async.} =
                        "navi: read timed out after " & $c.readMs & " ms")
   return await readFut
 
-proc closeSync*(c: Conn) =
-  ## Synchronous close, for a destructor that cannot `await` (an abandoned
-  ## streaming handle reclaimed by GC). Same teardown as `close`.
-  when defined(ssl):
-    if not c.ssl.isNil:
-      discard SSL_shutdown(c.ssl)
-      SSL_free(c.ssl)
-  if c.fd != invalidFd: closeSocket(c.fd)
-  when defined(ssl):
-    # A shared ctx is freed with the client's context store, not here; only an
-    # unshared one (bare TlsConfig, e.g. interop tests) is destroyed per connection.
-    if c.ownsCtx and not c.ctx.isNil: c.ctx.destroyContext()
-
 proc shutdownConn*(c: Conn) =
   ## Shut the socket down in both directions so a pending read or write unblocks
   ## with EOF/error. Used to wake the h2 mux's background reader on client close so
@@ -322,8 +320,40 @@ proc shutdownConn*(c: Conn) =
   else:
     discard posix.shutdown(c.fd.SocketHandle, posix.SHUT_RDWR)
 
+proc freeConn(c: Conn) =
+  ## The raw teardown: free the SSL and close the fd. Callers set/guard the
+  ## `closed` flag first.
+  when defined(ssl):
+    if not c.ssl.isNil:
+      discard SSL_shutdown(c.ssl)
+      SSL_free(c.ssl)
+  if c.fd != invalidFd: closeSocket(c.fd)
+  when defined(ssl):
+    # A shared ctx is freed with the client's context store, not here; only an
+    # unshared one (bare TlsConfig, e.g. interop tests) is destroyed per connection.
+    if c.ownsCtx and not c.ctx.isNil: c.ctx.destroyContext()
+
+proc closeSync*(c: Conn) =
+  ## Synchronous close, for a destructor that cannot `await` (an abandoned
+  ## streaming handle reclaimed by GC). No read is parked on a GC-reclaimed handle,
+  ## so freeing directly is safe; `close` handles the read-in-flight case.
+  if not c.closed.isNil:
+    if c.closed[]: return               # idempotent; stops a double-free
+    c.closed[] = true
+  freeConn(c)
+
 proc close*(c: Conn): Future[void] {.async.} =
-  c.closeSync()
+  ## Close, safe to call while a `sslRead` is parked (e.g. stopping an SSE stream):
+  ## flag the teardown, shut the socket down to wake the parked read, then yield one
+  ## tick so the dispatcher delivers that wake (the read observes EOF via the flag)
+  ## before we free the fd. Freeing in the same atomic step would lose the wake and
+  ## hang the reader on an unregistered fd.
+  if not c.closed.isNil:
+    if c.closed[]: return
+    c.closed[] = true
+    shutdownConn(c)
+    await sleepAsync(0)
+  freeConn(c)
 
 proc sleep*(ms: int): Future[void] = sleepAsync(ms)
 

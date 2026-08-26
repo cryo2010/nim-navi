@@ -1,9 +1,15 @@
 ## stressSse, async backends (built twice: asyncdispatch, -d:useChronos -> chronos).
 ##
 ## Opens `concurrency` SSE subscriptions across the server pool and consumes events
-## until the deadline. The server drops mid-stream periodically, so navi's
-## transparent reconnect + Last-Event-ID resume is exercised continuously. Each
-## event tallies as 200; nothing is retained. Reporter prints every interval.
+## until the deadline, using navi's native transparent reconnect + Last-Event-ID
+## resume (the server drops periodically, so this exercises it). Each event tallies
+## as 200; nothing is retained.
+##
+## Each worker checks the deadline in the `each` body (events flow continuously, so
+## it runs constantly) and breaks, then closes its own stream when NOT parked in a
+## read. This avoids closing a stream out from under a parked h2 read, which orphans
+## the read's future and crashes the dispatcher at teardown ("No handles or timers
+## registered"). Reporter prints every interval.
 
 import std/times
 import ../common/[config, reporter, servers]
@@ -15,16 +21,15 @@ else:
   const backend = "asyncdispatch"
 include ../common/httpset
 
-proc worker(api: Navi, url: string, counter: StatusCounter,
-            deadline: float) {.async.} =
+proc worker(s: SseStream, counter: StatusCounter, deadline: float) {.async.} =
   try:
-    let s = await api.sse(url)
     s.each(ev):
       counter.tally(200)
-      if epochTime() >= deadline: break
-    await s.close()
+      if epochTime() >= deadline: break   # self-terminate: events flow continuously
   except CatchableError:
     counter.fail()
+  try: await s.close()                     # closed here, not mid-read: clean teardown
+  except CatchableError: discard
 
 proc reporterLoop(cfg: Config, counter: StatusCounter,
                   start, deadline: float) {.async.} =
@@ -47,11 +52,16 @@ proc main() {.async.} =
   c.tls.caFile = cfg.cert
   let api = newNavi(c)
 
+  # Low retry so reconnects are fast under load (the server ends the stream often);
+  # also bounds how long a worker parked in the backoff lags the deadline.
+  var streams: seq[SseStream]
+  for _ in 0 ..< cfg.concurrency:
+    streams.add await api.sse(pool.pick() & "/events", retryMs = 20, maxRetryMs = 100)
+
   let start = epochTime()
   let deadline = start + cfg.seconds
   var futs: seq[Future[void]]
-  for _ in 0 ..< cfg.concurrency:
-    futs.add worker(api, pool.pick() & "/events", counter, deadline)
+  for s in streams: futs.add worker(s, counter, deadline)
   futs.add reporterLoop(cfg, counter, start, deadline)
   for f in futs: await f
 

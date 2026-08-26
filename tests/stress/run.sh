@@ -29,24 +29,46 @@ trap cleanup EXIT
 
 # Self-signed cert. DNS:127.0.0.1 (not just the IP SAN) so chronos's TLS, which
 # matches the connect host against dNSName SANs, accepts the loopback IP.
-openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+# `env -u LD_LIBRARY_PATH`: the h3 image points LD_LIBRARY_PATH at the custom
+# OpenSSL 3.5 (for the ngtcp2 client), which makes the system `openssl` binary
+# load those libs and hunt for a config at /opt/ossl/ssl/openssl.cnf that does not
+# exist -- so cert generation fails and Caddy later can't find the cert. The CLI
+# only needs the stock system OpenSSL to mint a self-signed cert. `|| exit 1` so a
+# failure is loud, not a silently-missing cert.
+env -u LD_LIBRARY_PATH openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -keyout "$key" -out "$cert" -subj "/CN=localhost" \
-  -addext "subjectAltName=DNS:localhost,DNS:127.0.0.1,IP:127.0.0.1" >/dev/null 2>&1
+  -addext "subjectAltName=DNS:localhost,DNS:127.0.0.1,IP:127.0.0.1" >/dev/null 2>&1 \
+  || { echo "cert generation failed"; exit 1; }
 
 # --- start N servers for a given protocol -----------------------------------
 start_servers() {
   local p="$1" i port
   if [ "$p" = "h3" ]; then
     command -v caddy >/dev/null || { echo "caddy required for h3 (use the h3 image)"; return 1; }
-    local caddyfile="$work/Caddyfile"; : >"$caddyfile"
-    printf '{\n\tauto_https off\n\tservers { protocols h1 h2 h3 }\n}\n' >>"$caddyfile"
+    local caddyfile="$work/Caddyfile"
+    # Global options block. The `servers` block MUST be multi-line -- an inline
+    # `servers { protocols ... }` is a Caddyfile parse error (Caddy exits, nothing
+    # binds). Mirrors the known-good tests/interop/http3/Caddyfile.
+    cat >"$caddyfile" <<-EOF
+	{
+		auto_https off
+		servers {
+			protocols h1 h2 h3
+		}
+	}
+	EOF
     for ((i=0; i<servers; i++)); do
       port=$((base_port + i))
       local bport=$((base_port + 1000 + i))
       hypercorn "app:app" --bind "127.0.0.1:$bport" >"$work/srv-$i.log" 2>&1 &
       pids+=($!)
-      printf 'https://%s:%s {\n\ttls %s %s\n\theader Alt-Svc `h3=":%s"; ma=86400`\n\treverse_proxy 127.0.0.1:%s\n}\n' \
-        "$host" "$port" "$cert" "$key" "$port" "$bport" >>"$caddyfile"
+      cat >>"$caddyfile" <<-EOF
+	https://$host:$port {
+		tls $cert $key
+		header Alt-Svc \`h3=":$port"; ma=86400\`
+		reverse_proxy 127.0.0.1:$bport
+	}
+	EOF
     done
     caddy run --config "$caddyfile" --adapter caddyfile >"$work/caddy.log" 2>&1 &
     pids+=($!)
@@ -58,14 +80,23 @@ start_servers() {
       pids+=($!)
     done
   fi
-  # Wait for each public TLS listener to accept.
+  # Wait until each public port actually serves a 200 -- not just accepts TLS. For
+  # h3 the public port is Caddy; a bare TLS-accept check passes as soon as Caddy is
+  # up, before the hypercorn backend behind it is ready, so navi's first request
+  # gets a 502. Curling for a real 200 waits for the whole path (Caddy + backend).
   for ((i=0; i<servers; i++)); do
     port=$((base_port + i)); local ok=""
-    for _ in $(seq 1 100); do
-      if openssl s_client -connect "$host:$port" </dev/null >/dev/null 2>&1; then ok=1; break; fi
+    for _ in $(seq 1 150); do
+      if [ "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 2 \
+              "https://$host:$port/echo" 2>/dev/null)" = "200" ]; then ok=1; break; fi
       sleep 0.2
     done
-    [ -n "$ok" ] || { echo "server on :$port did not start"; cat "$work"/srv-*.log; return 1; }
+    [ -n "$ok" ] || {
+      echo "server on :$port did not start"
+      cat "$work"/srv-*.log 2>/dev/null
+      [ "$p" = "h3" ] && { echo "--- caddy.log ---"; cat "$work/caddy.log" 2>/dev/null; }
+      return 1
+    }
   done
 }
 
