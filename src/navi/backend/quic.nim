@@ -94,6 +94,16 @@ proc navi_h3_take_response*(c: pointer, sid: int64, outStatus: ptr clong,
                             outBody: ptr char, outCap: csize_t, outLen: ptr csize_t,
                             outHeaders: ptr char, hdrCap: csize_t,
                             hdrLen: ptr csize_t): cint {.importc, cdecl.}
+# Streaming read path (stream()/SSE): headers first, then body chunks as they land.
+proc navi_h3_response_headers*(c: pointer, sid: int64, outStatus: ptr clong,
+                               outHeaders: ptr char, hdrCap: csize_t,
+                               hdrLen: ptr csize_t, outReady: ptr cint): cint
+  {.importc, cdecl.}   ## outReady=1 once all headers are in (does not drop the stream)
+proc navi_h3_read_body*(c: pointer, sid: int64, buf: ptr char, cap: csize_t,
+                        outEof: ptr cint): int {.importc, cdecl.}
+  ## bytes drained (0 + eof=0 means "nothing yet"); does not drop the stream on eof
+proc navi_h3_stream_free*(c: pointer, sid: int64) {.importc, cdecl.}
+  ## drop a stream (after eof+reset check, or to abandon a handle)
 
 proc ngtcp2VersionStr*(): string = $ngtcp2_version(0).version_str
 proc nghttp3VersionStr*(): string = $nghttp3_version(0).version_str

@@ -23,7 +23,10 @@ type
     ## One multiplexed HTTP/3 connection to an origin. Reused across requests.
     c: pointer                        ## H3Conn* (nil once closed)
     fd: AsyncFD
-    waiters: Table[int64, Future[void]]  ## stream id -> completion future
+    waiters: Table[int64, Future[void]]  ## buffered request: stream id -> done future
+    recvReady: Table[int64, Future[void]] ## streaming: stream id -> "progress" future,
+                                          ## woken each reader cycle so a parked
+                                          ## headers/body pull re-checks the C buffers
     wakeup: Future[void]              ## the reader's current wait, wake() to poke it
     alive*: bool
     readerDone: Future[void]
@@ -73,9 +76,11 @@ proc reader(qc: QuicConnAsync) {.async.} =
   try:
     while qc.alive:
       await step(qc)
-      for sid, fut in qc.waiters:
+      for sid, fut in qc.waiters:                 # buffered: wake on stream done
         if not fut.finished and navi_h3_stream_done(qc.c, sid) != 0:
           fut.complete()
+      for sid, fut in qc.recvReady:               # streaming: wake parked pulls to
+        if not fut.finished: fut.complete()        # re-check headers/body each cycle
   except CatchableError:
     discard
   qc.alive = false
@@ -83,6 +88,9 @@ proc reader(qc: QuicConnAsync) {.async.} =
     if not fut.finished:
       fut.fail(newException(QuicError, "navi HTTP/3 connection closed"))
   qc.waiters.clear()
+  for sid, fut in qc.recvReady:                    # unblock parked streaming pulls;
+    if not fut.finished: fut.complete()             # they observe `not alive` and end
+  qc.recvReady.clear()
   unregister(qc.fd)
   navi_h3_close(qc.c)
   qc.c = nil
@@ -101,6 +109,7 @@ proc openConnAsync*(host: string, port: int, sni, caFile: string,
   let fd = navi_h3_fd(c).int.AsyncFD
   register(fd)
   let qc = QuicConnAsync(c: c, fd: fd, waiters: initTable[int64, Future[void]](),
+                         recvReady: initTable[int64, Future[void]](),
                          alive: true,
                          readerDone: newFuture[void]("navi.h3.readerDone"))
   try:
@@ -171,6 +180,78 @@ proc requestOnConn*(qc: QuicConnAsync, verb, path: string,
     hs.add((parts[i], parts[i + 1]))
     i += 2
   result = Http3Response(status: int(status), body: rbody, headers: hs)
+
+# --- streaming API (for stream()/SSE over h3) ------------------------------
+# Unlike requestOnConn (which awaits the whole buffered response), these let the
+# caller read a response incrementally: submit, await headers, then pull body
+# chunks. A parked pull waits on a per-stream `recvReady` future the reader wakes
+# each cycle, then re-checks the C-side buffers (mirrors the h2 mux's recvReady).
+
+proc waitProgress(qc: QuicConnAsync, sid: int64) {.async.} =
+  ## Park until the reader makes a cycle (headers/body may have advanced).
+  let f = newFuture[void]("navi.h3.recv")
+  qc.recvReady[sid] = f
+  wake(qc)                        # poke the reader so we don't wait its full timer
+  await f
+  qc.recvReady.del(sid)
+
+proc submitStream*(qc: QuicConnAsync, verb, path: string,
+                   headers: seq[(string, string)], body: string): int64 =
+  ## Open an h3 stream for a streaming read; returns the stream id (< 0 on error).
+  if not qc.alive: return -1
+  var reqHdr = ""
+  for (k, v) in headers:
+    reqHdr.add k; reqHdr.add '\n'; reqHdr.add v; reqHdr.add '\n'
+  var b = body
+  let bp = if b.len > 0: cast[ptr char](addr b[0]) else: nil
+  result = navi_h3_submit(qc.c, verb.cstring, path.cstring, reqHdr.cstring, bp,
+                          csize_t(b.len))
+  wake(qc)
+
+proc awaitHeaders*(qc: QuicConnAsync, sid: int64):
+    Future[tuple[status: int, headers: seq[(string, string)]]] {.async.} =
+  ## Await the response status + headers for `sid` (they arrive before any body).
+  var status: clong
+  var hbuf = newString(16 * 1024)
+  var ready: cint
+  while true:
+    if not qc.alive: raise newException(QuicError, "navi HTTP/3 connection closed")
+    var hlen: csize_t
+    if navi_h3_response_headers(qc.c, sid, addr status, cast[ptr char](addr hbuf[0]),
+                                csize_t(hbuf.len), addr hlen, addr ready) != 0:
+      raise newException(QuicError, "navi HTTP/3 stream gone")
+    if ready != 0:
+      hbuf.setLen(int(hlen))
+      var hs: seq[(string, string)]
+      let parts = hbuf.split('\n')
+      var i = 0
+      while i + 1 < parts.len:
+        hs.add((parts[i], parts[i + 1])); i += 2
+      return (int(status), hs)
+    await waitProgress(qc, sid)
+
+proc readStreamBody*(qc: QuicConnAsync, sid: int64): Future[string] {.async.} =
+  ## The next body chunk of `sid`, or "" at end of body. Parks until data lands.
+  var buf = newString(64 * 1024)
+  var eof: cint
+  while true:
+    if not qc.alive: raise newException(QuicError, "navi HTTP/3 connection closed")
+    let n = navi_h3_read_body(qc.c, sid, cast[ptr char](addr buf[0]),
+                              csize_t(buf.len), addr eof)
+    if n < 0: raise newException(QuicError, "navi HTTP/3 stream gone")
+    if n > 0:
+      buf.setLen(int(n)); return buf
+    if eof != 0: return ""
+    await waitProgress(qc, sid)
+
+proc streamWasReset*(qc: QuicConnAsync, sid: int64): bool =
+  ## Whether `sid` ended by reset/abort rather than a clean end. Check at EOF.
+  qc.c != nil and navi_h3_stream_reset(qc.c, sid) != 0
+
+proc freeStream*(qc: QuicConnAsync, sid: int64) =
+  ## Drop `sid` (after an EOF+reset check, or to abandon an undrained handle).
+  if qc.c != nil: navi_h3_stream_free(qc.c, sid)
+  qc.recvReady.del(sid)
 
 proc closeConn*(qc: QuicConnAsync): Future[void] {.async.} =
   ## Stop the reader and free the connection. Idempotent.

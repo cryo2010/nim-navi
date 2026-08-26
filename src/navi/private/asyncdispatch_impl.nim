@@ -316,7 +316,7 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
 # --- Streaming downloads (pull-based handle) ---
 
 type
-  StreamKind = enum skH1, skH2
+  StreamKind = enum skH1, skH2, skH3
   StreamResponseObj = object
     ## The response of a streaming request: status/headers are available
     ## immediately while the body is drained on demand. Holds either a checked-out
@@ -342,6 +342,11 @@ type
     of skH2:
       mux: H2Mux               ## the shared connection (stays live for reuse)
       sid: uint32              ## our stream on it
+    of skH3:
+      when defined(naviHttp3):
+        qc: QuicConnAsync      ## the shared h3 connection (stays live for reuse)
+        h3sid: int64           ## our QUIC stream on it
+      else: discard
   StreamResponse* = ref StreamResponseObj
 
 proc close*(sr: StreamResponse): Future[void] {.async.} =
@@ -354,6 +359,9 @@ proc close*(sr: StreamResponse): Future[void] {.async.} =
   case sr.kind
   of skH1: await close(sr.transport)
   of skH2: await sr.mux.abandon(sr.sid)
+  of skH3:
+    when defined(naviHttp3): sr.qc.freeStream(sr.h3sid)  # STOP_SENDING; conn stays up
+    else: discard
 
 proc status*(sr: StreamResponse): int = sr.resp.status
   ## The response status code, available before the body is drained.
@@ -372,6 +380,31 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
   let wantH2 = client.config.wantsH2 and req.url.isTls
   let decompress = client.config.wantsDecompress
   let cap = client.config.maxResponseBytes
+
+  when defined(naviHttp3):
+    # Stream over HTTP/3 when the origin has advertised h3 (Alt-Svc). Mirrors the
+    # buffered h3TransportAsync path: submit on the shared connection, read headers,
+    # return a handle whose readChunk pulls the body incrementally. Any QUIC failure
+    # falls through to h2/h1.
+    if client.config.wantsH3 and req.url.isTls and req.bodyStream == nil:
+      let ep = client.altSvc.h3Endpoint("https", req.url.host, req.url.port)
+      if ep.isSome:
+        try:
+          let qc = await client.getH3Conn(origin, ep.get, req)
+          var fwd: seq[(string, string)]
+          for k, v in req.headers:
+            let lk = k.toLowerAscii
+            if lk notin h3SkipHeaders: fwd.add((lk, v))
+          let sid = qc.submitStream($req.verb, req.url.requestTarget, fwd, req.body)
+          if sid >= 0:
+            let (status, hdrs) = await qc.awaitHeaders(sid)
+            return StreamResponse(kind: skH3, qc: qc, h3sid: sid,
+              resp: initResponse(status, "", "HTTP/3", initHeaders(hdrs), ""),
+              client: client, key: origin, decompress: decompress, cap: cap)
+        except QuicError:
+          if client.h3conns.getOrDefault(origin, nil) != nil and
+             not client.h3conns[origin].alive:
+            client.h3conns.del(origin)     # drop a dead connection; fall back below
 
   if wantH2:
     if client.muxes.hasKey(origin) and client.muxes[origin].canReuse:
@@ -474,6 +507,15 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
         {.cast(gcsafe).}:
           try: (if mux != nil: mux.dropStream(sid))
           except Exception: discard)
+    of skH3:
+      when defined(naviHttp3):
+        let qc = handle.qc
+        let sid = handle.h3sid
+        handle.guard = newStreamGuard(proc() {.gcsafe, raises: [].} =
+          {.cast(gcsafe).}:
+            try: (if qc != nil: qc.freeStream(sid))
+            except Exception: discard)
+      else: discard
     storeCookies(client.jar, rreq.url, handle.resp)
     if handle.status == 401 and client.config.auth.kind == akDigest and
        not rreq.headers.contains("authorization"):
@@ -526,6 +568,38 @@ proc readChunk*(sr: StreamResponse): Future[string] {.async.} =
       disarm(sr.guard)
       await close(sr.transport)
       raise
+  of skH3:
+    when defined(naviHttp3):
+      # h3 body arrives raw; apply the same streamed decode + size-cap as h1, then
+      # free the stream at EOF (a reset surfaces as an error). The mux stays live.
+      try:
+        while true:
+          let raw = await sr.qc.readStreamBody(sr.h3sid)
+          if raw.len == 0:                # EOF
+            sr.drained = true
+            disarm(sr.guard)
+            let wasReset = sr.qc.streamWasReset(sr.h3sid)
+            sr.qc.freeStream(sr.h3sid)
+            if wasReset: raise newException(IOError, "navi: http/3 stream reset")
+            return ""
+          if not sr.decReady:
+            sr.dec = if sr.decompress:
+                newStreamDecoder(sr.resp.headers.get("content-encoding")) else: nil
+            sr.decReady = true
+          let decoded = if sr.dec != nil:
+              sr.dec.update(raw.toOpenArrayByte(0, raw.high)) else: raw
+          if decoded.len == 0: continue   # decoder buffered input; pull more
+          sr.seen += decoded.len
+          if sr.cap > 0 and sr.seen > sr.cap:
+            raise newException(ResponseTooLargeError,
+              "navi: response exceeded maxResponseBytes")
+          return decoded
+      except CatchableError:
+        if not sr.drained: sr.drained = true
+        disarm(sr.guard)
+        sr.qc.freeStream(sr.h3sid)
+        raise
+    else: discard
 
 proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
   ## Deliver the response body to `sink` as it arrives (decoded and size-capped),
@@ -556,6 +630,14 @@ proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
       if not sr.drained: sr.drained = true
       await close(sr.transport)
       raise
+  of skH3:
+    when defined(naviHttp3):
+      # Reuse readChunk's decode/cap/free per chunk; it sets `drained` at EOF.
+      while true:
+        let chunk = await sr.readChunk()
+        if chunk.len == 0: break
+        await sink(chunk)
+    else: discard
 
 template each*(sr: StreamResponse; chunk, body: untyped): untyped =
   ## Drain the streaming body, running `body` for each decoded chunk with `chunk`

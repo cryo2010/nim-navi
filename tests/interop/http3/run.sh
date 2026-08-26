@@ -43,6 +43,10 @@ echo ">>> building and running the h3 multiplexing test (concurrent streams)"
 nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/dispatch_mux_test "$DIR/dispatch_mux_test.nim"
 /tmp/dispatch_mux_test
 
+echo ">>> building and running the h3 streaming test (stream()/each over h3)"
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/stream_async_test "$DIR/stream_async_test.nim"
+/tmp/stream_async_test
+
 echo ">>> building and running the h3 leak check (fd + heap growth)"
 nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/leak_test "$DIR/leak_test.nim"
 /tmp/leak_test
