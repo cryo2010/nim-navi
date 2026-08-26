@@ -42,7 +42,6 @@ proc oneUpload(api: Navi, cfg: Config, url: string) =
       "  sent " & $sent & " bytes, client sha1=" & clientSha & "\n" &
       "  server got " & $j{"size"}.getInt & " bytes, sha1=" & j{"sha1"}.getStr
     quit(1)
-  echo cfg.label, " verified: sha1 match (", sent, " bytes)"
 
 proc main() =
   let cfg = loadConfig("sync")

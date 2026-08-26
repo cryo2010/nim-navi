@@ -32,7 +32,6 @@ proc oneDownload(api: Navi, cfg: JsCfg, url: string) {.async.} =
     echo "[streamDownload js] FAIL: checksum mismatch got ", got,
          " bytes client=", clientSha, " server=", expected
     jsExit(1)
-  echo "[streamDownload js] verified: sha1 match (", got, " bytes)"
 
 proc main() {.async.} =
   let cfg = loadJsCfg()

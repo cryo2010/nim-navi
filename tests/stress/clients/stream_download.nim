@@ -39,7 +39,6 @@ proc oneDownload(api: Navi, cfg: Config, url: string) {.async.} =
       "  got " & $got & " bytes, client sha1=" & clientSha & "\n" &
       "  server x-sha1=" & expected
     quit(1)
-  echo cfg.label, " verified: sha1 match (", got, " bytes)"
 
 proc main() {.async.} =
   let cfg = loadConfig(backend)

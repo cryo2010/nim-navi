@@ -95,6 +95,11 @@ async def ws(sock: WebSocket) -> None:
 async def events(request: Request) -> StreamingResponse:
     last = request.headers.get("last-event-id")
     start = int(last) if (last and last.isdigit()) else 0
+    # Stream continuously so an SSE soak is mostly steady-state consumption; drop
+    # only every SSE_DROP_EVERY events (default 1000) so reconnect + Last-Event-ID
+    # resume is still exercised, without the churn (and error noise) of dropping
+    # after a handful of events.
+    drop_every = int(os.environ.get("NAVI_SSE_DROP_EVERY", "1000"))
 
     async def gen():
         eid = start + 1
@@ -103,8 +108,8 @@ async def events(request: Request) -> StreamingResponse:
             yield f"id: {eid}\ndata: event-{eid}\n\n"
             eid += 1
             sent += 1
-            if sent >= 50:             # drop mid-stream; client reconnects + resumes
-                return
+            if drop_every > 0 and sent >= drop_every:
+                return                 # occasional drop; client reconnects + resumes
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 

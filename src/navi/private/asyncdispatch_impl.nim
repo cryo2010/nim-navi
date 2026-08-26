@@ -12,7 +12,6 @@ import navi/core/[engine, pool, session, proxy, h2glue]
 import navi/core/[redirect, cookies, digest, cancel]
 import navi/core/decompress   # StreamDecoder, for the h1 readChunk decode state
 import navi/proto/h1
-import navi/proto/h2/conn
 import navi/proto/ws
 import navi/backend/[asyncdispatch, h2mux]
 from std/strutils import startsWith, find, splitLines, contains
@@ -655,8 +654,8 @@ proc lastEventId*(s: SseStream): string = s.parser.lastEventId()
 proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
   ## The next event, or none once the stream ends. Reconnects transparently on a
   ## drop when enabled, resending Last-Event-ID.
-  if s.closed: return none(SseEvent)
   while true:
+    if s.closed: return none(SseEvent)   # also catches a close during a parked read
     let ev = s.parser.next()
     if ev.isSome:
       if s.parser.retryMs() >= 0:
@@ -665,6 +664,7 @@ proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
     if s.handle == nil:
       if not s.reconnect: return none(SseEvent)
       await sleepAsync(min(s.retryMs, s.maxRetryMs))
+      if s.closed: return none(SseEvent)    # closed during the backoff: do not reconnect
       try:
         await s.openConn()
         s.retryMs = s.baseRetryMs
