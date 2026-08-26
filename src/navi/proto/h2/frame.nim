@@ -26,6 +26,9 @@ type
 
   FrameDecoder* = object
     buf: string
+    pos: int               ## read offset into `buf`; consumed frames sit before it
+                           ## and are dropped on the next `feed` (so popping N frames
+                           ## is O(total), not O(n^2) from front-deleting each)
     frameSizeError: bool   ## a peer frame declared a length over the max frame size
 
 const
@@ -89,6 +92,10 @@ proc encodeFrame*(typ: FrameType, flags: uint8, streamId: uint32, payload = ""):
   encodeFrame(uint8(typ), flags, streamId, payload)
 
 proc feed*(d: var FrameDecoder, data: openArray[char]) =
+  if d.pos > 0:                         # drop already-consumed frames in one shift
+    if d.pos >= d.buf.len: d.buf.setLen(0)
+    else: d.buf = d.buf[d.pos .. ^1]
+    d.pos = 0
   let start = d.buf.len
   d.buf.setLen(start + data.len)
   for i in 0 ..< data.len:
@@ -98,19 +105,21 @@ proc frameSizeError*(d: FrameDecoder): bool = d.frameSizeError
   ## A peer frame declared a length over `defaultMaxFrameSize` (FRAME_SIZE_ERROR).
 
 proc next*(d: var FrameDecoder, frame: var Frame): bool =
-  ## Pop the next complete frame, if one is fully buffered.
-  if d.buf.len < 9: return false
-  let length = readU24(d.buf, 0)
+  ## Pop the next complete frame, if one is fully buffered. Advances a read offset
+  ## rather than deleting from the front, so popping many frames stays linear.
+  let avail = d.buf.len - d.pos
+  if avail < 9: return false
+  let length = readU24(d.buf, d.pos)
   if length > defaultMaxFrameSize:      # reject before buffering the oversized payload
     d.frameSizeError = true
     return false
   let total = 9 + length
-  if d.buf.len < total: return false
-  frame.typ = uint8(d.buf[3])
-  frame.flags = uint8(d.buf[4])
-  frame.streamId = readU32(d.buf, 5) and 0x7fffffff'u32
-  frame.payload = d.buf[9 ..< total]
-  d.buf.delete(0 ..< total)
+  if avail < total: return false
+  frame.typ = uint8(d.buf[d.pos + 3])
+  frame.flags = uint8(d.buf[d.pos + 4])
+  frame.streamId = readU32(d.buf, d.pos + 5) and 0x7fffffff'u32
+  frame.payload = d.buf[d.pos + 9 ..< d.pos + total]
+  d.pos += total
   true
 
 # --- Payload builders for the frames a client sends ---

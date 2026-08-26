@@ -33,14 +33,19 @@ jobs:
       - name: Install brotli/zstd
         run: sudo apt-get update && sudo apt-get install -y libbrotli1 libzstd1
 
-      # Run the suite directly (not `nimble test`): nimble does not reliably
-      # propagate a task's exit code (nim-lang/nimble#1802), so a failing suite
-      # under `nimble test` can pass CI. tests/run.sh runs `nim c -r` per suite
-      # under `set -e`, so a failure fails the job.
+      # checkmate runs the unit suite and, unlike `nimble test`, propagates a
+      # proper exit code (nim-lang/nimble#1802). It also provides the `import
+      # checkmate` time-travel API that tt_mw_timing needs.
+      - name: Install checkmate
+        run: nimble install -y "https://github.com/cryo2010/nim-checkmate"
+
+      # --loop-in-process re-runs each file's tests 20x in one process to surface
+      # flakiness (shared state, port reuse); --bail stops at the first failure.
+      # `-d:ssl` and `--path:src` come from nim.cfg; the memory manager is matrixed
+      # via --nimflags. Discovery and excludes (e.g. tests/interop) live in
+      # .checkmate.toml.
       - name: Run tests
-        run: bash tests/run.sh
-        env:
-          NAVI_MM: ${{ matrix.mm }}
+        run: checkmate --loop=20 --loop-in-process --bail --nimflags:"--mm:${{ matrix.mm }}"
 
   compile:
     runs-on: ubuntu-latest
@@ -126,32 +131,6 @@ jobs:
       # path (a value-object client miscompiled via unsafeAddr under nim js).
       - name: navi/js cookie jar + middleware runtime test
         run: bash tests/interop/js_cookiejar.sh
-
-  middleware-timetravel:
-    runs-on: ubuntu-latest
-    name: middleware timing (checkmate time-travel)
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: jiro4989/setup-nim-action@v2
-        with:
-          nim-version: "2.2.10"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install checksums
-        run: nimble install -y checksums
-
-      # checkmate provides both the `import checkmate` time-travel API and the
-      # runner binary; `tests/tt_mw_timing.nim` is named so the plain `nimble test`
-      # glob (test_*.nim) skips it -- only this job runs it, under a virtual clock.
-      - name: Install checkmate
-        run: nimble install -y "https://github.com/cryo2010/nim-checkmate"
-
-      # Deterministically validate rateLimit pacing and the concurrency cap: inside
-      # the tests' `controlTime` blocks the async sleeps are instant but the virtual
-      # clock advances, so the asserted millisecond timings are exact and fast.
-      - name: Run the middleware timing tests under time travel
-        run: checkmate tt_mw_timing
 
   sanitize:
     runs-on: ubuntu-latest

@@ -38,7 +38,7 @@ suite "chronos entry end to end":
     joinThread(th)
 
   test "stream should return the connection to the pool after a full drain":
-    const port = 9214
+    var port = 0
     var accepts = 0
     var th: Thread[KeepAliveCtx]
     startKeepAlive(th, port, requests = 2, accepts = addr accepts)
@@ -58,7 +58,7 @@ suite "chronos entry end to end":
     check accepts == 1                            # both requests used the one connection
 
   test "stream should close (not pool) the connection when the drain fails":
-    const port = 9215
+    var port = 0
     var accepts = 0
     var th: Thread[KeepAliveCtx]
     startKeepAlive(th, port, requests = 1, accepts = addr accepts)
@@ -76,7 +76,7 @@ suite "chronos entry end to end":
     joinThread(th)
 
   test "cancel should abort an in-flight request":
-    const port = 9211
+    var port = 0
     var th: Thread[ServerCtx]
     startHang(th, port)  # accepts, reads the request, never replies
 

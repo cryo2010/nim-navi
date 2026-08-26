@@ -53,7 +53,7 @@ suite "sync entry end to end":
     joinThread(th)
 
   test "get should reuse a pooled connection for the same origin":
-    const port = 8974
+    var port = 0
     var accepts = 0
     var th: Thread[KeepAliveCtx]
     startKeepAlive(th, port, requests = 2, accepts = addr accepts)
@@ -72,7 +72,7 @@ suite "sync entry end to end":
     check accepts == 1  # both requests used the one connection
 
   test "close should drain the connection pool":
-    const port = 8995
+    var port = 0
     var accepts = 0
     var th: Thread[KeepAliveCtx]
     startKeepAlive(th, port, requests = 2, accepts = addr accepts)
@@ -86,7 +86,7 @@ suite "sync entry end to end":
     joinThread(th)
 
   test "a client dropped without close should still close its pooled connections":
-    const port = 8998
+    var port = 0
     var accepts = 0
     var th: Thread[KeepAliveCtx]
     startKeepAlive(th, port, requests = 1, accepts = addr accepts)
@@ -116,7 +116,7 @@ suite "sync entry end to end":
     joinThread(th)
 
   test "stream should return the connection to the pool after a full drain":
-    const port = 8996
+    var port = 0
     var accepts = 0
     var th: Thread[KeepAliveCtx]
     startKeepAlive(th, port, requests = 2, accepts = addr accepts)
@@ -136,7 +136,7 @@ suite "sync entry end to end":
     check accepts == 1                      # both requests used the one connection
 
   test "stream should close (not pool) the connection when the drain fails":
-    const port = 8997
+    var port = 0
     var accepts = 0
     var th: Thread[KeepAliveCtx]
     startKeepAlive(th, port, requests = 1, accepts = addr accepts)
@@ -154,7 +154,7 @@ suite "sync entry end to end":
     joinThread(th)
 
   test "readChunk should deliver the body in order and end by pooling the connection":
-    const port = 8999
+    var port = 0
     var accepts = 0
     var th: Thread[KeepAliveCtx]
     startKeepAlive(th, port, requests = 2, accepts = addr accepts)
@@ -173,7 +173,7 @@ suite "sync entry end to end":
     check accepts == 1
 
   test "a readChunk stream dropped before EOF should be closed by the guard":
-    const port = 9001
+    var port = 0
     var accepts = 0
     var th: Thread[KeepAliveCtx]
     startKeepAlive(th, port, requests = 1, accepts = addr accepts)
@@ -465,7 +465,7 @@ suite "sync entry end to end":
     joinThread(th)
 
   test "the client should time out when the response is stalled":
-    const port = 8996
+    var port = 0
     var th: Thread[ServerCtx]
     startHang(th, port)  # accepts, reads the request, never replies
 
@@ -482,7 +482,7 @@ suite "sync entry end to end":
     joinThread(th)
 
   test "parallel should time out when the response is stalled":
-    const port = 8997
+    var port = 0
     var th: Thread[ServerCtx]
     startHang(th, port)
 
@@ -546,7 +546,7 @@ suite "sync entry end to end":
     joinThread(th)
 
   test "parallel should fetch multiple same-origin URLs over one connection":
-    const port = 8993
+    var port = 0
     var accepts = 0
     var th: Thread[KeepAliveCtx]
     startKeepAlive(th, port, requests = 3, accepts = addr accepts)
@@ -721,7 +721,7 @@ suite "per-phase timeouts":
     check (cfg.connectMs, cfg.readMs, cfg.totalMs) == (100, 200, 300)
 
   test "the read timeout should fire when the response is stalled":
-    const port = 8998
+    var port = 0
     var th: Thread[ServerCtx]
     startHang(th, port)
     var cfg = initNaviConfig()
@@ -735,7 +735,7 @@ suite "per-phase timeouts":
     joinThread(th)
 
   test "the total timeout should fire when the response is stalled":
-    const port = 8999
+    var port = 0
     var th: Thread[ServerCtx]
     startHang(th, port)
     var cfg = initNaviConfig()
