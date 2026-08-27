@@ -490,6 +490,10 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
     applyCookies(client.jar, rreq)
     let handle = await openStreamConn(client, rreq)
     handle.cancel = cancel
+    when defined(naviHttp3):                       # learn h3 from a streamed response
+      let alt = handle.resp.headers.get("alt-svc")  # too, so SSE/stream can upgrade
+      if alt.len > 0:
+        client.altSvc.record("https", rreq.url.host, rreq.url.port, alt)
     # Arm the leak-guard for the synchronous fallback teardown if the handle is
     # dropped without drain/close. Captures only the connection essentials (never
     # `handle`, which would cycle): the h1 transport, or the mux + stream id.

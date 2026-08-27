@@ -11,10 +11,12 @@ import navi/core/[engine, pool, session, proxy, h2glue]
 import navi/core/[redirect, cookies, digest, cancel]
 import navi/core/decompress   # StreamDecoder, for the readChunk decode state
 import navi/proto/h1
-import navi/proto/h2/conn
 import navi/proto/ws
 import navi/backend/[chronos, h2mux_chronos]
 from std/strutils import startsWith, find, splitLines, contains, toLowerAscii
+when defined(naviHttp3):
+  import navi/core/altsvc
+  import navi/backend/quic_chronos
 
 claimEntry("navi/chronos")
 export public, chronos
@@ -51,6 +53,10 @@ type
     jar*: CookieJar
     muxes: TableRef[string, H2Mux]              ## live shared h2 connections
     pendingMux: TableRef[string, Future[H2Mux]] ## in-flight connects (coalescing)
+    when defined(naviHttp3):
+      altSvc: AltSvcCache                       ## per-origin h3 discovery cache
+      h3conns: TableRef[string, QuicConnChronos] ## live multiplexed h3 connections
+      pendingH3: TableRef[string, Future[QuicConnChronos]] ## in-flight h3 connects
 
 proc initNaviConfig*(): NaviConfig =
   ## The only way to build a config (`NaviConfig` requires every field). Sets the
@@ -66,18 +72,26 @@ proc newNavi*(config = initNaviConfig()): Navi =
   cfg.tls.sessionCache = newTlsStore(cfg.tls)   # always its own cache, so a config
   cfg.tls.contextStore = newTlsCtxStore(cfg.tls) # cloned from another client (e.g.
                                                  # newNavi(other.config)) is isolated
-  Navi(config: cfg, pool: newPool[PooledConn[Conn]](), jar: newCookieJar(),
+  result = Navi(config: cfg, pool: newPool[PooledConn[Conn]](), jar: newCookieJar(),
        muxes: newTable[string, H2Mux](),
        pendingMux: newTable[string, Future[H2Mux]]())
+  when defined(naviHttp3):
+    result.altSvc = newAltSvcCache()
+    result.h3conns = newTable[string, QuicConnChronos]()
+    result.pendingH3 = newTable[string, Future[QuicConnChronos]]()
 
 proc extend*(client: Navi, config: NaviConfig): Navi =
   var merged = mergeBase(client.config, config)
   merged.middleware = client.config.middleware & config.middleware
   merged.tls.sessionCache = newTlsStore(merged.tls)  # its own cache, not the parent's
   merged.tls.contextStore = newTlsCtxStore(merged.tls)  # its own contexts too
-  Navi(config: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar(),
+  result = Navi(config: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar(),
        muxes: newTable[string, H2Mux](),
        pendingMux: newTable[string, Future[H2Mux]]())
+  when defined(naviHttp3):
+    result.altSvc = newAltSvcCache()
+    result.h3conns = newTable[string, QuicConnChronos]()
+    result.pendingH3 = newTable[string, Future[QuicConnChronos]]()
 
 proc close*(client: Navi): Future[void] {.async.} =
   ## Close all pooled connections and shared h2 connections, freeing their TLS
@@ -88,8 +102,19 @@ proc close*(client: Navi): Future[void] {.async.} =
   for mux in client.muxes.values:
     await mux.close()
   client.muxes.clear()
+  when defined(naviHttp3):
+    for qc in client.h3conns.values:
+      await qc.closeConn()
+    client.h3conns.clear()
   closeTlsStore(client.config.tls.sessionCache)
   closeTlsCtxStore(client.config.tls.contextStore)
+
+when defined(naviHttp3):
+  proc recordAltSvc(client: Navi, req: Request, resp: Response) =
+    ## Cache an h3 endpoint the origin advertised, so later requests can upgrade.
+    let alt = resp.headers.get("alt-svc")
+    if alt.len > 0:
+      client.altSvc.record("https", req.url.host, req.url.port, alt)
 
 proc muxRequest(client: Navi, mux: H2Mux, req: Request,
                 sink: BodySink): Future[Response] {.async.} =
@@ -97,22 +122,84 @@ proc muxRequest(client: Navi, mux: H2Mux, req: Request,
   # content-encoding as it arrives), so the returned response's body is empty.
   # A non-streaming request (sink == nil) still buffers into r.body as before.
   result = toResponse(await mux.request(h2HeaderList(req), req.body, req.bodyStream, sink))
+  when defined(naviHttp3): client.recordAltSvc(req, result)
 
 proc h1OnConn(client: Navi, conn: Conn, origin: string, req: Request,
               sink: BodySink): Future[Response] {.async.} =
   var keep = false
   result = h1Exchange(conn, req, sink, keep,
                       client.config.wantsDecompress, client.config.maxResponseBytes)
+  when defined(naviHttp3): client.recordAltSvc(req, result)
   let pc = PooledConn[Conn](transport: conn)
   if not (keep and pushIdle(client.pool, origin, pc)):
     await close(conn)
 
+when defined(naviHttp3):
+  # Fields that must not cross to HTTP/3 (RFC 9114 connection-specific + the
+  # pseudo-header sources). accept-encoding IS forwarded so decodeBody decodes.
+  const h3SkipHeaders = ["host", "connection", "keep-alive", "proxy-connection",
+                         "transfer-encoding", "upgrade", "content-length"]
+
+  proc getH3Conn(client: Navi, origin: string, ep: AltSvcEndpoint,
+                 req: Request): Future[QuicConnChronos] {.async.} =
+    ## Reuse the origin's live h3 connection, or open one and cache it. Concurrent
+    ## cold connects to the same origin are coalesced through a single in-flight
+    ## future (mirrors pendingMux for h2): without it, a burst of streams to a new
+    ## origin each opens -- and leaks -- its own QUIC connection, since the plain
+    ## open-then-recheck races (both see an empty cache and both cache a survivor).
+    if client.h3conns.hasKey(origin) and client.h3conns[origin].alive:
+      return client.h3conns[origin]
+    if client.pendingH3.hasKey(origin):
+      let qc = await client.pendingH3[origin]
+      if qc != nil and qc.alive: return qc
+    # Register the in-flight connect synchronously (no await before this) so racing
+    # callers await it instead of opening a second connection.
+    let pending = newFuture[QuicConnChronos]("navi.pendingH3")
+    client.pendingH3[origin] = pending
+    try:
+      let qc = await openConnChronos(ep.host, ep.port, req.url.host,
+                                     client.config.tls.caFile,
+                                     client.config.tls.wantsVerify)
+      client.h3conns[origin] = qc
+      client.pendingH3.del(origin)
+      pending.complete(qc)
+      return qc
+    except CatchableError as e:
+      client.pendingH3.del(origin)
+      if not pending.finished: pending.fail(e)
+      raise
+
+  proc h3TransportChronos(client: Navi, req: Request,
+                          ep: AltSvcEndpoint): Future[Response] {.async.} =
+    ## Send a buffered-body request over a shared HTTP/3 connection. Raises QuicError.
+    var fwd: seq[(string, string)]
+    for k, v in req.headers:
+      let lk = k.toLowerAscii
+      if lk notin h3SkipHeaders: fwd.add((lk, v))
+    let origin = originKey(req.url)
+    let qc = await client.getH3Conn(origin, ep, req)
+    try:
+      let r = await qc.requestOnConn($req.verb, req.url.requestTarget, fwd, req.body)
+      result = initResponse(r.status, "", "HTTP/3", initHeaders(r.headers), r.body)
+    except QuicError:
+      if client.h3conns.getOrDefault(origin, nil) == qc:
+        client.h3conns.del(origin)
+      raise
+
 proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
   ## Multiplex over a shared h2 connection when available/negotiable; otherwise
   ## pool http/1.1. Concurrent connects to the same new origin are coalesced so a
-  ## cold burst still ends up on one h2 connection.
+  ## cold burst still ends up on one h2 connection. In a -d:naviHttp3 build, a
+  ## buffered request to an h3-advertised origin (Alt-Svc) goes over HTTP/3.
   let origin = originKey(req.url)
   let wantH2 = client.config.wantsH2 and req.url.isTls
+
+  when defined(naviHttp3):
+    if client.config.wantsH3 and req.url.isTls and req.bodyStream == nil:
+      let ep = client.altSvc.h3Endpoint("https", req.url.host, req.url.port)
+      if ep.isSome:
+        try: return await h3TransportChronos(client, req, ep.get)
+        except QuicError: discard   # fall back to h2/h1 below
 
   if wantH2:
     # 1. A live shared connection, or one currently being established.
@@ -244,7 +331,7 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
 # --- Streaming downloads (pull-based handle) ---
 
 type
-  StreamKind = enum skH1, skH2
+  StreamKind = enum skH1, skH2, skH3
   StreamResponseObj = object
     ## The response of a streaming request: status/headers are available
     ## immediately while the body is drained on demand. Holds either a checked-out
@@ -270,6 +357,11 @@ type
     of skH2:
       mux: H2Mux               ## the shared connection (stays live for reuse)
       sid: uint32              ## our stream on it
+    of skH3:
+      when defined(naviHttp3):
+        qc: QuicConnChronos    ## the shared h3 connection (stays live for reuse)
+        h3sid: int64           ## our QUIC stream on it
+      else: discard
   StreamResponse* = ref StreamResponseObj
 
 proc close*(sr: StreamResponse): Future[void] {.async.} =
@@ -282,6 +374,9 @@ proc close*(sr: StreamResponse): Future[void] {.async.} =
   case sr.kind
   of skH1: await close(sr.transport)
   of skH2: await sr.mux.abandon(sr.sid)
+  of skH3:
+    when defined(naviHttp3): sr.qc.freeStream(sr.h3sid)  # STOP_SENDING; conn stays up
+    else: discard
 
 proc status*(sr: StreamResponse): int = sr.resp.status
   ## The response status code, available before the body is drained.
@@ -300,6 +395,29 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
   let wantH2 = client.config.wantsH2 and req.url.isTls
   let decompress = client.config.wantsDecompress
   let cap = client.config.maxResponseBytes
+
+  when defined(naviHttp3):
+    # Stream over HTTP/3 when the origin advertised h3 (Alt-Svc); any QUIC failure
+    # falls through to h2/h1. Mirrors the buffered h3TransportChronos path.
+    if client.config.wantsH3 and req.url.isTls and req.bodyStream == nil:
+      let ep = client.altSvc.h3Endpoint("https", req.url.host, req.url.port)
+      if ep.isSome:
+        try:
+          let qc = await client.getH3Conn(origin, ep.get, req)
+          var fwd: seq[(string, string)]
+          for k, v in req.headers:
+            let lk = k.toLowerAscii
+            if lk notin h3SkipHeaders: fwd.add((lk, v))
+          let sid = qc.submitStream($req.verb, req.url.requestTarget, fwd, req.body)
+          if sid >= 0:
+            let (status, hdrs) = await qc.awaitHeaders(sid)
+            return StreamResponse(kind: skH3, qc: qc, h3sid: sid,
+              resp: initResponse(status, "", "HTTP/3", initHeaders(hdrs), ""),
+              client: client, key: origin, decompress: decompress, cap: cap)
+        except QuicError:
+          if client.h3conns.getOrDefault(origin, nil) != nil and
+             not client.h3conns[origin].alive:
+            client.h3conns.del(origin)
 
   if wantH2:
     if client.muxes.hasKey(origin) and client.muxes[origin].canReuse:
@@ -388,6 +506,8 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
     applyCookies(client.jar, rreq)
     let handle = await openStreamConn(client, rreq)
     handle.cancel = cancel
+    when defined(naviHttp3): client.recordAltSvc(rreq, handle.resp)  # learn h3 from a
+                                                                     # streamed response too
     # Arm the leak-guard for the synchronous fallback teardown if the handle is
     # dropped without drain/close. Captures only the connection essentials (never
     # `handle`, which would cycle): the h1 transport, or the mux + stream id.
@@ -405,6 +525,15 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
         {.cast(gcsafe).}:
           try: (if mux != nil: mux.dropStream(sid))
           except Exception: discard)
+    of skH3:
+      when defined(naviHttp3):
+        let qc = handle.qc
+        let sid = handle.h3sid
+        handle.guard = newStreamGuard(proc() {.gcsafe, raises: [].} =
+          {.cast(gcsafe).}:
+            try: (if qc != nil: qc.freeStream(sid))
+            except Exception: discard)
+      else: discard
     storeCookies(client.jar, rreq.url, handle.resp)
     if handle.status == 401 and client.config.auth.kind == akDigest and
        not rreq.headers.contains("authorization"):
@@ -457,6 +586,38 @@ proc readChunk*(sr: StreamResponse): Future[string] {.async.} =
       disarm(sr.guard)
       await close(sr.transport)
       raise
+  of skH3:
+    when defined(naviHttp3):
+      # h3 body arrives raw; apply the same streamed decode + size-cap as h1, then
+      # free the stream at EOF (a reset surfaces as an error). The connection stays up.
+      try:
+        while true:
+          let raw = await sr.qc.readStreamBody(sr.h3sid)
+          if raw.len == 0:                # EOF
+            sr.drained = true
+            disarm(sr.guard)
+            let wasReset = sr.qc.streamWasReset(sr.h3sid)
+            sr.qc.freeStream(sr.h3sid)
+            if wasReset: raise newException(IOError, "navi: http/3 stream reset")
+            return ""
+          if not sr.decReady:
+            sr.dec = if sr.decompress:
+                newStreamDecoder(sr.resp.headers.get("content-encoding")) else: nil
+            sr.decReady = true
+          let decoded = if sr.dec != nil:
+              sr.dec.update(raw.toOpenArrayByte(0, raw.high)) else: raw
+          if decoded.len == 0: continue   # decoder buffered input; pull more
+          sr.seen += decoded.len
+          if sr.cap > 0 and sr.seen > sr.cap:
+            raise newException(ResponseTooLargeError,
+              "navi: response exceeded maxResponseBytes")
+          return decoded
+      except CatchableError:
+        if not sr.drained: sr.drained = true
+        disarm(sr.guard)
+        sr.qc.freeStream(sr.h3sid)
+        raise
+    else: discard
 
 proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
   ## Deliver the response body to `sink` as it arrives (decoded and size-capped),
@@ -487,6 +648,19 @@ proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
       if not sr.drained: sr.drained = true   # mark consumed for the "call once" guard
       await close(sr.transport)
       raise
+  of skH3:
+    when defined(naviHttp3):
+      # Reuse readChunk's decode/cap/free per chunk; it sets `drained` at EOF. The
+      # sink is a bare closure (no chronos raises annotation); navi's contract is it
+      # raises at most CatchableError -- discharge chronos's strict effects here, as
+      # drainDownload does.
+      while true:
+        let chunk = await sr.readChunk()
+        if chunk.len == 0: break
+        {.cast(gcsafe).}:
+          {.cast(raises: [CatchableError]).}:
+            await sink(chunk)
+    else: discard
 
 template each*(sr: StreamResponse; chunk, body: untyped): untyped =
   ## Drain the streaming body, running `body` for each decoded chunk with `chunk`

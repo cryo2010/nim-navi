@@ -63,9 +63,6 @@ proc skipReason*(c: Config): string =
   if c.proto == "h3":
     when not defined(naviHttp3):
       return "skip: h3 needs a -d:naviHttp3 build (use the h3 image)"
-    else:
-      if c.backend in ["chronos", "js"]:
-        return "skip: h3 is sync + asyncdispatch only"
   if c.backend == "js":
     if c.workload == "streamUpload": return "skip: js cannot stream request bodies"
     if c.proto == "h3": return "skip: js/undici has no HTTP/3"

@@ -47,6 +47,6 @@ ENV LD_LIBRARY_PATH=$OSSL/lib:$NGHTTP3/lib:$NGTCP2/lib
 
 WORKDIR /navi
 COPY . .
-RUN nimble install -y checksums
+RUN nimble install -y checksums chronos
 
 ENTRYPOINT ["bash", "tests/interop/http3/run.sh"]

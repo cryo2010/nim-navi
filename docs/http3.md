@@ -3,7 +3,7 @@
 ## Goal
 
 Offer HTTP/3 as an **opt-in** capability on the native OpenSSL backends (`navi`
-sync and `navi/asyncdispatch`), reusing navi's existing request/response and
+sync, `navi/asyncdispatch`, and `navi/chronos`), reusing navi's existing request/response and
 streaming surface unchanged. h3 is negotiated per origin via Alt-Svc (or an
 HTTPS DNS record), transparently, so calling code does not change:
 
@@ -22,9 +22,11 @@ dependency-free default; nothing here is compiled unless `-d:naviHttp3` is set.
 
 - **No hand-rolled QUIC or QPACK.** Reimplementing QPACK and a QUIC state machine
   is not worth it; we link the same stack curl uses.
-- **No h3 on chronos.** The chronos backend is BearSSL; ngtcp2 does not support
-  BearSSL, so chronos stays h1. (A future native path could use a Nim QUIC lib,
-  out of scope here.)
+- **h3 on chronos (as of the OpenSSL migration).** The chronos backend now links
+  OpenSSL like the other native backends, so ngtcp2's crypto binding works there
+  too: `navi/chronos` gets HTTP/3 (buffered + streaming/SSE) via a chronos-native
+  QUIC driver (`backend/quic_chronos.nim`). This bullet originally read "no h3 on
+  chronos" back when chronos was BearSSL.
 - **No h3 work on `navi/js`.** The browser/Node runtime already does h3 under
   `fetch`; it needs nothing from navi.
 - **No h3 server, no 0-RTT early data (initially), no WebSocket-over-HTTP/3.**
@@ -166,8 +168,8 @@ This is the real work the library does not do for us:
 
 | Capability | `navi` (sync) | `navi/asyncdispatch` | `navi/chronos` | `navi/js` |
 | --- | :---: | :---: | :---: | :---: |
-| HTTP/3 | opt-in (`-d:naviHttp3`) | opt-in (`-d:naviHttp3`) | no (BearSSL) | runtime |
-| h3 multiplexing | sequential per conn | transparent | n/a | runtime |
+| HTTP/3 | opt-in (`-d:naviHttp3`) | opt-in (`-d:naviHttp3`) | opt-in (`-d:naviHttp3`) | runtime |
+| h3 multiplexing | sequential per conn | transparent | transparent | runtime |
 
 ## Feature parity notes
 
