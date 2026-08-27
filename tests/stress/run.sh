@@ -43,6 +43,13 @@ env -u LD_LIBRARY_PATH openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
 # --- start N servers for a given protocol -----------------------------------
 start_servers() {
   local p="$1" i port
+  # hypercorn recycles each h2 connection after keep_alive_max_requests (default
+  # 1000): on a high-throughput loopback soak that churns connections constantly and,
+  # for a non-idempotent request in flight when a connection is recycled, surfaces a
+  # spurious transport error. A real keep-alive server does not rotate that eagerly,
+  # so raise the cap (override with NAVI_KEEPALIVE_MAX to exercise recycling).
+  local hcfg="$work/hypercorn.toml"
+  printf 'keep_alive_max_requests = %s\n' "${NAVI_KEEPALIVE_MAX:-1000000000}" >"$hcfg"
   if [ "$p" = "h3" ]; then
     command -v caddy >/dev/null || { echo "caddy required for h3 (use the h3 image)"; return 1; }
     local caddyfile="$work/Caddyfile"
@@ -60,7 +67,7 @@ start_servers() {
     for ((i=0; i<servers; i++)); do
       port=$((base_port + i))
       local bport=$((base_port + 1000 + i))
-      hypercorn "app:app" --bind "127.0.0.1:$bport" >"$work/srv-$i.log" 2>&1 &
+      hypercorn "app:app" --bind "127.0.0.1:$bport" --config "$hcfg" >"$work/srv-$i.log" 2>&1 &
       pids+=($!)
       cat >>"$caddyfile" <<-EOF
 	https://$host:$port {
@@ -76,7 +83,7 @@ start_servers() {
     for ((i=0; i<servers; i++)); do
       port=$((base_port + i))
       hypercorn "app:app" --bind "$host:$port" --certfile "$cert" --keyfile "$key" \
-        >"$work/srv-$i.log" 2>&1 &
+        --config "$hcfg" >"$work/srv-$i.log" 2>&1 &
       pids+=($!)
     done
   fi
