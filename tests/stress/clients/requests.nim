@@ -10,9 +10,13 @@
 ## memory stays flat over a long soak. A reporter prints status counts + RSS every
 ## report interval. Transport failures increment an error count and the soak goes on.
 
-import std/times
+import std/[times, tables]
+from std/os import getEnv
 import ../zlibcodec
 import ../common/[config, reporter, servers]
+
+var errLog = initCountTable[string]()   # distinct error name+msg -> count (diagnostic)
+let logErrors = getEnv("NAVI_LOG_ERRORS").len > 0
 when defined(useChronos):
   import navi/chronos
   const backend = "chronos"
@@ -54,8 +58,10 @@ proc worker(api: Navi, cfg: Config, pool: ptr ServerPool,
     try:
       let res = await api.request(v, url, headers = h, body = body)
       counter.tally(res.status)        # then res drops: no body retained
-    except CatchableError:
+    except CatchableError as e:
       counter.fail()
+      if logErrors:
+        {.cast(gcsafe).}: errLog.inc($v & " " & $e.name & ": " & e.msg)  # single-threaded
 
 proc reporterLoop(cfg: Config, counter: StatusCounter,
                   start, deadline: float) {.async.} =
@@ -65,6 +71,10 @@ proc reporterLoop(cfg: Config, counter: StatusCounter,
     if epochTime() - last >= cfg.reportSeconds.float:
       last = epochTime()
       report(cfg.label, counter, epochTime() - start)
+      if logErrors:
+        {.cast(gcsafe).}:
+          for msg, cnt in errLog:                 # unsorted: sort() would freeze the table
+            stderr.writeLine "  err[" & $cnt & "] " & msg
 
 proc main() {.async.} =
   let cfg = loadConfig(backend)
