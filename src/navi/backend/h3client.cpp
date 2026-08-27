@@ -188,6 +188,13 @@ int on_recv_data(nghttp3_conn *, std::int64_t stream_id, const std::uint8_t *dat
   } catch (...) {
     return NGHTTP3_ERR_CALLBACK_FAILURE;
   }
+  // nghttp3_conn_read_stream's return (extended in on_recv_stream_data) does NOT
+  // count the DATA payload delivered here, so credit these bytes back to QUIC flow
+  // control now that we have buffered them. Without this the connection-level
+  // receive window (initial_max_data) leaks ~body-size per stream and wedges after
+  // ~1 MiB cumulative across a long-lived connection's streams (e.g. SSE reconnects).
+  ngtcp2_conn_extend_max_stream_offset(c->conn, stream_id, datalen);
+  ngtcp2_conn_extend_max_offset(c->conn, datalen);
   return 0;
 }
 
