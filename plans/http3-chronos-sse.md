@@ -9,7 +9,7 @@ needs more than a port, because two assumptions don't hold:
    `request()`-only**. The C driver (`h3client.cpp`) accumulates the whole
    response body (`Stream.body.append` in `on_recv_data`) and hands it over in one
    shot via `navi_h3_take_response`; there is no incremental read. `h3TransportAsync`
-   only hooks the buffered `transport()` path — `openStreamConn`/`stream()` has **no
+   only hooks the buffered `transport()` path - `openStreamConn`/`stream()` has **no
    h3 branch**. So `stream()`/`sse()` silently fall back to h2/h1. (An earlier "h3
    SSE" stress run got events because the SSE stream rode **h2** through Caddy, not
    h3.) `docs/http3.md` itself lists streaming/SSE over h3 as conditional future
@@ -29,7 +29,7 @@ hard parts are proven on the reference backend (asyncdispatch) before chronos:
   navi's `StreamResponse`), wired into `stream()`/`sse()` on asyncdispatch. This
   makes SSE-over-h3 real and testable on the reference backend. *Prerequisite for
   the actual goal; missing on every backend today.*
-- **B. `quic_chronos.nim`** — a chronos-native QUIC driver (the twin of
+- **B. `quic_chronos.nim`** - a chronos-native QUIC driver (the twin of
   `quic_async.nim`), giving chronos buffered `request()` h3 parity.
 - **C. Wire the h3 streaming layer (from A) into chronos**, so SSE/stream() ride
   h3 on chronos too.
@@ -42,24 +42,24 @@ reuses A.
 
 - `src/navi/backend/quic.nim` FFI + `h3client.cpp` step-function core
   (`navi_h3_new/fd/send/recv/timeout_ms/handle_timeout/handshake_done/bind/submit/
-  stream_done/stream_reset/take_response/close`) — event-loop-agnostic.
-- `src/navi/core/altsvc.nim` — Alt-Svc parse/record/`h3Endpoint`, backend-agnostic.
-- `src/navi/backend/openssl_ctx.nim` — TLS context/verify, already shared.
+  stream_done/stream_reset/take_response/close`) - event-loop-agnostic.
+- `src/navi/core/altsvc.nim` - Alt-Svc parse/record/`h3Endpoint`, backend-agnostic.
+- `src/navi/backend/openssl_ctx.nim` - TLS context/verify, already shared.
 - `Http3Response`, `QuicError` types.
 
 ---
 
-## Phase A — Streaming/SSE over h3 (on asyncdispatch first)
+## Phase A - Streaming/SSE over h3 (on asyncdispatch first)
 
 ### A1. Incremental-read C/FFI API (`h3client.cpp` + `quic.nim`)
 The driver already buffers `Stream.body` incrementally via nghttp3's `on_recv_data`.
 Add a non-buffering drain so navi can pull chunks as they land:
 
-- `navi_h3_read_body(c, sid, buf, cap, outEof) -> ssize` — copy up to `cap` bytes
+- `navi_h3_read_body(c, sid, buf, cap, outEof) -> ssize` - copy up to `cap` bytes
   of stream `sid`'s currently-accumulated body into `buf`, erase them from the
   internal `std::string`, and set `outEof` when the stream has ended and the buffer
   is drained. Returns bytes copied (0 = nothing available yet, not EOF).
-- `navi_h3_response_headers(c, sid, ...)` — take just the status + headers once
+- `navi_h3_response_headers(c, sid, ...)` - take just the status + headers once
   they've arrived (nghttp3 `on_recv_header`/end-of-headers), so `stream()` can
   return a headers-first handle before the body is done.
 - Keep `take_response` for the buffered path (unchanged).
@@ -69,7 +69,7 @@ Backpressure: nghttp3/QUIC stream flow control replenishes as the C buffer is
 drained; navi's awaited `each`/`drain` per-chunk pull gates it (mirrors the h2
 window model).
 
-### A2. `h3glue` — surface a `StreamResponse` over h3
+### A2. `h3glue` - surface a `StreamResponse` over h3
 New `src/navi/backend/h3glue.nim` (the h3 twin of `h2glue.nim`): given a
 `QuicConnAsync` + submitted `sid`, produce the same headers-first handle the h1/h2
 paths return, whose chunk-pull calls `navi_h3_read_body` and whose completion maps
@@ -83,7 +83,7 @@ wakes), exactly like the h2 mux's `recvReady`.
   enabled, TLS, and Alt-Svc has an endpoint, submit the request on the shared
   `QuicConnAsync` and return the `h3glue` `StreamResponse` (readChunk pulls body
   incrementally). Redirect/digest/close semantics match the h2 branch.
-- `sse()`/`stream()` need **no changes** — they ride `openStreamConn`.
+- `sse()`/`stream()` need **no changes** - they ride `openStreamConn`.
 - Streamed **request** bodies (`bodyStream`) over h3 can stay out of scope for A
   (map to nghttp3 `read_body` later); document it, like today.
 
@@ -94,7 +94,7 @@ and body integrity. Reuse the existing Caddy h3 origin/harness.
 
 ---
 
-## Phase B — `quic_chronos.nim` (chronos QUIC driver)
+## Phase B - `quic_chronos.nim` (chronos QUIC driver)
 
 Port `quic_async.nim` to chronos. Same shape (`QuicConnChronos` with `c`, fd,
 `waiters`, `wakeup`, `alive`, `readerDone`), different event-loop primitives:
@@ -110,7 +110,7 @@ Port `quic_async.nim` to chronos. Same shape (`QuicConnChronos` with `c`, fd,
 | raw `sockSend`/`sockRecv` on the fd | unchanged (OS syscalls on the driver's fd) |
 
 Recommended socket integration: **reuse the C driver's raw UDP fd** (`navi_h3_fd`)
-and wait on it with chronos's low-level fd readiness — the closest 1:1 port,
+and wait on it with chronos's low-level fd readiness - the closest 1:1 port,
 minimal C change. (A `DatagramTransport` is more idiomatic but would require the C
 driver to not own the socket; defer unless the raw-fd path fights chronos's
 strict-effects.) The chronos reader must satisfy `{.async: (raises: [...]).}` and
@@ -121,7 +121,7 @@ Wire buffered h3 in `chronos_impl.nim` mirroring `asyncdispatch_impl.nim`: add
 procs, the Alt-Svc record on responses, and h3 teardown in `close`. All under
 `when defined(naviHttp3)`.
 
-## Phase C — streaming h3 on chronos
+## Phase C - streaming h3 on chronos
 Reuse Phase A's `h3glue` design over `QuicConnChronos`; add the h3 branch to the
 chronos `openStreamConn`. Since `h3glue` is written against the FFI + a small
 per-driver "submit/read/close" interface, factor that interface so both drivers
@@ -140,7 +140,7 @@ letting one `h3glue` serve both backends.
   `src/navi/private/asyncdispatch_impl.nim` (A3 stream h3 branch);
   `src/navi/private/chronos_impl.nim` (B/C wiring); `src/navi/chronos.nim` if it
   gates the quic import; `tests/interop/http3/run.sh` (add chronos + streaming
-  legs); `navi.nimble` (h3 tasks); `docs/http3.md` (it's **stale** — remove the
+  legs); `navi.nimble` (h3 tasks); `docs/http3.md` (it's **stale** - remove the
   "no h3 on chronos / BearSSL" claim, document chronos h3 + streaming).
 
 ## Gap-policy / stress follow-up
@@ -149,14 +149,14 @@ Once chronos h3 lands, update the stress harness gap policy
 matrix. (Left as a small final step, not part of the core feature.)
 
 ## Verification
-- **A (asyncdispatch streaming h3):** `tests/interop/http3` streaming test — SSE
+- **A (asyncdispatch streaming h3):** `tests/interop/http3` streaming test - SSE
   receives events and `stream()` downloads a payload over `HTTP/3` (assert
   `httpVersion`), hash-verified, against the Caddy h3 origin. Also the stress
   `stressSse`/`stressStreamDownload` with `NAVI_PROTO=h3 NAVI_BACKEND=asyncdispatch`
   now genuinely ride h3 (confirm via a server/log check, since Caddy also serves h2).
-- **B (chronos buffered h3):** `dispatch_chronos_test.nim` — Alt-Svc upgrade + a
+- **B (chronos buffered h3):** `dispatch_chronos_test.nim` - Alt-Svc upgrade + a
   buffered GET/POST over h3 on chronos, mirroring `dispatch_async_test.nim`.
-- **C (chronos streaming h3):** `stream_chronos_test.nim` — SSE/stream() over h3 on
+- **C (chronos streaming h3):** `stream_chronos_test.nim` - SSE/stream() over h3 on
   chronos.
 - Full unit suite stays green; the h3 image already builds the ngtcp2/nghttp3/
   OpenSSL-3.5 toolchain.

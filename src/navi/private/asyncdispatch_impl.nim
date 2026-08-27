@@ -198,6 +198,12 @@ when defined(naviHttp3):
   const h3SkipHeaders = ["host", "connection", "keep-alive", "proxy-connection",
                          "transfer-encoding", "upgrade", "content-length"]
 
+  proc recordAltSvc(client: Navi, req: Request, resp: Response) =
+    ## Cache an h3 endpoint the origin advertised, so later requests can upgrade.
+    let alt = resp.headers.get("alt-svc")
+    if alt.len > 0:
+      client.altSvc.record("https", req.url.host, req.url.port, alt)
+
   proc getH3Conn(client: Navi, origin: string, ep: AltSvcEndpoint,
                  req: Request): Future[QuicConnAsync] {.async.} =
     ## Reuse the origin's live h3 connection, or open one and cache it. A cold
@@ -245,9 +251,7 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
         except QuicError: discard   # fall back to h2/h1 below
   result = await transportInner(client, req, sink)
   when defined(naviHttp3):
-    let alt = result.headers.get("alt-svc")
-    if alt.len > 0:
-      client.altSvc.record("https", req.url.host, req.url.port, alt)
+    client.recordAltSvc(req, result)
 
 proc doRequest(client: Navi, req: Request): Future[Response] {.async.} =
   result = performRequest(client, req)
@@ -397,10 +401,14 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
             if lk notin h3SkipHeaders: fwd.add((lk, v))
           let sid = qc.submitStream($req.verb, req.url.requestTarget, fwd, req.body)
           if sid >= 0:
-            let (status, hdrs) = await qc.awaitHeaders(sid)
-            return StreamResponse(kind: skH3, qc: qc, h3sid: sid,
-              resp: initResponse(status, "", "HTTP/3", initHeaders(hdrs), ""),
-              client: client, key: origin, decompress: decompress, cap: cap)
+            try:
+              let (status, hdrs) = await qc.awaitHeaders(sid)
+              return StreamResponse(kind: skH3, qc: qc, h3sid: sid,
+                resp: initResponse(status, "", "HTTP/3", initHeaders(hdrs), ""),
+                client: client, key: origin, decompress: decompress, cap: cap)
+            except CatchableError:                 # header wait failed or was cancelled
+              qc.freeStream(sid)                   # (e.g. timeout): free the submitted
+              raise                                # stream so it isn't left on the wire
         except QuicError:
           if client.h3conns.getOrDefault(origin, nil) != nil and
              not client.h3conns[origin].alive:
@@ -491,9 +499,7 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
     let handle = await openStreamConn(client, rreq)
     handle.cancel = cancel
     when defined(naviHttp3):                       # learn h3 from a streamed response
-      let alt = handle.resp.headers.get("alt-svc")  # too, so SSE/stream can upgrade
-      if alt.len > 0:
-        client.altSvc.record("https", rreq.url.host, rreq.url.port, alt)
+      client.recordAltSvc(rreq, handle.resp)        # too, so SSE/stream can upgrade
     # Arm the leak-guard for the synchronous fallback teardown if the handle is
     # dropped without drain/close. Captures only the connection essentials (never
     # `handle`, which would cycle): the h1 transport, or the mux + stream id.

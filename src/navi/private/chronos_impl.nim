@@ -147,27 +147,29 @@ when defined(naviHttp3):
     ## future (mirrors pendingMux for h2): without it, a burst of streams to a new
     ## origin each opens -- and leaks -- its own QUIC connection, since the plain
     ## open-then-recheck races (both see an empty cache and both cache a survivor).
-    if client.h3conns.hasKey(origin) and client.h3conns[origin].alive:
-      return client.h3conns[origin]
-    if client.pendingH3.hasKey(origin):
-      let qc = await client.pendingH3[origin]
-      if qc != nil and qc.alive: return qc
-    # Register the in-flight connect synchronously (no await before this) so racing
-    # callers await it instead of opening a second connection.
-    let pending = newFuture[QuicConnChronos]("navi.pendingH3")
-    client.pendingH3[origin] = pending
-    try:
-      let qc = await openConnChronos(ep.host, ep.port, req.url.host,
-                                     client.config.tls.caFile,
-                                     client.config.tls.wantsVerify)
-      client.h3conns[origin] = qc
-      client.pendingH3.del(origin)
-      pending.complete(qc)
-      return qc
-    except CatchableError as e:
-      client.pendingH3.del(origin)
-      if not pending.finished: pending.fail(e)
-      raise
+    while true:
+      if client.h3conns.hasKey(origin) and client.h3conns[origin].alive:
+        return client.h3conns[origin]
+      if client.pendingH3.hasKey(origin):
+        let qc = await client.pendingH3[origin]
+        if qc != nil and qc.alive: return qc
+        continue          # that connect resolved dead (rare race): re-check from top
+      # Register the in-flight connect synchronously (no await before this) so racing
+      # callers await it instead of opening a second connection.
+      let pending = newFuture[QuicConnChronos]("navi.pendingH3")
+      client.pendingH3[origin] = pending
+      try:
+        let qc = await openConnChronos(ep.host, ep.port, req.url.host,
+                                       client.config.tls.caFile,
+                                       client.config.tls.wantsVerify)
+        client.h3conns[origin] = qc
+        client.pendingH3.del(origin)
+        pending.complete(qc)
+        return qc
+      except CatchableError as e:
+        client.pendingH3.del(origin)
+        if not pending.finished: pending.fail(e)
+        raise
 
   proc h3TransportChronos(client: Navi, req: Request,
                           ep: AltSvcEndpoint): Future[Response] {.async.} =
@@ -410,10 +412,14 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
             if lk notin h3SkipHeaders: fwd.add((lk, v))
           let sid = qc.submitStream($req.verb, req.url.requestTarget, fwd, req.body)
           if sid >= 0:
-            let (status, hdrs) = await qc.awaitHeaders(sid)
-            return StreamResponse(kind: skH3, qc: qc, h3sid: sid,
-              resp: initResponse(status, "", "HTTP/3", initHeaders(hdrs), ""),
-              client: client, key: origin, decompress: decompress, cap: cap)
+            try:
+              let (status, hdrs) = await qc.awaitHeaders(sid)
+              return StreamResponse(kind: skH3, qc: qc, h3sid: sid,
+                resp: initResponse(status, "", "HTTP/3", initHeaders(hdrs), ""),
+                client: client, key: origin, decompress: decompress, cap: cap)
+            except CatchableError:                 # header wait failed or was cancelled
+              qc.freeStream(sid)                   # (e.g. timeout): free the submitted
+              raise                                # stream so it isn't left on the wire
         except QuicError:
           if client.h3conns.getOrDefault(origin, nil) != nil and
              not client.h3conns[origin].alive:
