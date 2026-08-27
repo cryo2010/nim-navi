@@ -325,6 +325,9 @@ proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: strin
     await slot
   if not mux.alive:
     raise newException(IOError, "navi: http/2 connection not usable")
+  if mux.h2.goneAway:       # a GOAWAY landed while we waited: opening a new stream now
+    raise newException(UnprocessedError,   # would break RFC 9113 6.8 (peer PROTOCOL_ERRORs
+      "navi: http/2 request not processed") # and drops the conn). Retry on a fresh conn.
   let sid = mux.h2.openStream()
   mux.h2.setSinkMode(sid)                 # gate the receive window; drainDownload acks it
   mux.sinkStreams.incl sid
@@ -427,6 +430,9 @@ proc request*(mux: H2Mux, headers: seq[(string, string)], body: string,
     await slot
   if not mux.alive:
     raise newException(IOError, "navi: http/2 connection not usable")
+  if mux.h2.goneAway:       # a GOAWAY landed while we waited: opening a new stream now
+    raise newException(UnprocessedError,   # would break RFC 9113 6.8 (peer PROTOCOL_ERRORs
+      "navi: http/2 request not processed") # and drops the conn). Retry on a fresh conn.
   # Streaming responses go through sendAndReadHeaders + readChunk/drainDownload on
   # the handle, not here, so this path is buffered: it waits for the whole response.
   # (`bodyStream` still streams the request body up.)
