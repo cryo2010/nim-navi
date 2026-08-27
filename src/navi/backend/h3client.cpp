@@ -47,6 +47,7 @@ struct Stream {
   long status = 0;
   std::string body;
   std::string resp_headers;                  // response fields as "name\nvalue\n"
+  bool headers_done = false;  // all response headers delivered (body/end has begun)
   bool done = false;
   bool reset = false;     // closed without a normal end_stream (server reset/abort)
   std::string req_body;   // owned copy (so the caller need not keep it alive)
@@ -182,6 +183,7 @@ int on_recv_data(nghttp3_conn *, std::int64_t stream_id, const std::uint8_t *dat
   auto it = c->streams.find(stream_id);
   if (it == c->streams.end()) return 0;
   try {
+    it->second.headers_done = true;  // nghttp3 delivers all headers before any body
     it->second.body.append(reinterpret_cast<const char *>(data), datalen);
   } catch (...) {
     return NGHTTP3_ERR_CALLBACK_FAILURE;
@@ -192,7 +194,24 @@ int on_recv_data(nghttp3_conn *, std::int64_t stream_id, const std::uint8_t *dat
 int on_end_stream(nghttp3_conn *, std::int64_t stream_id, void *cud, void *) {
   auto *c = static_cast<H3Conn *>(cud);
   auto it = c->streams.find(stream_id);
-  if (it != c->streams.end()) it->second.done = true;
+  if (it != c->streams.end()) {
+    it->second.headers_done = true;  // a bodyless response: headers are all there is
+    it->second.done = true;
+  }
+  return 0;
+}
+
+// nghttp3 kept some QUIC stream bytes buffered (e.g. QPACK-blocked) and has now
+// released them; extend the QUIC flow-control window by that amount so the peer is
+// not stalled. `on_recv_stream_data` extends by what nghttp3 consumed synchronously;
+// this covers the rest. Without it a QPACK-blocked stream can wedge the connection.
+int on_deferred_consume(nghttp3_conn *, std::int64_t stream_id, std::size_t consumed,
+                        void *cud, void *) {
+  auto *c = static_cast<H3Conn *>(cud);
+  if (c->conn) {
+    ngtcp2_conn_extend_max_stream_offset(c->conn, stream_id, consumed);
+    ngtcp2_conn_extend_max_offset(c->conn, consumed);
+  }
   return 0;
 }
 
@@ -330,6 +349,7 @@ int navi_h3_bind(H3Conn *c) {
   cb.recv_header = on_recv_header;
   cb.recv_data = on_recv_data;
   cb.end_stream = on_end_stream;
+  cb.deferred_consume = on_deferred_consume;
   if (nghttp3_conn_client_new(&c->h3, &cb, &settings, nullptr, c) != 0) return -1;
   std::int64_t ctrl, qenc, qdec;
   if (ngtcp2_conn_open_uni_stream(c->conn, &ctrl, nullptr) != 0 ||
@@ -549,6 +569,68 @@ int navi_h3_take_response(H3Conn *c, std::int64_t sid, long *out_status, char *o
   } catch (...) {
     return -1;
   }
+}
+
+// --- streaming read path (for stream()/SSE) --------------------------------
+// The buffered take_response reads the whole body at once and drops the stream.
+// These let navi read a response incrementally: headers first, then body chunks
+// as they arrive, keeping the stream alive until it is fully drained.
+
+// If stream `sid`'s response headers are all in, copy status + headers into the
+// caller's buffers WITHOUT dropping the stream, and set *out_ready = 1. Otherwise
+// set *out_ready = 0 and touch nothing else. Returns 0 on success, -1 if the
+// stream is unknown.
+int navi_h3_response_headers(H3Conn *c, std::int64_t sid, long *out_status,
+                            char *out_headers, std::size_t hdr_cap,
+                            std::size_t *hdr_len, int *out_ready) {
+  try {
+    auto it = c->streams.find(sid);
+    if (it == c->streams.end()) return -1;
+    Stream &s = it->second;
+    if (!s.headers_done) { *out_ready = 0; return 0; }
+    *out_status = s.status;
+    std::size_t hk = std::min(s.resp_headers.size(), hdr_cap);
+    std::memcpy(out_headers, s.resp_headers.data(), hk);
+    *hdr_len = hk;
+    *out_ready = 1;
+    return 0;
+  } catch (...) {
+    return -1;
+  }
+}
+
+// Drain up to `cap` body bytes of stream `sid` into `buf`, removing them from the
+// stream's buffer. Sets *out_eof = 1 once the stream has ended and its buffer is
+// drained. Returns bytes copied (0 with *out_eof == 0 means "nothing yet, more
+// coming"), or -1 if the stream is unknown. The stream is NOT dropped on EOF, so
+// the caller can still check navi_h3_stream_reset (clean end vs abort); call
+// navi_h3_stream_free once done.
+ngtcp2_ssize navi_h3_read_body(H3Conn *c, std::int64_t sid, char *buf,
+                               std::size_t cap, int *out_eof) {
+  try {
+    auto it = c->streams.find(sid);
+    if (it == c->streams.end()) return -1;
+    Stream &s = it->second;
+    std::size_t k = std::min(s.body.size(), cap);
+    if (k > 0) {
+      std::memcpy(buf, s.body.data(), k);
+      s.body.erase(0, k);
+    }
+    *out_eof = (s.done && s.body.empty()) ? 1 : 0;
+    return static_cast<ngtcp2_ssize>(k);
+  } catch (...) {
+    return -1;
+  }
+}
+
+// Drop stream `sid` without fully reading it (an abandoned streaming handle).
+// Tells the peer to stop sending and abandons our send side (STOP_SENDING +
+// RESET_STREAM, flushed by the reader's next send cycle), so an abandoned SSE
+// stream doesn't leave the server streaming into a dropped buffer. Idempotent.
+void navi_h3_stream_free(H3Conn *c, std::int64_t sid) {
+  if (c->conn && c->streams.find(sid) != c->streams.end())
+    ngtcp2_conn_shutdown_stream(c->conn, 0, sid, 0);
+  c->streams.erase(sid);
 }
 
 // Sync convenience: submit, drive to completion with a blocking poll loop, and
