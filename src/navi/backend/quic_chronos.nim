@@ -157,14 +157,15 @@ proc requestOnConn*(qc: QuicConnChronos, verb, path: string,
     raise newException(QuicError, "navi HTTP/3 submit failed")
   let fut = newFuture[void]("navi.h3.stream")
   qc.waiters[sid] = fut
-  wake(qc)
-  try:
-    await fut
-  finally:
+  var consumed = false                     # true once take_response has taken the stream
+  defer:
     qc.waiters.del(sid)
+    if not consumed and qc.c != nil:       # cancelled, reset, or take failed: free the
+      navi_h3_stream_free(qc.c, sid)       # C stream so an abandoned request isn't left
+  wake(qc)
+  await fut
 
   if navi_h3_stream_reset(qc.c, sid) != 0:
-    navi_h3_stream_free(qc.c, sid)
     raise newException(QuicError, "navi HTTP/3 stream was reset")
   var status: clong
   var blen, hlen: csize_t
@@ -175,6 +176,7 @@ proc requestOnConn*(qc: QuicConnChronos, verb, path: string,
                            cast[ptr char](addr hbuf[0]), csize_t(hbuf.len),
                            addr hlen) != 0:
     raise newException(QuicError, "navi HTTP/3 take_response failed")
+  consumed = true                          # take_response erased the C stream on success
   rbody.setLen(int(blen))
   hbuf.setLen(int(hlen))
   var hs: seq[(string, string)]
@@ -189,9 +191,9 @@ proc requestOnConn*(qc: QuicConnChronos, verb, path: string,
 proc waitProgress(qc: QuicConnChronos, sid: int64) {.async.} =
   let f = newFuture[void]("navi.h3.recv")
   qc.recvReady[sid] = f
+  defer: qc.recvReady.del(sid)   # runs on cancellation/exception too, not just success
   wake(qc)
   await f
-  qc.recvReady.del(sid)
 
 proc submitStream*(qc: QuicConnChronos, verb, path: string,
                    headers: seq[(string, string)], body: string): int64 =

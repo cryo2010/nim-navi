@@ -33,6 +33,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -382,23 +383,27 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
     crypto_inited = true;
   }
   try {
-    auto *c = new H3Conn();
+    // Owned locally so any early return / thrown exception frees it and the C
+    // handles it has acquired; ownership is handed to the caller via release().
+    auto c = std::make_unique<H3Conn>();
     c->authority = std::string(sni) + ":" + port;
-    c->fd = udp_connect(host, port, c);
+    c->fd = udp_connect(host, port, c.get());
     if (c->fd < 0) {
       std::fprintf(stderr, "udp connect failed\n");
-      delete c;
       return nullptr;
     }
 
     c->ssl_ctx = SSL_CTX_new(TLS_method());
+    if (!c->ssl_ctx) {
+      std::fprintf(stderr, "SSL_CTX_new failed\n");
+      return nullptr;
+    }
     // Verify the server certificate by default (matching navi's TlsConfig.verify).
     if (verify) {
       SSL_CTX_set_verify(c->ssl_ctx, SSL_VERIFY_PEER, nullptr);
       if (ca_file && ca_file[0]) {
         if (SSL_CTX_load_verify_locations(c->ssl_ctx, ca_file, nullptr) != 1) {
           std::fprintf(stderr, "failed to load CA file %s\n", ca_file);
-          delete c;
           return nullptr;
         }
       } else {
@@ -408,26 +413,27 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
       SSL_CTX_set_verify(c->ssl_ctx, SSL_VERIFY_NONE, nullptr);
     }
     c->ssl = SSL_new(c->ssl_ctx);
+    if (!c->ssl) {
+      std::fprintf(stderr, "SSL_new failed\n");
+      return nullptr;
+    }
     if (verify) {
       SSL_set_hostflags(c->ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
       if (SSL_set1_host(c->ssl, sni) != 1) {
         std::fprintf(stderr, "SSL_set1_host failed\n");
-        delete c;
         return nullptr;
       }
     }
     if (ngtcp2_crypto_ossl_ctx_new(&c->ossl, c->ssl) != 0) {
       std::fprintf(stderr, "ossl_ctx_new failed\n");
-      delete c;
       return nullptr;
     }
     c->ref.get_conn = get_conn;
-    c->ref.user_data = c;
+    c->ref.user_data = c.get();
     SSL_set_app_data(c->ssl, &c->ref);
     SSL_set_connect_state(c->ssl);
     if (ngtcp2_crypto_ossl_configure_client_session(c->ssl) != 0) {
       std::fprintf(stderr, "configure_client_session failed\n");
-      delete c;
       return nullptr;
     }
     SSL_set_alpn_protos(c->ssl, reinterpret_cast<const unsigned char *>("\x02h3"), 3);
@@ -470,13 +476,12 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
     RAND_bytes(scid.data, 16);
 
     if (ngtcp2_conn_client_new(&c->conn, &dcid, &scid, &c->path, NGTCP2_PROTO_VER_V1,
-                               &cb, &settings, &params, nullptr, c) != 0) {
+                               &cb, &settings, &params, nullptr, c.get()) != 0) {
       std::fprintf(stderr, "ngtcp2_conn_client_new failed\n");
-      delete c;
       return nullptr;
     }
     ngtcp2_conn_set_tls_native_handle(c->conn, c->ossl);
-    return c;
+    return c.release();   // ownership passes to the caller (freed via navi_h3_close)
   } catch (...) {
     return nullptr;
   }

@@ -143,23 +143,17 @@ proc requestOnConn*(qc: QuicConnAsync, verb, path: string,
     raise newException(QuicError, "navi HTTP/3 submit failed")
   let fut = newFuture[void]("navi.h3.stream")
   qc.waiters[sid] = fut
-  wake(qc)
-  try:
-    await fut
-  finally:
+  var consumed = false                     # true once take_response has taken the stream
+  defer:
     qc.waiters.del(sid)
+    if not consumed and qc.c != nil:       # cancelled, reset, or take failed: free the
+      navi_h3_stream_free(qc.c, sid)       # C stream so an abandoned request isn't left
+  wake(qc)
+  await fut
 
   if navi_h3_stream_reset(qc.c, sid) != 0:
-    # The stream was reset/aborted, not answered. Free its C-side entry (take
-    # erases it), then raise so the engine falls back to h2/h1 for this request
-    # instead of returning a bogus empty response.
-    var s: clong
-    var bl, hl: csize_t
-    var rb = newString(1)
-    var hb = newString(1)
-    discard navi_h3_take_response(qc.c, sid, addr s, cast[ptr char](addr rb[0]),
-                                  csize_t(rb.len), addr bl,
-                                  cast[ptr char](addr hb[0]), csize_t(hb.len), addr hl)
+    # The stream was reset/aborted, not answered. The defer frees its C-side entry;
+    # raise so the engine falls back to h2/h1 instead of a bogus empty response.
     raise newException(QuicError, "navi HTTP/3 stream was reset")
 
   var status: clong
@@ -171,6 +165,7 @@ proc requestOnConn*(qc: QuicConnAsync, verb, path: string,
                            cast[ptr char](addr hbuf[0]), csize_t(hbuf.len),
                            addr hlen) != 0:
     raise newException(QuicError, "navi HTTP/3 take_response failed")
+  consumed = true                          # take_response erased the C stream on success
   rbody.setLen(int(blen))
   hbuf.setLen(int(hlen))
   var hs: seq[(string, string)]
@@ -191,9 +186,9 @@ proc waitProgress(qc: QuicConnAsync, sid: int64) {.async.} =
   ## Park until the reader makes a cycle (headers/body may have advanced).
   let f = newFuture[void]("navi.h3.recv")
   qc.recvReady[sid] = f
+  defer: qc.recvReady.del(sid)    # runs on cancellation/exception too, not just success
   wake(qc)                        # poke the reader so we don't wait its full timer
   await f
-  qc.recvReady.del(sid)
 
 proc submitStream*(qc: QuicConnAsync, verb, path: string,
                    headers: seq[(string, string)], body: string): int64 =
