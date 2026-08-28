@@ -144,7 +144,11 @@ proc happyConnect*(addrs: seq[TransportAddress]):
       # flight or the stagger window has elapsed.
       if nextIdx < addrs.len and
          (inflight.len == 0 or Moment.now() - lastStart >= heAttemptDelayMs.milliseconds):
-        let f: Future[StreamTransport] = connect(addrs[nextIdx])
+        # Disable Nagle to match the sync/asyncdispatch backends: without it a
+        # streamed upload's trailing partial segments stall on delayed-ACK (~40ms
+        # each), collapsing throughput by ~10x.
+        let f: Future[StreamTransport] =
+          connect(addrs[nextIdx], flags = {SocketFlags.TcpNoDelay})
         inflight.add (f, nextIdx)
         inc nextIdx
         lastStart = Moment.now()
