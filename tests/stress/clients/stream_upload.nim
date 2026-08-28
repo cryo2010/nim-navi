@@ -63,7 +63,7 @@ proc reporterLoop(cfg: Config, prog: Progress, start, deadline: float) {.async.}
       last = epochTime()
       echo cfg.label, " ", prog.bytes div (1 shl 20), "MB tx | ",
            prog.transfers, " done | ", prog.errors, " retried | RSS ",
-           rssBytes() div (1 shl 20), "MB"
+           fmtBytes(rssBytes()), " | heap ", fmtBytes(getOccupiedMem())
 
 proc main() {.async.} =
   let cfg = loadConfig(backend)
