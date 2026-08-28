@@ -55,6 +55,11 @@ template h1SendAndReadHeaders*(transport, req, streaming: typed): H1Parser =
       let chunk = await recvSome(transport)
       if chunk.len == 0: parser.eof(); break
       parser.feed(chunk)
+    if not parser.headersReady and not parser.finished:
+      # The peer closed before any response headers -- typically a pooled keep-alive
+      # connection the server had already closed. Raise (rather than return a status-0
+      # response) so the caller discards it and retries on a fresh connection.
+      raise newException(IOError, "navi: http/1.1 connection closed before response")
     parser
 
 template h1DrainBody*(transport, parser, sink, keep, decompress, cap: typed) =

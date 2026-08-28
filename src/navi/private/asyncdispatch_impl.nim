@@ -184,7 +184,10 @@ proc transportInner(client: Navi, req: Request, sink: BodySink): Future[Response
         return await client.h1OnConn(conn, origin, rq, sink)
     except CatchableError as e:
       client.pendingMux.del(origin)
-      pending.fail(e)
+      # A failure after the branch already completed `pending` (h1 fallback via
+      # `complete(nil)`, or a post-handshake error like a rejected client cert while
+      # reading the response) must not complete the future twice (mirrors chronos).
+      if not pending.finished: pending.fail(e)
       raise
 
   let conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
@@ -469,7 +472,10 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
           decompress: decompress, cap: cap)
     except CatchableError as e:
       client.pendingMux.del(origin)
-      pending.fail(e)
+      # A failure after the branch already completed `pending` (h1 fallback via
+      # `complete(nil)`, or a post-handshake error like a rejected client cert while
+      # reading the response) must not complete the future twice (mirrors chronos).
+      if not pending.finished: pending.fail(e)
       raise
 
   let conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,

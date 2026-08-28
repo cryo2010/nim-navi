@@ -7,7 +7,10 @@
 ## interval. WebSocket is an h1 upgrade, so PROTO is not a dimension here.
 
 import std/[times, strutils]
+from std/os import getEnv
 import ../common/[config, reporter, servers]
+
+let logErrors = getEnv("NAVI_LOG_ERRORS").len > 0
 when defined(useChronos):
   import navi/chronos
   const backend = "chronos"
@@ -23,14 +26,25 @@ proc worker(ws: WebSocket, counter: StatusCounter, deadline: float) {.async.} =
     while epochTime() < deadline:
       await ws.send("ping")
       let t = await ws.receive()
-      if t.kind != wmText or t.data != "ping": counter.fail(); break
+      if t.kind == wmClose: break          # peer closed (e.g. the close handshake as
+                                           # the soak winds down): a normal end, not a fail
+      if t.kind != wmText or t.data != "ping":
+        counter.fail()
+        if logErrors: stderr.writeLine("ws text mismatch: kind=" & $t.kind & " len=" & $t.data.len)
+        break
       await ws.send("bytes", binary = true)
       let b = await ws.receive()
-      if b.kind != wmBinary or b.data != "bytes": counter.fail(); break
+      if b.kind == wmClose: break
+      if b.kind != wmBinary or b.data != "bytes":
+        counter.fail()
+        if logErrors: stderr.writeLine("ws bin mismatch: kind=" & $b.kind & " len=" & $b.data.len)
+        break
       counter.tally(200)
-    await ws.close()
-  except CatchableError:
+  except CatchableError as e:
     counter.fail()
+    if logErrors: stderr.writeLine("ws err: " & $e.name & ": " & e.msg)
+  try: await ws.close()                    # closing an already-closing socket is not a failure
+  except CatchableError: discard
 
 proc reporterLoop(cfg: Config, counter: StatusCounter,
                   start, deadline: float) {.async.} =

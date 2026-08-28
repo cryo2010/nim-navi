@@ -3,8 +3,6 @@
 ## Encodes frames to bytes and decodes them incrementally from a byte stream,
 ## with no I/O. The connection layer drives this over any transport.
 
-import std/strutils
-
 type
   FrameType* = enum
     ftData = 0x0
