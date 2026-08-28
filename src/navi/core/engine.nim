@@ -381,6 +381,11 @@ template poolTransport*(client, req, sink: typed): Response =
 
     var (found, pc) = popIdle(client.pool, key)
     if found:
+      # `gotResponse` splits a reused-connection failure into "before any response"
+      # (the request never reached a working server -> unprocessed) vs "after the
+      # response began" (the server processed it). h2 signals its own unprocessed
+      # case via UnprocessedError, so treat its failures as post-response.
+      var gotResponse = true
       try:
         if pc.h2 != nil:
           resp = h2Stream(pc.transport, pc.h2, rq, sink,
@@ -389,19 +394,28 @@ template poolTransport*(client, req, sink: typed): Response =
             await close(pc.transport)
         else:
           var keep = false
-          resp = h1Exchange(pc.transport, rq, sink, keep,
-                            client.config.wantsDecompress, client.config.maxResponseBytes)
+          gotResponse = false
+          var parser = h1SendAndReadHeaders(pc.transport, rq, not sink.isNil)
+          gotResponse = true
+          h1DrainBody(pc.transport, parser, sink, keep,
+                      client.config.wantsDecompress, client.config.maxResponseBytes)
+          resp = parser.toResponse()
           if not (keep and pushIdle(client.pool, key, pc)):
             await close(pc.transport)
         served = true
       except CatchableError as e:
         await close(pc.transport)  # pooled connection was stale
-        # Fall through to a fresh connection only when replaying is safe: an
-        # idempotent method, or the peer proved the request was unprocessed
-        # (h2 REFUSED_STREAM / above GOAWAY). A non-idempotent request (POST/PATCH)
-        # that failed on a reused connection must NOT be silently replayed -- the
-        # server may already have processed it -- so propagate the error instead.
-        if not (isIdempotent(req.verb) or (e of UnprocessedError)):
+        # Fall through to a fresh connection only when replaying is safe. A reused
+        # keep-alive connection can be dropped by the server at any time; a failure
+        # BEFORE any response byte means the request was almost certainly not
+        # processed (the classic keep-alive race), so it is safe to replay even when
+        # non-idempotent. A failure AFTER the response began means the server did
+        # process it, so only an idempotent method (or a proven-unprocessed peer
+        # signal: h2 REFUSED_STREAM / above GOAWAY) may be replayed. A non-replayable
+        # streamed body (`bodyStream`) is never retried (its producer cannot rewind).
+        let replayable = req.bodyStream == nil
+        if not (replayable and
+                (not gotResponse or isIdempotent(req.verb) or (e of UnprocessedError))):
           raise
 
     if not served:

@@ -8,7 +8,7 @@ import navi/proto/sse
 import navi/core/public
 export sse.SseEvent
 import navi/core/[engine, pool, session, proxy, h2glue]
-import navi/core/[redirect, cookies, digest, cancel]
+import navi/core/[redirect, cookies, digest, cancel, retry, response]
 import navi/core/decompress   # StreamDecoder, for the readChunk decode state
 import navi/proto/h1
 import navi/proto/ws
@@ -217,14 +217,26 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
   # 2. A pooled http/1.1 connection.
   var (found, pc) = popIdle(client.pool, origin)
   if found:
+    # `gotResponse` distinguishes a reused-connection failure BEFORE any response
+    # byte (unprocessed: safe to replay any method) from one AFTER the response began
+    # (processed: only an idempotent method may be replayed).
+    var gotResponse = false
     try:
       var keep = false
-      result = h1Exchange(pc.transport, req, sink,
-                          keep, client.config.wantsDecompress, client.config.maxResponseBytes)
+      var parser = h1SendAndReadHeaders(pc.transport, req, not sink.isNil)
+      gotResponse = true
+      h1DrainBody(pc.transport, parser, sink, keep,
+                  client.config.wantsDecompress, client.config.maxResponseBytes)
+      result = parser.toResponse()
       if not (keep and pushIdle(client.pool, origin, pc)): await close(pc.transport)
       return
-    except CatchableError:
-      await close(pc.transport)  # stale; fall through
+    except CatchableError as e:
+      await close(pc.transport)  # stale
+      let replayable = req.bodyStream == nil
+      if not (replayable and
+              (not gotResponse or isIdempotent(req.verb) or (e of UnprocessedError))):
+        raise
+      # else fall through to a fresh connection below
 
   # 3. Open a fresh connection.
   var rq = req

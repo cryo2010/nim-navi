@@ -382,6 +382,57 @@ proc startUploadEcho*(th: var Thread[ServerCtx], port: int) =
   createThread(th, serveUploadEcho, ServerCtx(port: port, ready: addr ready))
   while not ready: discard
 
+type StaleCtx* = object
+  portOut: ptr int
+  ready: ptr bool
+  closed1: ptr bool     ## set once the first (pooled) connection has been closed
+  accepts: ptr int
+
+proc serveStalePooled(ctx: StaleCtx) {.thread.} =
+  ## Answer one keep-alive request, then close the connection so the client's pooled
+  ## copy goes stale. Then accept the client's retry on a second connection and
+  ## answer it, echoing the request body so the test can confirm the replay.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(0), "127.0.0.1")     # ephemeral: no cross-run collision
+  server.listen()
+  ctx.portOut[] = server.getLocalAddr()[1].int
+  ctx.ready[] = true
+  # conn 1: a keep-alive response, then a silent close (no `Connection: close`, so
+  # the client pools it as reusable).
+  var c1 = acceptClient(server)
+  discard c1.recvUntil("\r\n\r\n")
+  c1.send("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: keep-alive\r\n\r\nabc")
+  c1.close()
+  ctx.accepts[] = 1
+  ctx.closed1[] = true
+  # conn 2: the client's retry lands here. Read its head + Content-Length body and
+  # echo the body back, so the test proves the (non-idempotent) request was replayed.
+  var c2 = acceptClient(server)
+  ctx.accepts[] = 2
+  let head = c2.recvUntil("\r\n\r\n")
+  let cl = headerValue(head, "content-length")
+  let n = if cl.len > 0: parseInt(cl) else: 0
+  var body = ""
+  while body.len < n:
+    let part = c2.recv(n - body.len)
+    if part.len == 0: break
+    body.add part
+  let respBody = "replayed:" & body
+  c2.send("HTTP/1.1 200 OK\r\nContent-Length: " & $respBody.len &
+          "\r\nConnection: close\r\n\r\n" & respBody)
+  c2.close()
+  server.close()
+
+proc startStalePooled*(th: var Thread[StaleCtx], port: var int, closed1: ptr bool,
+                       accepts: ptr int) =
+  ## Serve one keep-alive request then close it (stale pool), and answer the retry
+  ## on a fresh connection. Binds an ephemeral port, reported via `port`.
+  var ready = false
+  createThread(th, serveStalePooled,
+    StaleCtx(portOut: addr port, ready: addr ready, closed1: closed1, accepts: accepts))
+  while not ready: discard
+
 proc startKeepAlive*(th: var Thread[KeepAliveCtx], port: var int, requests: int,
                      accepts: ptr int) =
   ## Launch the keep-alive server and block until it is listening. Binds an

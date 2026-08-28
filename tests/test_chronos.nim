@@ -57,6 +57,25 @@ suite "chronos entry end to end":
     joinThread(th)
     check accepts == 1                            # both requests used the one connection
 
+  test "a non-idempotent request is replayed on a fresh connection when the pooled one was closed before any response":
+    var port = 0
+    var accepts = 0
+    var closed1 = false
+    var th: Thread[StaleCtx]
+    startStalePooled(th, port, addr closed1, addr accepts)
+
+    let api = newNavi()
+    let key = "http://127.0.0.1:" & $port
+    check (waitFor api.get(key & "/")).status == 200   # conn 1, then pooled
+    check api.pool.idleCount(key) == 1
+    while not closed1: discard                          # server closed the pooled conn
+
+    let r = waitFor api.request(POST, key & "/submit", body = "data")
+    check r.status == 200
+    check r.body == "replayed:data"                    # served on the fresh connection
+    joinThread(th)
+    check accepts == 2
+
   test "stream should close (not pool) the connection when the drain fails":
     var port = 0
     var accepts = 0
