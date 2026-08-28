@@ -6,6 +6,7 @@
 import std/[times, json]
 import ../common/[config, reporter, servers, streamcontent]
 import navi
+include ../common/httpset
 
 let blk = fillBlock()
 
@@ -36,6 +37,7 @@ proc oneUpload(api: Navi, cfg: Config, url: string) =
   if res.status != 200:
     stderr.writeLine cfg.label & " FAIL: /upload -> " & $res.status
     quit(1)
+  cfg.checkVersion(res.httpVersion)   # hard-fail if the streamed upload downgraded
   let clientSha = st.hex
   let j = parseJson(res.body)
   if j{"sha1"}.getStr != clientSha or j{"size"}.getInt != sent:
@@ -50,8 +52,18 @@ proc main() =
   if reason.len > 0: echo cfg.label, " ", reason; return
   var pool = initServerPool(cfg)
   var c = initNaviConfig()
+  c.http = httpVersions(cfg.proto)     # honor NAVI_PROTO (h3 was previously ignored here)
   c.tls.caFile = cfg.cert
   let api = newNavi(c)
+
+  # Warm up per-origin protocol discovery (h3 via Alt-Svc) before the measured uploads.
+  let expect = cfg.expectedVersion
+  if expect.len > 0:
+    for base in pool.all():
+      for _ in 0 ..< 3:
+        try:
+          if api.request(GET, base & "/echo").httpVersion == expect: break
+        except CatchableError: break
 
   let deadline = epochTime() + cfg.seconds
   var transfers = 0

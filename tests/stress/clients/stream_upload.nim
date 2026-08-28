@@ -16,6 +16,7 @@ when defined(useChronos):
 else:
   import navi/asyncdispatch
   const backend = "asyncdispatch"
+include ../common/httpset
 
 let blk = fillBlock()
 
@@ -45,6 +46,7 @@ proc oneUpload(api: Navi, cfg: Config, prog: Progress, url: string) {.async.} =
   if res.status != 200:
     stderr.writeLine cfg.label & " FAIL: /upload -> " & $res.status
     quit(1)
+  cfg.checkVersion(res.httpVersion)   # hard-fail if the streamed upload downgraded
   let clientSha = st.hex
   let j = parseJson(res.body)
   let serverSha = j{"sha1"}.getStr
@@ -72,8 +74,19 @@ proc main() {.async.} =
   var pool = initServerPool(cfg)
 
   var c = initNaviConfig()
+  c.http = httpVersions(cfg.proto)     # honor NAVI_PROTO (h3 was previously ignored here)
   c.tls.caFile = cfg.cert
   let api = newNavi(c)
+
+  # Warm up h3 discovery per origin (an Alt-Svc round-trip), so the measured uploads
+  # ride the pinned protocol and checkVersion catches any silent downgrade.
+  let expect = cfg.expectedVersion
+  if expect.len > 0:
+    for base in pool.all():
+      for _ in 0 ..< 3:
+        try:
+          if (await api.request(GET, base & "/echo")).httpVersion == expect: break
+        except CatchableError: break
 
   let start = epochTime()
   let deadline = start + cfg.seconds

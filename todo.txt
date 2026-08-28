@@ -1,0 +1,13 @@
+- Implement custom certificate-verification callback
+- Implement OCSP stapling
+- Implmenet SOCKS5 with a CI check
+- Implement Unix domain socket support (see plans/unix-domain-socket-support.md)
+- Implement HTTP response caching (RFC 9111: ETag/Last-Modified, Cache-Control freshness)
+- Implement custom DNS resolver / DoH / DNS caching
+- Implement cookie jar disk persistence (Netscape/JSON load-save)
+- Implement AWS SigV4 request signing
+- Implement certificate pinning (public-key / fingerprint pin)
+- Implement CRL revocation checking
+- Implement cookie prefix enforcement (__Host-/__Secure-)
+- Implement observability hooks (timing spans: DNS/connect/TLS/TTFB)
+- Implement client-side rate/concurrency limiting

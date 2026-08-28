@@ -56,6 +56,57 @@ proc label*(c: Config): string =
   ## The tag prefixed to every report line, e.g. "[requests h2 chronos]".
   "[" & c.workload & " " & c.proto & " " & c.backend & "]"
 
+proc expectedVersion*(c: Config): string =
+  ## The HTTP version a version-pinned cell must actually negotiate, or "" when the
+  ## check does not apply: js (can't report it), WebSocket (always an h1 upgrade; its
+  ## client doesn't call the check), and h1 (the lowest version -- nothing to
+  ## silently downgrade *to*, so there is nothing to guard). Only h2/h3, which can
+  ## quietly fall back to a lower version, are checked.
+  if c.backend == "js": return ""
+  case c.proto
+  of "h2": "HTTP/2"
+  of "h3": "HTTP/3"
+  else: ""
+
+proc checkVersion*(c: Config, got: string) =
+  ## Fail the run hard on a silent protocol downgrade. The point of an h2/h3 stress
+  ## cell is to exercise that protocol; a quiet fallback to a lower version (e.g. an
+  ## h3 request that isn't supported yet dropping to h2) would otherwise pass green
+  ## and hide the regression. A no-op when the version isn't checkable ("" expected).
+  let want = c.expectedVersion
+  if want.len > 0 and got != want:
+    stderr.writeLine c.label & " FAIL: protocol downgrade -- expected " & want &
+      ", got '" & got & "' (NAVI_PROTO=" & c.proto & " must not silently fall back)"
+    quit(1)
+
+type VersionGate* = object
+  ## Version check for a long-lived stream that can upgrade across reconnects (SSE).
+  ## A per-request `checkVersion` is too strict there: an h3 SSE stream necessarily
+  ## begins on h2 and switches to h3 only after an Alt-Svc reconnect. So instead:
+  ## reject a drop below the floor (h1 in an h2/h3 run), and require the pinned
+  ## version to be reached by the end -- a run that never reaches it is the silent
+  ## downgrade we want to catch.
+  cfg: Config
+  want: string
+  sawExpected: bool
+
+proc initVersionGate*(c: Config): VersionGate =
+  VersionGate(cfg: c, want: c.expectedVersion)
+
+proc sample*(g: var VersionGate, got: string) =
+  ## Record one observed version of the stream's current connection.
+  if g.want.len == 0 or got.len == 0: return
+  if got == g.want: g.sawExpected = true
+  elif got == "HTTP/1.1" and g.want != "HTTP/1.1":
+    g.cfg.checkVersion(got)             # h1 is never acceptable here: hard-fail now
+
+proc finish*(g: VersionGate) =
+  ## End of run: the pinned version must have been negotiated at least once.
+  if g.want.len > 0 and not g.sawExpected:
+    stderr.writeLine g.cfg.label & " FAIL: never negotiated " & g.want &
+      " over the whole run (silent protocol downgrade; NAVI_PROTO=" & g.cfg.proto & ")"
+    quit(1)
+
 proc skipReason*(c: Config): string =
   ## Non-empty when this cell cannot run on this build/backend, so the client
   ## should print it and exit 0 (a skip, not a failure). run.sh avoids most of

@@ -6,6 +6,7 @@
 import std/[times, strutils]
 import ../common/[config, reporter, servers, streamcontent]
 import navi
+include ../common/httpset
 
 proc oneDownload(api: Navi, cfg: Config, url: string) =
   var st = newSha1State()
@@ -15,6 +16,7 @@ proc oneDownload(api: Navi, cfg: Config, url: string) =
   if res.status != 200:
     stderr.writeLine cfg.label & " FAIL: /download -> " & $res.status
     quit(1)
+  cfg.checkVersion(res.httpVersion)   # hard-fail on a silent protocol downgrade
   let expected = res.headers.get("x-sha1").toLowerAscii
   res.each(chunk):
     if chunk.len > 0:
@@ -40,8 +42,18 @@ proc main() =
   if reason.len > 0: echo cfg.label, " ", reason; return
   var pool = initServerPool(cfg)
   var c = initNaviConfig()
+  c.http = httpVersions(cfg.proto)     # honor NAVI_PROTO (h3 was previously ignored here)
   c.tls.caFile = cfg.cert
   let api = newNavi(c)
+
+  # Warm up per-origin protocol discovery (h3 via Alt-Svc) before the measured phase.
+  let expect = cfg.expectedVersion
+  if expect.len > 0:
+    for base in pool.all():
+      for _ in 0 ..< 3:
+        try:
+          if api.request(GET, base & "/echo").httpVersion == expect: break
+        except CatchableError: break
 
   let deadline = epochTime() + cfg.seconds
   var transfers = 0
