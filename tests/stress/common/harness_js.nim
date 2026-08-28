@@ -8,6 +8,7 @@ import std/[strutils, tables]
 proc envJs*(name, dflt: cstring): cstring {.importjs: "(process.env[#] ?? #)".}
 proc nowMs*(): float {.importjs: "Date.now()".}
 proc rssMb*(): int {.importjs: "Math.round(process.memoryUsage().rss / 1048576)".}
+proc heapUsedMb*(): int {.importjs: "Math.round(process.memoryUsage().heapUsed / 1048576)".}
 proc setIntervalJs*(cb: proc (), ms: int): int {.importjs: "setInterval(#, #)".}
 proc clearIntervalJs*(id: int) {.importjs: "clearInterval(#)".}
 
@@ -58,5 +59,5 @@ proc render(c: JsCounter): string =
   if parts.len == 0: "(none)" else: parts.join(" ")
 
 proc report*(c: JsCounter, label: string, start: float) =
-  echo label, " ", c.render, " | RSS ", rssMb(), "MB | t=",
-       int((nowMs() - start) / 1000.0), "s"
+  echo label, " ", c.render, " | RSS ", rssMb(), "MB | heap ", heapUsedMb(),
+       "MB | t=", int((nowMs() - start) / 1000.0), "s"

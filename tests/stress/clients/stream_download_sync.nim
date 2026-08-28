@@ -24,7 +24,8 @@ proc oneDownload(api: Navi, cfg: Config, url: string) =
       if now - lastReport >= cfg.reportSeconds.float:
         lastReport = now
         echo cfg.label, " down ", got div (1 shl 20), "/",
-             cfg.streamBytes div (1 shl 20), "MB | RSS ", rssBytes() div (1 shl 20), "MB"
+             cfg.streamBytes div (1 shl 20), "MB | RSS ", fmtBytes(rssBytes()),
+             " | heap ", fmtBytes(getOccupiedMem())
 
   let clientSha = st.hex
   if clientSha != expected:

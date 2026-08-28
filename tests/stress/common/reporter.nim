@@ -38,7 +38,7 @@ proc rssBytes*(): int =
     except CatchableError: discard
   0
 
-proc fmtBytes(n: int): string =
+proc fmtBytes*(n: int): string =
   if n >= 1 shl 30: $(n div (1 shl 20)) & "MB"     # >1GiB still shown in MB for trend
   elif n >= 1 shl 20: $(n div (1 shl 20)) & "MB"
   elif n >= 1 shl 10: $(n div (1 shl 10)) & "KB"

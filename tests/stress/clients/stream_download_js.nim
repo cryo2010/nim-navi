@@ -15,7 +15,7 @@ proc createSha1(): Sha1 {.importjs: "require('crypto').createHash('sha1')".}
 proc update(h: Sha1, chunk: seq[byte]) {.importjs: "#.update(Buffer.from(#))".}
 proc digestHex(h: Sha1): cstring {.importjs: "#.digest('hex')".}
 
-proc oneDownload(api: Navi, cfg: JsCfg, url: string) {.async.} =
+proc oneDownload(api: Navi, cfg: JsCfg, url: string): Future[int] {.async.} =
   let h = createSha1()
   var got = 0
   let res = await api.stream(GET, url)
@@ -32,6 +32,7 @@ proc oneDownload(api: Navi, cfg: JsCfg, url: string) {.async.} =
     echo "[streamDownload js] FAIL: checksum mismatch got ", got,
          " bytes client=", clientSha, " server=", expected
     jsExit(1)
+  return got
 
 proc main() {.async.} =
   let cfg = loadJsCfg()
@@ -39,12 +40,20 @@ proc main() {.async.} =
   var c = initNaviConfig()
   let api = newNavi(c)
 
-  let deadline = nowMs() + cfg.seconds * 1000.0
+  let start = nowMs()
+  let deadline = start + cfg.seconds * 1000.0
   var transfers = 0
+  var bytes = 0                          # cumulative bytes rx, for the reporter
+  proc reportMem() =
+    echo "[streamDownload js] ", bytes div (1 shl 20), "MB rx | ", transfers,
+         " done | RSS ", rssMb(), "MB | heap ", heapUsedMb(), "MB | t=",
+         int((nowMs() - start) / 1000.0), "s"
+  let timer = setIntervalJs(reportMem, cfg.reportSeconds * 1000)
   while true:
-    await oneDownload(api, cfg, pool.pick() & "/download?size=" & $cfg.streamBytes)
+    bytes += await oneDownload(api, cfg, pool.pick() & "/download?size=" & $cfg.streamBytes)
     inc transfers
     if nowMs() >= deadline: break
+  clearIntervalJs(timer)
   echo "== streamDownload js passed (", transfers, " x ", cfg.streamBytes, " bytes) =="
 
 discard main()
