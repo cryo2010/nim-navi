@@ -161,10 +161,20 @@ proc trySend(mux: H2Mux, data: string) {.async.} =
   try: await mux.send(data)
   except CatchableError: discard
 
+const goAwayGraceMs = 30_000
+  ## After a GOAWAY, bound the wait for the in-flight streams' responses with a
+  ## generous idle grace (reset on each datagram), so a peer that sends GOAWAY and
+  ## then neither delivers nor closes cannot hang in-flight requests forever. A slow-
+  ## but-live server draining its work is unaffected. (chronos `withTimeout` cancels
+  ## the pending read cleanly on expiry.)
+
 proc reader(mux: H2Mux) {.async.} =
   try:
     while mux.alive:
-      let chunk = await be.recvSome(mux.transport)
+      let recvFut = be.recvSome(mux.transport)
+      if mux.h2.goneAway and mux.activeStreams > 0:
+        if not await withTimeout(recvFut, goAwayGraceMs.milliseconds): break
+      let chunk = await recvFut
       if chunk.len == 0: break                 # peer closed
       let toSend = mux.h2.feed(chunk)
       if toSend.len > 0: await mux.send(toSend)   # includes a GOAWAY on a conn error

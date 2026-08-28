@@ -94,6 +94,39 @@ suite "sync entry end to end":
     joinThread(th)
     check accepts == 2                           # a second connection was opened
 
+  test "a buffered request raises on a premature close mid-body (length-delimited)":
+    const port = 9260
+    var th: Thread[ServerCtx]
+    startTruncated(th, port, bodyBytes = 10)     # declares CL 100, sends 10, then closes
+    var cfg = initNaviConfig()
+    cfg.retry.limit = 0                          # no retry: observe the truncation directly
+    let api = newNavi(cfg)
+    expect IOError:                              # not a silent 200 with a 10-byte body
+      discard api.get("http://127.0.0.1:" & $port & "/")
+    joinThread(th)
+
+  test "a buffered request raises on a truncated chunked body":
+    const port = 9261
+    var th: Thread[ServerCtx]
+    startTruncatedChunked(th, port)              # one chunk, no terminating 0-chunk, close
+    var cfg = initNaviConfig()
+    cfg.retry.limit = 0
+    let api = newNavi(cfg)
+    expect IOError:
+      discard api.get("http://127.0.0.1:" & $port & "/")
+    joinThread(th)
+
+  test "a streaming request raises (not hangs) on a premature close mid-body":
+    const port = 9262
+    var th: Thread[ServerCtx]
+    startTruncated(th, port, bodyBytes = 10)
+    let api = newNavi()
+    let handle = api.stream(GET, "http://127.0.0.1:" & $port & "/")
+    check handle.status == 200                   # headers arrived fine
+    expect IOError:                              # draining the short body must raise,
+      handle.each(chunk): discard                # not spin forever
+    joinThread(th)
+
   test "close should drain the connection pool":
     var port = 0
     var accepts = 0

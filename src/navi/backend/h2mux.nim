@@ -153,10 +153,21 @@ proc send(mux: H2Mux, data: string) {.async.} =
   finally:
     mine.complete()
 
+const goAwayGraceMs = 30_000
+  ## After a GOAWAY, a peer promises (via last-stream-id) to finish the streams at or
+  ## below it, so the reader keeps waiting for their responses. Bound that wait with
+  ## a generous idle grace: a peer that sends GOAWAY and then neither delivers nor
+  ## closes must not hang in-flight requests forever (the wait was otherwise bounded
+  ## only by an optional read timeout). Reset on every received datagram, so a slow-
+  ## but-live server draining its in-flight work is unaffected.
+
 proc reader(mux: H2Mux) {.async.} =
   try:
     while mux.alive:
-      let chunk = await be.recvSome(mux.transport)
+      let recvFut = be.recvSome(mux.transport)
+      if mux.h2.goneAway and mux.activeStreams > 0:
+        if not await withTimeout(recvFut, goAwayGraceMs): break  # peer went silent
+      let chunk = await recvFut
       if chunk.len == 0: break                 # peer closed
       let toSend = mux.h2.feed(chunk)
       if toSend.len > 0: await mux.send(toSend)   # includes a GOAWAY on a conn error
