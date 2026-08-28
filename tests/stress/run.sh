@@ -161,6 +161,11 @@ for be in "${backends[@]}"; do
   [ -z "$bin" ] && { echo "[$workload $be] skip: no client for this backend/workload"; continue; }
 
   for pr in "${protos[@]}"; do
+    # js/undici has no HTTP/3 (mirrors config.nim skipReason): without this it would
+    # fall back to a slow proxied h1/h2 path against the Caddy h3 front, not real h3.
+    if [ "$be" = js ] && [ "$pr" = h3 ]; then
+      echo "[$workload $pr $be] skip: js/undici has no HTTP/3"; continue
+    fi
     # start fresh servers per protocol (h1/h2 vs h3 differ), run the cell, stop them
     start_servers "$pr" || { fail=1; continue; }
     export NAVI_BACKEND="$be" NAVI_PROTO="$pr"
