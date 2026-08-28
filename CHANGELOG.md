@@ -7,7 +7,19 @@ onward (pre-1.0, minor versions may include breaking changes).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-28
+
+Theme: HTTP/3 across the async backends, the chronos client's move to full OpenSSL
+TLS + HTTP/2 parity, batteries-included middleware, and a live-mutable client
+config.
+
 ### Added
+- **HTTP/3 (QUIC)** on the asyncdispatch and chronos backends, opt-in via
+  `-d:naviHttp3`: buffered requests, pull-based streaming downloads, and SSE now
+  ride genuine h3 (previously h3 was buffered-`request()`-only, and `stream()` /
+  `sse()` silently fell back to h2). Transparent per-connection stream
+  multiplexing, `Alt-Svc: h3` upgrades, and per-stream reset/abort handling.
+  Requires ngtcp2, nghttp3, and OpenSSL >= 3.5 (#160, #161, #162).
 - Batteries-included middleware, imported to match your client: `navi/mw` (sync),
   `navi/asyncdispatch/mw`, `navi/chronos/mw`, `navi/js/mw`. Factories:
   `cache` (an RFC 9111 response-cache subset -- freshness + ETag/Last-Modified
@@ -42,6 +54,20 @@ onward (pre-1.0, minor versions may include breaking changes).
   longer, more specific paths are sent before shorter ones; cookies with
   equal-length paths keep their creation order). Previously they were emitted in
   storage order, which could send a less-specific duplicate first.
+- chronos: disable Nagle on connect (matching the sync and asyncdispatch
+  backends). A streamed upload's trailing partial segments were stalling on
+  delayed-ACK (~40ms each), collapsing chronos upload throughput by ~10x versus
+  the other backends (#167).
+- HTTP/2: correct GOAWAY handling. Only streams the server never processed
+  (id > last-stream-id) are failed and retried; an in-flight, already-processed
+  stream is no longer failed un-retryably, and no new stream is opened after a
+  GOAWAY (which had raised a PROTOCOL_ERROR under connection recycling) (#163).
+- HTTP/3: credit the DATA payload to QUIC flow control, fixing a connection-level
+  receive-window leak that wedged a long-lived h3 connection after ~1 MiB
+  cumulative (surfaced as SSE freezing after ~36 reconnects) (#161).
+- SSE (asyncdispatch): fix a use-after-free when a stream was closed while a read
+  was parked in `sslRead` (the SSL was freed under the parked read, segfaulting at
+  teardown), and stop a closed stream from transparently reconnecting (#159).
 
 ## [0.7.0] - 2026-08-18
 
@@ -270,7 +296,8 @@ across four backends.
 - TLS certificates verified by default; HPACK bounds, negative `Content-Length`
   rejection, chunk-size bounds, and malformed-input rejection instead of crashes.
 
-[Unreleased]: https://github.com/cryo2010/nim-navi/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/cryo2010/nim-navi/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/cryo2010/nim-navi/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/cryo2010/nim-navi/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/cryo2010/nim-navi/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/cryo2010/nim-navi/compare/v0.4.0...v0.5.0
