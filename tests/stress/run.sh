@@ -114,13 +114,35 @@ start_servers() {
   done
 }
 
-# Kill the servers AND wait for them to fully exit, so their listening ports are
-# released before the next cell binds the same ones (otherwise: Address in use).
+# True once every port a cell uses (public base_port+i, and the h3 backend
+# base_port+1000+i) can be bound again -- i.e. no live listener is left. Uses
+# SO_REUSEADDR like the servers do, so a port merely in TIME_WAIT counts as free.
+ports_free() {
+  python3 - "$host" "$base_port" "$servers" <<'PY' 2>/dev/null
+import socket, sys
+host, base, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+for i in range(n):
+    for p in (base + i, base + 1000 + i):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try: s.bind((host, p))
+        except OSError: sys.exit(1)
+        finally: s.close()
+PY
+}
+
+# Kill the servers AND wait for their ports to actually free up before the next
+# cell binds the same ones (otherwise: Address already in use). Under load a kill of
+# the tracked pid can leave a listener behind (e.g. a hypercorn worker subprocess),
+# so also reap strays by name and then poll until the ports are bindable.
 stop_servers() {
   local p
   for p in "${pids[@]:-}"; do kill -9 "$p" 2>/dev/null || true; done
   for p in "${pids[@]:-}"; do wait "$p" 2>/dev/null || true; done
   pids=()
+  pkill -9 -f hypercorn 2>/dev/null || true
+  pkill -9 -f 'caddy run' 2>/dev/null || true
+  for _ in $(seq 1 100); do ports_free && break; sleep 0.1; done
 }
 
 # --- workload -> client source ----------------------------------------------
@@ -166,8 +188,10 @@ for be in "${backends[@]}"; do
     if [ "$be" = js ] && [ "$pr" = h3 ]; then
       echo "[$workload $pr $be] skip: js/undici has no HTTP/3"; continue
     fi
-    # start fresh servers per protocol (h1/h2 vs h3 differ), run the cell, stop them
-    start_servers "$pr" || { fail=1; continue; }
+    # start fresh servers per protocol (h1/h2 vs h3 differ), run the cell, stop them.
+    # On a failed start, stop_servers first so a partially-started cell does not leak
+    # its listeners into the next cell's ports.
+    start_servers "$pr" || { stop_servers; fail=1; continue; }
     export NAVI_BACKEND="$be" NAVI_PROTO="$pr"
     echo "== stress: $workload | $be | $pr | ${servers} servers =="
     if [[ "$bin" == *.js ]]; then NODE_EXTRA_CA_CERTS="$cert" node "$bin" || fail=1
