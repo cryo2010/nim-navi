@@ -2,8 +2,10 @@
 ##
 ## Streams `streamBytes` (default 1 GiB) down from /download and hashes each chunk
 ## incrementally, discarding it (never buffering the file), then compares to the
-## server's `x-sha1`. A mismatch FAILS HARD (exit 1). Repeats while time remains.
-## Progress + RSS printed every report interval.
+## server's `x-sha1`. A checksum mismatch FAILS HARD (exit 1). A transient transport
+## error (e.g. the server recycled/idle-closed a pooled connection mid-transfer) is
+## retried, not fatal. Repeats while time remains; a background reporter prints
+## cumulative progress + RSS on the interval regardless of per-transfer duration.
 
 import std/[times, strutils]
 import ../common/[config, reporter, servers, streamcontent]
@@ -14,10 +16,14 @@ else:
   import navi/asyncdispatch
   const backend = "asyncdispatch"
 
-proc oneDownload(api: Navi, cfg: Config, url: string) {.async.} =
+type Progress = ref object
+  bytes: int          ## cumulative bytes received across all transfers
+  transfers: int      ## completed+verified transfers
+  errors: int         ## retried transient transport failures
+
+proc oneDownload(api: Navi, cfg: Config, prog: Progress, url: string) {.async.} =
   var st = newSha1State()
   var got = 0
-  var lastReport = epochTime()
   let res = await api.stream(GET, url)
   if res.status != 200:
     stderr.writeLine cfg.label & " FAIL: /download -> " & $res.status
@@ -27,18 +33,23 @@ proc oneDownload(api: Navi, cfg: Config, url: string) {.async.} =
     if chunk.len > 0:
       st.update(chunk)                 # hash then discard: never buffered
       got += chunk.len
-      let now = epochTime()
-      if now - lastReport >= cfg.reportSeconds.float:
-        lastReport = now
-        echo cfg.label, " down ", got div (1 shl 20), "/",
-             cfg.streamBytes div (1 shl 20), "MB | RSS ", rssBytes() div (1 shl 20), "MB"
-
+      prog.bytes += chunk.len
   let clientSha = st.hex
   if clientSha != expected:
     stderr.writeLine cfg.label & " FAIL: checksum mismatch\n" &
       "  got " & $got & " bytes, client sha1=" & clientSha & "\n" &
       "  server x-sha1=" & expected
     quit(1)
+
+proc reporterLoop(cfg: Config, prog: Progress, start, deadline: float) {.async.} =
+  var last = start
+  while epochTime() < deadline:
+    await sleep(1000)                  # 1s granularity: stop within ~1s of the deadline
+    if epochTime() - last >= cfg.reportSeconds.float:
+      last = epochTime()
+      echo cfg.label, " ", prog.bytes div (1 shl 20), "MB rx | ",
+           prog.transfers, " done | ", prog.errors, " retried | RSS ",
+           rssBytes() div (1 shl 20), "MB"
 
 proc main() {.async.} =
   let cfg = loadConfig(backend)
@@ -52,12 +63,21 @@ proc main() {.async.} =
 
   let start = epochTime()
   let deadline = start + cfg.seconds
-  var transfers = 0
-  while true:
-    await oneDownload(api, cfg, pool.pick() & "/download?size=" & $cfg.streamBytes)
-    inc transfers
-    if epochTime() >= deadline: break
-  echo "== streamDownload ", backend, " passed (", transfers, " x ",
-       cfg.streamBytes, " bytes) =="
+  let prog = Progress()
+  let rep = reporterLoop(cfg, prog, start, deadline)
+  while epochTime() < deadline:
+    try:
+      await oneDownload(api, cfg, prog, pool.pick() & "/download?size=" & $cfg.streamBytes)
+      inc prog.transfers
+    except CatchableError as e:        # transient (recycled/idle-closed conn): retry
+      inc prog.errors
+      stderr.writeLine cfg.label & " transfer retried: " & e.msg
+  await rep
+
+  if prog.transfers == 0:
+    stderr.writeLine cfg.label & " FAIL: no transfer completed (" & $prog.errors & " errors)"
+    quit(1)
+  echo "== streamDownload ", backend, " passed (", prog.transfers, " x ",
+       cfg.streamBytes, " bytes, ", prog.errors, " retried) =="
 
 waitFor main()

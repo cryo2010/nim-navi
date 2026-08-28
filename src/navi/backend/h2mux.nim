@@ -85,14 +85,14 @@ proc dispatch(mux: H2Mux) =
       mux.waiters.del(sid)
       mux.releaseSlot()
       fut.complete(resp)
-    elif mux.h2.goneAway:
-      let unprocessed = mux.h2.streamUnprocessed(sid)
+    elif mux.h2.goneAway and mux.h2.streamUnprocessed(sid):
+      # Above GOAWAY's last-stream-id: the peer will not process it, so fail it as
+      # retryable. A stream at or below last-stream-id stays in `waiters` to finish
+      # (RFC 9113 6.8: the peer may still deliver it); the reader keeps running until
+      # it ends, or `failAll` fails it on the real connection close.
       mux.waiters.del(sid)
-      mux.releaseSlot()            # free the slot like the reset/ended branches do
-      if unprocessed:              # above GOAWAY's last id: not processed, retryable
-        fut.fail(newException(UnprocessedError, "navi: http/2 request not processed"))
-      else:
-        fut.fail(newException(IOError, "navi: http/2 connection went away"))
+      mux.releaseSlot()
+      fut.fail(newException(UnprocessedError, "navi: http/2 request not processed"))
 
 proc wakeSenders(mux: H2Mux) =
   ## Wake streaming uploads whose queued chunk has drained onto the wire (the
@@ -272,11 +272,11 @@ proc readChunk*(mux: H2Mux, sid: uint32): Future[string] {.async.} =
       if mux.h2.streamEnded(sid):                    # ended and the queue is drained
         mux.endStream(sid)
         return ""
-      if mux.h2.goneAway:
-        if mux.h2.streamUnprocessed(sid):
-          raise newException(UnprocessedError, "navi: http/2 request not processed")
-        else:
-          raise newException(IOError, "navi: http/2 connection went away")
+      if mux.h2.goneAway and mux.h2.streamUnprocessed(sid):
+        # Above last-stream-id: not processed, retryable. At or below it, fall through
+        # and keep pulling -- the peer may still deliver more body / END_STREAM, and a
+        # real close raises "connection closed" via the `not mux.alive` check above.
+        raise newException(UnprocessedError, "navi: http/2 request not processed")
       # Nothing pending and not finished: wait for the reader to feed more. There
       # is no yield between the checks above and registering here, so the reader
       # (which runs only while we await) cannot slip a wake in between -- no lost
@@ -325,6 +325,9 @@ proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: strin
     await slot
   if not mux.alive:
     raise newException(IOError, "navi: http/2 connection not usable")
+  if mux.h2.goneAway:       # a GOAWAY landed while we waited: opening a new stream now
+    raise newException(UnprocessedError,   # would break RFC 9113 6.8 (peer PROTOCOL_ERRORs
+      "navi: http/2 request not processed") # and drops the conn). Retry on a fresh conn.
   let sid = mux.h2.openStream()
   mux.h2.setSinkMode(sid)                 # gate the receive window; drainDownload acks it
   mux.sinkStreams.incl sid
@@ -358,16 +361,15 @@ proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: strin
         raise newException(IOError, "navi: http/2 stream reset")
     if mux.h2.headersReady(sid): break
     if mux.h2.streamEnded(sid): break        # headers-only response (no body)
-    if mux.h2.goneAway:
-      let unprocessed = mux.h2.streamUnprocessed(sid)
+    if mux.h2.goneAway and mux.h2.streamUnprocessed(sid):
+      # Above last-stream-id: not processed, retryable. At or below it, fall through
+      # and keep waiting for headers -- the peer may still deliver them, and a real
+      # close raises "connection closed" via the `not mux.alive` check above.
       mux.sinkStreams.excl sid
       mux.recvq.del(sid)
       discard mux.h2.takeResponse(sid)
       mux.releaseSlot()
-      if unprocessed:
-        raise newException(UnprocessedError, "navi: http/2 request not processed")
-      else:
-        raise newException(IOError, "navi: http/2 connection went away")
+      raise newException(UnprocessedError, "navi: http/2 request not processed")
     let ready = newFuture[void]("h2mux.recvhdr")
     mux.recvReady[sid] = ready
     await ready
@@ -428,6 +430,9 @@ proc request*(mux: H2Mux, headers: seq[(string, string)], body: string,
     await slot
   if not mux.alive:
     raise newException(IOError, "navi: http/2 connection not usable")
+  if mux.h2.goneAway:       # a GOAWAY landed while we waited: opening a new stream now
+    raise newException(UnprocessedError,   # would break RFC 9113 6.8 (peer PROTOCOL_ERRORs
+      "navi: http/2 request not processed") # and drops the conn). Retry on a fresh conn.
   # Streaming responses go through sendAndReadHeaders + readChunk/drainDownload on
   # the handle, not here, so this path is buffered: it waits for the whole response.
   # (`bodyStream` still streams the request body up.)

@@ -43,6 +43,20 @@ env -u LD_LIBRARY_PATH openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
 # --- start N servers for a given protocol -----------------------------------
 start_servers() {
   local p="$1" i port
+  # hypercorn's connection-lifecycle defaults are too aggressive for a loopback soak
+  # and manufacture spurious transport errors a real keep-alive server would not:
+  #  - keep_alive_max_requests (default 1000): closes each h2 connection after 1000
+  #    requests -> constant churn under load; an in-flight non-idempotent request at
+  #    the recycle then fails un-retryably.
+  #  - keep_alive_timeout (default 5s): closes a connection idle for 5s; a >5s stream
+  #    (a 1 GiB transfer) or an idle pooled connection between transfers is dropped
+  #    mid-flight, which without a client retry crashes the transfer.
+  # Raise both (override with NAVI_KEEPALIVE_MAX / NAVI_KEEPALIVE_TIMEOUT).
+  local hcfg="$work/hypercorn.toml"
+  {
+    printf 'keep_alive_max_requests = %s\n' "${NAVI_KEEPALIVE_MAX:-1000000000}"
+    printf 'keep_alive_timeout = %s\n' "${NAVI_KEEPALIVE_TIMEOUT:-3600}"
+  } >"$hcfg"
   if [ "$p" = "h3" ]; then
     command -v caddy >/dev/null || { echo "caddy required for h3 (use the h3 image)"; return 1; }
     local caddyfile="$work/Caddyfile"
@@ -60,7 +74,7 @@ start_servers() {
     for ((i=0; i<servers; i++)); do
       port=$((base_port + i))
       local bport=$((base_port + 1000 + i))
-      hypercorn "app:app" --bind "127.0.0.1:$bport" >"$work/srv-$i.log" 2>&1 &
+      hypercorn "app:app" --bind "127.0.0.1:$bport" --config "$hcfg" >"$work/srv-$i.log" 2>&1 &
       pids+=($!)
       cat >>"$caddyfile" <<-EOF
 	https://$host:$port {
@@ -76,7 +90,7 @@ start_servers() {
     for ((i=0; i<servers; i++)); do
       port=$((base_port + i))
       hypercorn "app:app" --bind "$host:$port" --certfile "$cert" --keyfile "$key" \
-        >"$work/srv-$i.log" 2>&1 &
+        --config "$hcfg" >"$work/srv-$i.log" 2>&1 &
       pids+=($!)
     done
   fi
