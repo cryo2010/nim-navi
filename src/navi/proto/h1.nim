@@ -228,8 +228,13 @@ proc eof*(p: var H1Parser) =
 
 proc keepAliveAfter*(p: H1Parser): bool =
   ## Whether the connection can be reused once this response is fully read.
-  ## Requires a self-delimited body (a body that ends only at connection close
-  ## cannot be pooled) and an HTTP/1.1 peer that did not ask to close.
+  ## Requires the response to be fully consumed (`stDone`) -- reusing a connection
+  ## whose body was not completely read leaves those bytes on the wire, so the next
+  ## request on it parses stale body as its status line (a short read on a pooled
+  ## keep-alive connection is exactly this case). Also requires a self-delimited body
+  ## (one that ends only at connection close cannot be pooled) and an HTTP/1.1 peer
+  ## that did not ask to close.
+  if p.state != stDone: return false
   if p.bodyMode == bmUntilClose: return false
   if p.version != "HTTP/1.1": return false
   "close" notin p.headers.get("connection").toLowerAscii

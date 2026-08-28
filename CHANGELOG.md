@@ -18,6 +18,12 @@ onward (pre-1.0, minor versions may include breaking changes).
   `SseStream` across all native backends.
 
 ### Fixed
+- HTTP/1.1 keep-alive: a connection whose response body was not fully read is no
+  longer returned to the pool. A short read (e.g. the peer closing a keep-alive
+  connection mid-body, which the async `SSL_set_fd` path surfaces as an EOF) left
+  the unread body bytes on the wire; reusing that connection then parsed the stale
+  body as the next response's status line, corrupting its version/status. `keepAlive`
+  now requires the response to be fully consumed before the connection is pooled.
 - HTTP/3: a streamed upload that exceeded a stream's QUIC flow-control window
   stalled (the driver treated `STREAM_DATA_BLOCKED` as fatal and never resumed the
   stream when the window reopened). The connection driver now blocks/unblocks the
