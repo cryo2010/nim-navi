@@ -111,7 +111,7 @@ nimble add navi
 - `checksums` (MD5 and SHA-256 for Digest auth; the former `std/md5`, now maintained by nim-lang as a separate package). This is navi's only required Nim dependency.
 - `chronos` >= 4.0, only if you `import navi/chronos`. The chronos client runs OpenSSL for TLS (like sync/asyncdispatch), so `https` needs a `-d:ssl` build. Aside from `checksums`, the sync and asyncdispatch clients pull in no third-party Nim packages.
 - `libbrotlidec` and `libzstd` (system libraries) are optional: needed only to decode `br`/`zstd` responses. They load lazily, so navi runs fine without them until a server actually sends those encodings.
-- HTTP/3 is opt-in via `-d:naviHttp3`, which needs **ngtcp2**, **nghttp3**, and **OpenSSL >= 3.5** (system libraries, located at build time via `pkg-config`) plus a C++ compiler. Without the flag none of these are required and h3 is unavailable; it applies to the sync and asyncdispatch clients only.
+- HTTP/3 is opt-in via `-d:naviHttp3`, which needs **ngtcp2**, **nghttp3**, and **OpenSSL >= 3.5** (system libraries, located at build time via `pkg-config`) plus a C++ compiler. Without the flag none of these are required and h3 is unavailable; it applies to the sync, asyncdispatch, and chronos clients.
 - **On Windows**, the DLL names decide which OpenSSL is loaded. Nim's default 64-bit
   list names only the (EOL) 1.1 pair, so navi targets 3.x via `-d:sslVersion=3-x64`
   -- already set for this repo in `nim.cfg`; set it in your own app too. Nim's
@@ -144,7 +144,7 @@ Every client shares the same API, and the below table details where they differ.
 | Capability | `navi` (sync) | `navi/asyncdispatch` | `navi/chronos` | `navi/js` |
 | --- | :---: | :---: | :---: | :---: |
 | HTTP/2 | ✓ | ✓ | ✓ | runtime |
-| HTTP/3 | opt-in | opt-in | ✗ | runtime |
+| HTTP/3 | opt-in | opt-in | opt-in | runtime |
 | Concurrent multiplexing | `parallel()` | transparent | transparent | runtime |
 | TLS engine | OpenSSL | OpenSSL | OpenSSL | runtime |
 | Custom CA (`caFile`) | ✓ | ✓ | ✓ | runtime |
@@ -173,7 +173,8 @@ Two clients carry caveats:
   OpenSSL (like the sync and asyncdispatch clients) rather than its bundled
   BearSSL, reaching full TLS parity: ALPN + HTTP/2, TLS 1.3, cipher selection,
   mTLS, and session resumption. TLS therefore links OpenSSL and requires a
-  `-d:ssl` build (plaintext `http` does not). HTTP/3 is still OpenSSL-backends-only.
+  `-d:ssl` build (plaintext `http` does not). HTTP/3 (opt-in via `-d:naviHttp3`)
+  is available here too, as on the other OpenSSL backends.
 - **`navi/js` runs on `fetch`/`WebSocket`,** so the platform owns connections,
   cookies, redirects, decompression, and TLS; navi keeps request building,
   retries, throw-on-non-2xx, and middleware. Its WebSocket wraps the native one, so
