@@ -18,6 +18,14 @@ onward (pre-1.0, minor versions may include breaking changes).
   `SseStream` across all native backends.
 
 ### Fixed
+- HTTP/1.1 keep-alive reuse is now safe *and* complete for non-idempotent methods.
+  When a pooled connection fails **before any response byte** (the classic keep-alive
+  race: the server closed the idle connection), the request was not processed, so it
+  is now replayed on a fresh connection even when non-idempotent (POST/PATCH) --
+  previously the sync backend errored out. A failure **after** the response began is
+  still only retried for idempotent methods, and the async/chronos backends no longer
+  fall through unconditionally (which could re-send a request the server had already
+  processed). A non-rewindable streamed body (`bodyStream`) is never replayed.
 - HTTP/1.1 keep-alive: a connection whose response body was not fully read is no
   longer returned to the pool. A short read (e.g. the peer closing a keep-alive
   connection mid-body, which the async `SSL_set_fd` path surfaces as an EOF) left

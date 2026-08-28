@@ -71,6 +71,29 @@ suite "sync entry end to end":
     joinThread(th)
     check accepts == 1  # both requests used the one connection
 
+  test "a non-idempotent request is replayed on a fresh connection when the pooled one was closed before any response":
+    # The keep-alive race: the server silently closes a pooled connection, then the
+    # client reuses it for a POST. The failure comes before any response byte, so the
+    # request was not processed and is safe to replay even though POST is not
+    # idempotent -- it must land on a fresh connection, not error out.
+    var port = 0
+    var accepts = 0
+    var closed1 = false
+    var th: Thread[StaleCtx]
+    startStalePooled(th, port, addr closed1, addr accepts)
+
+    let api = newNavi()
+    let key = "http://127.0.0.1:" & $port
+    check api.get(key & "/").status == 200      # conn 1, then pooled
+    check api.pool.idleCount(key) == 1
+    while not closed1: sleep(1)                  # server has closed the pooled conn
+
+    let r = api.request(POST, key & "/submit", body = "data")
+    check r.status == 200
+    check r.body == "replayed:data"             # served on the fresh connection
+    joinThread(th)
+    check accepts == 2                           # a second connection was opened
+
   test "close should drain the connection pool":
     var port = 0
     var accepts = 0
