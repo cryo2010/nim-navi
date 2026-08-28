@@ -139,11 +139,14 @@ export PYTHONPATH="$here/server"          # so hypercorn finds app.py as `app`
 cd "$here/server"
 
 common="--path:$root/src -d:ssl -d:release --hints:off"
-[ "$proto" = "h3" ] && common="$common -d:naviHttp3"
+# The single per-backend binary picks its protocol at runtime, so build it with h3
+# support whenever the run includes an h3 cell (h3 or all); h1/h2 cells just don't
+# use the h3 code. Needs the h3 image's toolchain (nimble stressX selects it).
+{ [ "$proto" = "h3" ] || [ "$proto" = "all" ]; } && common="$common -d:naviHttp3"
 
 # Which backends to run (skip those without a client source for this workload).
 case "$backend" in all) backends=(sync asyncdispatch chronos js) ;; *) backends=("$backend") ;; esac
-case "$proto"   in all) protos=(h1 h2) ;; *) protos=("$proto") ;; esac   # h3 opt-in via PROTO=h3
+case "$proto"   in all) protos=(h1 h2 h3) ;; *) protos=("$proto") ;; esac
 
 fail=0
 for be in "${backends[@]}"; do

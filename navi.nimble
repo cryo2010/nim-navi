@@ -80,7 +80,10 @@ proc runStress(workload: string) =
   # not propagate a task's exit code (nim-lang/nimble#1802), so a failure shows in
   # the output but this exits 0 -- run the docker command directly, or read the
   # final "== <workload>: all cells passed ==" banner, for CI-grade pass/fail.
-  let h3 = getEnv("NAVI_PROTO", "h2") == "h3"
+  # `all` includes h3, so it needs the h3 image (ngtcp2/nghttp3/OpenSSL 3.5 + Caddy)
+  # too -- that image is a superset and serves h1/h2 as well.
+  let proto = getEnv("NAVI_PROTO", "h2")
+  let h3 = proto == "h3" or proto == "all"
   let dockerfile = if h3: "tests/stress/Dockerfile.h3" else: "tests/stress/Dockerfile"
   let image = if h3: "navi-stress-h3" else: "navi-stress"
   exec "docker build -f " & dockerfile & " -t " & image & " ."
