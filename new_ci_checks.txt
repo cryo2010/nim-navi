@@ -1,0 +1,25 @@
+CI / valgrind / http1 (plaintext) / <target> / orc
+CI / valgrind / http1 (TLS) / <target> / orc
+CI / valgrind / http2 (plaintext) / <target> / orc
+CI / valgrind / http2 (TLS) / <target> / orc
+CI / valgrind / http2 stream up (TLS) / <target> / orc
+CI / valgrind / http2c stream up (TLS) / <target> / orc
+CI / valgrind / http2 stream down (TLS) / <target> / orc
+CI / valgrind / http2c stream down (TLS) / <target> / orc
+CI / valgrind / sse (TLS) / <target> / orc
+CI / valgrind / websocket (plaintext) / <target> / orc
+CI / valgrind / websocket (TLS) / <target> / orc
+
+CI / sanitize (asan + ubsan) / http1 (plaintext) / <target> / orc
+CI / sanitize (asan + ubsan) / http1 (TLS) / <target> / orc
+CI / sanitize (asan + ubsan) / http2 (plaintext) / <target> / orc
+CI / sanitize (asan + ubsan) / http2 (TLS) / <target> / orc
+CI / sanitize (asan + ubsan) / http2 stream up (TLS) / <target> / orc
+CI / sanitize (asan + ubsan) / http2c stream up (TLS) / <target> / orc
+CI / sanitize (asan + ubsan) / http2 stream down (TLS) / <target> / orc
+CI / sanitize (asan + ubsan) / http2c stream down (TLS) / <target> / orc
+CI / sanitize (asan + ubsan) / sse (TLS) / <target> / orc
+CI / sanitize (asan + ubsan) / websocket (plaintext) / <target> / orc
+CI / sanitize (asan + ubsan) / websocket (TLS) / <target> / orc
+
+17 high, 18 deep

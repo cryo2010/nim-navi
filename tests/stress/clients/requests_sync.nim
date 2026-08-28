@@ -33,6 +33,17 @@ proc main() =
   var apis: seq[Navi]
   for _ in 0 ..< cfg.clients: apis.add mkClient(cfg)
 
+  # Warm up per-origin protocol discovery (h3 needs an Alt-Svc round-trip) so the
+  # measured phase is pinned from the first request; then a downgrade fails hard.
+  let expect = cfg.expectedVersion
+  if expect.len > 0:
+    for api in apis:
+      for base in pool.all():
+        for _ in 0 ..< 3:
+          try:
+            if api.request(GET, base & "/echo").httpVersion == expect: break
+          except CatchableError: break
+
   let start = epochTime()
   let deadline = start + cfg.seconds
   var lastReport = start
@@ -53,6 +64,7 @@ proc main() =
           h["x-want-encoding"] = cfg.respCompression
       try:
         let res = api.request(v, url, headers = h, body = body)
+        cfg.checkVersion(res.httpVersion)   # hard-fail on a silent protocol downgrade
         counter.tally(res.status)
       except CatchableError:
         counter.fail()

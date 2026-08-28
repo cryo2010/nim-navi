@@ -10,10 +10,11 @@
 // exception must never unwind into Nim-generated code), and the ngtcp2/nghttp3
 // callbacks never throw across the C library frames that invoke them.
 //
-// Scope: blocking sync wrappers over a non-blocking step-function core (the
-// asyncdispatch backend drives the same core from its event loop). One request
-// in flight at a time; cert + hostname verified by default. TODO: async/mux and
-// streaming bodies.
+// The core is a non-blocking step function (send/recv/timer + submit/read); the
+// async backends drive it from their event loop, and blocking sync wrappers drive
+// it with a poll loop (navi_h3_pump). Multiplexed streams, incremental response
+// reads, and streamed request bodies (a pull callback into navi, kept until acked)
+// are all supported. Cert + hostname verified by default.
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
 #include <ngtcp2/ngtcp2_crypto_ossl.h>
@@ -28,11 +29,14 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <memory>
 #include <span>
 #include <string>
@@ -40,7 +44,23 @@
 #include <unordered_map>
 #include <vector>
 
+// Pull the next request-body chunk from navi (its `bodyStream` producer, which is
+// synchronous): returns the chunk length and sets *out_ptr to the bytes (borrowed
+// for the call only -- the driver copies them). 0 = end of body, < 0 = error.
+extern "C" {
+typedef std::ptrdiff_t (*NaviBodyPull)(void *env, const char **out_ptr);
+}
+
 namespace {
+
+// A produced-but-not-yet-acked request-body chunk. nghttp3 borrows the vec memory
+// a data reader returns until it is acked, so a streamed chunk must stay put until
+// `acked_stream_data` covers it -- hence a deque of stable std::strings, not one
+// growing buffer that could reallocate and invalidate outstanding vecs.
+struct BodyChunk {
+  std::string data;
+  std::size_t acked = 0;
+};
 
 // One in-flight request/response on the connection. Many can be live at once
 // (multiplexing): each is keyed by its QUIC stream id.
@@ -52,6 +72,12 @@ struct Stream {
   bool done = false;
   bool reset = false;     // closed without a normal end_stream (server reset/abort)
   std::string req_body;   // owned copy (so the caller need not keep it alive)
+  // Streaming request body (navi bodyStream): chunks pulled from Nim on demand and
+  // kept until acked. `pull` null => this stream has no streamed body.
+  std::deque<BodyChunk> out;
+  bool out_eof = false;   // producer returned end-of-body (EOF flagged to nghttp3)
+  NaviBodyPull pull = nullptr;
+  void *pull_env = nullptr;
 };
 
 // One QUIC/h3 connection. RAII: the destructor releases the library objects and
@@ -135,6 +161,17 @@ int on_acked(ngtcp2_conn *, std::int64_t stream_id, std::uint64_t, std::uint64_t
              void *ud, void *) {
   auto *c = static_cast<H3Conn *>(ud);
   if (c->h3) nghttp3_conn_add_ack_offset(c->h3, stream_id, datalen);
+  return 0;
+}
+
+// The peer granted more send window for `stream_id` (MAX_STREAM_DATA). If we had
+// blocked it on STREAM_DATA_BLOCKED, let nghttp3 offer its body again so a large
+// streamed upload resumes instead of stalling forever.
+int on_extend_max_stream_data(ngtcp2_conn *, std::int64_t stream_id, std::uint64_t,
+                              void *ud, void *) {
+  auto *c = static_cast<H3Conn *>(ud);
+  if (c->h3 && nghttp3_conn_unblock_stream(c->h3, stream_id) != 0)
+    return NGTCP2_ERR_CALLBACK_FAILURE;
   return 0;
 }
 
@@ -236,6 +273,53 @@ nghttp3_ssize read_body(nghttp3_conn *, std::int64_t stream_id, nghttp3_vec *vec
   return 1;
 }
 
+// Streaming request body: pull the next chunk from navi (via the stream's `pull`
+// callback) and hand it to nghttp3, keeping it alive in `out` until acked. Setting
+// EOF one call after the last non-empty chunk (when the producer returns 0) matches
+// nghttp3's read-until-EOF loop. Returning WOULDBLOCK is never needed: navi's
+// producer is synchronous and always returns immediately (a chunk, or 0 at end).
+nghttp3_ssize read_body_stream(nghttp3_conn *, std::int64_t stream_id, nghttp3_vec *vec,
+                               std::size_t, std::uint32_t *pflags, void *cud, void *) {
+  auto *c = static_cast<H3Conn *>(cud);
+  auto it = c->streams.find(stream_id);
+  if (it == c->streams.end()) { *pflags |= NGHTTP3_DATA_FLAG_EOF; return 0; }
+  Stream &s = it->second;
+  if (s.out_eof || !s.pull) { *pflags |= NGHTTP3_DATA_FLAG_EOF; return 0; }
+  const char *p = nullptr;
+  std::ptrdiff_t n = s.pull(s.pull_env, &p);
+  if (n < 0) return NGHTTP3_ERR_CALLBACK_FAILURE;   // producer raised
+  if (n == 0) { s.out_eof = true; *pflags |= NGHTTP3_DATA_FLAG_EOF; return 0; }
+  try {
+    s.out.push_back(BodyChunk{std::string(p, static_cast<std::size_t>(n)), 0});
+  } catch (...) {
+    return NGHTTP3_ERR_CALLBACK_FAILURE;
+  }
+  vec[0].base = reinterpret_cast<std::uint8_t *>(const_cast<char *>(s.out.back().data.data()));
+  vec[0].len = s.out.back().data.size();
+  return 1;
+}
+
+// A streamed request body's bytes have been acked; drop them from `out` so a large
+// upload stays bounded by the flow-control window rather than buffering the whole
+// body. Acked bytes are always a prefix of what we handed out, so free from front.
+int on_body_acked(nghttp3_conn *, std::int64_t stream_id, std::uint64_t datalen,
+                  void *cud, void *) {
+  auto *c = static_cast<H3Conn *>(cud);
+  auto it = c->streams.find(stream_id);
+  if (it == c->streams.end()) return 0;
+  auto &out = it->second.out;
+  std::uint64_t left = datalen;
+  while (left > 0 && !out.empty()) {
+    BodyChunk &f = out.front();
+    std::size_t avail = f.data.size() - f.acked;
+    std::size_t take = static_cast<std::size_t>(std::min<std::uint64_t>(left, avail));
+    f.acked += take;
+    left -= take;
+    if (f.acked == f.data.size()) out.pop_front();
+  }
+  return 0;
+}
+
 int udp_connect(const char *host, const char *port, H3Conn *c) {
   addrinfo hints{};
   hints.ai_family = AF_UNSPEC;
@@ -291,6 +375,18 @@ ngtcp2_ssize send_step(H3Conn *c, std::span<std::uint8_t> buf) {
         static_cast<std::size_t>(sveccnt), now_ns());
     if (wrote == NGTCP2_ERR_WRITE_MORE) {
       nghttp3_conn_add_write_offset(c->h3, stream_id, static_cast<std::size_t>(ndatalen));
+      continue;
+    }
+    // The stream can't send right now: its QUIC flow-control window is exhausted
+    // (a large streamed upload) or its write side is shut. Tell nghttp3 to stop
+    // offering that stream's body until it reopens (via extend_max_stream_data ->
+    // unblock); NOT a fatal error, so keep writing other streams / control frames.
+    if (wrote == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
+      nghttp3_conn_block_stream(c->h3, stream_id);
+      continue;
+    }
+    if (wrote == NGTCP2_ERR_STREAM_SHUT_WR) {
+      nghttp3_conn_shutdown_stream_write(c->h3, stream_id);
       continue;
     }
     if (wrote < 0) {
@@ -349,6 +445,32 @@ int navi_h3_handle_timeout(H3Conn *c) {
   return 0;
 }
 
+// One blocking I/O cycle: flush all pending datagrams, then wait (bounded by the
+// QUIC timer) for one readable batch or the timer, and service it. The building
+// block for the sync blocking loops (handshake, buffered request, and the sync
+// streaming reader). Returns 0 on success, -1 on a transport error.
+int navi_h3_pump(H3Conn *c) {
+  std::array<std::uint8_t, 1500> buf{};
+  ngtcp2_ssize n;
+  while ((n = navi_h3_send(c, buf.data(), buf.size())) > 0)
+    if (send(c->fd, buf.data(), static_cast<std::size_t>(n), 0) < 0) {
+      std::perror("send");
+      return -1;
+    }
+  if (n < 0) return -1;
+  pollfd pfd{c->fd, POLLIN, 0};
+  int pr = poll(&pfd, 1, static_cast<int>(navi_h3_timeout_ms(c)));
+  if (pr > 0 && (pfd.revents & POLLIN))
+    for (;;) {   // drain EVERY queued datagram this cycle, not just one: a streamed
+      ssize_t r = recv(c->fd, buf.data(), buf.size(), 0);   // upload otherwise advances
+      if (r <= 0) break;                                    // one MAX_STREAM_DATA per
+      if (navi_h3_recv(c, buf.data(), static_cast<std::size_t>(r)) != 0)  // cycle -> crawls
+        return -1;
+    }
+  if (navi_h3_timeout_ms(c) == 0 && navi_h3_handle_timeout(c) != 0) return -1;
+  return 0;
+}
+
 // Create the nghttp3 client session and bind the control + QPACK streams.
 int navi_h3_bind(H3Conn *c) {
   nghttp3_settings settings;
@@ -358,6 +480,7 @@ int navi_h3_bind(H3Conn *c) {
   cb.recv_data = on_recv_data;
   cb.end_stream = on_end_stream;
   cb.deferred_consume = on_deferred_consume;
+  cb.acked_stream_data = on_body_acked;   // free acked streamed-upload chunks
   if (nghttp3_conn_client_new(&c->h3, &cb, &settings, nullptr, c) != 0) return -1;
   std::int64_t ctrl, qenc, qdec;
   if (ngtcp2_conn_open_uni_stream(c->conn, &ctrl, nullptr) != 0 ||
@@ -457,6 +580,7 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
     cb.recv_stream_data = on_recv_stream_data;
     cb.acked_stream_data_offset = on_acked;
     cb.stream_close = on_stream_close;
+    cb.extend_max_stream_data = on_extend_max_stream_data;   // resume a blocked upload
 
     ngtcp2_settings settings;
     ngtcp2_settings_default(&settings);
@@ -508,14 +632,17 @@ H3Conn *navi_h3_open(const char *host, const char *port, const char *sni,
 // functions until navi_h3_stream_done(sid), then reads with navi_h3_take_response.
 // req_headers: extra fields as "name\nvalue\n..." or nullptr/"" for none; body may
 // be null (borrowed until the stream completes).
+// `pull` (with `pull_env`) streams the request body from navi on demand; if null,
+// `body`/`body_len` is a buffered body (or none). The two are mutually exclusive.
 std::int64_t navi_h3_submit(H3Conn *c, const char *method, const char *path_,
                             const char *req_headers, const char *body,
-                            std::size_t body_len) {
+                            std::size_t body_len, NaviBodyPull pull, void *pull_env) {
   try {
     std::int64_t sid;
     if (ngtcp2_conn_open_bidi_stream(c->conn, &sid, nullptr) != 0) return -1;
     Stream &s = c->streams[sid];
-    if (body && body_len) s.req_body.assign(body, body_len);  // owned copy
+    if (pull) { s.pull = pull; s.pull_env = pull_env; }     // streamed body
+    else if (body && body_len) s.req_body.assign(body, body_len);  // owned copy
 
     std::vector<nghttp3_nv> nva;
     nva.reserve(8);
@@ -536,8 +663,10 @@ std::int64_t navi_h3_submit(H3Conn *c, const char *method, const char *path_,
         nva.push_back(make_nv(toks[i], toks[i + 1]));
     }
 
-    nghttp3_data_reader dr{read_body};
-    const nghttp3_data_reader *drp = s.req_body.empty() ? nullptr : &dr;
+    nghttp3_data_reader dr{};
+    const nghttp3_data_reader *drp = nullptr;
+    if (s.pull) { dr.read_data = read_body_stream; drp = &dr; }
+    else if (!s.req_body.empty()) { dr.read_data = read_body; drp = &dr; }
     // nghttp3 copies the header data during submit, so nva may be freed after.
     if (nghttp3_conn_submit_request(c->h3, sid, nva.data(), nva.size(), drp, nullptr) != 0) {
       c->streams.erase(sid);
@@ -649,10 +778,11 @@ void navi_h3_stream_free(H3Conn *c, std::int64_t sid) {
 // take the response.
 int navi_h3_request(H3Conn *c, const char *method, const char *path_,
                     const char *req_headers, const char *body, std::size_t body_len,
-                    long *out_status, char *out_body, std::size_t out_cap,
-                    std::size_t *out_len, char *out_headers, std::size_t hdr_cap,
-                    std::size_t *hdr_len) {
-  std::int64_t sid = navi_h3_submit(c, method, path_, req_headers, body, body_len);
+                    NaviBodyPull pull, void *pull_env, long *out_status, char *out_body,
+                    std::size_t out_cap, std::size_t *out_len, char *out_headers,
+                    std::size_t hdr_cap, std::size_t *hdr_len) {
+  std::int64_t sid =
+      navi_h3_submit(c, method, path_, req_headers, body, body_len, pull, pull_env);
   if (sid < 0) return -1;
   if (drive_until(c, &c->streams.at(sid).done) != 0) return -1;
   if (navi_h3_stream_reset(c, sid)) {   // reset/abort, not a real response
@@ -666,26 +796,17 @@ int navi_h3_request(H3Conn *c, const char *method, const char *path_,
 }  // extern "C"
 
 namespace {
+// Drive the blocking loops (handshake, buffered request, streamed upload) until
+// `*flag`. Bounded by wall-clock, not an iteration count: a large streamed upload
+// legitimately needs many cycles, but a genuinely stuck connection must still fail
+// rather than hang forever. 120s is a generous safety net (higher layers enforce
+// navi's own timeouts).
 int drive_until(H3Conn *c, const bool *flag) {
-  std::array<std::uint8_t, 1500> buf{};
-  pollfd pfd{c->fd, POLLIN, 0};
-  for (int loops = 0; loops < 2000 && !*flag; ++loops) {
-    ngtcp2_ssize n;
-    while ((n = navi_h3_send(c, buf.data(), buf.size())) > 0)
-      if (send(c->fd, buf.data(), static_cast<std::size_t>(n), 0) < 0) {
-        std::perror("send");
-        return -1;
-      }
-    if (n < 0) return -1;
-    int pr = poll(&pfd, 1, static_cast<int>(navi_h3_timeout_ms(c)));
-    if (pr > 0 && (pfd.revents & POLLIN)) {
-      ssize_t r = recv(c->fd, buf.data(), buf.size(), 0);
-      if (r > 0 && navi_h3_recv(c, buf.data(), static_cast<std::size_t>(r)) != 0)
-        return -1;
-    } else if (navi_h3_handle_timeout(c) != 0) {
-      return -1;
-    }
+  std::uint64_t start = now_ns();
+  while (!*flag) {
+    if (navi_h3_pump(c) != 0) return -1;
+    if (now_ns() - start > 120ULL * NGTCP2_SECONDS) return -1;
   }
-  return *flag ? 0 : -1;
+  return 0;
 }
 }  // namespace

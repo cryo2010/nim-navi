@@ -22,10 +22,12 @@ proc main() =
   let start = epochTime()
   let deadline = start + cfg.seconds
   var lastReport = start
+  var gate = initVersionGate(cfg)
   try:
     let s = api.sse(pool.pick() & "/events")
     s.each(ev):
       counter.tally(200)
+      gate.sample(s.httpVersion)         # track the negotiated version (h3 after upgrade)
       if epochTime() - lastReport >= cfg.reportSeconds.float:
         lastReport = epochTime()
         report(cfg.label, counter, epochTime() - start)
@@ -33,6 +35,7 @@ proc main() =
     s.close()
   except CatchableError:
     counter.fail()
+  gate.finish()   # hard-fail if the pinned protocol (h2/h3) was never negotiated
 
   report(cfg.label & " final", counter, epochTime() - start)
   echo "== sse sync ", cfg.proto, " passed (", counter.ops, " events) =="

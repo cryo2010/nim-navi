@@ -140,26 +140,37 @@ proc openConnChronos*(host: string, port: int, sni, caFile: string,
   return qc
 
 proc requestOnConn*(qc: QuicConnChronos, verb, path: string,
-                    headers: seq[(string, string)],
-                    body: string): Future[Http3Response] {.async.} =
+                    headers: seq[(string, string)], body: string,
+                    producer: proc(): string {.closure, raises: [CatchableError].} = nil):
+                    Future[Http3Response] {.async.} =
   ## Run one buffered HTTP/3 request on the shared connection, concurrently with
-  ## others. Awaits the whole response.
+  ## others. Awaits the whole response. The request body is buffered (`body`) or
+  ## streamed from `producer` (navi bodyStream).
   if not qc.alive:
     raise newException(QuicError, "navi HTTP/3 connection is closed")
   var reqHdr = ""
   for (k, v) in headers:
     reqHdr.add k; reqHdr.add '\n'; reqHdr.add v; reqHdr.add '\n'
   var b = body
-  let bp = if b.len > 0: cast[ptr char](addr b[0]) else: nil
+  let streamed = producer != nil
+  let pe = if streamed: H3PullEnv(producer: producer) else: nil  # kept alive by this
+  let pull = if streamed: h3PullThunk else: nil                  # async frame until done
+  let bp = if not streamed and b.len > 0: cast[ptr char](addr b[0]) else: nil
+  # Pin the pull env for the request's lifetime: the reader calls it from a
+  # background task after this proc's last textual use (the submit), so the async
+  # transform would otherwise let it be collected mid-request (use-after-free).
+  if pe != nil: GC_ref(pe)
   let sid = navi_h3_submit(qc.c, verb.cstring, path.cstring, reqHdr.cstring, bp,
-                           csize_t(b.len))
+                           csize_t(if streamed: 0 else: b.len), pull, cast[pointer](pe))
   if sid < 0:
+    if pe != nil: GC_unref(pe)
     raise newException(QuicError, "navi HTTP/3 submit failed")
   let fut = newFuture[void]("navi.h3.stream")
   qc.waiters[sid] = fut
   var consumed = false                     # true once take_response has taken the stream
   defer:
     qc.waiters.del(sid)
+    if pe != nil: GC_unref(pe)
     if not consumed and qc.c != nil:       # cancelled, reset, or take failed: free the
       navi_h3_stream_free(qc.c, sid)       # C stream so an abandoned request isn't left
   wake(qc)
@@ -196,15 +207,16 @@ proc waitProgress(qc: QuicConnChronos, sid: int64) {.async.} =
   await f
 
 proc submitStream*(qc: QuicConnChronos, verb, path: string,
-                   headers: seq[(string, string)], body: string): int64 =
+                   headers: seq[(string, string)], body: string,
+                   pull: H3BodyPull = nil, pullEnv: pointer = nil): int64 =
   if not qc.alive: return -1
   var reqHdr = ""
   for (k, v) in headers:
     reqHdr.add k; reqHdr.add '\n'; reqHdr.add v; reqHdr.add '\n'
   var b = body
-  let bp = if b.len > 0: cast[ptr char](addr b[0]) else: nil
+  let bp = if pull == nil and b.len > 0: cast[ptr char](addr b[0]) else: nil
   result = navi_h3_submit(qc.c, verb.cstring, path.cstring, reqHdr.cstring, bp,
-                          csize_t(b.len))
+                          csize_t(if pull != nil: 0 else: b.len), pull, pullEnv)
   wake(qc)
 
 proc awaitHeaders*(qc: QuicConnChronos, sid: int64):

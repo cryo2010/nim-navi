@@ -234,7 +234,8 @@ when defined(naviHttp3):
     let origin = originKey(req.url)
     let qc = await client.getH3Conn(origin, ep, req)
     try:
-      let r = await qc.requestOnConn($req.verb, req.url.requestTarget, fwd, req.body)
+      let r = await qc.requestOnConn($req.verb, req.url.requestTarget, fwd, req.body,
+                                     req.bodyStream)
       result = initResponse(r.status, "", "HTTP/3", initHeaders(r.headers), r.body)
     except QuicError:
       if client.h3conns.getOrDefault(origin, nil) == qc:
@@ -247,7 +248,7 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
   ## any QUIC failure falling back to h2/h1; `alt-svc` on h2/h1 responses is
   ## captured for later upgrades.
   when defined(naviHttp3):
-    if client.config.wantsH3 and req.url.isTls and req.bodyStream == nil:
+    if client.config.wantsH3 and req.url.isTls:   # buffered or streamed (bodyStream) body
       let ep = client.altSvc.h3Endpoint("https", req.url.host, req.url.port)
       if ep.isSome:
         try: return await h3TransportAsync(client, req, ep.get)
@@ -746,6 +747,11 @@ proc close*(s: SseStream): Future[void] {.async.} =
     await s.handle.close()
     s.handle = nil
   await s.client.close()
+
+proc httpVersion*(s: SseStream): string =
+  ## HTTP version of the current underlying connection, or "" between reconnects.
+  ## An SSE stream starts on h1/h2 and upgrades to h3 only after a reconnect.
+  if s.handle != nil: s.handle.httpVersion else: ""
 
 proc lastEventId*(s: SseStream): string = s.parser.lastEventId()
 

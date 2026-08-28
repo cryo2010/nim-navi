@@ -7,6 +7,23 @@ onward (pre-1.0, minor versions may include breaking changes).
 
 ## [Unreleased]
 
+### Added
+- HTTP/3 now carries **streamed request bodies** (`bodyStream`): an upload is pulled
+  chunk by chunk over the h3 request stream (with QUIC stream flow-control
+  backpressure), on the sync, asyncdispatch, and chronos backends. Previously a
+  request with a `bodyStream` silently fell back to h2/h1.
+- The **sync** client gains HTTP/3 `stream()` and SSE: streaming downloads and
+  Server-Sent Events ride h3 (discovered via Alt-Svc, upgrading on a reconnect for
+  SSE) instead of silently downgrading to h2/h1. `httpVersion` is now exposed on
+  `SseStream` across all native backends.
+
+### Fixed
+- HTTP/3: a streamed upload that exceeded a stream's QUIC flow-control window
+  stalled (the driver treated `STREAM_DATA_BLOCKED` as fatal and never resumed the
+  stream when the window reopened). The connection driver now blocks/unblocks the
+  stream correctly and drains all queued datagrams per I/O cycle, so large uploads
+  progress at full speed.
+
 ## [0.8.0] - 2026-08-28
 
 Theme: HTTP/3 across the async backends, the chronos client's move to full OpenSSL

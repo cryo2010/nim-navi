@@ -150,7 +150,8 @@ when defined(naviHttp3):
                       caFile = client.config.tls.caFile,
                       verify = client.config.tls.wantsVerify)
     try:
-      let r = conn.request($req.verb, req.url.requestTarget, fwd, req.body)
+      let r = conn.request($req.verb, req.url.requestTarget, fwd, req.body,
+                           req.bodyStream)
       result = initResponse(r.status, "", "HTTP/3", initHeaders(r.headers), r.body)
     finally:
       conn.close()
@@ -161,9 +162,9 @@ proc transport(client: Navi, req: Request, sink: BodySink): Response =
   ## sent over HTTP/3; any QUIC failure falls back to h2/h1. The h3 endpoint is
   ## learned from the `alt-svc` header captured on prior h2/h1 responses.
   when defined(naviHttp3):
-    # Any verb with a buffered body may use h3; a streaming upload (bodyStream)
-    # is not supported over h3 yet, so it falls through to h2/h1.
-    if client.config.wantsH3 and req.url.isTls and req.bodyStream == nil:
+    # Any verb may use h3, whether its body is buffered or streamed (bodyStream is
+    # pulled over the h3 request stream, just like h2).
+    if client.config.wantsH3 and req.url.isTls:
       let ep = client.altSvc.h3Endpoint("https", req.url.host, req.url.port)
       if ep.isSome:
         try: return h3Transport(client, req, ep.get)
@@ -233,6 +234,9 @@ type
     dec: StreamDecoder         ## decode + size-cap state carried across readChunk
     decReady: bool             ## calls (chosen once the response headers are in)
     seen: int
+    when defined(naviHttp3):
+      qc: QuicConn             ## h3 connection (non-nil marks an h3 stream; pc unused)
+      h3sid: int64             ## its h3 stream id
   StreamResponse* = ref StreamResponseObj
 
 proc close*(sr: StreamResponse) =
@@ -262,6 +266,36 @@ proc openStream(client: Navi, req0: Request): StreamResponse =
   let key = originKey(rq.url)
   let decompress = client.config.wantsDecompress
   let cap = client.config.maxResponseBytes
+
+  when defined(naviHttp3):
+    # Stream over HTTP/3 when the origin has advertised h3 (Alt-Svc). Blocking twin
+    # of the async openStreamConn skH3 path: open a QUIC connection, submit, read the
+    # headers, and return a handle whose readChunk pulls the body. The connection is
+    # per-stream (no sync h3 pooling, matching the buffered path) and closed at EOF /
+    # by the guard. Any QUIC failure falls through to the h2/h1 pool below.
+    if client.config.wantsH3 and rq.url.isTls and client.altSvc != nil:
+      let ep = client.altSvc.h3Endpoint("https", rq.url.host, rq.url.port)
+      if ep.isSome:
+        try:
+          let conn = h3Open(ep.get.host, ep.get.port, sni = rq.url.host,
+                            caFile = client.config.tls.caFile,
+                            verify = client.config.tls.wantsVerify)
+          var fwd: seq[(string, string)]
+          for k, v in rq.headers:
+            let lk = k.toLowerAscii
+            if lk notin h3SkipHeaders: fwd.add((lk, v))
+          let sid = conn.submitStream($rq.verb, rq.url.requestTarget, fwd)
+          if sid < 0:
+            conn.close()
+          else:
+            try:
+              let (status, hdrs) = conn.awaitHeaders(sid)
+              return StreamResponse(resp: initResponse(status, "", "HTTP/3",
+                initHeaders(hdrs), ""), client: client, key: key, qc: conn,
+                h3sid: sid, decompress: decompress, cap: cap)
+            except CatchableError:
+              conn.freeStream(sid); conn.close(); raise
+        except QuicError: discard   # fall back to the h2/h1 transport below
 
   var (found, pc) = popIdle(client.pool, key)
   if found:
@@ -312,13 +346,30 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
     applyCookies(client.jar, rreq)
     let handle = openStream(client, rreq)
     handle.cancel = cancel
+    when defined(naviHttp3):
+      # Learn h3 from a streamed response too, so SSE/stream upgrade on a reconnect.
+      if client.altSvc != nil:
+        let alt = handle.resp.headers.get("alt-svc")
+        if alt.len > 0:
+          client.altSvc.record("https", rreq.url.host, rreq.url.port, alt)
     # Arm the leak-guard: if the handle is dropped without drain/close, close its
-    # connection. Captures only `pc` (not `handle`, which would cycle).
-    let pc = handle.pc
-    handle.guard = newStreamGuard(proc() {.gcsafe, raises: [].} =
-      {.cast(gcsafe).}:
-        try: pc.transport.close()
-        except Exception: discard)     # best-effort finalizer: never propagate
+    # connection. Captures only the connection essentials (not `handle`, which cycles).
+    var armed = false
+    when defined(naviHttp3):
+      if handle.qc != nil:
+        let qc = handle.qc
+        let sid = handle.h3sid
+        handle.guard = newStreamGuard(proc() {.gcsafe, raises: [].} =
+          {.cast(gcsafe).}:
+            try: qc.freeStream(sid); qc.close()
+            except Exception: discard)
+        armed = true
+    if not armed:
+      let pc = handle.pc
+      handle.guard = newStreamGuard(proc() {.gcsafe, raises: [].} =
+        {.cast(gcsafe).}:
+          try: pc.transport.close()
+          except Exception: discard)   # best-effort finalizer: never propagate
     storeCookies(client.jar, rreq.url, handle.resp)
     # 401 Digest challenge: re-open with an Authorization header (mirrors the
     # buffered path's maybeDigest), discarding the challenge body.
@@ -348,6 +399,36 @@ proc readChunk*(sr: StreamResponse): string =
   ## (a `while (let c = sr.readChunk(); c.len > 0)` loop) that the SSE reader builds
   ## on; `drain`/`each` remain the push form.
   if sr.drained or sr.closed: return ""
+  when defined(naviHttp3):
+    if sr.qc != nil:
+      # h3 body arrives raw; apply the same streamed decode + size-cap as h1, then
+      # close the per-stream connection at EOF (a reset surfaces as an error). The
+      # guard does freeStream + close, so closeNow both frees and tears down.
+      try:
+        while true:
+          let raw = sr.qc.readStreamBody(sr.h3sid)
+          if raw.len == 0:                       # EOF
+            sr.drained = true
+            let wasReset = sr.qc.streamWasReset(sr.h3sid)
+            closeNow(sr.guard)
+            if wasReset: raise newException(IOError, "navi: http/3 stream reset")
+            return ""
+          if not sr.decReady:
+            sr.dec = if sr.decompress:
+                newStreamDecoder(sr.resp.headers.get("content-encoding")) else: nil
+            sr.decReady = true
+          let decoded = if sr.dec != nil:
+              sr.dec.update(raw.toOpenArrayByte(0, raw.high)) else: raw
+          if decoded.len == 0: continue          # decoder buffered input; pull more
+          sr.seen += decoded.len
+          if sr.cap > 0 and sr.seen > sr.cap:
+            raise newException(ResponseTooLargeError,
+              "navi: response exceeded maxResponseBytes")
+          return decoded
+      except CatchableError:
+        if not sr.drained: sr.drained = true
+        closeNow(sr.guard)
+        raise
   try:
     if sr.pc.h2 != nil:
       result = h2ReadChunk(sr.pc.transport, sr.pc.h2, sr.sid,
@@ -377,6 +458,13 @@ proc drain*(sr: StreamResponse, sink: BodySink) =
   if sr.drained or sr.closed:
     raise newException(IOError, "navi: stream already drained or closed")
   throwIfCancelled(sr.cancel)
+  when defined(naviHttp3):
+    if sr.qc != nil:                          # h3: readChunk owns decode + teardown
+      while true:
+        let c = sr.readChunk()
+        if c.len == 0: break
+        sink(c)
+      return
   try:
     if sr.pc.h2 != nil:
       h2DrainBody(sr.pc.transport, sr.pc.h2, sr.sid, sink, sr.decompress, sr.cap)
@@ -469,8 +557,12 @@ proc sse*(client: Navi, target: string, verb = GET,
   var h = headers
   if not h.contains("accept"): h["accept"] = "text/event-stream"
   if not h.contains("cache-control"): h["cache-control"] = "no-cache"
+  # A dedicated client (own pool; via newNavi so it has an Alt-Svc cache and can
+  # upgrade to h3 on a reconnect), sharing the caller's cookie jar.
+  let sc = newNavi(cfg)
+  sc.jar = client.jar
   result = SseStream(
-    client: Navi(config: cfg, pool: newPool[PooledConn[Conn]](), jar: client.jar),
+    client: sc,
     verb: verb, target: target, headers: h, params: params, cancel: cancel,
     reconnect: reconnect, baseRetryMs: retryMs, retryMs: retryMs,
     maxRetryMs: maxRetryMs, parser: initSseParser(lastEventId))
@@ -489,6 +581,12 @@ proc close*(s: SseStream) =
 
 proc lastEventId*(s: SseStream): string = s.parser.lastEventId()
   ## The persistent last event id (what a reconnect resends as Last-Event-ID).
+
+proc httpVersion*(s: SseStream): string =
+  ## The HTTP version of the current underlying connection ("HTTP/1.1"|"HTTP/2"|
+  ## "HTTP/3"), or "" between reconnects. Note an SSE stream begins on h1/h2 and
+  ## upgrades to h3 only on a reconnect (once Alt-Svc has been learned).
+  if s.handle != nil: s.handle.httpVersion else: ""
 
 proc next*(s: SseStream): Option[SseEvent] =
   ## The next event, or none once the stream ends (the server closed it and

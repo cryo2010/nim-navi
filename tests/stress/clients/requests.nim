@@ -57,6 +57,7 @@ proc worker(api: Navi, cfg: Config, pool: ptr ServerPool,
         h["x-want-encoding"] = cfg.respCompression
     try:
       let res = await api.request(v, url, headers = h, body = body)
+      cfg.checkVersion(res.httpVersion)  # hard-fail on a silent protocol downgrade
       counter.tally(res.status)        # then res drops: no body retained
     except CatchableError as e:
       counter.fail()
@@ -84,6 +85,19 @@ proc main() {.async.} =
   let counter = newStatusCounter()
   var apis: seq[Navi]
   for _ in 0 ..< cfg.clients: apis.add mkClient(cfg)
+
+  # Warm up each client's per-origin protocol so the measured phase runs pinned from
+  # the first request: h3 is discovered via an initial Alt-Svc round-trip, so hit
+  # each origin until the expected version is negotiated. After this, any downgrade
+  # during the soak fails hard (checkVersion), catching a silent fallback.
+  let expect = cfg.expectedVersion
+  if expect.len > 0:
+    for api in apis:
+      for base in pool.all():
+        for _ in 0 ..< 3:
+          try:
+            if (await api.request(GET, base & "/echo")).httpVersion == expect: break
+          except CatchableError: break
 
   let start = epochTime()
   let deadline = start + cfg.seconds

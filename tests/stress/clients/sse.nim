@@ -21,10 +21,12 @@ else:
   const backend = "asyncdispatch"
 include ../common/httpset
 
-proc worker(s: SseStream, counter: StatusCounter, deadline: float) {.async.} =
+proc worker(s: SseStream, counter: StatusCounter, gate: ptr VersionGate,
+            deadline: float) {.async.} =
   try:
     s.each(ev):
       counter.tally(200)
+      gate[].sample(s.httpVersion)        # track the negotiated version (h3 after upgrade)
       if epochTime() >= deadline: break   # self-terminate: events flow continuously
   except CatchableError:
     counter.fail()
@@ -60,10 +62,12 @@ proc main() {.async.} =
 
   let start = epochTime()
   let deadline = start + cfg.seconds
+  var gate = initVersionGate(cfg)
   var futs: seq[Future[void]]
-  for s in streams: futs.add worker(s, counter, deadline)
+  for s in streams: futs.add worker(s, counter, addr gate, deadline)
   futs.add reporterLoop(cfg, counter, start, deadline)
   for f in futs: await f
+  gate.finish()   # hard-fail if the pinned protocol (h2/h3) was never negotiated
 
   report(cfg.label & " final", counter, epochTime() - start)
   echo "== sse ", backend, " ", cfg.proto, " passed (", counter.ops, " events) =="
