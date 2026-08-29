@@ -17,6 +17,11 @@ import ./headers, ./url, ./request, ./response, ./pool, ./decompress, ./redirect
 import ../proto/h1
 import ../proto/h2/conn
 
+const h1TruncatedErr* =
+  "navi: http/1.1 response truncated (connection closed before the body completed)"
+const h2TruncatedErr* =
+  "navi: http/2 response truncated (connection closed before the stream completed)"
+
 proc raiseHttpError(req: Request, resp: Response) =
   raise (ref HttpError)(
     msg: $req.verb & " " & $req.url & " -> " & $resp.status & " " & resp.reason,
@@ -102,10 +107,17 @@ template h1DrainBody*(transport, parser, sink, keep, decompress, cap: typed) =
     deliver()                               # body read alongside the headers
     while not parser.finished:
       let chunk = await recvSome(transport)
-      if chunk.len == 0: parser.eof()
+      if chunk.len == 0: parser.eof()       # completes a read-until-close body
       else: parser.feed(chunk)
       deliver()
-      if chunk.len == 0: break
+      if chunk.len == 0:
+        # A length- or chunked-delimited body that isn't `finished` at EOF was cut
+        # short by a premature close. Raise rather than return the partial body as a
+        # complete response (silent truncation). `eof` already completed a
+        # read-until-close body, so `finished` here means a clean end.
+        if not parser.finished:
+          raise newException(IOError, h1TruncatedErr)
+        break
     keep = parser.keepAliveAfter()
 
 template h1ReadChunk*(transport, parser, dec, decReady, seen, decompress, cap: typed): string =
@@ -123,7 +135,14 @@ template h1ReadChunk*(transport, parser, dec, decReady, seen, decompress, cap: t
       if raw.len == 0:
         if parser.finished: break            # end of body: res stays ""
         let chunk = await recvSome(transport)
-        if chunk.len == 0: parser.eof() else: parser.feed(chunk)
+        if chunk.len == 0:
+          parser.eof()                       # completes a read-until-close body
+          # A length/chunked body not `finished` at EOF was cut short. Raise instead
+          # of looping on a socket that keeps returning "" (a busy hang) or ending
+          # silently with a truncated body.
+          if not parser.finished:
+            raise newException(IOError, h1TruncatedErr)
+        else: parser.feed(chunk)
         continue
       if not decReady:
         dec = if decompress: newStreamDecoder(parser.contentEncoding()) else: nil
@@ -180,7 +199,8 @@ template h2ReadChunk*(transport, h2, sid, dec, decReady, seen, decompress, cap: 
           raise newException(IOError, "navi: http/2 request did not complete")
         break                                 # clean end: res ""
       let chunk = await recvSome(transport)
-      if chunk.len == 0: break                # transport EOF: treat as end
+      if chunk.len == 0:                       # transport EOF before END_STREAM:
+        raise newException(IOError, h2TruncatedErr)   # truncated, not a clean end
       let toSend = h2.feed(chunk)
       if toSend.len > 0: await sendAll(transport, toSend)
     res
@@ -260,6 +280,7 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
     let tooLarge = h2.streamTooLarge(sid)
     let unprocessed = h2.streamUnprocessed(sid)
     let connErr = h2.connError
+    let done = h2.streamDone(sid)  # END_STREAM seen (else the loop broke on transport EOF)
     var r = toResponse(h2.takeResponse(sid))
     if connErr.len > 0:            # bad preface / oversized frame / unexpected push
       raise newException(IOError, "navi: http/2 " & connErr)
@@ -270,6 +291,8 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
       raise newException(UnprocessedError, "navi: http/2 request not processed")
     if wasReset or r.status == 0:  # reset, or gone away before a response
       raise newException(IOError, "navi: http/2 request did not complete")
+    if not done:                   # headers seen but the connection died mid-body:
+      raise newException(IOError, h2TruncatedErr)   # don't return a partial body
     if not sink.isNil: r.body = ""  # delivered incrementally above
     r
 
@@ -354,6 +377,7 @@ template h2DrainBody*(transport, h2, sid, sink, decompress, cap: typed) =
     let tooLarge = h2.streamTooLarge(sid)
     let unprocessed = h2.streamUnprocessed(sid)
     let connErr = h2.connError
+    let done = h2.streamDone(sid)      # END_STREAM seen (else the loop broke on EOF)
     discard h2.takeResponse(sid)       # body delivered; drop the stream
     if connErr.len > 0: raise newException(IOError, "navi: http/2 " & connErr)
     if tooLarge:
@@ -363,6 +387,8 @@ template h2DrainBody*(transport, h2, sid, sink, decompress, cap: typed) =
       raise newException(UnprocessedError, "navi: http/2 request not processed")
     if wasReset:
       raise newException(IOError, "navi: http/2 request did not complete")
+    if not done:                       # connection died mid-body: don't truncate silently
+      raise newException(IOError, h2TruncatedErr)
 
 template poolTransport*(client, req, sink: typed): Response =
   ## Pool-based transport: reuse a pooled connection (http/1.1 or a persistent

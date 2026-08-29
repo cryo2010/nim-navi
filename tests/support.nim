@@ -382,6 +382,48 @@ proc startUploadEcho*(th: var Thread[ServerCtx], port: int) =
   createThread(th, serveUploadEcho, ServerCtx(port: port, ready: addr ready))
   while not ready: discard
 
+proc serveTruncated(ctx: ServerCtx) {.thread.} =
+  ## Send response headers declaring `Content-Length: 100` but only `failures` body
+  ## bytes, then close the connection mid-body (premature close). Used to prove the
+  ## client raises rather than returning the partial body as a complete response.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.listen()
+  ctx.ready[] = true
+  var client = acceptClient(server)
+  discard client.recvUntil("\r\n\r\n")
+  client.send("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n" & repeat('x', ctx.failures))
+  client.close()
+  server.close()
+
+proc startTruncated*(th: var Thread[ServerCtx], port, bodyBytes: int) =
+  ## Serve one connection: 200 with Content-Length 100 but only `bodyBytes` of body,
+  ## then close.
+  var ready = false
+  createThread(th, serveTruncated,
+    ServerCtx(port: port, ready: addr ready, failures: bodyBytes))
+  while not ready: discard
+
+proc serveTruncatedChunked(ctx: ServerCtx) {.thread.} =
+  ## Send a chunked response but close after one chunk, without the terminating
+  ## `0\r\n\r\n` -- a truncated chunked body.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.listen()
+  ctx.ready[] = true
+  var client = acceptClient(server)
+  discard client.recvUntil("\r\n\r\n")
+  client.send("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n")
+  client.close()
+  server.close()
+
+proc startTruncatedChunked*(th: var Thread[ServerCtx], port: int) =
+  var ready = false
+  createThread(th, serveTruncatedChunked, ServerCtx(port: port, ready: addr ready))
+  while not ready: discard
+
 type StaleCtx* = object
   portOut: ptr int
   ready: ptr bool

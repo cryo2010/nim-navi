@@ -76,6 +76,34 @@ suite "chronos entry end to end":
     joinThread(th)
     check accepts == 2
 
+  test "a buffered request raises on a premature close mid-body":
+    const port = 9265
+    var th: Thread[ServerCtx]
+    startTruncated(th, port, bodyBytes = 10)
+    var cfg = initNaviConfig()
+    cfg.retry.limit = 0
+    let api = newNavi(cfg)
+    expect IOError:
+      discard waitFor api.get("http://127.0.0.1:" & $port & "/")
+    joinThread(th)
+
+  test "a streaming request raises (not hangs) on a premature close mid-body":
+    const port = 9266
+    var th: Thread[ServerCtx]
+    startTruncated(th, port, bodyBytes = 10)
+    proc run(api: Navi): Future[(int, bool)] {.async.} =
+      let handle = await api.stream(GET, "http://127.0.0.1:" & $port & "/")
+      let st = handle.status
+      var raised = false
+      try:
+        handle.each(chunk): discard                     # must raise, not spin the loop
+      except CatchableError: raised = true
+      return (st, raised)
+    let (st, raised) = waitFor run(newNavi())
+    check st == 200
+    check raised
+    joinThread(th)
+
   test "stream should close (not pool) the connection when the drain fails":
     var port = 0
     var accepts = 0

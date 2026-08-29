@@ -85,6 +85,32 @@ suite "asyncdispatch entry end to end":
     joinThread(th)
     check accepts == 2
 
+  test "a buffered request raises on a premature close mid-body":
+    const port = 9263
+    var th: Thread[ServerCtx]
+    startTruncated(th, port, bodyBytes = 10)           # declares CL 100, sends 10, closes
+    var cfg = initNaviConfig()
+    cfg.retry.limit = 0
+    let api = newNavi(cfg)
+    expect IOError:
+      discard waitFor api.get("http://127.0.0.1:" & $port & "/")
+    joinThread(th)
+
+  test "a streaming request raises (not hangs) on a premature close mid-body":
+    const port = 9264
+    var th: Thread[ServerCtx]
+    startTruncated(th, port, bodyBytes = 10)
+    let api = newNavi()
+    proc run(): Future[bool] {.async.} =
+      let handle = await api.stream(GET, "http://127.0.0.1:" & $port & "/")
+      check handle.status == 200
+      try:
+        handle.each(chunk): discard                     # must raise, not spin the loop
+      except IOError: return true
+      return false
+    check waitFor run()
+    joinThread(th)
+
   test "stream should expose headers before the body and deliver it via each":
     const port = 9204
     var th: Thread[ServerCtx]

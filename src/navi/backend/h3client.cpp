@@ -78,6 +78,8 @@ struct Stream {
   bool out_eof = false;   // producer returned end-of-body (EOF flagged to nghttp3)
   NaviBodyPull pull = nullptr;
   void *pull_env = nullptr;
+  bool abort = false;      // producer raised: reset just this stream (not the session)
+  bool abort_sent = false; // RESET_STREAM already queued for it
 };
 
 // One QUIC/h3 connection. RAII: the destructor releases the library objects and
@@ -94,6 +96,7 @@ struct H3Conn {
   ngtcp2_crypto_ossl_ctx *ossl = nullptr;
   std::string authority;
   bool handshake_done = false;
+  bool has_abort = false;   // some stream's producer failed; reset it in send_step
   std::unordered_map<int64_t, Stream> streams;   // live streams by id
 
   ~H3Conn() {
@@ -287,7 +290,14 @@ nghttp3_ssize read_body_stream(nghttp3_conn *, std::int64_t stream_id, nghttp3_v
   if (s.out_eof || !s.pull) { *pflags |= NGHTTP3_DATA_FLAG_EOF; return 0; }
   const char *p = nullptr;
   std::ptrdiff_t n = s.pull(s.pull_env, &p);
-  if (n < 0) return NGHTTP3_ERR_CALLBACK_FAILURE;   // producer raised
+  if (n < 0) {
+    // Producer raised. Reset just THIS stream (send_step flushes RESET_STREAM) rather
+    // than failing the whole session, which would take down every other multiplexed
+    // request. Pause the stream so nghttp3 stops pulling until the reset lands.
+    s.abort = true;
+    c->has_abort = true;
+    return NGHTTP3_ERR_WOULDBLOCK;
+  }
   if (n == 0) { s.out_eof = true; *pflags |= NGHTTP3_DATA_FLAG_EOF; return 0; }
   try {
     s.out.push_back(BodyChunk{std::string(p, static_cast<std::size_t>(n)), 0});
@@ -352,6 +362,18 @@ int udp_connect(const char *host, const char *port, H3Conn *c) {
 
 // Fill buf with the next datagram to send: its length, 0 = nothing, <0 = error.
 ngtcp2_ssize send_step(H3Conn *c, std::span<std::uint8_t> buf) {
+  // Flush RESET_STREAM for any stream whose body producer raised (read_body_stream
+  // marked it). Resets just that stream (STOP_SENDING + RESET_STREAM); on_stream_close
+  // then surfaces it to the caller as a reset, leaving the connection and every other
+  // multiplexed stream intact.
+  if (c->has_abort) {
+    for (auto &kv : c->streams)
+      if (kv.second.abort && !kv.second.abort_sent) {
+        ngtcp2_conn_shutdown_stream(c->conn, 0, kv.first, NGHTTP3_H3_INTERNAL_ERROR);
+        kv.second.abort_sent = true;
+      }
+    c->has_abort = false;
+  }
   for (;;) {
     std::int64_t stream_id = -1;
     int fin = 0;

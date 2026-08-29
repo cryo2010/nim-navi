@@ -18,6 +18,19 @@ onward (pre-1.0, minor versions may include breaking changes).
   `SseStream` across all native backends.
 
 ### Fixed
+- Premature connection close mid-body no longer produces a silent partial response.
+  On HTTP/1.1 and HTTP/2, a length- or chunked-delimited response whose connection
+  drops before the body completes now raises instead of returning the truncated body
+  as a successful 200. This also fixes a busy-loop hang in the streaming reader
+  (`readChunk`/`drain`/SSE) on such a truncated length/chunked body. Complete
+  responses and read-until-close bodies are unaffected.
+- HTTP/2: after a GOAWAY, the wait for in-flight streams (at or below the last
+  stream id) is bounded by a generous idle grace, so a peer that sends GOAWAY and
+  then neither delivers the responses nor closes can no longer hang requests
+  indefinitely (previously bounded only by an optional read timeout).
+- HTTP/3: a request-body producer (`bodyStream`) that raises now resets just its own
+  stream instead of failing the whole QUIC connection, so one bad upload no longer
+  takes down every other request multiplexed on that origin's connection.
 - HTTP/1.1 keep-alive reuse is now safe *and* complete for non-idempotent methods.
   When a pooled connection fails **before any response byte** (the classic keep-alive
   race: the server closed the idle connection), the request was not processed, so it
