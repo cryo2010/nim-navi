@@ -235,18 +235,20 @@ proc close*(mux: H2Mux) {.async.} =
     except CatchableError: discard
   if not mux.readerDone.finished: mux.readerDone.complete()
 
-proc streamBody(mux: H2Mux, sid: uint32, bodyStream: BodyProducer) {.async.} =
+proc streamBody(mux: H2Mux, sid: uint32, bodyStream: BodyProducer,
+                trailers: seq[(string, string)] = @[]) {.async.} =
   ## Send DATA frames pulled from `bodyStream`, pulling the next chunk only once the
   ## previous one has drained onto the wire (the reader releases window-blocked bytes
   ## on WINDOW_UPDATE and wakes us), so buffered upload memory stays ~one chunk.
-  ## END_STREAM rides the final frame via `finishSend`.
+  ## END_STREAM rides the final frame via `finishSend` (a trailing HEADERS block when
+  ## `trailers` is set).
   while mux.alive and not mux.h2.streamDone(sid):
     if mux.h2.sendDrained(sid):
       # single-threaded client; the producer need not be gcsafe (see engine).
       var chunk: string
       {.cast(gcsafe).}: chunk = bodyStream()
       if chunk.len == 0:
-        await mux.send(mux.h2.finishSend(sid))
+        await mux.send(mux.h2.finishSend(sid, trailers))
         break
       await mux.send(mux.h2.queueSend(sid, chunk))
     else:
@@ -349,7 +351,8 @@ proc respSnapshot*(mux: H2Mux, sid: uint32): H2Response =
   mux.h2.respSnapshot(sid)
 
 proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: string,
-                         bodyStream: BodyProducer = nil): Future[uint32] {.async.} =
+                         bodyStream: BodyProducer = nil,
+                         trailers: seq[(string, string)] = @[]): Future[uint32] {.async.} =
   ## Open a sink stream, send the request, and await only until the response HEADERS
   ## arrive; return the stream id with the stream left open and its body queuing into
   ## `recvq` for a later `drainDownload`. The header/body split lets a pull-based
@@ -372,9 +375,9 @@ proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: strin
   mux.sinkStreams.incl sid
   if bodyStream != nil:
     await mux.send(mux.h2.encodeRequestHead(sid, headers))
-    await mux.streamBody(sid, bodyStream)
+    await mux.streamBody(sid, bodyStream, trailers)
   else:
-    await mux.send(mux.h2.encodeRequest(sid, headers, body))
+    await mux.send(mux.h2.encodeRequest(sid, headers, body, trailers))
   # Wait for the response headers. As in drainDownload, there is no yield between the
   # state checks and registering `recvReady`, so the reader (which runs only while we
   # await) cannot slip a wake in between: no lost wakeup.
@@ -452,7 +455,8 @@ proc abandon*(mux: H2Mux, sid: uint32): Future[void] {.async.} =
 
 proc request*(mux: H2Mux, headers: seq[(string, string)], body: string,
               bodyStream: BodyProducer = nil,
-              sink: BodySink = nil): Future[H2Response] {.async.} =
+              sink: BodySink = nil,
+              trailers: seq[(string, string)] = @[]): Future[H2Response] {.async.} =
   ## Open a stream, send the request, and await this stream's response. Blocks while
   ## the connection is at the peer's MAX_CONCURRENT_STREAMS, resuming when a stream
   ## completes (so a burst of concurrent requests is queued, not RST). When
@@ -476,7 +480,7 @@ proc request*(mux: H2Mux, headers: seq[(string, string)], body: string,
   mux.waiters[sid] = fut
   if bodyStream != nil:
     await mux.send(mux.h2.encodeRequestHead(sid, headers))
-    await mux.streamBody(sid, bodyStream)
+    await mux.streamBody(sid, bodyStream, trailers)
   else:
-    await mux.send(mux.h2.encodeRequest(sid, headers, body))
+    await mux.send(mux.h2.encodeRequest(sid, headers, body, trailers))
   result = await fut

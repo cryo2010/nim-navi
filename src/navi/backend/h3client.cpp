@@ -68,6 +68,7 @@ struct Stream {
   long status = 0;
   std::string body;
   std::string resp_headers;                  // response fields as "name\nvalue\n"
+  std::string resp_trailers;                 // trailing fields (after the body) same shape
   bool headers_done = false;  // all response headers delivered (body/end has begun)
   bool done = false;
   bool reset = false;     // closed without a normal end_stream (server reset/abort)
@@ -87,6 +88,11 @@ struct Stream {
   void *pull_env = nullptr;
   bool abort = false;      // producer raised: reset just this stream (not the session)
   bool abort_sent = false; // RESET_STREAM already queued for it
+  // Request trailers (RFC 9114 4.1): fields sent after the body as a trailing HEADERS
+  // section. "name\nvalue\n...", submitted once the body reaches EOF (via
+  // NGHTTP3_DATA_FLAG_NO_END_STREAM + nghttp3_conn_submit_trailers). Empty = none.
+  std::string req_trailers;
+  bool req_trailers_submitted = false;
 };
 
 // One QUIC/h3 connection. RAII: the destructor releases the library objects and
@@ -232,6 +238,28 @@ int on_recv_header(nghttp3_conn *, std::int64_t stream_id, std::int32_t,
   return 0;
 }
 
+// Response trailers (RFC 9114 4.1): a trailing HEADERS section after the body.
+// nghttp3 delivers them through this callback (distinct from recv_header). Keep the
+// non-pseudo fields so navi can surface them on `res.trailers`.
+int on_recv_trailer(nghttp3_conn *, std::int64_t stream_id, std::int32_t,
+                    nghttp3_rcbuf *name, nghttp3_rcbuf *value, std::uint8_t, void *cud,
+                    void *) {
+  auto *c = static_cast<H3Conn *>(cud);
+  auto it = c->streams.find(stream_id);
+  if (it == c->streams.end()) return 0;
+  nghttp3_vec n = nghttp3_rcbuf_get_buf(name);
+  nghttp3_vec v = nghttp3_rcbuf_get_buf(value);
+  std::string_view nm{reinterpret_cast<char *>(n.base), n.len};
+  std::string_view val{reinterpret_cast<char *>(v.base), v.len};
+  try {
+    if (!nm.empty() && nm.front() != ':')      // pseudo-headers are invalid in trailers
+      it->second.resp_trailers.append(nm).append("\n").append(val).append("\n");
+  } catch (...) {
+    return NGHTTP3_ERR_CALLBACK_FAILURE;
+  }
+  return 0;
+}
+
 int on_recv_data(nghttp3_conn *, std::int64_t stream_id, const std::uint8_t *data,
                  std::size_t datalen, void *cud, void *) {
   auto *c = static_cast<H3Conn *>(cud);
@@ -285,17 +313,50 @@ int on_deferred_consume(nghttp3_conn *, std::int64_t stream_id, std::size_t cons
   return 0;
 }
 
-// Hand nghttp3 the whole buffered request body for `stream_id` in one vec, with
-// EOF, on the first call. The body is borrowed for the request's duration.
+// Submit the stream's request trailers (once) as a trailing HEADERS section. Parses
+// the "name\nvalue\n..." blob into nghttp3_nv pointing into the stable req_trailers
+// string; nghttp3_conn_submit_trailers copies the data, so it may be freed after.
+// Called from the data reader when the body reaches EOF (the reader has already set
+// NGHTTP3_DATA_FLAG_NO_END_STREAM so nghttp3 keeps the stream open for the trailers).
+int submit_stream_trailers(H3Conn *c, std::int64_t stream_id, Stream &s) {
+  if (s.req_trailers_submitted || s.req_trailers.empty()) return 0;
+  s.req_trailers_submitted = true;
+  std::vector<nghttp3_nv> nva;
+  std::string_view hs{s.req_trailers};
+  std::vector<std::string_view> toks;
+  std::size_t start = 0;
+  for (std::size_t i = 0; i < hs.size(); ++i)
+    if (hs[i] == '\n') {
+      toks.push_back(hs.substr(start, i - start));
+      start = i + 1;
+    }
+  for (std::size_t i = 0; i + 1 < toks.size(); i += 2)
+    nva.push_back(make_nv(toks[i], toks[i + 1]));
+  if (nva.empty()) return 0;
+  return nghttp3_conn_submit_trailers(c->h3, stream_id, nva.data(), nva.size());
+}
+
+// Hand nghttp3 the whole buffered request body for `stream_id` in one vec, with EOF,
+// on the first call. The body is borrowed for the request's duration. When the request
+// carries trailers, keep the stream open past the DATA (NO_END_STREAM) and submit them.
 nghttp3_ssize read_body(nghttp3_conn *, std::int64_t stream_id, nghttp3_vec *vec,
                         std::size_t, std::uint32_t *pflags, void *cud, void *) {
   auto *c = static_cast<H3Conn *>(cud);
-  *pflags |= NGHTTP3_DATA_FLAG_EOF;
   auto it = c->streams.find(stream_id);
-  if (it == c->streams.end() || it->second.req_body.empty()) return 0;
-  vec[0].base = reinterpret_cast<std::uint8_t *>(it->second.req_body.data());
-  vec[0].len = it->second.req_body.size();
-  return 1;
+  *pflags |= NGHTTP3_DATA_FLAG_EOF;
+  if (it == c->streams.end()) return 0;
+  Stream &s = it->second;
+  nghttp3_ssize nv = 0;
+  if (!s.req_body.empty()) {
+    vec[0].base = reinterpret_cast<std::uint8_t *>(s.req_body.data());
+    vec[0].len = s.req_body.size();
+    nv = 1;
+  }
+  if (!s.req_trailers.empty()) {
+    *pflags |= NGHTTP3_DATA_FLAG_NO_END_STREAM;
+    if (submit_stream_trailers(c, stream_id, s) != 0) return NGHTTP3_ERR_CALLBACK_FAILURE;
+  }
+  return nv;
 }
 
 // Streaming request body: pull the next chunk from navi (via the stream's `pull`
@@ -309,7 +370,17 @@ nghttp3_ssize read_body_stream(nghttp3_conn *, std::int64_t stream_id, nghttp3_v
   auto it = c->streams.find(stream_id);
   if (it == c->streams.end()) { *pflags |= NGHTTP3_DATA_FLAG_EOF; return 0; }
   Stream &s = it->second;
-  if (s.out_eof || !s.pull) { *pflags |= NGHTTP3_DATA_FLAG_EOF; return 0; }
+  // End of body: EOF, plus (if the request carries trailers) keep the stream open for
+  // a trailing HEADERS section (NO_END_STREAM) and submit it.
+  auto finishBody = [&](std::uint32_t *pf) -> nghttp3_ssize {
+    *pf |= NGHTTP3_DATA_FLAG_EOF;
+    if (!s.req_trailers.empty()) {
+      *pf |= NGHTTP3_DATA_FLAG_NO_END_STREAM;
+      if (submit_stream_trailers(c, stream_id, s) != 0) return NGHTTP3_ERR_CALLBACK_FAILURE;
+    }
+    return 0;
+  };
+  if (s.out_eof || !s.pull) return finishBody(pflags);
   const char *p = nullptr;
   std::ptrdiff_t n = s.pull(s.pull_env, &p);
   if (n < 0) {
@@ -320,7 +391,7 @@ nghttp3_ssize read_body_stream(nghttp3_conn *, std::int64_t stream_id, nghttp3_v
     c->has_abort = true;
     return NGHTTP3_ERR_WOULDBLOCK;
   }
-  if (n == 0) { s.out_eof = true; *pflags |= NGHTTP3_DATA_FLAG_EOF; return 0; }
+  if (n == 0) { s.out_eof = true; return finishBody(pflags); }
   try {
     s.out.push_back(BodyChunk{std::string(p, static_cast<std::size_t>(n)), 0});
   } catch (...) {
@@ -521,6 +592,7 @@ int navi_h3_bind(H3Conn *c) {
   nghttp3_settings_default(&settings);
   nghttp3_callbacks cb{};
   cb.recv_header = on_recv_header;
+  cb.recv_trailer = on_recv_trailer;      // surface response trailers on res.trailers
   cb.recv_data = on_recv_data;
   cb.end_stream = on_end_stream;
   cb.deferred_consume = on_deferred_consume;
@@ -680,7 +752,8 @@ H3Conn *navi_h3_open(const char *host, const char *port, const char *sni,
 // `body`/`body_len` is a buffered body (or none). The two are mutually exclusive.
 std::int64_t navi_h3_submit(H3Conn *c, const char *method, const char *path_,
                             const char *req_headers, const char *body,
-                            std::size_t body_len, NaviBodyPull pull, void *pull_env) {
+                            std::size_t body_len, NaviBodyPull pull, void *pull_env,
+                            const char *req_trailers) {
   try {
     std::int64_t sid;
     if (ngtcp2_conn_open_bidi_stream(c->conn, &sid, nullptr) != 0) return -1;
@@ -688,6 +761,7 @@ std::int64_t navi_h3_submit(H3Conn *c, const char *method, const char *path_,
     s.is_head = std::strcmp(method, "HEAD") == 0;   // its Content-Length has no body
     if (pull) { s.pull = pull; s.pull_env = pull_env; }     // streamed body
     else if (body && body_len) s.req_body.assign(body, body_len);  // owned copy
+    if (req_trailers && req_trailers[0]) s.req_trailers.assign(req_trailers);
 
     std::vector<nghttp3_nv> nva;
     nva.reserve(8);
@@ -711,7 +785,11 @@ std::int64_t navi_h3_submit(H3Conn *c, const char *method, const char *path_,
     nghttp3_data_reader dr{};
     const nghttp3_data_reader *drp = nullptr;
     if (s.pull) { dr.read_data = read_body_stream; drp = &dr; }
-    else if (!s.req_body.empty()) { dr.read_data = read_body; drp = &dr; }
+    // A data reader is needed for a buffered body OR trailers-only (no body): the
+    // trailing HEADERS section is emitted from the reader once it signals body EOF.
+    else if (!s.req_body.empty() || !s.req_trailers.empty()) {
+      dr.read_data = read_body; drp = &dr;
+    }
     // nghttp3 copies the header data during submit, so nva may be freed after.
     if (nghttp3_conn_submit_request(c->h3, sid, nva.data(), nva.size(), drp, nullptr) != 0) {
       c->streams.erase(sid);
@@ -743,9 +821,11 @@ int navi_h3_stream_length_mismatch(H3Conn *c, std::int64_t sid) {
 }
 
 // Copy stream `sid`'s completed response into the caller's buffers and drop it.
+// out_trailers receives the trailing fields ("name\nvalue\n"), empty if none.
 int navi_h3_take_response(H3Conn *c, std::int64_t sid, long *out_status, char *out_body,
                           std::size_t out_cap, std::size_t *out_len,
-                          char *out_headers, std::size_t hdr_cap, std::size_t *hdr_len) {
+                          char *out_headers, std::size_t hdr_cap, std::size_t *hdr_len,
+                          char *out_trailers, std::size_t trl_cap, std::size_t *trl_len) {
   try {
     auto it = c->streams.find(sid);
     if (it == c->streams.end()) return -1;
@@ -757,7 +837,26 @@ int navi_h3_take_response(H3Conn *c, std::int64_t sid, long *out_status, char *o
     std::size_t hk = std::min(s.resp_headers.size(), hdr_cap);
     std::memcpy(out_headers, s.resp_headers.data(), hk);
     *hdr_len = hk;
+    std::size_t tk = std::min(s.resp_trailers.size(), trl_cap);
+    std::memcpy(out_trailers, s.resp_trailers.data(), tk);
+    *trl_len = tk;
     c->streams.erase(it);
+    return 0;
+  } catch (...) {
+    return -1;
+  }
+}
+
+// Copy stream `sid`'s response trailers into the caller's buffer WITHOUT dropping the
+// stream (the streaming read path: trailers land after the body EOF, before free).
+int navi_h3_response_trailers(H3Conn *c, std::int64_t sid, char *out_trailers,
+                              std::size_t trl_cap, std::size_t *trl_len) {
+  try {
+    auto it = c->streams.find(sid);
+    if (it == c->streams.end()) return -1;
+    std::size_t tk = std::min(it->second.resp_trailers.size(), trl_cap);
+    std::memcpy(out_trailers, it->second.resp_trailers.data(), tk);
+    *trl_len = tk;
     return 0;
   } catch (...) {
     return -1;
@@ -830,11 +929,13 @@ void navi_h3_stream_free(H3Conn *c, std::int64_t sid) {
 // take the response.
 int navi_h3_request(H3Conn *c, const char *method, const char *path_,
                     const char *req_headers, const char *body, std::size_t body_len,
-                    NaviBodyPull pull, void *pull_env, long *out_status, char *out_body,
+                    NaviBodyPull pull, void *pull_env, const char *req_trailers,
+                    long *out_status, char *out_body,
                     std::size_t out_cap, std::size_t *out_len, char *out_headers,
-                    std::size_t hdr_cap, std::size_t *hdr_len) {
-  std::int64_t sid =
-      navi_h3_submit(c, method, path_, req_headers, body, body_len, pull, pull_env);
+                    std::size_t hdr_cap, std::size_t *hdr_len,
+                    char *out_trailers, std::size_t trl_cap, std::size_t *trl_len) {
+  std::int64_t sid = navi_h3_submit(c, method, path_, req_headers, body, body_len, pull,
+                                    pull_env, req_trailers);
   if (sid < 0) return -1;
   if (drive_until(c, &c->streams.at(sid).done) != 0) return -1;
   if (navi_h3_stream_reset(c, sid)) {   // reset/abort, not a real response
@@ -846,7 +947,8 @@ int navi_h3_request(H3Conn *c, const char *method, const char *path_,
     return -2;                                    // distinct: caller raises, no fallback
   }
   return navi_h3_take_response(c, sid, out_status, out_body, out_cap, out_len,
-                               out_headers, hdr_cap, hdr_len);
+                               out_headers, hdr_cap, hdr_len,
+                               out_trailers, trl_cap, trl_len);
 }
 
 }  // extern "C"
