@@ -18,6 +18,16 @@ onward (pre-1.0, minor versions may include breaking changes).
 - **HTTP/3 response trailers.** `res.trailers` now also surfaces the trailing HEADERS
   section of an HTTP/3 response, matching the existing HTTP/1.1 and HTTP/2 support.
 
+### Fixed
+- HTTP/3: certificate verification now runs after the handshake completes (checking
+  `SSL_get_verify_result`) instead of aborting the handshake with `SSL_VERIFY_PEER`.
+  On a rejected certificate, OpenSSL's in-handshake abort drove ngtcp2's experimental
+  OpenSSL QUIC crypto binding to over-release its crypto buffers, tripping an
+  assertion (`crypto_ossl_ctx_release_crypto_data`) and killing the process instead
+  of raising `QuicError`. navi now rejects an untrusted or hostname-mismatched peer
+  cleanly, before any request is sent, matching the post-handshake verification the
+  TCP backends already use.
+
 ## [0.9.0] - 2026-08-29
 
 ### Added
