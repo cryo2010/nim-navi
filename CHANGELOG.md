@@ -7,6 +7,8 @@ onward (pre-1.0, minor versions may include breaking changes).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-29
+
 ### Added
 - **Default `User-Agent` and `Accept` headers.** Requests now send
   `User-Agent: navi/<version>` and `Accept: */*` unless the caller sets their own,
@@ -379,7 +381,8 @@ across four backends.
 - TLS certificates verified by default; HPACK bounds, negative `Content-Length`
   rejection, chunk-size bounds, and malformed-input rejection instead of crashes.
 
-[Unreleased]: https://github.com/cryo2010/nim-navi/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/cryo2010/nim-navi/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/cryo2010/nim-navi/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/cryo2010/nim-navi/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/cryo2010/nim-navi/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/cryo2010/nim-navi/compare/v0.5.0...v0.6.0

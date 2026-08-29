@@ -109,7 +109,24 @@ config.tls.caFile = "/etc/navi/internal-ca.pem"
 
 Default `""` uses the system trust store. Setting `caFile` restricts trust to the
 given CA bundle, which both enables a private CA and narrows the accepted chain
-for a public one. Verification stays on.
+for a public one. Verification stays on. `tls.caBundle` does the same from an
+in-memory PEM string (added alongside the system roots / `caFile`).
+
+### Public-key pinning (`pinnedKeys`)
+
+```nim
+# base64(SHA-256(DER SubjectPublicKeyInfo)); compute with:
+#   openssl x509 -in cert.pem -pubkey -noout \
+#     | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64
+config.tls.pinnedKeys = @["r/pas0ue6zqoBH4vVvBxz7i+94EMJ3kAdyJWSd381TY="]
+```
+
+Beyond trusting a CA, `pinnedKeys` requires the peer's public key to match one of
+the given SPKI pins, rejecting an otherwise chain-valid certificate whose key is
+not pinned (e.g. a mis-issued cert from another CA). Pin the leaf and at least one
+backup key so a routine key rotation does not lock you out. For arbitrary custom
+logic over the leaf certificate, `tls.verifyCallback` receives it in DER form and
+returns whether to accept; both run after the standard chain + hostname checks.
 
 ### TLS version floor and ceiling
 

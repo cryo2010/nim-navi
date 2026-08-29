@@ -4,4 +4,4 @@
 ## field in navi.nimble (the release source of truth); a build via nimble
 ## overrides it with the packaged version through `-d:naviVersion=<v>`.
 
-const naviVersion* {.strdefine.} = "0.8.0"
+const naviVersion* {.strdefine.} = "0.9.0"

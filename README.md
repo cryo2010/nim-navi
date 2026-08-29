@@ -59,6 +59,7 @@ discard main()
   - [Cancellation](#cancellation)
   - [Response size limits](#response-size-limits)
   - [Auth and proxy](#auth-and-proxy)
+  - [Unix domain sockets](#unix-domain-sockets)
   - [Cookies](#cookies)
   - [Middleware](#middleware)
     - [Batteries-included middleware](#batteries-included-middleware)
@@ -158,7 +159,8 @@ Every client shares the same API, and the below table details where they differ.
 | Streaming upload | ✓ | ✓ | ✓ | buffered |
 | Streaming download (pull) | ✓ | ✓ | ✓ | ✓ |
 | Cookie jar | ✓ | ✓ | ✓ | ✓ |
-| Proxy configuration | ✓ | ✓ | ✓ | ✗ |
+| Proxy (HTTP + SOCKS5) | ✓ | ✓ | ✓ | ✗ |
+| Unix domain sockets | ✓ | ✓ | ✓ | ✗ |
 
 Legend: ✓ supported · ✗ not supported · **opt-in** = requires a `-d:naviHttp3`
 build (ngtcp2 + nghttp3 + OpenSSL >= 3.5), reached transparently via Alt-Svc ·
@@ -276,19 +278,24 @@ Every field, and the default `initNaviConfig()` gives it:
 | `decompress` | `bool` | `true` | Decode `gzip`/`deflate`/`br`/`zstd` response bodies. |
 | `headers` | `Headers` | empty | Headers sent on every request. |
 | `http` | `set[HttpVersion]` | `{H1, H2}` | HTTP versions to negotiate; add `H3` (needs `-d:naviHttp3`). |
+| `idleConnTimeout` | `int` | `0` | Evict and close an idle pooled connection after this many ms; `0` = no timeout. |
+| `maxIdleConns` | `int` | `0` | Global cap on idle pooled connections; `0` = unlimited. |
+| `maxIdleConnsPerHost` | `int` | `0` | Idle pooled connections kept per origin; `0` = default (8). |
 | `maxRedirects` | `int` | `20` | Redirects to follow; `0` disables. |
 | `maxResponseBytes` | `int` | `0` | Max response body size in bytes; `0` is unlimited. |
 | `middleware` | `seq[NaviMiddleware]` | `@[]` | Onion-style steps wrapping each request. |
 | `prefixUrl` | `string` | `""` | Base URL that relative request targets resolve against. |
-| `proxy` | `string` | `""` | Proxy URL; `""` falls back to `HTTP(S)_PROXY` / `NO_PROXY`. |
+| `proxy` | `string` | `""` | Proxy URL (`http://`, `https://`, or `socks5://`/`socks5h://`, with optional `user:pass@`); `""` falls back to `HTTP(S)_PROXY` / `ALL_PROXY` / `NO_PROXY`. |
 | `retry.limit` | `int` | `2` | Retry attempts; `0` disables. |
 | `retry.maxDelay` | `int` | `10000` | Upper bound on the wait between attempts, in ms. |
 | `retry.methods` | `set[HttpVerb]` | `{GET, HEAD, PUT, DELETE, OPTIONS}` | Verbs eligible for retry. |
 | `retry.statuses` | `seq[int]` | `@[408, 413, 429, 500, 502, 503, 504]` | Response statuses that trigger a retry. |
 | `throwHttpErrors` | `bool` | `true` | Raise `HttpError` on a non-2xx response. |
+| `unixSocket` | `string` | `""` | Dial this Unix socket path instead of TCP (POSIX; native backends); the URL host is used only for the Host header and TLS SNI. Bypasses proxies. |
 | `timeouts.connect` | `int` | `0` | TCP connect + TLS handshake deadline (ms); `0` disables. |
 | `timeouts.read` | `int` | `0` | Per-read idle deadline (ms); `0` disables. |
 | `timeouts.total` | `int` | `0` | Whole-request deadline including retries/redirects (ms); `0` disables. |
+| `tls.caBundle` | `string` | `""` | Extra trusted CA certificates as an in-memory PEM string (added alongside `caFile` / the system roots). |
 | `tls.caFile` | `string` | `""` | Custom CA bundle path; `""` uses the system trust store. |
 | `tls.certFile` | `string` | `""` | Client certificate file (PEM or DER) for mTLS. |
 | `tls.certPem` | `string` | `""` | Client certificate as an in-memory PEM string. |
@@ -299,9 +306,11 @@ Every field, and the default `initNaviConfig()` gives it:
 | `tls.maxVersion` | `TlsVersion` | `tlsDefault` | Highest TLS version to negotiate (`tlsDefault` = unset). |
 | `tls.minVersion` | `TlsVersion` | `tlsDefault` | Lowest TLS version to negotiate (`tlsDefault` = unset). |
 | `tls.password` | `string` | `""` | Passphrase for an encrypted key, or the PKCS#12 password. |
+| `tls.pinnedKeys` | `seq[string]` | `@[]` | SPKI SHA-256 pins (base64, HPKP form); the peer public key must match one or the connection is rejected. |
 | `tls.pkcs12File` | `string` | `""` | PKCS#12/PFX bundle (cert + key + chain); highest precedence. |
 | `tls.resumeSessions` | `bool` | `true` | Reuse TLS sessions across connections (abbreviated handshake). |
 | `tls.verify` | `bool` | `true` | Verify the certificate chain and hostname. |
+| `tls.verifyCallback` | `proc` | `nil` | Hook run after the chain + hostname checks; receives the peer leaf cert (DER), returns whether to accept. |
 
 ### Requests
 
@@ -327,10 +336,14 @@ res.ok                # true for 2xx
 res.headers.get("content-type")
 res.body              # body as a string; a Nim string is a byte buffer, so this
                       # is also your bytes (res.body.toOpenArrayByte(...) for a view)
+res.text              # body decoded to UTF-8 from its Content-Type charset (or BOM)
 res.data              # body parsed as JsonNode (cached; raises on invalid)
+res.trailers          # trailing header fields, if the response carried any
 ```
 
 `std/json` is re-exported, so `res.data["field"].getBool()` works without importing it yourself. `data` parses the body regardless of Content-Type, caches it, and raises `JsonParsingError` on invalid JSON.
+
+`res.body` is the raw bytes; `res.text` decodes them to UTF-8 using the `Content-Type` charset (or a leading BOM, else UTF-8), covering UTF-8, ISO-8859-1, Windows-1252, and UTF-16, so a non-UTF-8 response reads correctly. An unrecognized charset falls back to the raw bytes. `res.trailers` is a `Headers` holding the fields after the body (chunked HTTP/1.1 or an HTTP/2 trailing block, e.g. `grpc-status`); it is empty when there are none.
 
 ### Headers
 
@@ -353,6 +366,37 @@ let api = newNavi(config)
 ```
 
 `verify` defaults to on. `caFile` is honored by all three native clients, each through OpenSSL (chronos included; without a `caFile` they verify against the system trust store). All three negotiate modern TLS (up to the library's maximum, typically TLS 1.3) and support client certificates (mTLS).
+
+#### Trusting a CA in memory
+
+`caBundle` adds trusted CA certificates from an in-memory PEM string, alongside
+the system roots (and any `caFile`). Handy when the CA is embedded in the binary
+or fetched at runtime rather than on disk:
+
+```nim
+config.tls.caBundle = readFile("corp-root.pem")   # or an embedded const
+```
+
+#### Certificate pinning and a custom verify callback
+
+For an extra check beyond chain + hostname verification, pin the peer's public
+key or inspect the leaf certificate yourself. Both run after the standard checks
+(and still run when `verify` is off, so you can replace verification entirely).
+
+```nim
+# SPKI SHA-256 pins (base64, the HPKP form). Compute one with:
+#   openssl x509 -in cert.pem -pubkey -noout \
+#     | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64
+config.tls.pinnedKeys = @["r/pas0ue6zqoBH4vVvBxz7i+94EMJ3kAdyJWSd381TY="]
+
+# Or a callback over the leaf certificate (DER); return false to reject.
+config.tls.verifyCallback = proc(leafDer: string): bool =
+  leafDer.len > 0
+```
+
+A non-matching pin, or a callback returning false, rejects the connection at
+connect time. Both are honored on the three native clients (`navi/js` defers TLS
+to the runtime).
 
 #### Session resumption
 
@@ -526,15 +570,42 @@ when connections open, so set it before the first request or build a new client.
 
 ```nim
 var config = initNaviConfig()
-config.proxy = "http://proxy:8080"     # else HTTP(S)_PROXY / NO_PROXY env
+config.proxy = "http://proxy:8080"     # else HTTP(S)_PROXY / ALL_PROXY / NO_PROXY env
 let api = newNavi(config)
 
 api.config.auth = bearerAuth("token")  # or basicAuth("user", "pass"); safe any time
 ```
 
+The proxy URL scheme selects the kind: `http://` / `https://` for an HTTP proxy
+(a `CONNECT` tunnel for https targets, absolute-URI for http), or `socks5://` /
+`socks5h://` for a SOCKS5 proxy (a raw TCP tunnel for every target). A `user:pass@`
+userinfo authenticates to the proxy: `Proxy-Authorization` on an HTTP `CONNECT`,
+or the RFC 1929 username/password method on SOCKS5. Proxies are supported on the
+three native clients (`navi/js` delegates connection setup to `fetch`).
+
+```nim
+config.proxy = "socks5://user:pass@127.0.0.1:1080"   # SOCKS5 with auth
+```
+
+### Unix domain sockets
+
+Set `unixSocket` to dial a Unix socket path instead of TCP, for services that
+listen on a socket file (the Docker daemon, systemd-activated services, local
+sidecars). The URL still carries the host (used for the `Host` header and, over
+https, the TLS SNI/verification name) and the path; only where the bytes go
+changes. Proxies are bypassed. Supported on the native clients on POSIX
+(`navi/js` and Windows raise a clear error).
+
+```nim
+var cfg = initNaviConfig()
+cfg.unixSocket = "/var/run/docker.sock"
+cfg.prefixUrl = "http://localhost"       # host is only for the Host header
+let info = newNavi(cfg).get("/v1.45/info")
+```
+
 ### Cookies
 
-Each client keeps a cookie jar automatically: cookies from `Set-Cookie` are stored and replayed on later requests to the same client (matched by domain, path, and Secure). There is nothing to configure.
+Each client keeps a cookie jar automatically: cookies from `Set-Cookie` are stored and replayed on later requests to the same client (matched by domain, path, and Secure). `__Host-` and `__Secure-` name-prefixed cookies are enforced per RFC 6265bis (rejected unless Secure over https, and for `__Host-` also host-only with `Path=/`). There is nothing to configure.
 
 ### Middleware
 
@@ -690,6 +761,14 @@ HTTP/1.1, set `http: {H1}` in `NaviConfig`.
 ### Keep-alive
 
 Connection reuse is automatic. Each client keeps an idle-connection pool keyed by origin; responses that are self-delimited (content-length or chunked) and not marked `Connection: close` return their connection to the pool. A pooled connection that the server has since closed is transparently retried on a fresh connection.
+
+Pool sizing is configurable: `maxIdleConnsPerHost` caps idle connections per origin (default 8), `maxIdleConns` caps them globally, and `idleConnTimeout` evicts and closes a connection that has sat idle too long (never handing out a stale one). All default to no limit beyond the per-host cap.
+
+```nim
+config.maxIdleConnsPerHost = 4
+config.maxIdleConns = 100
+config.idleConnTimeout = 90_000   # ms
+```
 
 ### Happy Eyeballs
 

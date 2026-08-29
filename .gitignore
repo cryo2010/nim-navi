@@ -1,6 +1,9 @@
 # Nim build artifacts
 nimcache/
 *.exe
+# Local review/scratch artifacts (never committed)
+issues.txt
+/stressH*.log
 # Compiled JavaScript output (demos/examples have .nim sources)
 demos/**/*.js
 examples/**/*.js
