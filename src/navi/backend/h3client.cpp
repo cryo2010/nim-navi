@@ -53,6 +53,28 @@ typedef std::ptrdiff_t (*NaviBodyPull)(void *env, const char **out_ptr);
 
 namespace {
 
+// RAII wrappers for the C resources this file manages by hand, so an acquire is freed
+// on every path (including early returns and future edits) without a manual free.
+struct X509Deleter { void operator()(X509 *p) const noexcept { X509_free(p); } };
+using X509Ptr = std::unique_ptr<X509, X509Deleter>;
+
+struct AddrInfoDeleter {
+  void operator()(addrinfo *p) const noexcept { freeaddrinfo(p); }
+};
+using AddrInfoPtr = std::unique_ptr<addrinfo, AddrInfoDeleter>;
+
+// A raw file descriptor is not a pointer, so it needs its own guard: it closes the fd
+// on scope exit unless `release()` hands ownership off first.
+struct FdGuard {
+  int fd = -1;
+  FdGuard() = default;
+  explicit FdGuard(int f) : fd(f) {}
+  FdGuard(const FdGuard &) = delete;
+  FdGuard &operator=(const FdGuard &) = delete;
+  ~FdGuard() { if (fd >= 0) ::close(fd); }
+  int release() noexcept { int f = fd; fd = -1; return f; }
+};
+
 // A produced-but-not-yet-acked request-body chunk. nghttp3 borrows the vec memory
 // a data reader returns until it is acked, so a streamed chunk must stay put until
 // `acked_stream_data` covers it -- hence a deque of stable std::strings, not one
@@ -113,6 +135,14 @@ struct H3Conn {
   bool has_abort = false;   // some stream's producer failed; reset it in send_step
   std::unordered_map<int64_t, Stream> streams;   // live streams by id
 
+  // Teardown order is deliberate and load-bearing (which is why this is an explicit
+  // destructor rather than per-member smart pointers whose order would follow
+  // declaration order): each handle is released before the thing it depends on --
+  // `conn` references `ossl` (ngtcp2_conn_set_tls_native_handle), `ossl` wraps `ssl`,
+  // and `ssl` belongs to `ssl_ctx`. It also relies on the library `_del` functions not
+  // re-entering our callbacks (e.g. ngtcp2_conn_del must not fire on_stream_close, or
+  // it would touch the already-freed `h3`). A new handle added here must be slotted in
+  // by this dependency order, and freed here.
   ~H3Conn() {
     if (h3) nghttp3_conn_del(h3);
     if (conn) ngtcp2_conn_del(conn);
@@ -428,10 +458,11 @@ int udp_connect(const char *host, const char *port, H3Conn *c) {
   addrinfo hints{};
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_DGRAM;
-  addrinfo *res = nullptr;
-  if (getaddrinfo(host, port, &hints, &res) != 0) return -1;
+  addrinfo *raw = nullptr;
+  if (getaddrinfo(host, port, &hints, &raw) != 0) return -1;
+  AddrInfoPtr res{raw};                        // freed on every return below
   int fd = -1;
-  for (addrinfo *rp = res; rp; rp = rp->ai_next) {
+  for (addrinfo *rp = res.get(); rp; rp = rp->ai_next) {
     fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
     if (fd < 0) continue;
     if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
@@ -443,15 +474,15 @@ int udp_connect(const char *host, const char *port, H3Conn *c) {
     ::close(fd);
     fd = -1;
   }
-  freeaddrinfo(res);
   if (fd < 0) return -1;
-  fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);  // for the async reader
+  FdGuard sock{fd};                            // closes fd on any early return below
+  fcntl(sock.fd, F_SETFL, fcntl(sock.fd, F_GETFL, 0) | O_NONBLOCK);  // async reader
   socklen_t ll = sizeof c->local_ss;
-  getsockname(fd, reinterpret_cast<sockaddr *>(&c->local_ss), &ll);
+  getsockname(sock.fd, reinterpret_cast<sockaddr *>(&c->local_ss), &ll);
   c->path.local.addr = reinterpret_cast<ngtcp2_sockaddr *>(&c->local_ss);
   c->path.local.addrlen = ll;
   c->path.user_data = nullptr;
-  return fd;
+  return sock.release();                        // hand the fd to the caller (H3Conn)
 }
 
 // Fill buf with the next datagram to send: its length, 0 = nothing, <0 = error.
@@ -593,12 +624,11 @@ int navi_h3_pump(H3Conn *c) {
 // mismatched peer here, before any h3 stream is opened.
 int navi_h3_bind(H3Conn *c) {
   if (c->want_verify) {
-    X509 *cert = SSL_get1_peer_certificate(c->ssl);
+    X509Ptr cert{SSL_get1_peer_certificate(c->ssl)};   // freed on every path below
     if (!cert) {   // a TLS server always sends one; its absence is a failure
       std::fprintf(stderr, "h3 verify: peer presented no certificate\n");
       return -1;
     }
-    X509_free(cert);
     long vr = SSL_get_verify_result(c->ssl);   // chain + hostname (SSL_set1_host)
     if (vr != X509_V_OK) {
       std::fprintf(stderr, "h3 verify: certificate verification failed (%ld)\n", vr);
@@ -962,7 +992,13 @@ int navi_h3_request(H3Conn *c, const char *method, const char *path_,
   std::int64_t sid = navi_h3_submit(c, method, path_, req_headers, body, body_len, pull,
                                     pull_env, req_trailers);
   if (sid < 0) return -1;
-  if (drive_until(c, &c->streams.at(sid).done) != 0) return -1;
+  // Look the stream up with find(), not at(): this is an extern "C" boundary with no
+  // try/catch, so an at() miss would throw std::out_of_range into Nim-generated C.
+  // (References into an unordered_map stay valid across inserts, so &done survives the
+  // drive_until pump loop -- only erasing the element would invalidate it.)
+  auto it = c->streams.find(sid);
+  if (it == c->streams.end()) return -1;
+  if (drive_until(c, &it->second.done) != 0) return -1;
   if (navi_h3_stream_reset(c, sid)) {   // reset/abort, not a real response
     c->streams.erase(sid);
     return -1;
