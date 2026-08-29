@@ -151,20 +151,27 @@ jobs:
       - name: Install checksums
         run: nimble install -y checksums
 
-      # Rebuilds and runs the whole suite under AddressSanitizer + UBSan
-      # (NAVI_SANITIZE=1, see tests/run.sh). Catches heap overflows,
-      # use-after-free, and undefined behavior in the sans-io parsers and buffer
-      # handling that a passing test would otherwise hide. Leak detection is off:
-      # short-lived test processes leak by design (no teardown), and it is not
-      # what this job is looking for.
+      # Rebuilds and runs the whole suite under AddressSanitizer + UBSan. Catches
+      # heap overflows, use-after-free, and undefined behavior in the sans-io
+      # parsers and buffer handling that a passing test would otherwise hide. Leak
+      # detection is off: short-lived test processes leak by design (no teardown),
+      # and it is not what this job is looking for.
       - name: Install brotli/zstd
         run: sudo apt-get update && sudo apt-get install -y libbrotli1 libzstd1
 
+      - name: Install checkmate
+        run: nimble install -y "https://github.com/cryo2010/nim-checkmate"
+
+      # -d:useMalloc routes Nim allocations through malloc so ASan sees them; -g +
+      # frame pointers give symbolized reports. checkmate space-splits --nimflags,
+      # so each sanitizer flag is a separate --passC/--passL (no spaces within one).
       - name: Run tests under ASan/UBSan
-        run: bash tests/run.sh
+        run: >-
+          checkmate --nimflags:"--mm:orc -d:useMalloc
+          --passC:-fsanitize=address --passC:-fsanitize=undefined
+          --passC:-fno-omit-frame-pointer --passC:-g
+          --passL:-fsanitize=address --passL:-fsanitize=undefined"
         env:
-          NAVI_MM: orc
-          NAVI_SANITIZE: "1"
           ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
 
@@ -180,7 +187,7 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       # navi's only required Nim dependency (MD5 for Digest auth); the interop
-      # tests build navi via raw `nim` inside run.sh.
+      # tests build navi via raw `nim` inside tests/interop/run.sh.
       - name: Install checksums
         run: nimble install -y checksums
 

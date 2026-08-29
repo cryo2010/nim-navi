@@ -1,4 +1,5 @@
-## Compile-only fixture (no `test_` prefix, so tests/run.sh does not run it): a
+## Compile-only fixture (the name doesn't match checkmate's `t*.nim`, so the unit
+## runner skips it): a
 ## library-style module written on navi/asyncdispatch must also build under
 ## `nim js`, where the entry falls back to navi/js. Exercises the portable pieces
 ## -- a capturing `{.async.}` middleware that awaits `ctx.next()`, config, params.

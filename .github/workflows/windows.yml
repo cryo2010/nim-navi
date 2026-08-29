@@ -34,13 +34,15 @@ jobs:
       - uses: ./.github/actions/setup-navi-windows
         with:
           chronos: "true"
-      # Run the suite directly, not via `nimble test`: nimble does not propagate a
-      # task's exit code (nim-lang/nimble#1802), so a failing suite would pass CI.
+      # checkmate runs the unit suite and propagates a proper exit code (unlike
+      # `nimble test`, nim-lang/nimble#1802). Discovery and excludes live in
+      # .checkmate.toml; the memory manager is matrixed via --nimflags.
+      - name: Install checkmate
+        shell: bash
+        run: nimble install -y "https://github.com/cryo2010/nim-checkmate"
       - name: Run tests
         shell: bash
-        run: bash tests/run.sh
-        env:
-          NAVI_MM: ${{ matrix.mm }}
+        run: checkmate --nimflags:"--mm:${{ matrix.mm }}"
 
   # `nim check` only type-checks -- no linking, no execution, so no runtime libs.
   # This is the cheapest guard on the openssl_ctx.nim X509 declarations.

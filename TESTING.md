@@ -22,9 +22,12 @@ demand; "nightly" runs on a schedule. A green PR is **96 checks**: 85 from
 ## Running at a glance
 
 ```sh
-nimble test               # default unit + integration suite (orc)
-NAVI_MM=arc nimble test   # same suite under the arc memory manager
-NAVI_SANITIZE=1 nimble test   # same suite under AddressSanitizer + UBSan
+nimble test               # default unit suite via checkmate (orc)
+checkmate                 # the same, run directly (scope with a path regex, e.g. `checkmate test_h1`)
+checkmate --nimflags:"--mm:arc"   # same suite under the arc memory manager
+# Under AddressSanitizer + UBSan (the `sanitizers` CI job; each flag is its own
+# --passC/--passL because checkmate space-splits --nimflags):
+checkmate --nimflags:"--mm:orc -d:useMalloc --passC:-fsanitize=address --passC:-fsanitize=undefined --passC:-fno-omit-frame-pointer --passC:-g --passL:-fsanitize=address --passL:-fsanitize=undefined"
 
 # Interop (each stands up a real server and exits non-zero on failure):
 nimble interop            # HTTP/2 vs nghttpd (needs nghttpd + openssl)
@@ -33,6 +36,9 @@ nimble tlsFallback        # handshake-aware address fallback (needs openssl + py
 nimble tlsVersion         # TLS min/max version pinning (needs openssl w/ TLS 1.3)
 nimble happyEyeballs      # RFC 8305 address racing (needs openssl)
 nimble cipherSuite        # cipher / ciphersuite selection (needs openssl w/ TLS 1.3)
+nimble tlsPinning         # in-memory CA + SPKI pinning + verify callback (needs openssl)
+nimble socks              # SOCKS5 proxy + user/pass auth, all native backends (needs python3)
+nimble unixSocket         # Unix domain socket transport, native backends (needs python3)
 nimble servers            # h2 vs nginx / Caddy / h2o (needs Docker + openssl)
 nimble streamConcurrent   # 50x simultaneous streamed up+down over the h2 mux (needs Docker)
 nimble sse                # SSE reconnect + Last-Event-ID resume over the h2 mux (needs Docker)
@@ -108,12 +114,14 @@ fast as "network unreachable".
 
 ## Default suite (`nimble test`)
 
-Compiles and runs every `tests/test_*.nim`. `nimble test` delegates to
-`tests/run.sh` (nimble does not propagate a task's exit code, nim-lang/nimble#1802,
-so CI runs the script directly under `set -e`). In CI it runs three times: the
-**`test`** job over the memory-manager matrix (`orc` and `arc`) and the
-**`sanitize`** job under AddressSanitizer + UBSan (`NAVI_SANITIZE=1`, which also
-switches to `-d:useMalloc`). All tests below are covered by those three runs.
+Compiles and runs every `tests/` suite matching `t*.nim` (discovery and excludes,
+e.g. `tests/interop/*`, live in `.checkmate.toml`) with the **checkmate** runner.
+`nimble test` invokes `checkmate`; CI runs `checkmate` directly, since nimble does
+not propagate a task's exit code (nim-lang/nimble#1802). checkmate fails a `test`
+that executes zero assertions, so every case must `check`/`require`/`expect`. In
+CI it runs three times: the **`test`** job over the memory-manager matrix (`orc`
+and `arc`) and the **`sanitize`** job under AddressSanitizer + UBSan (with
+`-d:useMalloc`). All tests below are covered by those three runs.
 
 Configuration: the repo-root `config.nims` adds `src` to the path and `-d:ssl`
 (navi needs OpenSSL for https; library consumers must likewise build with
@@ -259,7 +267,7 @@ reference cycle could differ (`arc` does not collect cycles).
 
 | Check | CI | Verifies |
 |------|----|----------|
-| `sanitize` job → `tests/run.sh` | **yes** (`sanitizers`) | The whole default suite rebuilt under AddressSanitizer + UBSan (`-d:useMalloc`): heap overflows, use-after-free, and UB in the sans-io parsers a passing test would hide. Leak detection off (short-lived test processes leak by design) |
+| `sanitize` job → `checkmate` (ASan/UBSan nimflags) | **yes** (`sanitizers`) | The whole default suite rebuilt under AddressSanitizer + UBSan (`-d:useMalloc`): heap overflows, use-after-free, and UB in the sans-io parsers a passing test would hide. Leak detection off (short-lived test processes leak by design) |
 | `leak.nim` (matrix orc/arc) | **yes** (`leak check`) | Every verb + `request` in a 100,000× loop (800k requests) against an in-process keep-alive server; asserts the Nim heap stays flat (an orc/arc gap would mean a reference cycle) |
 | `leak_valgrind.nim` (matrix orc/arc, Docker) | **yes** (`valgrind leak check`) | navi's HTTPS request loop under Valgrind memcheck; fails on any definite/indirect leak (e.g. a per-connection `SSL_CTX` that `getOccupiedMem` and LeakSanitizer miss) |
 | `leak_sanitize.nim` | **yes** (`leak check (codec FFI…)`) | Codec-FFI leaks LeakSanitizer sees but `getOccupiedMem` cannot: zlib / libbrotlidec / libzstd contexts a dropped `=destroy`/defer would leak (`detect_leaks=1`) |

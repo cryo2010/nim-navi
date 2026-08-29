@@ -84,8 +84,9 @@ verification off is a deliberate, explicit `tls.verify = false`.
 **Verified by:** `badssl.nim` (rejects invalid certificates, accepts a valid one),
 `mtls.sh` (client-certificate handshake).
 
-**Residual risk:** navi verifies against a CA but does not do SPKI/public-key
-pinning, and revocation is left to OpenSSL's defaults (no added OCSP/CRL). See
+**Residual risk:** SPKI/public-key pinning (`tls.pinnedKeys`) and a custom verify
+callback (`tls.verifyCallback`) are available but off by default; revocation is
+left to OpenSSL's defaults (no added OCSP/CRL). See
 [Application responsibilities](#application-responsibilities).
 
 ### Tampering (was the response altered in transit?)
@@ -195,9 +196,11 @@ application, not the library:
   metadata IPs, and so on); navi does not, because "which hosts are safe to reach"
   is deployment policy. `maxRedirects = 0` lets you inspect a 3xx before following
   it yourself.
-- **Certificate pinning.** navi supports a custom CA (`tls.caFile`) plus version
-  and cipher pinning, but not SPKI/public-key pinning. Pin the trust anchor via
-  `caFile` if you need to constrain the accepted chain.
+- **Certificate pinning.** navi supports a custom CA (`tls.caFile` or the
+  in-memory `tls.caBundle`), version and cipher pinning, SPKI/public-key pinning
+  (`tls.pinnedKeys`), and a custom verify callback (`tls.verifyCallback`). Pin the
+  trust anchor via `caFile`/`caBundle`, or pin the exact key via `pinnedKeys`, to
+  constrain the accepted chain.
 - **Secret handling.** `Authorization` set via `config.auth` or a header is
   stripped across origins on redirects, but secrets placed directly in a URL
   (query string) are the application's to manage.

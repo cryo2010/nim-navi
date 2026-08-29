@@ -1,6 +1,6 @@
 # Package
 
-version       = "0.8.0"
+version       = "0.9.0"
 author        = "Craig Younker"
 description   = "A fast HTTP/1.1-3 client with TLS, streaming, SSE and WebSockets"
 license       = "MIT"
@@ -18,16 +18,17 @@ requires "checksums >= 0.2.2"   # MD5 + SHA-256 (sha2 API) for Digest auth; 0.2.
 # for TLS (like sync/asyncdispatch), so an https build needs `-d:ssl`.
 # requires "chronos >= 4.0.0"
 
-task test, "Run the test suite (delegates to tests/run.sh)":
-  # The suite list and build options live in tests/run.sh, so there is one source
-  # of truth shared with CI. NAVI_MM (orc/arc) and NAVI_SANITIZE=1 are read from
-  # the environment by the script.
+task test, "Run the unit test suite (via checkmate)":
+  # checkmate discovers, compiles, and runs the tests/ suite (config in
+  # .checkmate.toml: pattern t*.nim, excluding tests/interop). It is the same
+  # runner CI uses. Install it with:
+  #   nimble install "https://github.com/cryo2010/nim-checkmate"
   #
   # WARNING: `nimble` does not propagate a task's exit code (nim-lang/nimble#1802)
   # -- on this nimble a failing test still makes `nimble test` exit 0. A failure
-  # is visible in the output, but CI runs `bash tests/run.sh` directly so a real
-  # failure actually fails the job.
-  exec "bash tests/run.sh"
+  # is visible in the output, but CI runs `checkmate` directly so a real failure
+  # actually fails the job.
+  exec "checkmate"
 
 task leak, "Memory-growth check: every verb + request in a 100,000x loop":
   # Not in the default `test` suites (800k requests); its own PR job. NAVI_MM
