@@ -97,7 +97,9 @@ proc initNaviConfig*(): NaviConfig =
     prefixUrl: "", headers: initHeaders(), http: {H1, H2}, tls: defaultTls(),
     decompress: true, throwHttpErrors: true, maxRedirects: 20,
     retry: defaultRetryPolicy(), maxResponseBytes: 0,
-    auth: Auth(), proxy: "", timeouts: Timeouts(), middleware: @[])
+    auth: Auth(), proxy: "", unixSocket: "",
+    maxIdleConns: 0, maxIdleConnsPerHost: 0, idleConnTimeout: 0,
+    timeouts: Timeouts(), middleware: @[])
 
 proc newNavi*(config = initNaviConfig()): Navi =
   ## Create a client. `config` supplies defaults (prefixUrl, headers, TLS,
@@ -106,7 +108,9 @@ proc newNavi*(config = initNaviConfig()): Navi =
   cfg.tls.sessionCache = newTlsStore(cfg.tls)   # always its own cache, so a config
   cfg.tls.contextStore = newTlsCtxStore(cfg.tls) # cloned from another client (e.g.
                                                  # newNavi(other.config)) is isolated
-  result = Navi(config: cfg, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
+  result = Navi(config: cfg,
+    pool: newPool[PooledConn[Conn]](cfg.idlePerHost, cfg.idleGlobal, cfg.idleTimeoutMs),
+    jar: newCookieJar())
   when defined(naviHttp3): result.altSvc = newAltSvcCache()
 
 proc extend*(client: Navi, config: NaviConfig): Navi =
@@ -116,7 +120,9 @@ proc extend*(client: Navi, config: NaviConfig): Navi =
   merged.middleware = client.config.middleware & config.middleware
   merged.tls.sessionCache = newTlsStore(merged.tls)  # its own cache, not the parent's
   merged.tls.contextStore = newTlsCtxStore(merged.tls)  # its own contexts too
-  result = Navi(config: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar())
+  result = Navi(config: merged,
+    pool: newPool[PooledConn[Conn]](merged.idlePerHost, merged.idleGlobal, merged.idleTimeoutMs),
+    jar: newCookieJar())
   when defined(naviHttp3): result.altSvc = newAltSvcCache()
 
 proc close*(client: Navi) =
@@ -261,7 +267,7 @@ proc openStream(client: Navi, req0: Request): StreamResponse =
   ## retried once on a fresh one. Does not throw on non-2xx.
   var rq = req0
   let proxy = resolveProxy(client.config, rq.url)
-  rq.absoluteForm = proxy.isSet and not rq.url.isTls
+  rq.absoluteForm = usesAbsoluteForm(proxy, rq.url.isTls)
   let alpn = if client.config.wantsH2 and rq.url.isTls: @["h2", "http/1.1"] else: @[]
   let key = originKey(rq.url)
   let decompress = client.config.wantsDecompress
@@ -297,6 +303,8 @@ proc openStream(client: Navi, req0: Request): StreamResponse =
               conn.freeStream(sid); conn.close(); raise
         except QuicError: discard   # fall back to the h2/h1 transport below
 
+  for dead in reapExpired(client.pool):    # close idle connections past idleConnTimeout
+    try: dead.transport.close() except CatchableError: discard
   var (found, pc) = popIdle(client.pool, key)
   if found:
     try:

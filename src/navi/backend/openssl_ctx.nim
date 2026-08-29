@@ -14,7 +14,8 @@
 import ./api
 
 when defined(ssl):
-  import std/[net, openssl, nativesockets, tables, strutils]
+  import std/[net, openssl, nativesockets, tables, strutils, base64]
+  import checksums/sha2
   # Re-export the context type + destructor so backends can own the socket and
   # handshake while still building the (verified) context through newContext.
   export net.SslContext, net.destroyContext
@@ -64,6 +65,24 @@ when defined(ssl):
   # Match an IP literal against the certificate's iPAddress SANs. std/openssl
   # wraps X509_check_host (DNS names) but not this IP variant.
   proc X509_check_ip_asc(cert: PX509, ipasc: cstring, flags: cuint): cint
+    {.cdecl, dynlib: DLLUtilName, importc.}
+  when defined(windows):
+    # std/openssl hides its X509_STORE type and DER helpers behind
+    # `not defined(windows)` (like the X509 block below), so declare the ones the
+    # caBundle / pinning / verify-callback paths use. PX509_STORE is an opaque
+    # handle, like the other pointer aliases.
+    type PX509_STORE = SslPtr
+    proc X509_STORE_add_cert(store: PX509_STORE, x: PX509): cint
+      {.cdecl, dynlib: DLLUtilName, importc.}
+    proc i2d_X509(cert: PX509, o: ptr ptr uint8): cint
+      {.cdecl, dynlib: DLLUtilName, importc.}
+  # In-memory CA trust: reach the context's X509_STORE and add certs to it.
+  proc SSL_CTX_get_cert_store(ctx: SslCtx): PX509_STORE
+    {.cdecl, dynlib: DLLSSLName, importc.}
+  # SPKI pinning: the peer's public key, DER-encoded as SubjectPublicKeyInfo.
+  proc X509_get_pubkey(cert: PX509): EVP_PKEY
+    {.cdecl, dynlib: DLLUtilName, importc.}
+  proc i2d_PUBKEY(pkey: EVP_PKEY, o: ptr ptr uint8): cint
     {.cdecl, dynlib: DLLUtilName, importc.}
 
   when defined(windows):
@@ -186,6 +205,23 @@ when defined(ssl):
     if SSL_CTX_check_private_key(ctx) != 1:
       fail("the client certificate and private key do not match")
 
+  proc addCaBundle(ctx: SslCtx, pem: string) =
+    ## Add every certificate in the in-memory PEM `pem` to the context's trust
+    ## store, so a chain anchored at one of them verifies. Supplements the system
+    ## roots / `caFile` rather than replacing them.
+    let store = SSL_CTX_get_cert_store(ctx)
+    if store.isNil: fail("could not access the TLS trust store")
+    let bio = memBio(pem)
+    defer: discard BIO_free(bio)
+    var added = 0
+    while true:
+      let cert = PEM_read_bio_X509(bio, nil, nil, nil)
+      if cert.isNil: break
+      discard X509_STORE_add_cert(store, cert)   # bumps refcount; free ours after
+      X509_free(cert)
+      inc added
+    if added == 0: fail("no certificate found in TlsConfig.caBundle")
+
   # --- the builder -------------------------------------------------------
 
   const
@@ -249,6 +285,7 @@ when defined(ssl):
       keyFile = if custom: "" else: cfg.clientKeyFile,
       caFile = cfg.caFile)
     if custom: loadClientCert(result.context, cfg)
+    if cfg.caBundle.len > 0: addCaBundle(result.context, cfg.caBundle)
     setAlpn(result.context, alpn)
     setVersionBounds(result.context, cfg)
     setCiphers(result.context, cfg)
@@ -459,6 +496,52 @@ when defined(ssl):
     if host.len > 0:
       if isIpAddress(host): checkCertIp(ssl, host)   # match the iPAddress SAN
       else: checkCertName(ssl, host)
+
+  proc certDer(cert: PX509): string =
+    ## DER encoding of `cert`, via the pointer-form i2d_X509 (std/openssl's string
+    ## wrapper is inferred to raise `Exception`, which the strict async paths reject).
+    let n = i2d_X509(cert, nil)
+    if n <= 0: return ""
+    result = newString(n)
+    var p = cast[ptr uint8](addr result[0])
+    if i2d_X509(cert, addr p) <= 0: return ""
+
+  proc peerSpkiPin(ssl: SslPtr): string =
+    ## Base64 SHA-256 of the peer certificate's SubjectPublicKeyInfo -- the HPKP
+    ## pin form (`openssl ... | openssl dgst -sha256 -binary | base64`). "" when the
+    ## peer presented no certificate or its key could not be encoded.
+    let cert = SSL_get_peer_certificate(ssl)
+    if cert.isNil: return ""
+    defer: X509_free(cert)
+    let pkey = X509_get_pubkey(cert)
+    if pkey.isNil: return ""
+    defer: EVP_PKEY_free(pkey)
+    let n = i2d_PUBKEY(pkey, nil)
+    if n <= 0: return ""
+    var der = newString(n)
+    var p = cast[ptr uint8](addr der[0])
+    if i2d_PUBKEY(pkey, addr p) <= 0: return ""
+    var h = initSha_256()
+    h.update(der)
+    base64.encode(h.digest())
+
+  proc postHandshakeVerify*(ssl: SslPtr, host: string, cfg: TlsConfig)
+      {.raises: [CatchableError].} =
+    ## Extra peer checks after `verifyPeer`'s chain + hostname verification: SPKI
+    ## pinning and the user's verify callback. Both run even when `verify` is off,
+    ## so an app that disables chain checking can still pin or inspect the leaf. A
+    ## no-op when neither is configured. Raises `ValueError` on rejection.
+    if cfg.pinnedKeys.len > 0:
+      let pin = peerSpkiPin(ssl)
+      if pin.len == 0 or pin notin cfg.pinnedKeys:
+        fail("certificate public key does not match any pin for " & host)
+    if cfg.verifyCallback != nil:
+      let cert = SSL_get_peer_certificate(ssl)
+      if cert.isNil: fail("server presented no certificate")
+      let der = certDer(cert)
+      X509_free(cert)
+      if not cfg.verifyCallback(der):
+        fail("the verify callback rejected the certificate for " & host)
 
   proc startClientTls*(ctx: SslContext, fd: SocketHandle, host: string,
                        verify: bool, slot: SessionSlot = nil): SslPtr =

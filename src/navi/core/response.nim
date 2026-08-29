@@ -1,7 +1,7 @@
 ## Response model and body accessors.
 
 import std/json
-import ./headers
+import ./headers, ./charset
 export json
 
 type
@@ -10,6 +10,8 @@ type
     reason*: string
     httpVersion*: string
     headers*: Headers
+    trailers*: Headers         ## trailing fields after the body (chunked/h2); empty
+                               ## when the response carried none
     body*: string
     dataCache: ref JsonNode    ## lazily-parsed, cached JSON (see `data`)
 
@@ -52,6 +54,13 @@ proc enforceMaxResponse*(r: Response, limit: int) =
 proc ok*(r: Response): bool {.inline.} =
   ## True for 2xx status codes.
   r.status >= 200 and r.status < 300
+
+proc text*(r: Response): string =
+  ## The body decoded to UTF-8 from its charset. Uses a leading BOM if present,
+  ## else the `Content-Type` charset parameter, else UTF-8; an unrecognized
+  ## charset returns the raw bytes. Unlike `body` (raw bytes) this yields correct
+  ## text for non-UTF-8 responses (ISO-8859-1, Windows-1252, UTF-16).
+  decodeText(r.body, r.headers.get("content-type"))
 
 proc data*(r: Response): JsonNode =
   ## The body parsed as JSON, regardless of Content-Type, parsed once and cached

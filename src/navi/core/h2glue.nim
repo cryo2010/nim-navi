@@ -26,5 +26,7 @@ proc toResponse*(r: H2Response): Response =
   var headers: Headers
   for (name, value) in r.headers:
     headers.add(name, value)
-  initResponse(r.status, "", "HTTP/2", headers, r.body)
+  result = initResponse(r.status, "", "HTTP/2", headers, r.body)
+  for (name, value) in r.trailers:
+    result.trailers.add(name, value)
 

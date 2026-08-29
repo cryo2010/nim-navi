@@ -56,6 +56,7 @@ type
     reason: string
     version: string
     headers: Headers
+    trailers: Headers       ## trailing fields after a chunked body (RFC 9110 7.1.2)
     body: string
     streaming: bool         ## when set, body bytes accumulate in `pending` for
                             ## the engine to drain and hand to a sink, not `body`
@@ -207,7 +208,12 @@ proc step(p: var H1Parser): bool =
   of stTrailers:
     var line: string
     if not p.takeLine(line): return false
-    if line.len == 0: p.state = stDone
+    if line.len == 0:
+      p.state = stDone
+    else:
+      let colon = line.find(':')
+      if colon > 0:
+        p.trailers.add(line[0 ..< colon].strip(), line[colon + 1 .. ^1].strip())
     true
   of stDone:
     false
@@ -239,5 +245,10 @@ proc keepAliveAfter*(p: H1Parser): bool =
   if p.version != "HTTP/1.1": return false
   "close" notin p.headers.get("connection").toLowerAscii
 
+proc trailers*(p: H1Parser): Headers =
+  ## Trailing header fields received after a chunked body (empty if none).
+  p.trailers
+
 proc toResponse*(p: H1Parser): Response =
-  initResponse(p.status, p.reason, p.version, p.headers, p.body)
+  result = initResponse(p.status, p.reason, p.version, p.headers, p.body)
+  result.trailers = p.trailers

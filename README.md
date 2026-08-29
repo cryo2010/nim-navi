@@ -85,14 +85,18 @@ discard main()
 - **Streaming** uploads (chunked) and downloads (with backpressure)
 - **Server-Sent Events** with transparent reconnection
 - **Retries** with capped exponential backoff, honoring `Retry-After`
-- **Redirect following** with method rewrites and cross-origin `Authorization` stripping
+- **Redirect following** with method rewrites and cross-origin `Authorization` / `Proxy-Authorization` stripping
 - **Throw-on-non-2xx** by default, opt-out available
-- **Automatic decompression**: gzip, deflate, brotli and zstd
+- **Automatic decompression**: gzip, deflate, brotli and zstd; `res.text` charset decoding
+- **Response trailers** surfaced (chunked HTTP/1.1 and HTTP/2)
 - **Request timeouts** per-phase (connect / read / total)
+- **Connection-pool sizing:** per-host and global idle caps, idle-timeout eviction
 - **Middleware**: onion-style functions that modify, observe, or short-circuit requests
-- **Cookie jar:** (RFC 6265) automatic and per-client; per-domain with expiration
+- **Cookie jar:** (RFC 6265) automatic and per-client; per-domain with expiration and `__Host-`/`__Secure-` prefixes
 - **Basic/bearer/digest auth:** digest: MD5 and SHA-256, RFC 7616
-- **Proxy:** http absolute-URI and https CONNECT
+- **Proxy:** http absolute-URI, https CONNECT (with Proxy-Authorization), and SOCKS5
+- **Unix domain sockets** (native backends, POSIX): dial a socket path instead of TCP
+- **TLS controls:** custom/in-memory CA, mTLS, version and cipher pinning, SPKI certificate pinning, and a custom verify callback
 - **WebSockets** (RFC 6455) text and binary messages, fragmentation reassembly, and automatic ping/pong
 
 ## Install

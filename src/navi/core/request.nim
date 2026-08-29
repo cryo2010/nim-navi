@@ -5,7 +5,7 @@
 
 import std/[options, json, base64, tables]
 from std/uri import encodeQuery
-import ./headers, ./url, ./response, ./multipart
+import ./headers, ./url, ./response, ./multipart, ./version
 import ../backend/api
 export options, multipart
 
@@ -84,6 +84,14 @@ type
     maxResponseBytes*: int          ## cap on response body size; 0 (default) unlimited
     auth*: Auth                     ## Authorization applied to every request
     proxy*: string                  ## proxy URL; "" falls back to env vars
+    unixSocket*: string             ## connect over this Unix socket path instead of
+                                    ## TCP; the URL host/port are used only for the
+                                    ## Host header and TLS SNI. "" (default) uses TCP.
+                                    ## Bypasses proxies; POSIX + native backends only.
+    maxIdleConns*: int              ## global cap on idle pooled connections; 0 = unlimited
+    maxIdleConnsPerHost*: int       ## idle pooled connections per origin; 0 = default (8)
+    idleConnTimeout*: int           ## ms an idle pooled connection may live before it is
+                                    ## evicted and closed; 0 (default) = no timeout
     timeouts*: Timeouts             ## per-phase deadlines (connect/read/total)
 
   BodyProducer* = proc(): string {.closure, raises: [CatchableError].}
@@ -118,6 +126,17 @@ proc wantsDecompress*(opts: NaviConfigBase): bool = opts.decompress
 proc wantsThrow*(opts: NaviConfigBase): bool = opts.throwHttpErrors
 proc redirectLimit*(opts: NaviConfigBase): int = opts.maxRedirects
 proc retryLimit*(opts: NaviConfigBase): int = opts.retry.limit
+
+proc unixSocket*(opts: NaviConfigBase): string = opts.unixSocket
+  ## Unix socket path to dial instead of TCP; "" (default) uses TCP.
+
+proc idlePerHost*(opts: NaviConfigBase): int =
+  ## Per-origin idle-connection cap; 0 in the config means the default of 8.
+  if opts.maxIdleConnsPerHost > 0: opts.maxIdleConnsPerHost else: 8
+proc idleGlobal*(opts: NaviConfigBase): int = opts.maxIdleConns
+  ## Global idle-connection cap; 0 = unlimited.
+proc idleTimeoutMs*(opts: NaviConfigBase): int = opts.idleConnTimeout
+  ## Idle-connection lifetime in ms; 0 = no timeout.
 
 proc connectMs*(opts: NaviConfigBase): int = opts.timeouts.connect
   ## Deadline for TCP connect + TLS handshake, in ms; 0 disables.
@@ -214,3 +233,10 @@ proc buildRequest*(opts: NaviConfigBase, verb: HttpVerb, target: string,
     result.headers.add("authorization", opts.auth.header)
   if opts.wantsDecompress and not result.headers.contains("accept-encoding"):
     result.headers.add("accept-encoding", "gzip, deflate, br, zstd")
+  # Identify the client and advertise a catch-all Accept unless the caller set
+  # their own. Every mainstream client (Go, curl, axios, httpx) sends both; some
+  # servers and WAFs reject or misroute a User-Agent-less request.
+  if not result.headers.contains("user-agent"):
+    result.headers.add("user-agent", "navi/" & naviVersion)
+  if not result.headers.contains("accept"):
+    result.headers.add("accept", "*/*")

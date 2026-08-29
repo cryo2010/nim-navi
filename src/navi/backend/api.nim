@@ -19,6 +19,12 @@ type
     ## `tlsDefault` (the zero value) leaves that bound to the backend's default.
     tlsDefault, tls10, tls11, tls12, tls13
 
+  CertVerifyProc* = proc(leafDer: string): bool {.closure, gcsafe, raises: [CatchableError].}
+    ## User hook run after the built-in chain + hostname checks pass, receiving the
+    ## peer's leaf certificate in DER form. Return false to reject the connection.
+    ## Use it for extra checks (custom pinning, CT, name policy). To replace
+    ## verification entirely, set `verify=false` and do all the checking here.
+
   TlsConfig* = object
     ## TLS options, including the client certificate for mTLS. The client
     ## credential can come from several sources; precedence is `pkcs12File`, then
@@ -28,6 +34,13 @@ type
     ## not present client certificates.
     verify*: bool          ## verify the cert chain and hostname (default on)
     caFile*: string        ## custom CA bundle path; "" uses the system trust store
+    caBundle*: string      ## additional trusted CA certificates as an in-memory PEM
+                           ## string; added to the trust store alongside `caFile` /
+                           ## the system roots (supplements, does not replace)
+    pinnedKeys*: seq[string] ## SPKI SHA-256 pins (base64, HPKP form). When non-empty,
+                           ## the peer's public key must match one pin or the
+                           ## connection is rejected -- checked after chain + hostname
+    verifyCallback*: CertVerifyProc ## optional post-verification hook (see CertVerifyProc)
     certFile*: string      ## client certificate file (PEM or DER) for mTLS
     keyFile*: string       ## private key file for `certFile`; "" reuses certFile
     password*: string      ## passphrase for an encrypted key, or the PKCS#12 bundle password
@@ -48,11 +61,23 @@ type
     cipherSuites*: string  ## TLS 1.3 ciphersuites (colon-separated, e.g.
                            ## "TLS_AES_128_GCM_SHA256"); "" = library default
 
+  ProxyKind* = enum
+    pkHttp     ## an HTTP proxy: CONNECT tunnel for https, absolute-URI for http
+    pkSocks5   ## a SOCKS5 proxy: a raw TCP tunnel for both http and https targets
+    pkUnix     ## not a proxy: dial this Unix socket path directly (`host` holds the
+               ## path). The request still uses origin form and the URL host for
+               ## Host + TLS SNI; proxies are bypassed.
+
   ProxyTarget* = object
-    ## The HTTP proxy to dial through. An empty `host` means a direct
-    ## connection. For https targets the backend issues a CONNECT tunnel.
+    ## The proxy to dial through. An empty `host` means a direct connection. An
+    ## HTTP proxy issues a CONNECT tunnel for https targets; a SOCKS5 proxy tunnels
+    ## every target. `user`/`pass` authenticate to the proxy (Proxy-Authorization
+    ## for HTTP CONNECT, RFC 1929 for SOCKS5).
+    kind*: ProxyKind
     host*: string
     port*: int
+    user*: string
+    pass*: string
 
 proc wantsVerify*(tls: TlsConfig): bool = tls.verify
   ## Whether to verify the cert chain and hostname. `defaultTls()` /
@@ -74,3 +99,9 @@ proc defaultTls*(): TlsConfig =
 
 proc direct*(): ProxyTarget = ProxyTarget()
 proc isSet*(p: ProxyTarget): bool = p.host.len > 0
+
+proc usesAbsoluteForm*(p: ProxyTarget, isTls: bool): bool =
+  ## Whether a request should use absolute-URI form on its request line: only for a
+  ## plain-http target through an HTTP proxy. A SOCKS5 proxy tunnels raw TCP, so the
+  ## request uses origin form as if talking to the server directly.
+  p.isSet and p.kind == pkHttp and not isTls

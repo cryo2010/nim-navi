@@ -103,3 +103,36 @@ suite "cookie replay ordering (RFC 6265 5.4)":
     storeCookies(jar, parseUrl("http://x.test/"), setCookieResp("a=1; Path=/"))
     storeCookies(jar, parseUrl("http://x.test/"), setCookieResp("b=2; Path=/"))
     check jar.replayed("http://x.test/") == "a=1; b=2"
+
+suite "cookie name prefixes (RFC 6265bis 5.5)":
+  test "a __Secure- cookie should be stored when Secure over https":
+    let jar = stored("__Secure-a=1; Secure", "https://x.test/")
+    check jar.replayed("https://x.test/") == "__Secure-a=1"
+
+  test "a __Secure- cookie should be rejected without the Secure attribute":
+    let jar = stored("__Secure-a=1", "https://x.test/")
+    check jar.replayed("https://x.test/") == ""
+
+  test "a __Secure- cookie should be rejected over an insecure origin":
+    let jar = stored("__Secure-a=1; Secure", "http://x.test/")
+    check jar.replayed("http://x.test/") == ""
+
+  test "a __Host- cookie should be stored when Secure, host-only, Path=/":
+    let jar = stored("__Host-a=1; Secure; Path=/", "https://x.test/")
+    check jar.replayed("https://x.test/") == "__Host-a=1"
+
+  test "a __Host- cookie should be rejected when it carries a Domain":
+    let jar = stored("__Host-a=1; Secure; Path=/; Domain=x.test", "https://x.test/")
+    check jar.replayed("https://x.test/") == ""
+
+  test "a __Host- cookie should be rejected when its Path is not /":
+    let jar = stored("__Host-a=1; Secure; Path=/foo", "https://x.test/foo")
+    check jar.replayed("https://x.test/foo") == ""
+
+  test "a __Host- cookie should be rejected without the Secure attribute":
+    let jar = stored("__Host-a=1; Path=/", "https://x.test/")
+    check jar.replayed("https://x.test/") == ""
+
+  test "the prefix match should be case-insensitive":
+    let jar = stored("__HOST-a=1; Path=/", "https://x.test/")   # missing Secure
+    check jar.replayed("https://x.test/") == ""

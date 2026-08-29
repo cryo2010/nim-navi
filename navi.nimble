@@ -141,6 +141,24 @@ task caVerify, "Private-CA (TlsConfig.caFile) verification, sync backend (needs 
   # reject it without the CA (private root is not in the system trust store).
   exec "bash tests/interop/ca_verify.sh"
 
+task tlsPinning, "In-memory CA bundle + SPKI pinning + verify callback, sync backend (needs openssl)":
+  # A server signed by a throwaway CA: navi must trust it via an in-memory
+  # caBundle, honor a matching SPKI pin (reject a wrong one), and run the verify
+  # callback (accept/reject, and even with chain verification disabled).
+  exec "bash tests/interop/tls_pin.sh"
+
+task socks, "SOCKS5 proxy tunnelling + user/pass auth, all native backends (needs python3)":
+  # A local HTTP origin behind two SOCKS5 proxies (no-auth and user/pass): navi
+  # must tunnel through, authenticate, and reject wrong credentials, on the sync,
+  # asyncdispatch and chronos backends.
+  exec "bash tests/interop/socks5.sh"
+
+task unixSocket, "Unix domain socket transport, all native backends (POSIX; needs python3)":
+  # An AF_UNIX HTTP server that echoes the Host header: navi must dial the socket
+  # path, send the URL host as Host, and reject an over-long path, on the sync,
+  # asyncdispatch and chronos backends.
+  exec "bash tests/interop/unixsocket.sh"
+
 task streaming, "File-streaming interop: http1/http2 x upload/download (needs nghttpd + openssl)":
   # Streams a 3 MiB file each way over each protocol and asserts the transfer used
   # that protocol and hash-matches the original. Mirrors the four CI checks.

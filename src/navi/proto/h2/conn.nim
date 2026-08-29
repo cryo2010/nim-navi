@@ -20,6 +20,7 @@ type
   H2Response* = object
     status*: int
     headers*: seq[(string, string)]
+    trailers*: seq[(string, string)]   ## fields from a trailing HEADERS block (RFC 9113 8.1)
     body*: string
 
   Stream = ref object
@@ -223,8 +224,10 @@ proc applyHeaders(c: H2Conn, s: Stream) =
       headers.add((name, value))
   s.hdrBuf.setLen(0)
   if s.sawFinal:
-    # A header block after the final response is trailers (RFC 9113 8.1). navi
-    # does not surface trailers; they were decoded above (HPACK sync) and dropped.
+    # A header block after the final response is trailers (RFC 9113 8.1). They
+    # were HPACK-decoded above (required to keep the dynamic table in sync); keep
+    # the non-pseudo fields so the caller can read them off the response.
+    for h in headers: s.resp.trailers.add(h)
     if s.hdrEndStream: s.ended = true
     return
   if status in 100 .. 199:
