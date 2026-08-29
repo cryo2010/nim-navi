@@ -24,7 +24,7 @@ command -v hypercorn >/dev/null || { echo "hypercorn required (pip install -r se
 work="$(mktemp -d)"
 cert="$work/cert.pem"; key="$work/key.pem"
 pids=()
-cleanup() { for p in "${pids[@]:-}"; do kill "$p" 2>/dev/null || true; done; rm -rf "$work"; }
+cleanup() { for p in "${pids[@]:-}"; do kill -- -"$p" 2>/dev/null || true; done; rm -rf "$work"; }
 trap cleanup EXIT
 
 # Self-signed cert. DNS:127.0.0.1 (not just the IP SAN) so chronos's TLS, which
@@ -74,7 +74,7 @@ start_servers() {
     for ((i=0; i<servers; i++)); do
       port=$((base_port + i))
       local bport=$((base_port + 1000 + i))
-      hypercorn "app:app" --bind "127.0.0.1:$bport" --config "$hcfg" >"$work/srv-$i.log" 2>&1 &
+      setsid hypercorn "app:app" --bind "127.0.0.1:$bport" --config "$hcfg" >"$work/srv-$i.log" 2>&1 &
       pids+=($!)
       cat >>"$caddyfile" <<-EOF
 	https://$host:$port {
@@ -84,12 +84,12 @@ start_servers() {
 	}
 	EOF
     done
-    caddy run --config "$caddyfile" --adapter caddyfile >"$work/caddy.log" 2>&1 &
+    setsid caddy run --config "$caddyfile" --adapter caddyfile >"$work/caddy.log" 2>&1 &
     pids+=($!)
   else
     for ((i=0; i<servers; i++)); do
       port=$((base_port + i))
-      hypercorn "app:app" --bind "$host:$port" --certfile "$cert" --keyfile "$key" \
+      setsid hypercorn "app:app" --bind "$host:$port" --certfile "$cert" --keyfile "$key" \
         --config "$hcfg" >"$work/srv-$i.log" 2>&1 &
       pids+=($!)
     done
@@ -132,15 +132,18 @@ PY
 }
 
 # Kill the servers AND wait for their ports to actually free up before the next
-# cell binds the same ones (otherwise: Address already in use). Under load a kill of
-# the tracked pid can leave a listener behind (e.g. a hypercorn worker subprocess),
-# so also reap strays by name and then poll until the ports are bindable.
+# cell binds the same ones (otherwise: Address already in use). Each server is a
+# `setsid` process-group leader, so kill the whole group (negative pid): that reaps
+# hypercorn's multiprocessing worker subprocesses too, whose command line has no
+# "hypercorn" for pkill to match and which otherwise stay orphaned holding the
+# listening sockets -- shadowing the next cell's server (notably an h3 Caddy, so navi
+# never sees Alt-Svc and every request downgrades to h2). Then poll until bindable.
 stop_servers() {
   local p
-  for p in "${pids[@]:-}"; do kill -9 "$p" 2>/dev/null || true; done
+  for p in "${pids[@]:-}"; do kill -9 -"$p" 2>/dev/null || true; done  # -pid = process group
   for p in "${pids[@]:-}"; do wait "$p" 2>/dev/null || true; done
   pids=()
-  pkill -9 -f hypercorn 2>/dev/null || true
+  pkill -9 -f hypercorn 2>/dev/null || true      # belt-and-suspenders for any stray
   pkill -9 -f 'caddy run' 2>/dev/null || true
   for _ in $(seq 1 100); do ports_free && break; sleep 0.1; done
 }
