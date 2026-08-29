@@ -103,6 +103,7 @@ struct H3Conn {
   ngtcp2_crypto_ossl_ctx *ossl = nullptr;
   std::string authority;
   bool handshake_done = false;
+  bool want_verify = false; // verify the peer certificate after the handshake (see below)
   bool has_abort = false;   // some stream's producer failed; reset it in send_step
   std::unordered_map<int64_t, Stream> streams;   // live streams by id
 
@@ -515,8 +516,24 @@ int navi_h3_pump(H3Conn *c) {
   return 0;
 }
 
-// Create the nghttp3 client session and bind the control + QPACK streams.
+// Create the nghttp3 client session and bind the control + QPACK streams. Called by
+// both drivers once the handshake has completed, so it is also where the post-
+// handshake certificate verification runs (see navi_h3_new): reject an untrusted or
+// mismatched peer here, before any h3 stream is opened.
 int navi_h3_bind(H3Conn *c) {
+  if (c->want_verify) {
+    X509 *cert = SSL_get1_peer_certificate(c->ssl);
+    if (!cert) {   // a TLS server always sends one; its absence is a failure
+      std::fprintf(stderr, "h3 verify: peer presented no certificate\n");
+      return -1;
+    }
+    X509_free(cert);
+    long vr = SSL_get_verify_result(c->ssl);   // chain + hostname (SSL_set1_host)
+    if (vr != X509_V_OK) {
+      std::fprintf(stderr, "h3 verify: certificate verification failed (%ld)\n", vr);
+      return -1;
+    }
+  }
   nghttp3_settings settings;
   nghttp3_settings_default(&settings);
   nghttp3_callbacks cb{};
@@ -565,9 +582,19 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
       std::fprintf(stderr, "SSL_CTX_new failed\n");
       return nullptr;
     }
-    // Verify the server certificate by default (matching navi's TlsConfig.verify).
+    // Verify the server certificate by default (matching navi's TlsConfig.verify),
+    // but do it AFTER the handshake (navi_h3_bind), not with SSL_VERIFY_PEER. On a
+    // rejected certificate, OpenSSL's in-handshake abort drives ngtcp2's experimental
+    // crypto_ossl binding to over-release its crypto buffers, tripping an assert
+    // (crypto_ossl_ctx_release_crypto_data). Setting SSL_VERIFY_NONE lets the
+    // handshake complete; we then check SSL_get_verify_result and reject before any
+    // request is sent -- the same post-handshake pattern navi's TCP backends use
+    // (backend/openssl_ctx postHandshakeVerify). The chain is still built and the
+    // hostname still matched (SSL_set1_host feeds the verify result); nothing is sent
+    // to an unverified peer, since h3Open verifies before returning.
+    SSL_CTX_set_verify(c->ssl_ctx, SSL_VERIFY_NONE, nullptr);
+    c->want_verify = verify != 0;
     if (verify) {
-      SSL_CTX_set_verify(c->ssl_ctx, SSL_VERIFY_PEER, nullptr);
       if (ca_file && ca_file[0]) {
         if (SSL_CTX_load_verify_locations(c->ssl_ctx, ca_file, nullptr) != 1) {
           std::fprintf(stderr, "failed to load CA file %s\n", ca_file);
@@ -576,8 +603,6 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
       } else {
         SSL_CTX_set_default_verify_paths(c->ssl_ctx);
       }
-    } else {
-      SSL_CTX_set_verify(c->ssl_ctx, SSL_VERIFY_NONE, nullptr);
     }
     c->ssl = SSL_new(c->ssl_ctx);
     if (!c->ssl) {
