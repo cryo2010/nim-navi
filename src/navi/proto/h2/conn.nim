@@ -41,6 +41,8 @@ type
     sendOff: int          ## bytes of sendBuf already sent
     sendWindow: int       ## per-stream send window (peer's INITIAL_WINDOW_SIZE)
     sendClosed: bool      ## the request body is complete; END_STREAM may be sent
+    trailers: seq[HeaderPair]  ## request trailer fields; when set, END_STREAM rides a
+                          ## trailing HEADERS block after the body, not the last DATA
     endSent: bool         ## END_STREAM has already been emitted for this body
     isHead: bool          ## request was HEAD -> a declared content-length has no body
 
@@ -100,26 +102,6 @@ proc openStream*(c: H2Conn): uint32 =
   c.nextId += 2
   c.streams[result] = Stream(sendWindow: c.peerInitialWindow)
 
-proc flushSend(c: H2Conn, streamId: uint32, s: Stream, outbuf: var string) =
-  ## Emit as many DATA frames as the stream and connection send windows allow.
-  ## END_STREAM rides the final DATA frame once the body is closed (`sendClosed`);
-  ## a body that closes with nothing pending gets an empty END_STREAM DATA frame.
-  if s.endSent: return
-  while s.sendOff < s.sendBuf.len:
-    let avail = min(s.sendWindow, c.connSendWindow)
-    if avail <= 0: return                      # windowed out; wait for a WINDOW_UPDATE
-    let n = min(min(avail, c.maxFrameSize), s.sendBuf.len - s.sendOff)
-    let last = s.sendClosed and s.sendOff + n >= s.sendBuf.len
-    outbuf.add encodeData(streamId, s.sendBuf[s.sendOff ..< s.sendOff + n],
-                          endStream = last)
-    s.sendOff += n
-    s.sendWindow -= n
-    c.connSendWindow -= n
-    if last: s.endSent = true
-  if s.sendClosed and not s.endSent:           # closed with all bytes already sent
-    outbuf.add encodeData(streamId, "", endStream = true)
-    s.endSent = true
-
 proc encodeHeaderFrames(c: H2Conn, streamId: uint32, headers: openArray[HeaderPair],
                         endStream: bool): string =
   ## Encode the header block as a HEADERS frame, splitting it across CONTINUATION
@@ -144,18 +126,51 @@ proc encodeHeaderFrames(c: H2Conn, streamId: uint32, headers: openArray[HeaderPa
                                     endHeaders = i + n >= headerBlock.len)
       i += n
 
+proc flushSend(c: H2Conn, streamId: uint32, s: Stream, outbuf: var string) =
+  ## Emit as many DATA frames as the stream and connection send windows allow. Once
+  ## the body is closed (`sendClosed`) and fully on the wire, close the stream:
+  ## END_STREAM rides the final DATA frame, or -- when the request carries trailers
+  ## -- a trailing HEADERS block after the body (RFC 9113 8.1). A body that closes
+  ## with nothing pending gets an empty END_STREAM DATA frame (or the trailers).
+  if s.endSent: return
+  while s.sendOff < s.sendBuf.len:
+    let avail = min(s.sendWindow, c.connSendWindow)
+    if avail <= 0: return                      # windowed out; wait for a WINDOW_UPDATE
+    let n = min(min(avail, c.maxFrameSize), s.sendBuf.len - s.sendOff)
+    # END_STREAM rides the last DATA frame only when no trailers follow.
+    let last = s.sendClosed and s.sendOff + n >= s.sendBuf.len and s.trailers.len == 0
+    outbuf.add encodeData(streamId, s.sendBuf[s.sendOff ..< s.sendOff + n],
+                          endStream = last)
+    s.sendOff += n
+    s.sendWindow -= n
+    c.connSendWindow -= n
+    if last: s.endSent = true
+  if s.sendClosed and not s.endSent and s.sendOff >= s.sendBuf.len:
+    # Body fully on the wire: close the stream with the trailing HEADERS block if the
+    # request carries trailers, else an empty END_STREAM DATA frame.
+    if s.trailers.len > 0:
+      outbuf.add c.encodeHeaderFrames(streamId, s.trailers, endStream = true)
+    else:
+      outbuf.add encodeData(streamId, "", endStream = true)
+    s.endSent = true
+
 proc encodeRequest*(c: H2Conn, streamId: uint32, headers: openArray[HeaderPair],
-                    body: string): string =
+                    body: string, trailers: openArray[HeaderPair] = []): string =
   ## `headers` must start with the pseudo-headers (:method, :scheme, :path,
   ## :authority) in order, followed by regular headers. Sends the header block
   ## and as much of the (buffered) body as the send window allows now; the rest is
-  ## released by `feed` as the peer sends WINDOW_UPDATE frames.
+  ## released by `feed` as the peer sends WINDOW_UPDATE frames. When `trailers` is
+  ## set, END_STREAM rides a trailing HEADERS block after the body (RFC 9113 8.1)
+  ## rather than the last DATA frame.
   let hasBody = body.len > 0
-  result = c.encodeHeaderFrames(streamId, headers, endStream = not hasBody)
-  if hasBody:
+  let hasTrailers = trailers.len > 0
+  result = c.encodeHeaderFrames(streamId, headers,
+                                endStream = not hasBody and not hasTrailers)
+  if hasBody or hasTrailers:
     let s = c.streams[streamId]
     s.sendBuf = body
     s.sendClosed = true                        # whole body known: END_STREAM on last DATA
+    if hasTrailers: s.trailers = @trailers      # ... or on the trailing HEADERS block
     c.flushSend(streamId, s, result)
 
 proc encodeRequestHead*(c: H2Conn, streamId: uint32,
@@ -182,13 +197,16 @@ proc queueSend*(c: H2Conn, streamId: uint32, data: string): string =
   s.sendBuf.add data
   c.flushSend(streamId, s, result)
 
-proc finishSend*(c: H2Conn, streamId: uint32): string =
+proc finishSend*(c: H2Conn, streamId: uint32,
+                 trailers: openArray[HeaderPair] = []): string =
   ## Mark the streamed request body complete. Emits END_STREAM -- on the last DATA
-  ## frame, or an empty DATA frame if nothing is pending. Bytes still blocked by
-  ## the send window are released (with END_STREAM) by `feed` on WINDOW_UPDATE.
+  ## frame, an empty DATA frame if nothing is pending, or (when `trailers` is set) a
+  ## trailing HEADERS block after the body. Bytes still blocked by the send window
+  ## are released (with END_STREAM / the trailers) by `feed` on WINDOW_UPDATE.
   let s = c.streams.getOrDefault(streamId)
   if s == nil: return
   s.sendClosed = true
+  if trailers.len > 0: s.trailers = @trailers
   c.flushSend(streamId, s, result)
 
 proc replenishConn(c: H2Conn, n: int, outbuf: var string) =

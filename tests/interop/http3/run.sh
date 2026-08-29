@@ -43,6 +43,14 @@ echo ">>> building and running the transparent h3 dispatch test (chronos client)
 nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/dispatch_chronos_test "$DIR/dispatch_chronos_test.nim"
 /tmp/dispatch_chronos_test
 
+echo ">>> building and running the h3 request-trailers test (sync client)"
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/trailers_test "$DIR/trailers_test.nim"
+/tmp/trailers_test
+
+echo ">>> building and running the h3 request-trailers test (asyncdispatch client)"
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/trailers_async_test "$DIR/trailers_async_test.nim"
+/tmp/trailers_async_test
+
 echo ">>> building and running the h3 multiplexing test (concurrent streams)"
 nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/dispatch_mux_test "$DIR/dispatch_mux_test.nim"
 /tmp/dispatch_mux_test
