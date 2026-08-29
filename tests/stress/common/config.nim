@@ -57,35 +57,36 @@ proc label*(c: Config): string =
   "[" & c.workload & " " & c.proto & " " & c.backend & "]"
 
 proc expectedVersion*(c: Config): string =
-  ## The HTTP version a version-pinned cell must actually negotiate, or "" when the
-  ## check does not apply: js (can't report it), WebSocket (always an h1 upgrade; its
-  ## client doesn't call the check), and h1 (the lowest version -- nothing to
-  ## silently downgrade *to*, so there is nothing to guard). Only h2/h3, which can
-  ## quietly fall back to a lower version, are checked.
+  ## The exact HTTP version a version-pinned cell must negotiate on every request. A
+  ## cell exists to exercise one protocol, so any upgrade OR downgrade to a different
+  ## version is a failure -- including an h1 cell that ends up on h2. Returns "" only
+  ## where the check can't apply: js (the runtime chooses/hides the version) and
+  ## WebSocket (an h1 upgrade whose client doesn't dial a version).
   if c.backend == "js": return ""
   case c.proto
+  of "h1": "HTTP/1.1"
   of "h2": "HTTP/2"
   of "h3": "HTTP/3"
   else: ""
 
 proc checkVersion*(c: Config, got: string) =
-  ## Fail the run hard on a silent protocol downgrade. The point of an h2/h3 stress
-  ## cell is to exercise that protocol; a quiet fallback to a lower version (e.g. an
-  ## h3 request that isn't supported yet dropping to h2) would otherwise pass green
-  ## and hide the regression. A no-op when the version isn't checkable ("" expected).
+  ## Fail the run hard if a request did not negotiate the pinned protocol. The cell
+  ## exists to exercise exactly that protocol, so a silent upgrade or downgrade to a
+  ## different version must fail rather than pass green and hide the regression. A
+  ## no-op when the version isn't checkable ("" expected).
   let want = c.expectedVersion
   if want.len > 0 and got != want:
-    stderr.writeLine c.label & " FAIL: protocol downgrade -- expected " & want &
-      ", got '" & got & "' (NAVI_PROTO=" & c.proto & " must not silently fall back)"
+    stderr.writeLine c.label & " FAIL: wrong protocol -- expected " & want &
+      ", got '" & got & "' (NAVI_PROTO=" & c.proto & " must negotiate exactly that)"
     quit(1)
 
 type VersionGate* = object
   ## Version check for a long-lived stream that can upgrade across reconnects (SSE).
-  ## A per-request `checkVersion` is too strict there: an h3 SSE stream necessarily
-  ## begins on h2 and switches to h3 only after an Alt-Svc reconnect. So instead:
-  ## reject a drop below the floor (h1 in an h2/h3 run), and require the pinned
-  ## version to be reached by the end -- a run that never reaches it is the silent
-  ## downgrade we want to catch.
+  ## A per-request `checkVersion` is too strict there for one case only: an h3 SSE
+  ## stream necessarily begins on h2 and switches to h3 only after an Alt-Svc
+  ## reconnect. So h2 is tolerated during an h3 run (until the upgrade); every other
+  ## mismatch fails immediately, and `finish` requires the pinned version to have
+  ## actually been reached.
   cfg: Config
   want: string
   sawExpected: bool
@@ -94,17 +95,23 @@ proc initVersionGate*(c: Config): VersionGate =
   VersionGate(cfg: c, want: c.expectedVersion)
 
 proc sample*(g: var VersionGate, got: string) =
-  ## Record one observed version of the stream's current connection.
+  ## Record one observed version of the stream's current connection. Strict: any
+  ## version other than the pinned one hard-fails now, except the unavoidable h2 ->
+  ## h3 warmup of an h3 SSE stream.
   if g.want.len == 0 or got.len == 0: return
-  if got == g.want: g.sawExpected = true
-  elif got == "HTTP/1.1" and g.want != "HTTP/1.1":
-    g.cfg.checkVersion(got)             # h1 is never acceptable here: hard-fail now
+  if got == g.want:
+    g.sawExpected = true
+  elif g.want == "HTTP/3" and got == "HTTP/2":
+    discard                             # h3 SSE begins on h2 until the Alt-Svc reconnect
+  else:
+    g.cfg.checkVersion(got)             # any other upgrade/downgrade: hard-fail now
 
 proc finish*(g: VersionGate) =
-  ## End of run: the pinned version must have been negotiated at least once.
+  ## End of run: the pinned version must have been negotiated at least once (catches
+  ## an h3 SSE stream that stayed on h2 and never actually upgraded).
   if g.want.len > 0 and not g.sawExpected:
     stderr.writeLine g.cfg.label & " FAIL: never negotiated " & g.want &
-      " over the whole run (silent protocol downgrade; NAVI_PROTO=" & g.cfg.proto & ")"
+      " over the whole run (NAVI_PROTO=" & g.cfg.proto & ")"
     quit(1)
 
 proc skipReason*(c: Config): string =
