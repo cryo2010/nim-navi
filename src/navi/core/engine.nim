@@ -21,6 +21,7 @@ const h1TruncatedErr* =
   "navi: http/1.1 response truncated (connection closed before the body completed)"
 const h2TruncatedErr* =
   "navi: http/2 response truncated (connection closed before the stream completed)"
+  # bodyLengthErr is defined in proto/h2/conn (shared with the h2 muxes).
 
 proc raiseHttpError(req: Request, resp: Response) =
   raise (ref HttpError)(
@@ -188,6 +189,7 @@ template h2ReadChunk*(transport, h2, sid, dec, decReady, seen, decompress, cap: 
         let tooLarge = h2.streamTooLarge(sid)
         let unprocessed = h2.streamUnprocessed(sid)
         let connErr = h2.connError
+        let lengthBad = h2.streamLengthMismatch(sid)  # capture before takeResponse
         discard h2.takeResponse(sid)
         if connErr.len > 0: raise newException(IOError, "navi: http/2 " & connErr)
         if tooLarge:
@@ -197,6 +199,8 @@ template h2ReadChunk*(transport, h2, sid, dec, decReady, seen, decompress, cap: 
           raise newException(UnprocessedError, "navi: http/2 request not processed")
         if wasReset:
           raise newException(IOError, "navi: http/2 request did not complete")
+        if lengthBad:
+          raise newException(IOError, bodyLengthErr)
         break                                 # clean end: res ""
       let chunk = await recvSome(transport)
       if chunk.len == 0:                       # transport EOF before END_STREAM:
@@ -281,6 +285,7 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
     let unprocessed = h2.streamUnprocessed(sid)
     let connErr = h2.connError
     let done = h2.streamDone(sid)  # END_STREAM seen (else the loop broke on transport EOF)
+    let lengthBad = h2.streamLengthMismatch(sid)   # capture before takeResponse drops it
     var r = toResponse(h2.takeResponse(sid))
     if connErr.len > 0:            # bad preface / oversized frame / unexpected push
       raise newException(IOError, "navi: http/2 " & connErr)
@@ -293,6 +298,8 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
       raise newException(IOError, "navi: http/2 request did not complete")
     if not done:                   # headers seen but the connection died mid-body:
       raise newException(IOError, h2TruncatedErr)   # don't return a partial body
+    if lengthBad:                  # cleanly ended, but body != declared Content-Length
+      raise newException(IOError, bodyLengthErr)
     if not sink.isNil: r.body = ""  # delivered incrementally above
     r
 
@@ -378,6 +385,7 @@ template h2DrainBody*(transport, h2, sid, sink, decompress, cap: typed) =
     let unprocessed = h2.streamUnprocessed(sid)
     let connErr = h2.connError
     let done = h2.streamDone(sid)      # END_STREAM seen (else the loop broke on EOF)
+    let lengthBad = h2.streamLengthMismatch(sid)   # capture before takeResponse
     discard h2.takeResponse(sid)       # body delivered; drop the stream
     if connErr.len > 0: raise newException(IOError, "navi: http/2 " & connErr)
     if tooLarge:
@@ -389,6 +397,8 @@ template h2DrainBody*(transport, h2, sid, sink, decompress, cap: typed) =
       raise newException(IOError, "navi: http/2 request did not complete")
     if not done:                       # connection died mid-body: don't truncate silently
       raise newException(IOError, h2TruncatedErr)
+    if lengthBad:                      # cleanly ended, but body != declared Content-Length
+      raise newException(IOError, bodyLengthErr)
 
 template poolTransport*(client, req, sink: typed): Response =
   ## Pool-based transport: reuse a pooled connection (http/1.1 or a persistent
