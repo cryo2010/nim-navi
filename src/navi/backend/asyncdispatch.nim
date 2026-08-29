@@ -9,11 +9,16 @@
 ## (WANT_READ / WANT_WRITE). That is the same lean loop as the sync backend, made
 ## async: the per-connection cost drops to roughly the sync backend's.
 
-import std/[asyncdispatch, nativesockets, strutils, monotimes, times]
+import std/[asyncdispatch, nativesockets, strutils, monotimes, times, base64]
 import ./api, ./openssl_ctx, ./happyeyeballs
 import ../core/response  # for navi's TimeoutError
+import ../core/socks
 when defined(ssl):
   import std/openssl
+when defined(posix):
+  from std/posix import Sockaddr_un, TSa_Family, EINPROGRESS, errno
+  proc cConnect(fd: SocketHandle, sa: ptr SockAddr, sl: SockLen): cint
+    {.importc: "connect", header: "<sys/socket.h>".}
 
 export api, asyncdispatch
 
@@ -128,13 +133,82 @@ when defined(ssl):
       of SSL_ERROR_WANT_WRITE: await waitWrite(c.fd)
       else: result.setLen(0); return   # ZERO_RETURN / reset -> EOF
 
-proc proxyConnect(fd: AsyncFD, host: string, port: int) {.async.} =
-  ## Establish a CONNECT tunnel to `host:port` through an already-connected proxy.
+proc proxyConnect(fd: AsyncFD, host: string, port: int, user, pass: string) {.async.} =
+  ## Establish a CONNECT tunnel to `host:port` through an already-connected HTTP
+  ## proxy, sending Proxy-Authorization when credentials are supplied.
   let target = host & ":" & $port
-  await send(fd, "CONNECT " & target & " HTTP/1.1\r\nHost: " & target & "\r\n\r\n")
+  var req = "CONNECT " & target & " HTTP/1.1\r\nHost: " & target & "\r\n"
+  if user.len > 0 or pass.len > 0:
+    req.add("Proxy-Authorization: Basic " & encode(user & ":" & pass) & "\r\n")
+  req.add("\r\n")
+  await send(fd, req)
   let resp = await recv(fd, 1024)
   if not resp.startsWith("HTTP/1.1 200") and not resp.startsWith("HTTP/1.0 200"):
     raise newException(ValueError, "navi: proxy CONNECT failed: " & resp.splitLines()[0])
+
+proc recvExactly(fd: AsyncFD, n: int): Future[string] {.async.} =
+  ## Read exactly `n` bytes or raise; SOCKS5 replies are fixed-size frames.
+  result = ""
+  while result.len < n:
+    let chunk = await recv(fd, n - result.len)
+    if chunk.len == 0: raise newException(IOError, "navi: SOCKS5 proxy closed the connection")
+    result.add chunk
+
+proc socksConnect(fd: AsyncFD, host: string, port: int, user, pass: string) {.async.} =
+  ## SOCKS5 handshake to tunnel to `host:port` (RFC 1928 + RFC 1929). The target is
+  ## sent as a domain name so the proxy resolves DNS.
+  let hasAuth = user.len > 0 or pass.len > 0
+  await send(fd, greeting(hasAuth))
+  case selectedMethod(await recvExactly(fd, 2))
+  of methodUserPass:
+    if not hasAuth:
+      raise newException(ValueError, "navi: SOCKS5 proxy requires authentication")
+    await send(fd, authRequest(user, pass))
+    checkAuthReply(await recvExactly(fd, 2))
+  of methodNoAuth: discard
+  else: raise newException(ValueError, "navi: SOCKS5 proxy rejected the offered auth methods")
+  await send(fd, connectRequest(host, port))
+  let header = await recvExactly(fd, 4)
+  let status = replyStatus(header)
+  if status != 0: raiseReply(status)
+  let tail = boundTailLen(int(uint8(header[3])))
+  if tail >= 0: discard await recvExactly(fd, tail)
+  else:
+    let dlen = int(uint8((await recvExactly(fd, 1))[0]))
+    discard await recvExactly(fd, dlen + 2)
+
+proc unixConnect(path: string): Future[AsyncFD] {.async.} =
+  ## Connect a non-blocking AF_UNIX/SOCK_STREAM socket to `path`, awaiting
+  ## writability on EINPROGRESS just like the TCP async connect.
+  when not defined(posix):
+    raise newException(ValueError,
+      "navi: Unix domain sockets are only supported on POSIX")
+  else:
+    var sa: Sockaddr_un
+    if path.len >= sizeof(sa.sun_path):
+      raise newException(ValueError,
+        "navi: Unix socket path exceeds " & $(sizeof(sa.sun_path) - 1) &
+        " bytes: " & path)
+    sa.sun_family = TSa_Family(toInt(nativesockets.AF_UNIX))
+    for i in 0 ..< path.len: sa.sun_path[i] = path[i]
+    let sh = createNativeSocket(nativesockets.AF_UNIX, nativesockets.SOCK_STREAM,
+                                nativesockets.IPPROTO_IP)  # protocol 0
+    if sh == osInvalidSocket:
+      raise newException(IOError, "navi: could not create a Unix socket")
+    sh.setBlocking(false)
+    register(sh.AsyncFD)
+    let fd = sh.AsyncFD
+    if cConnect(fd.SocketHandle, cast[ptr SockAddr](addr sa), SockLen(sizeof(sa))) != 0:
+      if errno != EINPROGRESS:
+        closeSocket(fd)
+        raise newException(IOError, "navi: could not connect to Unix socket " & path)
+      await waitWrite(fd)
+      let err = getSockOptInt(fd.SocketHandle, SOL_SOCKET.int, SO_ERROR.int)
+      if err != 0:
+        closeSocket(fd)
+        raise newException(IOError,
+          "navi: could not connect to Unix socket " & path & " (errno " & $err & ")")
+    return fd
 
 proc happyConnect*(ips: seq[string], port: int):
     Future[tuple[fd: AsyncFD, idx: int]] {.async.} =
@@ -239,6 +313,20 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   conn.closed = new(bool)   # shared teardown flag (see Conn.closed)
 
   proc establish() {.async.} =
+    if proxy.kind == pkUnix:
+      conn.fd = await unixConnect(proxy.host)
+      if tls:
+        when defined(ssl):
+          (conn.ctx, conn.ownsCtx) = obtainContext(cfg.contextStore, cfg, alpn)
+          conn.slot = resumeSlot(cfg, host & ":" & $port)
+          conn.ssl = newClientSsl(conn.ctx, conn.fd.SocketHandle, host, conn.slot)
+          await driveHandshake(conn.ssl, conn.fd, host)
+          verifyPeer(conn.ssl, host, cfg.wantsVerify)
+          postHandshakeVerify(conn.ssl, host, cfg)
+          conn.protocol = negotiatedProtocol(conn.ssl)
+        else:
+          raise newException(ValueError, "navi: https requires compiling with -d:ssl")
+      return
     let dialHost = if proxy.isSet: proxy.host else: host
     let dialPort = if proxy.isSet: proxy.port else: port
     var pool = resolveAddrs(dialHost, dialPort)
@@ -251,17 +339,23 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
       let (fd, idx) = await happyConnect(pool, dialPort)
       conn.fd = fd
       try:
-        if proxy.isSet and tls:
-          await proxyConnect(fd, host, port)
+        # SOCKS5 tunnels every target; an HTTP proxy tunnels only https (CONNECT).
+        if proxy.kind == pkSocks5:
+          await socksConnect(fd, host, port, proxy.user, proxy.pass)
+        elif proxy.isSet and tls:
+          await proxyConnect(fd, host, port, proxy.user, proxy.pass)
         if tls:
           when defined(ssl):
-            # No ALPN over a proxy tunnel (the old path negotiated it lazily).
+            # No ALPN over an HTTP-proxy CONNECT tunnel (negotiated lazily); a SOCKS5
+            # tunnel is transparent, so offer the normal ALPN to reach h2.
             (conn.ctx, conn.ownsCtx) = obtainContext(
-              cfg.contextStore, cfg, if proxy.isSet: @[] else: alpn)
+              cfg.contextStore, cfg,
+              if proxy.isSet and proxy.kind == pkHttp: @[] else: alpn)
             conn.slot = resumeSlot(cfg, host & ":" & $port)
             conn.ssl = newClientSsl(conn.ctx, fd.SocketHandle, host, conn.slot)
             await driveHandshake(conn.ssl, fd, host)
             verifyPeer(conn.ssl, host, cfg.wantsVerify)
+            postHandshakeVerify(conn.ssl, host, cfg)   # SPKI pin + verify callback
             conn.protocol = negotiatedProtocol(conn.ssl)
           else:
             raise newException(ValueError, "navi: https requires compiling with -d:ssl")

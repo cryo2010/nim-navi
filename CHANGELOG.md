@@ -8,6 +8,38 @@ onward (pre-1.0, minor versions may include breaking changes).
 ## [Unreleased]
 
 ### Added
+- **Default `User-Agent` and `Accept` headers.** Requests now send
+  `User-Agent: navi/<version>` and `Accept: */*` unless the caller sets their own,
+  matching Go, curl, axios, and httpx (some servers and WAFs reject a
+  User-Agent-less request).
+- **`res.text`**: the response body decoded to UTF-8 using the `Content-Type`
+  charset (or a leading BOM, else UTF-8), covering UTF-8, ISO-8859-1, Windows-1252,
+  and UTF-16. Unlike `res.body` (raw bytes), it yields correct text for non-UTF-8
+  responses; an unknown charset falls back to the raw bytes.
+- **Response trailers.** `Response.trailers` now surfaces the trailing header fields
+  of a chunked HTTP/1.1 response and an HTTP/2 trailing HEADERS block (e.g.
+  `grpc-status`); previously they were parsed and discarded.
+- **SOCKS5 proxies** (`socks5://` / `socks5h://`, with optional `user:pass@`
+  credentials, RFC 1928 + RFC 1929) on the sync, asyncdispatch, and chronos
+  backends. Also honors the `ALL_PROXY` env var. HTTP-proxy `CONNECT` now sends
+  `Proxy-Authorization` when the proxy URL carries credentials.
+- **Unix domain socket transport** via `NaviConfig.unixSocket`: dial a socket path
+  (e.g. the Docker daemon) instead of TCP; the URL host/port are used only for the
+  Host header and TLS SNI, and proxies are bypassed. Sync/asyncdispatch/chronos on
+  POSIX; the js backend raises a clear error.
+- **In-memory CA bundle** (`TlsConfig.caBundle`, a PEM string) added to the trust
+  store alongside the system roots / `caFile`.
+- **Certificate pinning** (`TlsConfig.pinnedKeys`): SPKI SHA-256 pins (base64, HPKP
+  form); the peer's public key must match a pin or the connection is rejected.
+- **Custom certificate-verification callback** (`TlsConfig.verifyCallback`): a hook
+  run after the built-in chain + hostname checks, receiving the peer's leaf
+  certificate (DER) and returning whether to accept it.
+- **Connection-pool sizing**: `maxIdleConnsPerHost` (configurable per-origin idle
+  cap), `maxIdleConns` (global idle cap), and `idleConnTimeout` (evict and close an
+  idle pooled connection after a lifetime, never handing out a stale one).
+- **Cookie name-prefix enforcement** (RFC 6265bis 5.5): a `__Secure-` cookie must be
+  Secure over a secure origin, and a `__Host-` cookie must additionally be host-only
+  and scoped to `Path=/`, or it is rejected.
 - HTTP/3 now carries **streamed request bodies** (`bodyStream`): an upload is pulled
   chunk by chunk over the h3 request stream (with QUIC stream flow-control
   backpressure), on the sync, asyncdispatch, and chronos backends. Previously a

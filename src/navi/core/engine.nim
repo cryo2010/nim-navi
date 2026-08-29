@@ -408,7 +408,7 @@ template poolTransport*(client, req, sink: typed): Response =
   block:
     var rq = req
     let proxy = resolveProxy(client.config, rq.url)
-    rq.absoluteForm = proxy.isSet and not rq.url.isTls
+    rq.absoluteForm = usesAbsoluteForm(proxy, rq.url.isTls)
     let alpn = if client.config.wantsH2 and rq.url.isTls:
                  @["h2", "http/1.1"] else: @[]
     let key = originKey(rq.url)

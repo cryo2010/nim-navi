@@ -65,14 +65,18 @@ proc initNaviConfig*(): NaviConfig =
     prefixUrl: "", headers: initHeaders(), http: {H1, H2}, tls: defaultTls(),
     decompress: true, throwHttpErrors: true, maxRedirects: 20,
     retry: defaultRetryPolicy(), maxResponseBytes: 0,
-    auth: Auth(), proxy: "", timeouts: Timeouts(), middleware: @[])
+    auth: Auth(), proxy: "", unixSocket: "",
+    maxIdleConns: 0, maxIdleConnsPerHost: 0, idleConnTimeout: 0,
+    timeouts: Timeouts(), middleware: @[])
 
 proc newNavi*(config = initNaviConfig()): Navi =
   var cfg = config
   cfg.tls.sessionCache = newTlsStore(cfg.tls)   # always its own cache, so a config
   cfg.tls.contextStore = newTlsCtxStore(cfg.tls) # cloned from another client (e.g.
                                                  # newNavi(other.config)) is isolated
-  result = Navi(config: cfg, pool: newPool[PooledConn[Conn]](), jar: newCookieJar(),
+  result = Navi(config: cfg,
+       pool: newPool[PooledConn[Conn]](cfg.idlePerHost, cfg.idleGlobal, cfg.idleTimeoutMs),
+       jar: newCookieJar(),
        muxes: newTable[string, H2Mux](),
        pendingMux: newTable[string, Future[H2Mux]]())
   when defined(naviHttp3):
@@ -85,7 +89,9 @@ proc extend*(client: Navi, config: NaviConfig): Navi =
   merged.middleware = client.config.middleware & config.middleware
   merged.tls.sessionCache = newTlsStore(merged.tls)  # its own cache, not the parent's
   merged.tls.contextStore = newTlsCtxStore(merged.tls)  # its own contexts too
-  result = Navi(config: merged, pool: newPool[PooledConn[Conn]](), jar: newCookieJar(),
+  result = Navi(config: merged,
+       pool: newPool[PooledConn[Conn]](merged.idlePerHost, merged.idleGlobal, merged.idleTimeoutMs),
+       jar: newCookieJar(),
        muxes: newTable[string, H2Mux](),
        pendingMux: newTable[string, Future[H2Mux]]())
   when defined(naviHttp3):
@@ -215,6 +221,8 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
       # else: turned out http/1.1, fall through
 
   # 2. A pooled http/1.1 connection.
+  for dead in reapExpired(client.pool):    # close idle connections past idleConnTimeout
+    await close(dead.transport)
   var (found, pc) = popIdle(client.pool, origin)
   if found:
     # `gotResponse` distinguishes a reused-connection failure BEFORE any response
@@ -241,7 +249,7 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
   # 3. Open a fresh connection.
   var rq = req
   let proxyTarget = resolveProxy(client.config, rq.url)
-  rq.absoluteForm = proxyTarget.isSet and not rq.url.isTls
+  rq.absoluteForm = usesAbsoluteForm(proxyTarget, rq.url.isTls)
   let alpn = if wantH2: @["h2", "http/1.1"] else: @[]
 
   if wantH2:
@@ -465,7 +473,7 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
 
   var rq = req
   let proxyTarget = resolveProxy(client.config, rq.url)
-  rq.absoluteForm = proxyTarget.isSet and not rq.url.isTls
+  rq.absoluteForm = usesAbsoluteForm(proxyTarget, rq.url.isTls)
   let alpn = if wantH2: @["h2", "http/1.1"] else: @[]
 
   if wantH2:

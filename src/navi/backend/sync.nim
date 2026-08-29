@@ -7,11 +7,14 @@
 ## openssl_ctx). `await` is an identity template so the shared engine's
 ## `await`-shaped body compiles to straight-line blocking code.
 
-import std/[os, strutils, nativesockets, monotimes, times]
+import std/[os, strutils, nativesockets, monotimes, times, base64]
 import ./api, ./openssl_ctx, ./happyeyeballs
 import ../core/response  # for navi's TimeoutError
+import ../core/socks
 when defined(ssl):
   import std/openssl
+when defined(posix):
+  from std/posix import Sockaddr_un, TSa_Family
 
 export api
 
@@ -130,19 +133,99 @@ proc sendRaw(fd: SocketHandle, data: string) =
     if n <= 0: raise newException(IOError, "navi: socket write failed")
     off += n
 
-proc proxyConnect(fd: SocketHandle, host: string, port: int) =
-  ## Establish a CONNECT tunnel to `host:port` through an already-connected proxy.
+proc proxyConnect(fd: SocketHandle, host: string, port: int, user, pass: string) =
+  ## Establish a CONNECT tunnel to `host:port` through an already-connected HTTP
+  ## proxy, sending Proxy-Authorization when credentials are supplied.
   let target = host & ":" & $port
-  sendRaw(fd, "CONNECT " & target & " HTTP/1.1\r\nHost: " & target & "\r\n\r\n")
+  var req = "CONNECT " & target & " HTTP/1.1\r\nHost: " & target & "\r\n"
+  if user.len > 0 or pass.len > 0:
+    req.add("Proxy-Authorization: Basic " & encode(user & ":" & pass) & "\r\n")
+  req.add("\r\n")
+  sendRaw(fd, req)
   var resp = newString(1024)
   let n = sysRecv(fd, addr resp[0], resp.len)
   resp.setLen(max(n, 0))
   if not resp.startsWith("HTTP/1.1 200") and not resp.startsWith("HTTP/1.0 200"):
     raise newException(ValueError, "navi: proxy CONNECT failed: " & resp.splitLines()[0])
 
+proc recvExactly(fd: SocketHandle, n: int): string =
+  ## Read exactly `n` bytes or raise; SOCKS5 replies are fixed-size frames.
+  result = newString(n)
+  var off = 0
+  while off < n:
+    let r = sysRecv(fd, addr result[off], n - off)
+    if r <= 0: raise newException(IOError, "navi: SOCKS5 proxy closed the connection")
+    off += r
+
+proc socksConnect(fd: SocketHandle, host: string, port: int, user, pass: string) =
+  ## Perform the SOCKS5 handshake to tunnel to `host:port` through a connected
+  ## proxy (RFC 1928 + RFC 1929 user/pass). The target is sent as a domain name so
+  ## the proxy resolves DNS.
+  let hasAuth = user.len > 0 or pass.len > 0
+  sendRaw(fd, greeting(hasAuth))
+  case selectedMethod(recvExactly(fd, 2))
+  of methodUserPass:
+    if not hasAuth:
+      raise newException(ValueError, "navi: SOCKS5 proxy requires authentication")
+    sendRaw(fd, authRequest(user, pass))
+    checkAuthReply(recvExactly(fd, 2))
+  of methodNoAuth: discard
+  else: raise newException(ValueError, "navi: SOCKS5 proxy rejected the offered auth methods")
+  sendRaw(fd, connectRequest(host, port))
+  let header = recvExactly(fd, 4)
+  let status = replyStatus(header)
+  if status != 0: raiseReply(status)
+  let tail = boundTailLen(int(uint8(header[3])))   # discard BND.ADDR + BND.PORT
+  if tail >= 0: discard recvExactly(fd, tail)
+  else:
+    let dlen = int(uint8(recvExactly(fd, 1)[0]))
+    discard recvExactly(fd, dlen + 2)
+
 # --- Happy Eyeballs (RFC 8305) -----------------------------------------
 # `heAttemptDelayMs`, `interleaveFamilies`, and `resolveAddrs` are shared with the
 # async backends in ./happyeyeballs; `happyConnect` below is the sync racer.
+
+proc unixConnect(path: string, connectMs = 0): SocketHandle =
+  ## Connect a blocking AF_UNIX/SOCK_STREAM socket to `path`, honoring `connectMs`
+  ## (non-blocking connect + select) exactly as `tcpConnect` does for TCP.
+  when not defined(posix):
+    raise newException(ValueError,
+      "navi: Unix domain sockets are only supported on POSIX")
+  else:
+    var sa: Sockaddr_un
+    if path.len >= sizeof(sa.sun_path):
+      raise newException(ValueError,
+        "navi: Unix socket path exceeds " & $(sizeof(sa.sun_path) - 1) &
+        " bytes: " & path)
+    sa.sun_family = TSa_Family(toInt(nativesockets.AF_UNIX))
+    for i in 0 ..< path.len: sa.sun_path[i] = path[i]
+    let fd = createNativeSocket(nativesockets.AF_UNIX, nativesockets.SOCK_STREAM,
+                                nativesockets.IPPROTO_IP)  # protocol 0
+    if fd == osInvalidSocket:
+      raise newException(IOError, "navi: could not create a Unix socket")
+    let sap = cast[ptr SockAddr](addr sa)
+    let sl = SockLen(sizeof(sa))
+    if connectMs <= 0:
+      if sysConnect(fd, sap, sl) == 0'i32: return fd
+      let e = osErrorMsg(osLastError()); close(fd)
+      raise newException(IOError,
+        "navi: could not connect to Unix socket " & path & ": " & e)
+    fd.setBlocking(false)
+    if sysConnect(fd, sap, sl) == 0'i32:
+      fd.setBlocking(true); return fd
+    elif not connectInProgress():
+      let e = osErrorMsg(osLastError()); close(fd)
+      raise newException(IOError,
+        "navi: could not connect to Unix socket " & path & ": " & e)
+    elif not waitWritable(fd, connectMs):
+      close(fd)
+      raise newException(response.TimeoutError,
+        "navi: Unix socket connect timed out after " & $connectMs & " ms")
+    elif getSockOptInt(fd, SOL_SOCKET.int, SO_ERROR.int) != 0:
+      close(fd)
+      raise newException(IOError, "navi: connection refused on Unix socket " & path)
+    else:
+      fd.setBlocking(true); return fd
 
 proc happyConnect(ips: seq[string], port: int,
                   connectMs = 0): (SocketHandle, int) =
@@ -275,12 +358,11 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
         if result.ownsCtx and not result.ctx.isNil: result.ctx.destroyContext()
       if result.fd != osInvalidSocket:
         close(result.fd)
-  if proxy.isSet:
-    result.fd = tcpConnect(proxy.host, proxy.port, establishMs)
+  if proxy.kind == pkUnix:
+    result.fd = unixConnect(proxy.host, establishMs)
     if tls:
-      if establishMs > 0: setIoTimeout(result.fd, establishMs)
-      proxyConnect(result.fd, host, port)
       when defined(ssl):
+        if establishMs > 0: setIoTimeout(result.fd, establishMs)
         (result.ctx, result.ownsCtx) = obtainContext(cfg.contextStore, cfg, alpn)
         result.slot = resumeSlot(cfg, host & ":" & $port)
         result.ssl = startClientTls(result.ctx, result.fd, host, cfg.wantsVerify,
@@ -289,6 +371,25 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
         result.protocol = negotiatedProtocol(result.ssl)
       else:
         raise newException(ValueError, "navi: https requires compiling with -d:ssl")
+  elif proxy.isSet:
+    result.fd = tcpConnect(proxy.host, proxy.port, establishMs)
+    if establishMs > 0: setIoTimeout(result.fd, establishMs)
+    # SOCKS5 tunnels every target; an HTTP proxy tunnels only https (CONNECT) and
+    # relays http via an absolute-URI request (no tunnel needed here).
+    if proxy.kind == pkSocks5:
+      socksConnect(result.fd, host, port, proxy.user, proxy.pass)
+    elif tls:
+      proxyConnect(result.fd, host, port, proxy.user, proxy.pass)
+    if tls:
+      when defined(ssl):
+        (result.ctx, result.ownsCtx) = obtainContext(cfg.contextStore, cfg, alpn)
+        result.slot = resumeSlot(cfg, host & ":" & $port)
+        result.ssl = startClientTls(result.ctx, result.fd, host, cfg.wantsVerify,
+                                    result.slot)
+        result.protocol = negotiatedProtocol(result.ssl)
+      else:
+        raise newException(ValueError, "navi: https requires compiling with -d:ssl")
+    if establishMs > 0: setIoTimeout(result.fd, 0)
   elif tls:
     when defined(ssl):
       let (ctx, owned) = obtainContext(cfg.contextStore, cfg, alpn)
@@ -314,6 +415,10 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
       raise newException(ValueError, "navi: https requires compiling with -d:ssl")
   else:
     result.fd = happyConnect(resolveAddrs(host, port), port, establishMs)[0]
+  when defined(ssl):
+    # SPKI pinning + the user's verify callback (no-op unless configured). Runs
+    # before `established`, so a rejection cleans up the fd/SSL via the defer.
+    if tls: postHandshakeVerify(result.ssl, host, cfg)
   established = true
 
 proc sendAll*(c: Conn, data: string) =

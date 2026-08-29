@@ -72,20 +72,30 @@ proc initNaviConfig*(): NaviConfig =
     prefixUrl: "", headers: initHeaders(), http: {}, tls: defaultTls(),
     decompress: false, throwHttpErrors: true, maxRedirects: 20,
     retry: defaultRetryPolicy(), maxResponseBytes: 0,
-    auth: Auth(), proxy: "", timeouts: Timeouts(), middleware: @[])
+    auth: Auth(), proxy: "", unixSocket: "",
+    maxIdleConns: 0, maxIdleConnsPerHost: 0, idleConnTimeout: 0,
+    timeouts: Timeouts(), middleware: @[])
 
 # A browser owns the cookie store (and hides Set-Cookie from fetch); Node, Deno,
 # Bun, and Workers do not, so navi keeps the jar there. `document` exists only in
 # a browser document context.
 proc inBrowser(): bool {.importjs: "(typeof document !== 'undefined')".}
 
+proc checkUnsupported(cfg: NaviConfig) =
+  ## The js backend uses `fetch`, which cannot dial a Unix socket path.
+  if cfg.unixSocket.len > 0:
+    raise newException(ValueError,
+      "navi: Unix domain sockets are not supported on the js backend")
+
 proc newNavi*(config = initNaviConfig()): Navi =
+  checkUnsupported(config)
   result = Navi(config: config)
   if not inBrowser(): result.jar = newCookieJar()
 
 proc extend*(client: Navi, config: NaviConfig): Navi =
   var merged = mergeBase(client.config, config)
   merged.middleware = client.config.middleware & config.middleware
+  checkUnsupported(merged)
   result = Navi(config: merged)
   if not inBrowser(): result.jar = newCookieJar()
 

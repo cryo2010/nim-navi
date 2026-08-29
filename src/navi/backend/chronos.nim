@@ -7,11 +7,12 @@
 ## mTLS, and session resumption). TLS therefore requires compiling with `-d:ssl`
 ## (it links OpenSSL, exactly as the other native backends do).
 
-import std/strutils
+import std/[strutils, base64]
 import pkg/chronos, pkg/chronos/transports/stream
 import pkg/chronos/streams/asyncstream
 import ./api
 import ../core/response  # for navi's TimeoutError
+import ../core/socks
 from ./happyeyeballs import heAttemptDelayMs
 when defined(ssl):
   import ./openssl_ctx, ./chronos_tls
@@ -92,15 +93,53 @@ when defined(ssl):
     except CatchableError: discard
     except Exception: discard
 
-proc proxyConnect(transport: StreamTransport, host: string, port: int) {.async.} =
+proc proxyConnect(transport: StreamTransport, host: string, port: int,
+                  user, pass: string) {.async.} =
   let target = host & ":" & $port
-  discard await transport.write(
-    "CONNECT " & target & " HTTP/1.1\r\nHost: " & target & "\r\n\r\n")
+  var req = "CONNECT " & target & " HTTP/1.1\r\nHost: " & target & "\r\n"
+  if user.len > 0 or pass.len > 0:
+    req.add("Proxy-Authorization: Basic " & encode(user & ":" & pass) & "\r\n")
+  req.add("\r\n")
+  discard await transport.write(req)
   var buf = newString(1024)
   let n = await transport.readOnce(addr buf[0], buf.len)
   buf.setLen(n)
   if not (buf.startsWith("HTTP/1.1 200") or buf.startsWith("HTTP/1.0 200")):
     raise newException(ValueError, "navi: proxy CONNECT failed: " & buf.splitLines()[0])
+
+proc recvExactly(transport: StreamTransport, n: int): Future[string] {.async.} =
+  ## Read exactly `n` bytes or raise; SOCKS5 replies are fixed-size frames.
+  var buf = newString(n)
+  var off = 0
+  while off < n:
+    let r = await transport.readOnce(addr buf[off], n - off)
+    if r <= 0: raise newException(IOError, "navi: SOCKS5 proxy closed the connection")
+    off += r
+  buf
+
+proc socksConnect(transport: StreamTransport, host: string, port: int,
+                  user, pass: string) {.async.} =
+  ## SOCKS5 handshake to tunnel to `host:port` (RFC 1928 + RFC 1929). The target is
+  ## sent as a domain name so the proxy resolves DNS.
+  let hasAuth = user.len > 0 or pass.len > 0
+  discard await transport.write(greeting(hasAuth))
+  case selectedMethod(await recvExactly(transport, 2))
+  of methodUserPass:
+    if not hasAuth:
+      raise newException(ValueError, "navi: SOCKS5 proxy requires authentication")
+    discard await transport.write(authRequest(user, pass))
+    checkAuthReply(await recvExactly(transport, 2))
+  of methodNoAuth: discard
+  else: raise newException(ValueError, "navi: SOCKS5 proxy rejected the offered auth methods")
+  discard await transport.write(connectRequest(host, port))
+  let header = await recvExactly(transport, 4)
+  let status = replyStatus(header)
+  if status != 0: raiseReply(status)
+  let tail = boundTailLen(int(uint8(header[3])))
+  if tail >= 0: discard await recvExactly(transport, tail)
+  else:
+    let dlen = int(uint8((await recvExactly(transport, 1))[0]))
+    discard await recvExactly(transport, dlen + 2)
 
 proc interleaveTAddr(addrs: seq[TransportAddress]): seq[TransportAddress] =
   ## RFC 8305 §4 family interleaving over resolved transport addresses, leading
@@ -199,6 +238,35 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   conn.readMs = readMs
 
   proc establish() {.async.} =
+    if proxy.kind == pkUnix:
+      # A Unix path (leading '/') builds a Unix TransportAddress; chronos dials it
+      # like any StreamTransport. TLS still layers over it using the URL host.
+      let transport = await connect(initTAddress(proxy.host))
+      conn.transport = transport
+      if tls:
+        when defined(ssl):
+          let (ctx, owned) = obtainCtx(cfg, alpn)
+          var ok = false
+          try:
+            let slot = resumeSlot(cfg, host & ":" & $port)
+            let tlsc = newChronosTls(transport, ctx, host, slot)
+            conn.tls = tlsc
+            await tlsc.handshake()
+            verifyPeer(tlsc.sslPtr, host, cfg.wantsVerify)
+            postHandshakeVerify(tlsc.sslPtr, host, cfg)
+            conn.protocol = negotiatedProtocol(tlsc.sslPtr)
+            conn.ctx = ctx
+            conn.ownsCtx = owned
+            ok = true
+          finally:
+            if owned and not ok and not ctx.isNil: destroyCtx(ctx)
+        else:
+          raise newException(ValueError,
+            "navi: the chronos backend requires -d:ssl for https")
+      else:
+        conn.reader = newAsyncStreamReader(transport)
+        conn.writer = newAsyncStreamWriter(transport)
+      return
     let dialHost = if proxy.isSet: proxy.host else: host
     let dialPort = if proxy.isSet: proxy.port else: port
     var pool = interleaveTAddr(resolveTAddress(dialHost, Port(dialPort)))
@@ -237,8 +305,11 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
           let (transport, idx) = await happyConnect(pool)
           conn.transport = transport
           try:
-            if proxy.isSet and tls:
-              await proxyConnect(transport, host, port)
+            # SOCKS5 tunnels every target; an HTTP proxy tunnels only https (CONNECT).
+            if proxy.kind == pkSocks5:
+              await socksConnect(transport, host, port, proxy.user, proxy.pass)
+            elif proxy.isSet and tls:
+              await proxyConnect(transport, host, port, proxy.user, proxy.pass)
             if tls:
               let slot = resumeSlot(cfg, host & ":" & $port)
               let tlsc = newChronosTls(transport, ctx, host, slot)
@@ -247,6 +318,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
               # mid-read; verifyPeer re-checks the chain + hostname/IP identity.
               await tlsc.handshake()
               verifyPeer(tlsc.sslPtr, host, cfg.wantsVerify)
+              postHandshakeVerify(tlsc.sslPtr, host, cfg)   # SPKI pin + verify callback
               conn.protocol = negotiatedProtocol(tlsc.sslPtr)
               conn.ctx = ctx
               conn.ownsCtx = owned

@@ -20,6 +20,12 @@ tests/test_cookies
 tests/test_digest
 tests/test_stream_decompress
 tests/test_ws
+tests/test_request
+tests/test_charset
+tests/test_redirect
+tests/test_trailers
+tests/test_socks
+tests/test_pool
 tests/test_mw
 tests/test_mw_async
 tests/test_mw_chronos

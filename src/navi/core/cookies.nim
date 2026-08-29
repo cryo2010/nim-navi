@@ -56,10 +56,23 @@ proc pathMatches(reqPath, cookiePath: string): bool =
            (reqPath.len > cookiePath.len and reqPath[cookiePath.len] == '/')
   false
 
-proc parseSetCookie(line, host, reqPath: string): (Cookie, bool) =
+proc prefixAllows(c: Cookie, secureContext: bool): bool =
+  ## RFC 6265bis 5.5 cookie name prefixes (case-insensitive). `__Secure-` demands
+  ## the Secure attribute over a secure origin; `__Host-` additionally demands a
+  ## host-only cookie (no Domain) scoped to Path=/. A cookie that claims a prefix
+  ## it doesn't satisfy is rejected rather than silently downgraded.
+  let name = c.name.toLowerAscii
+  if name.startsWith("__host-"):
+    return secureContext and c.secure and c.hostOnly and c.path == "/"
+  if name.startsWith("__secure-"):
+    return secureContext and c.secure
+  true
+
+proc parseSetCookie(line, host, reqPath: string, secureContext: bool): (Cookie, bool) =
   ## Parse one Set-Cookie. Returns (cookie, discard?) where discard is set when
-  ## the cookie is already expired, or its Domain attribute is not one the
-  ## request host is within (so it must not be stored).
+  ## the cookie is already expired, its Domain attribute is not one the request
+  ## host is within, or it violates its `__Host-`/`__Secure-` name prefix (so it
+  ## must not be stored).
   var c = Cookie(hostOnly: true, domain: host.toLowerAscii,
                  path: defaultPath(reqPath))
   var maxAge = none(int)
@@ -100,6 +113,7 @@ proc parseSetCookie(line, host, reqPath: string): (Cookie, bool) =
   elif expiresAt.isSome:
     if expiresAt.get <= now: discardIt = true
     else: c.expires = expiresAt
+  if not prefixAllows(c, secureContext): discardIt = true
   (c, discardIt)
 
 proc live(c: Cookie, now: Time): bool =
@@ -112,7 +126,7 @@ proc matchesHost(c: Cookie, host: string): bool =
 proc storeCookies*(jar: CookieJar, url: Url, resp: Response) =
   for (name, value) in resp.headers.pairs:
     if cmpIgnoreCase(name, "set-cookie") != 0: continue
-    let (c, discardIt) = parseSetCookie(value, url.host, url.path)
+    let (c, discardIt) = parseSetCookie(value, url.host, url.path, url.isTls)
     if c.name.len == 0: continue   # a nameless cookie is ignored
     jar.cookies.keepItIf(not (it.name == c.name and it.domain == c.domain and
                               it.path == c.path))

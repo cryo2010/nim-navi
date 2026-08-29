@@ -13,7 +13,11 @@ proc redirectRequest*(req: Request, status: int, location: string): Request =
   result.url = resolve(req.url, location)
   result.headers.del("cookie") # recomputed from the jar for the new target
   if result.url.originKey != previousOrigin:
+    # Credentials are origin-scoped: never carry them to a different origin.
+    # Proxy-Authorization is stripped too -- a redirect can point at a host the
+    # proxy reaches directly, so its credentials must not leak downstream.
     result.headers.del("authorization")
+    result.headers.del("proxy-authorization")
   case status
   of 303:
     # 303 See Other always continues with GET and no body.
