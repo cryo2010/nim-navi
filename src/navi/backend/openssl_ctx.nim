@@ -66,6 +66,16 @@ when defined(ssl):
   # wraps X509_check_host (DNS names) but not this IP variant.
   proc X509_check_ip_asc(cert: PX509, ipasc: cstring, flags: cuint): cint
     {.cdecl, dynlib: DLLUtilName, importc.}
+  when defined(windows):
+    # std/openssl hides its X509_STORE type and DER helpers behind
+    # `not defined(windows)` (like the X509 block below), so declare the ones the
+    # caBundle / pinning / verify-callback paths use. PX509_STORE is an opaque
+    # handle, like the other pointer aliases.
+    type PX509_STORE = SslPtr
+    proc X509_STORE_add_cert(store: PX509_STORE, x: PX509): cint
+      {.cdecl, dynlib: DLLUtilName, importc.}
+    proc i2d_X509(cert: PX509, o: ptr ptr uint8): cint
+      {.cdecl, dynlib: DLLUtilName, importc.}
   # In-memory CA trust: reach the context's X509_STORE and add certs to it.
   proc SSL_CTX_get_cert_store(ctx: SslCtx): PX509_STORE
     {.cdecl, dynlib: DLLSSLName, importc.}

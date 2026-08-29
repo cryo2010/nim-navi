@@ -23,7 +23,10 @@ suite "SOCKS5 username/password auth (RFC 1929)":
     check authRequest("me", "pw") == "\x01\x02me\x02pw"
 
   test "checkAuthReply should accept a zero status":
-    checkAuthReply("\x01\x00")
+    var accepted = true
+    try: checkAuthReply("\x01\x00")
+    except SocksError: accepted = false
+    check accepted
 
   test "checkAuthReply should reject a non-zero status":
     expect SocksError: checkAuthReply("\x01\x01")
