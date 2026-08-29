@@ -410,8 +410,10 @@ proc readChunk*(sr: StreamResponse): string =
           if raw.len == 0:                       # EOF
             sr.drained = true
             let wasReset = sr.qc.streamWasReset(sr.h3sid)
+            let lengthBad = sr.qc.streamLengthMismatch(sr.h3sid)  # before the guard frees it
             closeNow(sr.guard)
             if wasReset: raise newException(IOError, "navi: http/3 stream reset")
+            if lengthBad: raise newException(IOError, h3BodyLengthErr)
             return ""
           if not sr.decReady:
             sr.dec = if sr.decompress:

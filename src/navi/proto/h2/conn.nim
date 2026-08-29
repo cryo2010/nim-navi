@@ -41,6 +41,7 @@ type
     sendWindow: int       ## per-stream send window (peer's INITIAL_WINDOW_SIZE)
     sendClosed: bool      ## the request body is complete; END_STREAM may be sent
     endSent: bool         ## END_STREAM has already been emitted for this body
+    isHead: bool          ## request was HEAD -> a declared content-length has no body
 
   H2Conn* = ref object
     enc: HpackEncoder
@@ -123,6 +124,10 @@ proc encodeHeaderFrames(c: H2Conn, streamId: uint32, headers: openArray[HeaderPa
   ## Encode the header block as a HEADERS frame, splitting it across CONTINUATION
   ## frames when it exceeds the peer's max frame size (RFC 9113 6.2/6.10); a single
   ## oversized HEADERS frame would be a FRAME_SIZE_ERROR.
+  let s = c.streams.getOrDefault(streamId)   # remember HEAD: its response's declared
+  if s != nil:                               # content-length describes an absent body
+    for (k, v) in headers:
+      if k == ":method": s.isHead = v == "HEAD"; break
   let headerBlock = c.enc.encode(headers)
   let mfs = c.maxFrameSize
   if headerBlock.len <= mfs:
@@ -427,6 +432,26 @@ proc streamUnprocessed*(c: H2Conn, streamId: uint32): bool =
   ## safe to retry even a non-idempotent method.
   let s = c.streams.getOrDefault(streamId)
   (s != nil and s.refused) or (c.goneAway and streamId > c.goAwayLastId)
+
+const bodyLengthErr* =
+  "navi: response body length does not match the declared Content-Length"
+
+proc streamLengthMismatch*(c: H2Conn, streamId: uint32): bool =
+  ## A cleanly-ended response whose received body length disagrees with its declared
+  ## Content-Length -- malformed (RFC 9113 8.1.1), so the caller must not accept the
+  ## truncated body as complete. Skips responses that carry no body by definition:
+  ## HEAD, and 1xx / 204 / 304 statuses.
+  let s = c.streams.getOrDefault(streamId)
+  if s == nil or not s.ended or s.reset: return false
+  if s.isHead or s.resp.status < 200 or s.resp.status == 204 or s.resp.status == 304:
+    return false
+  for (k, v) in s.resp.headers:
+    if k == "content-length":
+      var cl: int
+      try: cl = parseInt(v.strip())
+      except ValueError: return false   # unparseable length: not a mismatch we assert
+      return cl != s.bodyTotal
+  false
 
 proc takeBody*(c: H2Conn, streamId: uint32): string =
   ## Drain and return the response-body bytes buffered for `streamId` so far, for

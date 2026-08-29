@@ -569,3 +569,51 @@ suite "h2 malformed control frames (DoS hardening)":
     let c = newServerConn()
     let outp = c.feed(encodeSettings(@[(settingsInitialWindowSize, 0xffffffff'u32)]))
     check hasGoAway(outp)
+
+proc headersFrame(streamId: uint32, fields: seq[HeaderPair], endStream: bool): string =
+  ## HEADERS-only frame (no DATA) with a caller-controlled END_STREAM flag.
+  encodeHeaders(streamId, HpackEncoder().encode(fields), endStream = endStream,
+                endHeaders = true)
+
+suite "h2 response length validation":
+  test "streamLengthMismatch should flag a body shorter than the declared Content-Length":
+    let c = newServerConn()
+    let id = c.openStream()
+    discard c.feed(headersFrame(id, @[(":status", "200"), ("content-length", "100")], false) &
+                   encodeData(id, "x".repeat(40), endStream = true))
+    check c.streamDone(id)
+    check c.streamLengthMismatch(id)          # 40 != 100, cleanly ended -> malformed
+
+  test "streamLengthMismatch should flag a longer body too":
+    let c = newServerConn()
+    let id = c.openStream()
+    discard c.feed(serverResponse(id, "200", @[("content-length", "3")], "hello"))
+    check c.streamLengthMismatch(id)          # 5 != 3
+
+  test "streamLengthMismatch should be false when the body matches Content-Length":
+    let c = newServerConn()
+    let id = c.openStream()
+    discard c.feed(serverResponse(id, "200", @[("content-length", "5")], "hello"))
+    check not c.streamLengthMismatch(id)
+
+  test "streamLengthMismatch should be false without a Content-Length":
+    let c = newServerConn()
+    let id = c.openStream()
+    discard c.feed(serverResponse(id, "200", @[], "hello"))
+    check not c.streamLengthMismatch(id)
+
+  test "streamLengthMismatch should be false for a 204 with Content-Length and no body":
+    let c = newServerConn()
+    let id = c.openStream()
+    discard c.feed(headersFrame(id, @[(":status", "204"), ("content-length", "100")], true))
+    check c.streamDone(id)
+    check not c.streamLengthMismatch(id)
+
+  test "streamLengthMismatch should be false for a HEAD response with Content-Length":
+    let c = newServerConn()
+    let id = c.openStream()
+    discard c.encodeRequest(id, @[(":method", "HEAD"), (":scheme", "https"),
+                                  (":path", "/"), (":authority", "h")], "")  # marks isHead
+    discard c.feed(headersFrame(id, @[(":status", "200"), ("content-length", "100")], true))
+    check c.streamDone(id)
+    check not c.streamLengthMismatch(id)

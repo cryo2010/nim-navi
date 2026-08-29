@@ -81,10 +81,12 @@ proc dispatch(mux: H2Mux) =
       else:
         fut.fail(newException(IOError, "navi: http/2 stream reset"))
     elif mux.h2.streamEnded(sid):
+      let lengthBad = mux.h2.streamLengthMismatch(sid)   # before takeResponse drops it
       let resp = mux.h2.takeResponse(sid)
       mux.waiters.del(sid)
       mux.releaseSlot()
-      fut.complete(resp)
+      if lengthBad: fut.fail(newException(IOError, bodyLengthErr))  # body != Content-Length
+      else: fut.complete(resp)
     elif mux.h2.goneAway and mux.h2.streamUnprocessed(sid):
       # Above GOAWAY's last-stream-id: the peer will not process it, so fail it as
       # retryable. A stream at or below last-stream-id stays in `waiters` to finish
@@ -281,6 +283,8 @@ proc readChunk*(mux: H2Mux, sid: uint32): Future[string] {.async.} =
         if decoded.len > 0: return decoded
         continue                                     # decoder buffered input; pull more
       if mux.h2.streamEnded(sid):                    # ended and the queue is drained
+        if mux.h2.streamLengthMismatch(sid):         # body != declared Content-Length
+          raise newException(IOError, bodyLengthErr) # the except below drops the stream
         mux.endStream(sid)
         return ""
       if mux.h2.goneAway and mux.h2.streamUnprocessed(sid):

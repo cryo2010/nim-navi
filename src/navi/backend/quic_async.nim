@@ -167,6 +167,10 @@ proc requestOnConn*(qc: QuicConnAsync, verb, path: string,
     # The stream was reset/aborted, not answered. The defer frees its C-side entry;
     # raise so the engine falls back to h2/h1 instead of a bogus empty response.
     raise newException(QuicError, "navi HTTP/3 stream was reset")
+  if navi_h3_stream_length_mismatch(qc.c, sid) != 0:
+    # Cleanly ended but body != Content-Length: a real (received) response, so raise a
+    # non-QuicError (IOError) that propagates rather than triggering the h2/h1 fallback.
+    raise newException(IOError, h3BodyLengthErr)
 
   var status: clong
   var blen, hlen: csize_t
@@ -257,6 +261,10 @@ proc readStreamBody*(qc: QuicConnAsync, sid: int64): Future[string] {.async.} =
 proc streamWasReset*(qc: QuicConnAsync, sid: int64): bool =
   ## Whether `sid` ended by reset/abort rather than a clean end. Check at EOF.
   qc.c != nil and navi_h3_stream_reset(qc.c, sid) != 0
+
+proc streamLengthMismatch*(qc: QuicConnAsync, sid: int64): bool =
+  ## Whether `sid` ended cleanly but its body length disagreed with Content-Length.
+  qc.c != nil and navi_h3_stream_length_mismatch(qc.c, sid) != 0
 
 proc freeStream*(qc: QuicConnAsync, sid: int64) =
   ## Drop `sid` (after an EOF+reset check, or to abandon an undrained handle).

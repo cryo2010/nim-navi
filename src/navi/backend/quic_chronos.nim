@@ -178,6 +178,8 @@ proc requestOnConn*(qc: QuicConnChronos, verb, path: string,
 
   if navi_h3_stream_reset(qc.c, sid) != 0:
     raise newException(QuicError, "navi HTTP/3 stream was reset")
+  if navi_h3_stream_length_mismatch(qc.c, sid) != 0:   # body != Content-Length: real
+    raise newException(IOError, h3BodyLengthErr)        # response -> raise, no fallback
   var status: clong
   var blen, hlen: csize_t
   var rbody = newString(64 * 1024)
@@ -255,6 +257,9 @@ proc readStreamBody*(qc: QuicConnChronos, sid: int64): Future[string] {.async.} 
 
 proc streamWasReset*(qc: QuicConnChronos, sid: int64): bool =
   qc.c != nil and navi_h3_stream_reset(qc.c, sid) != 0
+
+proc streamLengthMismatch*(qc: QuicConnChronos, sid: int64): bool =
+  qc.c != nil and navi_h3_stream_length_mismatch(qc.c, sid) != 0
 
 proc freeStream*(qc: QuicConnChronos, sid: int64) =
   if qc.c != nil: navi_h3_stream_free(qc.c, sid)

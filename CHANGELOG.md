@@ -18,6 +18,13 @@ onward (pre-1.0, minor versions may include breaking changes).
   `SseStream` across all native backends.
 
 ### Fixed
+- HTTP/2 and HTTP/3 now validate the response body length against a declared
+  `Content-Length`: a stream that ends cleanly (END_STREAM / FIN) but delivered a
+  body of a different length is rejected as malformed (RFC 9113 8.1.1 / RFC 9114
+  4.1.2) rather than accepted as a complete, truncated response. HEAD responses and
+  1xx/204/304 statuses (which carry no body) are exempt. HTTP/1.1 already had this
+  guarantee structurally (a `Content-Length` body is delimited by the byte count),
+  and `navi/js` inherits it from the `fetch` runtime.
 - Premature connection close mid-body no longer produces a silent partial response.
   On HTTP/1.1 and HTTP/2, a length- or chunked-delimited response whose connection
   drops before the body completes now raises instead of returning the truncated body

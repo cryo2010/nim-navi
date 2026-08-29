@@ -121,6 +121,11 @@ proc navi_h3_submit*(c: pointer, verb, path, reqHeaders: cstring, body: ptr char
 proc navi_h3_stream_done*(c: pointer, sid: int64): cint {.importc, cdecl.}
 proc navi_h3_stream_reset*(c: pointer, sid: int64): cint {.importc, cdecl.}
   ## 1 if the stream ended by reset/abort rather than a normal response.
+proc navi_h3_stream_length_mismatch*(c: pointer, sid: int64): cint {.importc, cdecl.}
+  ## 1 if the stream ended cleanly but its body length disagreed with Content-Length.
+
+const h3BodyLengthErr* =
+  "navi: response body length does not match the declared Content-Length"
 proc navi_h3_take_response*(c: pointer, sid: int64, outStatus: ptr clong,
                             outBody: ptr char, outCap: csize_t, outLen: ptr csize_t,
                             outHeaders: ptr char, hdrCap: csize_t,
@@ -183,6 +188,8 @@ proc request*(c: QuicConn, verb: string, path = "/",
                            cast[ptr char](addr rbody[0]), csize_t(rbody.len),
                            addr blen, cast[ptr char](addr hbuf[0]),
                            csize_t(hbuf.len), addr hlen)
+  if rv == -2:   # body length disagreed with Content-Length: a real (received) response,
+    raise newException(IOError, h3BodyLengthErr)   # so raise instead of QuicError (no h2 fallback)
   if rv != 0:
     raise newException(QuicError, "navi HTTP/3 " & verb & " " & path & " failed")
   rbody.setLen(int(blen))
@@ -265,6 +272,11 @@ proc readStreamBody*(c: QuicConn, sid: int64): string =
 proc streamWasReset*(c: QuicConn, sid: int64): bool =
   ## Whether `sid` ended by reset/abort rather than a clean end (check at EOF).
   c.handle != nil and navi_h3_stream_reset(c.handle, sid) != 0
+
+proc streamLengthMismatch*(c: QuicConn, sid: int64): bool =
+  ## Whether `sid` ended cleanly but its body length disagreed with Content-Length
+  ## (check at EOF, before freeStream).
+  c.handle != nil and navi_h3_stream_length_mismatch(c.handle, sid) != 0
 
 proc freeStream*(c: QuicConn, sid: int64) =
   ## Drop `sid` (STOP_SENDING + RESET_STREAM), abandoning an undrained handle.

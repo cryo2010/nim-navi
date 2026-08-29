@@ -72,6 +72,13 @@ struct Stream {
   bool done = false;
   bool reset = false;     // closed without a normal end_stream (server reset/abort)
   std::string req_body;   // owned copy (so the caller need not keep it alive)
+  // Response-length validation (RFC 9114 4.1.2): a body whose total length disagrees
+  // with a declared Content-Length is malformed. `body` is drained on the streaming
+  // path, so count total received bytes separately.
+  bool is_head = false;           // request was HEAD -> Content-Length has no body
+  long long content_length = -1;  // declared Content-Length, or -1 if absent
+  unsigned long long body_total = 0;  // total DATA bytes received
+  bool length_mismatch = false;   // set at end_stream when body_total != content_length
   // Streaming request body (navi bodyStream): chunks pulled from Nim on demand and
   // kept until acked. `pull` null => this stream has no streamed body.
   std::deque<BodyChunk> out;
@@ -211,6 +218,13 @@ int on_recv_header(nghttp3_conn *, std::int64_t stream_id, std::int32_t,
       it->second.status = std::strtol(std::string(val).c_str(), nullptr, 10);
     } else if (!nm.empty() && nm.front() != ':') {  // a regular response field
       it->second.resp_headers.append(nm).append("\n").append(val).append("\n");
+      if (nm == "content-length") {   // remember it for the end-of-stream length check
+        std::string vs(val);
+        char *end = nullptr;
+        long long cl = std::strtoll(vs.c_str(), &end, 10);
+        if (!vs.empty() && end && *end == '\0' && cl >= 0)
+          it->second.content_length = cl;   // ignore a malformed value (stays -1)
+      }
     }
   } catch (...) {
     return NGHTTP3_ERR_CALLBACK_FAILURE;
@@ -226,6 +240,7 @@ int on_recv_data(nghttp3_conn *, std::int64_t stream_id, const std::uint8_t *dat
   try {
     it->second.headers_done = true;  // nghttp3 delivers all headers before any body
     it->second.body.append(reinterpret_cast<const char *>(data), datalen);
+    it->second.body_total += datalen;   // total received (body is drained on streaming)
   } catch (...) {
     return NGHTTP3_ERR_CALLBACK_FAILURE;
   }
@@ -243,8 +258,15 @@ int on_end_stream(nghttp3_conn *, std::int64_t stream_id, void *cud, void *) {
   auto *c = static_cast<H3Conn *>(cud);
   auto it = c->streams.find(stream_id);
   if (it != c->streams.end()) {
-    it->second.headers_done = true;  // a bodyless response: headers are all there is
-    it->second.done = true;
+    auto &s = it->second;
+    s.headers_done = true;  // a bodyless response: headers are all there is
+    s.done = true;
+    // RFC 9114 4.1.2: a body whose length disagrees with a declared Content-Length is
+    // malformed. Skip responses that carry no body by definition (HEAD; 1xx/204/304).
+    if (!s.is_head && s.content_length >= 0 && s.status >= 200 && s.status != 204 &&
+        s.status != 304 &&
+        s.body_total != static_cast<unsigned long long>(s.content_length))
+      s.length_mismatch = true;
   }
   return 0;
 }
@@ -663,6 +685,7 @@ std::int64_t navi_h3_submit(H3Conn *c, const char *method, const char *path_,
     std::int64_t sid;
     if (ngtcp2_conn_open_bidi_stream(c->conn, &sid, nullptr) != 0) return -1;
     Stream &s = c->streams[sid];
+    s.is_head = std::strcmp(method, "HEAD") == 0;   // its Content-Length has no body
     if (pull) { s.pull = pull; s.pull_env = pull_env; }     // streamed body
     else if (body && body_len) s.req_body.assign(body, body_len);  // owned copy
 
@@ -710,6 +733,13 @@ int navi_h3_stream_done(H3Conn *c, std::int64_t sid) {
 int navi_h3_stream_reset(H3Conn *c, std::int64_t sid) {
   auto it = c->streams.find(sid);
   return (it != c->streams.end() && it->second.reset) ? 1 : 0;
+}
+
+// 1 if stream `sid` ended cleanly but its body length disagreed with a declared
+// Content-Length (malformed, RFC 9114 4.1.2). Valid once done and before free.
+int navi_h3_stream_length_mismatch(H3Conn *c, std::int64_t sid) {
+  auto it = c->streams.find(sid);
+  return (it != c->streams.end() && it->second.length_mismatch) ? 1 : 0;
 }
 
 // Copy stream `sid`'s completed response into the caller's buffers and drop it.
@@ -810,6 +840,10 @@ int navi_h3_request(H3Conn *c, const char *method, const char *path_,
   if (navi_h3_stream_reset(c, sid)) {   // reset/abort, not a real response
     c->streams.erase(sid);
     return -1;
+  }
+  if (navi_h3_stream_length_mismatch(c, sid)) {   // body != declared Content-Length
+    c->streams.erase(sid);
+    return -2;                                    // distinct: caller raises, no fallback
   }
   return navi_h3_take_response(c, sid, out_status, out_body, out_cap, out_len,
                                out_headers, hdr_cap, hdr_len);
