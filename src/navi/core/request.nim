@@ -107,6 +107,11 @@ type
     verb*: HttpVerb
     url*: Url
     headers*: Headers
+    trailers*: Headers          ## trailing fields sent after the body. Requires a
+                                ## body framed to carry them: chunked transfer-encoding
+                                ## (h1) or a trailing HEADERS block (h2/h3). Empty by
+                                ## default. Not available on navi/js (fetch cannot send
+                                ## request trailers).
     body*: string
     bodyStream*: BodyProducer  ## when set, the body is streamed chunked
     absoluteForm*: bool         ## use absolute-URI on the request line (http proxy)
@@ -195,22 +200,30 @@ proc validateRequest*(req: Request) =
     if hasCtl(k) or hasCtl(v):
       raise newException(ValueError,
         "navi: invalid header '" & k & "' (name or value contains CR, LF, or NUL)")
+  for (k, v) in req.trailers.pairs:
+    if hasCtl(k) or hasCtl(v):
+      raise newException(ValueError,
+        "navi: invalid trailer '" & k & "' (name or value contains CR, LF, or NUL)")
 
 proc buildRequest*(opts: NaviConfigBase, verb: HttpVerb, target: string,
                    headers: Headers = initHeaders(), body = "",
                    json: JsonNode = nil, form: seq[(string, string)] = @[],
                    multipart: Multipart = @[],
                    bodyStream: BodyProducer = nil,
-                   params: seq[(string, string)] = @[]): Request =
+                   params: seq[(string, string)] = @[],
+                   trailers: Headers = initHeaders()): Request =
   ## Resolve `target` against the client's prefixUrl, merge headers, and encode
   ## the body. `json`, `form`, and `multipart` take precedence over `body` (in
   ## that order) and set a matching Content-Type unless the caller supplied one.
   ## `params` are appended to the resolved URL's query string (url-encoded).
+  ## `trailers` are sent after the body (chunked on h1, a trailing HEADERS block on
+  ## h2/h3); they are per-request and not merged with the client's default headers.
   result.verb = verb
   result.url = join(opts.prefixUrl, target)
   if params.len > 0:
     result.url = result.url.withQuery(params)
   result.headers = merge(opts.headers, headers)
+  result.trailers = trailers
   result.bodyStream = bodyStream
   if json != nil:
     result.body = $json

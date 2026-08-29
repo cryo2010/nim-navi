@@ -141,16 +141,16 @@ proc openConnChronos*(host: string, port: int, sni, caFile: string,
 
 proc requestOnConn*(qc: QuicConnChronos, verb, path: string,
                     headers: seq[(string, string)], body: string,
-                    producer: proc(): string {.closure, raises: [CatchableError].} = nil):
+                    producer: proc(): string {.closure, raises: [CatchableError].} = nil,
+                    trailers: seq[(string, string)] = @[]):
                     Future[Http3Response] {.async.} =
   ## Run one buffered HTTP/3 request on the shared connection, concurrently with
   ## others. Awaits the whole response. The request body is buffered (`body`) or
-  ## streamed from `producer` (navi bodyStream).
+  ## streamed from `producer` (navi bodyStream); `trailers` are sent after the body.
   if not qc.alive:
     raise newException(QuicError, "navi HTTP/3 connection is closed")
-  var reqHdr = ""
-  for (k, v) in headers:
-    reqHdr.add k; reqHdr.add '\n'; reqHdr.add v; reqHdr.add '\n'
+  let reqHdr = encodeH3Fields(headers)
+  let reqTrl = encodeH3Fields(trailers)
   var b = body
   let streamed = producer != nil
   let pe = if streamed: H3PullEnv(producer: producer) else: nil  # kept alive by this
@@ -161,7 +161,8 @@ proc requestOnConn*(qc: QuicConnChronos, verb, path: string,
   # transform would otherwise let it be collected mid-request (use-after-free).
   if pe != nil: GC_ref(pe)
   let sid = navi_h3_submit(qc.c, verb.cstring, path.cstring, reqHdr.cstring, bp,
-                           csize_t(if streamed: 0 else: b.len), pull, cast[pointer](pe))
+                           csize_t(if streamed: 0 else: b.len), pull, cast[pointer](pe),
+                           reqTrl.cstring)
   if sid < 0:
     if pe != nil: GC_unref(pe)
     raise newException(QuicError, "navi HTTP/3 submit failed")
@@ -181,23 +182,22 @@ proc requestOnConn*(qc: QuicConnChronos, verb, path: string,
   if navi_h3_stream_length_mismatch(qc.c, sid) != 0:   # body != Content-Length: real
     raise newException(IOError, h3BodyLengthErr)        # response -> raise, no fallback
   var status: clong
-  var blen, hlen: csize_t
+  var blen, hlen, tlen: csize_t
   var rbody = newString(64 * 1024)
   var hbuf = newString(16 * 1024)
+  var tbuf = newString(16 * 1024)
   if navi_h3_take_response(qc.c, sid, addr status, cast[ptr char](addr rbody[0]),
                            csize_t(rbody.len), addr blen,
-                           cast[ptr char](addr hbuf[0]), csize_t(hbuf.len),
-                           addr hlen) != 0:
+                           cast[ptr char](addr hbuf[0]), csize_t(hbuf.len), addr hlen,
+                           cast[ptr char](addr tbuf[0]), csize_t(tbuf.len),
+                           addr tlen) != 0:
     raise newException(QuicError, "navi HTTP/3 take_response failed")
   consumed = true                          # take_response erased the C stream on success
   rbody.setLen(int(blen))
   hbuf.setLen(int(hlen))
-  var hs: seq[(string, string)]
-  let parts = hbuf.split('\n')
-  var i = 0
-  while i + 1 < parts.len:
-    hs.add((parts[i], parts[i + 1])); i += 2
-  result = Http3Response(status: int(status), body: rbody, headers: hs)
+  tbuf.setLen(int(tlen))
+  result = Http3Response(status: int(status), body: rbody,
+                         headers: parseH3Fields(hbuf), trailers: parseH3Fields(tbuf))
 
 # --- streaming API (stream()/SSE over h3), twin of quic_async's ------------
 
@@ -210,15 +210,16 @@ proc waitProgress(qc: QuicConnChronos, sid: int64) {.async.} =
 
 proc submitStream*(qc: QuicConnChronos, verb, path: string,
                    headers: seq[(string, string)], body: string,
-                   pull: H3BodyPull = nil, pullEnv: pointer = nil): int64 =
+                   pull: H3BodyPull = nil, pullEnv: pointer = nil,
+                   trailers: seq[(string, string)] = @[]): int64 =
   if not qc.alive: return -1
-  var reqHdr = ""
-  for (k, v) in headers:
-    reqHdr.add k; reqHdr.add '\n'; reqHdr.add v; reqHdr.add '\n'
+  let reqHdr = encodeH3Fields(headers)
+  let reqTrl = encodeH3Fields(trailers)
   var b = body
   let bp = if pull == nil and b.len > 0: cast[ptr char](addr b[0]) else: nil
   result = navi_h3_submit(qc.c, verb.cstring, path.cstring, reqHdr.cstring, bp,
-                          csize_t(if pull != nil: 0 else: b.len), pull, pullEnv)
+                          csize_t(if pull != nil: 0 else: b.len), pull, pullEnv,
+                          reqTrl.cstring)
   wake(qc)
 
 proc awaitHeaders*(qc: QuicConnChronos, sid: int64):
@@ -254,6 +255,18 @@ proc readStreamBody*(qc: QuicConnChronos, sid: int64): Future[string] {.async.} 
       buf.setLen(int(n)); return buf
     if eof != 0: return ""
     await waitProgress(qc, sid)
+
+proc streamTrailers*(qc: QuicConnChronos, sid: int64): seq[(string, string)] =
+  ## Response trailer fields of `sid` (after the body EOF); "" if none. Read after
+  ## `readStreamBody` returns "" and before `freeStream`.
+  if qc.c == nil: return
+  var tbuf = newString(16 * 1024)
+  var tlen: csize_t
+  if navi_h3_response_trailers(qc.c, sid, cast[ptr char](addr tbuf[0]),
+                               csize_t(tbuf.len), addr tlen) != 0:
+    return
+  tbuf.setLen(int(tlen))
+  parseH3Fields(tbuf)
 
 proc streamWasReset*(qc: QuicConnChronos, sid: int64): bool =
   qc.c != nil and navi_h3_stream_reset(qc.c, sid) != 0

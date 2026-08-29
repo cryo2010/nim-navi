@@ -26,6 +26,12 @@ proc serializeHead*(req: Request, chunked = false): string =
   if chunked:
     if not req.headers.contains("transfer-encoding"):
       result.add("Transfer-Encoding: chunked\r\n")
+    # Advertise which fields arrive as trailers (RFC 9110 6.6.2). Recommended so an
+    # intermediary keeps them; only added when the caller did not set it themselves.
+    if req.trailers.len > 0 and not req.headers.contains("trailer"):
+      var names: seq[string]
+      for (k, _) in req.trailers.pairs: names.add(k)
+      result.add("Trailer: " & names.join(", ") & "\r\n")
   elif req.body.len > 0 and not req.headers.contains("content-length"):
     result.add("Content-Length: " & $req.body.len & "\r\n")
   result.add("\r\n")
@@ -39,6 +45,14 @@ const chunkTerminator* = "0\r\n\r\n"
 proc encodeChunk*(data: string): string =
   ## One HTTP/1.1 chunked-transfer frame. `data` must be non-empty.
   fmt"{data.len:X}" & "\r\n" & data & "\r\n"
+
+proc finalChunk*(req: Request): string =
+  ## The terminating zero-length chunk plus any request trailer fields (RFC 9110
+  ## 7.1.2). With no trailers this is exactly `chunkTerminator` ("0\r\n\r\n").
+  result = "0\r\n"
+  for (k, v) in req.trailers.pairs:
+    result.add(k & ": " & v & "\r\n")
+  result.add("\r\n")
 
 type
   H1BodyMode = enum

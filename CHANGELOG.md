@@ -7,6 +7,17 @@ onward (pre-1.0, minor versions may include breaking changes).
 
 ## [Unreleased]
 
+### Added
+- **Request trailers.** `req.trailers` (a `Headers`, the same shape as `req.headers`)
+  sends trailing header fields after the body: chunked transfer-encoding with a
+  `Trailer` header on HTTP/1.1, and a trailing HEADERS section on HTTP/2 and HTTP/3
+  (e.g. `grpc-status` for a gRPC-style request). Available on `request` and
+  `buildRequest` via a `trailers` argument. A buffered body is sent chunked when
+  trailers are present. Not supported on the js backend (fetch cannot send request
+  trailers; setting them raises). Sync, asyncdispatch, and chronos backends.
+- **HTTP/3 response trailers.** `res.trailers` now also surfaces the trailing HEADERS
+  section of an HTTP/3 response, matching the existing HTTP/1.1 and HTTP/2 support.
+
 ### Fixed
 - HTTP/3: certificate verification now runs after the handshake completes (checking
   `SSL_get_verify_result`) instead of aborting the handshake with `SSL_VERIFY_PEER`.

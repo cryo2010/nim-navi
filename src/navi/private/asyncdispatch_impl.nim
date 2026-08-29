@@ -122,7 +122,8 @@ proc muxRequest(client: Navi, mux: H2Mux, req: Request,
   # The mux delivers a streaming request's body to `sink` incrementally (decoding
   # content-encoding as it arrives), so the returned response's body is empty.
   # A non-streaming request (sink == nil) still buffers into r.body as before.
-  result = toResponse(await mux.request(h2HeaderList(req), req.body, req.bodyStream, sink))
+  result = toResponse(await mux.request(h2HeaderList(req), req.body, req.bodyStream,
+                                        sink, h2TrailerList(req)))
 
 proc h1OnConn(client: Navi, conn: Conn, origin: string, req: Request,
               sink: BodySink): Future[Response] {.async.} =
@@ -252,12 +253,18 @@ when defined(naviHttp3):
     for k, v in req.headers:
       let lk = k.toLowerAscii
       if lk notin h3SkipHeaders: fwd.add((lk, v))
+    var fwdTrl: seq[(string, string)]
+    for k, v in req.trailers:
+      let lk = k.toLowerAscii
+      if lk.len > 0 and lk[0] != ':' and lk notin h3SkipHeaders and lk notin ["te", "trailer"]:
+        fwdTrl.add((lk, v))
     let origin = originKey(req.url)
     let qc = await client.getH3Conn(origin, ep, req)
     try:
       let r = await qc.requestOnConn($req.verb, req.url.requestTarget, fwd, req.body,
-                                     req.bodyStream)
+                                     req.bodyStream, fwdTrl)
       result = initResponse(r.status, "", "HTTP/3", initHeaders(r.headers), r.body)
+      result.trailers = initHeaders(r.trailers)
     except QuicError:
       if client.h3conns.getOrDefault(origin, nil) == qc:
         client.h3conns.del(origin)       # drop a dead connection
@@ -332,11 +339,13 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
               form: seq[(string, string)] = @[], multipart: Multipart = @[],
               bodyStream: BodyProducer = nil,
               params: seq[(string, string)] = @[],
-              cancel: CancelToken = nil): Future[Response] {.async.} =
+              cancel: CancelToken = nil,
+              trailers = initHeaders()): Future[Response] {.async.} =
   ## Perform a request; configured middleware wraps the whole call. `params` are
-  ## appended to the URL query; `cancel` aborts the in-flight request.
+  ## appended to the URL query; `cancel` aborts the in-flight request. `trailers`
+  ## are sent after the body (chunked on h1, a trailing HEADERS block on h2/h3).
   let req = buildRequest(client.config, verb, target, headers, body, json,
-                         form, multipart, bodyStream, params)
+                         form, multipart, bodyStream, params, trailers)
   if client.config.middleware.len == 0:
     return await client.guard(doRequest(client, req), cancel)
   let ctx = NaviContext(req: req, clientv: client)
@@ -442,14 +451,14 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
   if wantH2:
     if client.muxes.hasKey(origin) and client.muxes[origin].canReuse:
       let mux = client.muxes[origin]
-      let sid = await mux.sendAndReadHeaders(h2HeaderList(req), req.body, req.bodyStream)
+      let sid = await mux.sendAndReadHeaders(h2HeaderList(req), req.body, req.bodyStream, h2TrailerList(req))
       return StreamResponse(kind: skH2, mux: mux, sid: sid,
         resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
         decompress: decompress, cap: cap)
     if client.pendingMux.hasKey(origin):
       let mux = await client.pendingMux[origin]
       if mux != nil and mux.canReuse:
-        let sid = await mux.sendAndReadHeaders(h2HeaderList(req), req.body, req.bodyStream)
+        let sid = await mux.sendAndReadHeaders(h2HeaderList(req), req.body, req.bodyStream, h2TrailerList(req))
         return StreamResponse(kind: skH2, mux: mux, sid: sid,
           resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
           decompress: decompress, cap: cap)
@@ -481,7 +490,7 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
         client.muxes[origin] = mux
         client.pendingMux.del(origin)
         pending.complete(mux)
-        let sid = await mux.sendAndReadHeaders(h2HeaderList(rq), rq.body, rq.bodyStream)
+        let sid = await mux.sendAndReadHeaders(h2HeaderList(rq), rq.body, rq.bodyStream, h2TrailerList(rq))
         return StreamResponse(kind: skH2, mux: mux, sid: sid,
           resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
           decompress: decompress, cap: cap)

@@ -24,11 +24,13 @@ proc redirectRequest*(req: Request, status: int, location: string): Request =
     result.verb = GET
     result.body = ""
     result.bodyStream = nil
+    result.trailers = initHeaders()   # trailers belong to the dropped body
   of 301, 302:
     # A non-idempotent method degrades to GET (matching fetch/browsers).
     if req.verb notin {GET, HEAD}:
       result.verb = GET
       result.body = ""
       result.bodyStream = nil
+      result.trailers = initHeaders()
   else:
     discard # 307/308 preserve method and body

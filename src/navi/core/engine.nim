@@ -30,7 +30,8 @@ proc raiseHttpError(req: Request, resp: Response) =
 
 template sendRequest(conn, req: typed) =
   ## Write the request, streaming the body as chunked transfer-encoding when a
-  ## producer is set, otherwise sending it buffered.
+  ## producer is set. A buffered body with trailers is also sent chunked (trailers
+  ## only exist in chunked transfer-encoding); otherwise the body is sent buffered.
   if req.bodyStream != nil:
     await sendAll(conn, serializeHead(req, chunked = true))
     while true:
@@ -40,7 +41,12 @@ template sendRequest(conn, req: typed) =
         chunk = req.bodyStream()
       if chunk.len == 0: break
       await sendAll(conn, encodeChunk(chunk))
-    await sendAll(conn, chunkTerminator)
+    await sendAll(conn, finalChunk(req))
+  elif req.trailers.len > 0:
+    await sendAll(conn, serializeHead(req, chunked = true))
+    if req.body.len > 0:
+      await sendAll(conn, encodeChunk(req.body))
+    await sendAll(conn, finalChunk(req))
   else:
     await sendAll(conn, serializeRequest(req))
 
@@ -237,7 +243,7 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
           var chunk: string
           {.cast(gcsafe).}: chunk = req.bodyStream()
           if chunk.len == 0:
-            await sendAll(transport, h2.finishSend(sid))
+            await sendAll(transport, h2.finishSend(sid, h2TrailerList(req)))
             sending = false
           else:
             await sendAll(transport, h2.queueSend(sid, chunk))
@@ -247,7 +253,8 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
           let toSend = h2.feed(inbound)
           if toSend.len > 0: await sendAll(transport, toSend)
     else:
-      await sendAll(transport, h2.encodeRequest(sid, h2HeaderList(req), req.body))
+      await sendAll(transport,
+        h2.encodeRequest(sid, h2HeaderList(req), req.body, h2TrailerList(req)))
     # Deliver the body to the sink incrementally as DATA arrives (bounded memory),
     # or buffer it for a non-streaming request. The decoder is built once the
     # response headers are in (so content-encoding is known); the loop runs once
@@ -320,7 +327,7 @@ template h2SendAndReadHeaders*(transport, h2, req: typed): uint32 =
           var chunk: string
           {.cast(gcsafe).}: chunk = req.bodyStream()
           if chunk.len == 0:
-            await sendAll(transport, h2.finishSend(sid))
+            await sendAll(transport, h2.finishSend(sid, h2TrailerList(req)))
             sending = false
           else:
             await sendAll(transport, h2.queueSend(sid, chunk))
@@ -330,7 +337,8 @@ template h2SendAndReadHeaders*(transport, h2, req: typed): uint32 =
           let toSend = h2.feed(inbound)
           if toSend.len > 0: await sendAll(transport, toSend)
     else:
-      await sendAll(transport, h2.encodeRequest(sid, h2HeaderList(req), req.body))
+      await sendAll(transport,
+        h2.encodeRequest(sid, h2HeaderList(req), req.body, h2TrailerList(req)))
     while not h2.headersReady(sid) and not h2.streamDone(sid):
       let chunk = await recvSome(transport)
       if chunk.len == 0: break

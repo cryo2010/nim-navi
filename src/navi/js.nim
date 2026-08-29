@@ -165,14 +165,19 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
               form: seq[(string, string)] = @[], multipart: Multipart = @[],
               bodyStream: BodyProducer = nil,
               params: seq[(string, string)] = @[],
-              cancel: CancelToken = nil): Future[Response] {.async.} =
+              cancel: CancelToken = nil,
+              trailers = initHeaders()): Future[Response] {.async.} =
   ## Perform a request; configured middleware wraps the whole call. `params` are
   ## appended to the URL query; `cancel` aborts the fetch.
   ##
   ## `bodyStream` is accepted for parity with the native backends, but the js
   ## backend **buffers** it: `fetch` cannot reliably stream a request body
   ## (`ReadableStream` + `duplex: "half"` support is uneven across runtimes), so
-  ## the producer is drained into a full body before sending.
+  ## the producer is drained into a full body before sending. `trailers` are
+  ## rejected: `fetch` cannot send request trailers.
+  if trailers.len > 0:
+    raise newException(ValueError,
+      "navi: request trailers are not supported on the js backend (fetch cannot send them)")
   var buffered = body
   if bodyStream != nil:
     buffered = ""

@@ -152,13 +152,19 @@ when defined(naviHttp3):
     for k, v in req.headers:
       let lk = k.toLowerAscii
       if lk notin h3SkipHeaders: fwd.add((lk, v))
+    var fwdTrl: seq[(string, string)]
+    for k, v in req.trailers:
+      let lk = k.toLowerAscii
+      if lk.len > 0 and lk[0] != ':' and lk notin h3SkipHeaders and lk notin ["te", "trailer"]:
+        fwdTrl.add((lk, v))
     let conn = h3Open(ep.host, ep.port, sni = req.url.host,
                       caFile = client.config.tls.caFile,
                       verify = client.config.tls.wantsVerify)
     try:
       let r = conn.request($req.verb, req.url.requestTarget, fwd, req.body,
-                           req.bodyStream)
+                           req.bodyStream, fwdTrl)
       result = initResponse(r.status, "", "HTTP/3", initHeaders(r.headers), r.body)
+      result.trailers = initHeaders(r.trailers)
     finally:
       conn.close()
 
@@ -204,13 +210,15 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
               form: seq[(string, string)] = @[], multipart: Multipart = @[],
               bodyStream: BodyProducer = nil,
               params: seq[(string, string)] = @[],
-              cancel: CancelToken = nil): Response =
+              cancel: CancelToken = nil,
+              trailers = initHeaders()): Response =
   ## Perform a request and return the response. `json`/`form`/`multipart` encode
   ## the body; `bodyStream` uploads a chunked body from a pull-based producer.
   ## `params` are appended to the URL query; `cancel` aborts the request.
-  ## Configured middleware wraps the whole call.
+  ## `trailers` are sent after the body (chunked on h1, a trailing HEADERS block on
+  ## h2/h3). Configured middleware wraps the whole call.
   let req = buildRequest(client.config, verb, target, headers, body, json,
-                         form, multipart, bodyStream, params)
+                         form, multipart, bodyStream, params, trailers)
   if client.config.middleware.len == 0: return runCore(client, req, cancel)
   let ctx = NaviContext(req: req, clientv: client, cancel: cancel)
   ctx.next()

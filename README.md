@@ -89,7 +89,7 @@ discard main()
 - **Redirect following** with method rewrites and cross-origin `Authorization` / `Proxy-Authorization` stripping
 - **Throw-on-non-2xx** by default, opt-out available
 - **Automatic decompression**: gzip, deflate, brotli and zstd; `res.text` charset decoding
-- **Response trailers** surfaced (chunked HTTP/1.1 and HTTP/2)
+- **Trailers**: request trailers sent (`req.trailers`) and response trailers surfaced (`res.trailers`) on HTTP/1.1, HTTP/2, and HTTP/3
 - **Request timeouts** per-phase (connect / read / total)
 - **Connection-pool sizing:** per-host and global idle caps, idle-timeout eviction
 - **Middleware**: onion-style functions that modify, observe, or short-circuit requests
@@ -325,6 +325,11 @@ discard api.head("path")
 
 # Any verb, explicitly:
 discard api.request(POST, "path", body = payload)
+
+# Request trailers: fields sent after the body (chunked on h1, a trailing HEADERS
+# block on h2/h3). Same shape as headers; a buffered body is sent chunked when set.
+discard api.request(POST, "path", body = payload,
+                    trailers = initHeaders({"x-checksum": "abc123"}))
 ```
 
 ### Responses
@@ -343,7 +348,7 @@ res.trailers          # trailing header fields, if the response carried any
 
 `std/json` is re-exported, so `res.data["field"].getBool()` works without importing it yourself. `data` parses the body regardless of Content-Type, caches it, and raises `JsonParsingError` on invalid JSON.
 
-`res.body` is the raw bytes; `res.text` decodes them to UTF-8 using the `Content-Type` charset (or a leading BOM, else UTF-8), covering UTF-8, ISO-8859-1, Windows-1252, and UTF-16, so a non-UTF-8 response reads correctly. An unrecognized charset falls back to the raw bytes. `res.trailers` is a `Headers` holding the fields after the body (chunked HTTP/1.1 or an HTTP/2 trailing block, e.g. `grpc-status`); it is empty when there are none.
+`res.body` is the raw bytes; `res.text` decodes them to UTF-8 using the `Content-Type` charset (or a leading BOM, else UTF-8), covering UTF-8, ISO-8859-1, Windows-1252, and UTF-16, so a non-UTF-8 response reads correctly. An unrecognized charset falls back to the raw bytes. `res.trailers` is a `Headers` holding the fields after the body (chunked HTTP/1.1, or an HTTP/2 / HTTP/3 trailing HEADERS block, e.g. `grpc-status`); it is empty when there are none. To *send* trailers, set `req.trailers` (the `trailers` argument to `request`), which uses the same `Headers` shape.
 
 ### Headers
 
