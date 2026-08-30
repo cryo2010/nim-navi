@@ -443,6 +443,12 @@ proc waitReadable(c: Conn, ms: int): bool =
   var fds = @[c.fd]
   selectRead(fds, ms) > 0
 
+proc dataWaiting*(c: Conn, ms: int): bool =
+  ## True when the socket has data ready within `ms` (the WebSocket keepalive poll
+  ## reads only once this says so, so it never blocks past the interval). Also sees
+  ## bytes already buffered inside OpenSSL, which a raw `select` would miss.
+  c.waitReadable(ms)
+
 proc recvSome*(c: Conn): string =
   ## One chunk of up to 4096 bytes; "" means the peer closed. Waits up to the read
   ## stall limit -- capped by the time left to the overall deadline -- then reads

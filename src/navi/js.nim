@@ -32,7 +32,8 @@ import navi/backend/jsws
 claimEntry("navi/js")
 export public, asyncjs
 export jsws.WebSocket, jsws.WsMessage, jsws.WsMessageKind,
-       jsws.send, jsws.receive, jsws.close, jsws.closeNormal, jsws.closeGoingAway
+       jsws.send, jsws.receive, jsws.close, jsws.closeNormal, jsws.closeGoingAway,
+       jsws.closeMessageTooBig, jsws.WsMessageTooLarge
 
 type
   NaviContext* = ref object
@@ -431,14 +432,22 @@ template each*(s: SseStream; ev, body: untyped): untyped =
     body
 
 proc websocket*(client: Navi, url: string,
-                headers = initHeaders()): Future[WebSocket] =
+                headers = initHeaders(),
+                maxMessageBytes = 0, keepAlive = 0): Future[WebSocket] =
   ## Open a WebSocket over the runtime's native `WebSocket`. Accepts `ws://` /
   ## `wss://` (or http/https, which are mapped to ws/wss). Use `send`, `receive`,
   ## and `close`. `headers` is ignored: a browser WebSocket cannot set custom
   ## handshake headers, and the runtime handles ping/pong.
+  ##
+  ## `maxMessageBytes` (0 = unlimited) rejects an oversized message on delivery
+  ## (closing with 1009), for parity with the native backends; the runtime has
+  ## already buffered it and enforces its own limit, so this is not a memory guard.
+  ## `keepAlive` is accepted for API parity but ignored: the runtime manages its own
+  ## WebSocket keepalive and does not expose ping/pong.
+  discard keepAlive
   var u = url
   if u.startsWith("http://"): u = "ws://" & u["http://".len .. ^1]
   elif u.startsWith("https://"): u = "wss://" & u["https://".len .. ^1]
-  openWebSocket(u)
+  openWebSocket(u, maxMessageBytes)
 
 include navi/private/verbs

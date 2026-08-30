@@ -53,6 +53,7 @@ Security controls that are **opt-in** (off until you set them):
 | Opt-in | Field / flag |
 |--------|--------------|
 | Response body cap (decompression-bomb guard) | `maxResponseBytes` (default `0`, unbounded) |
+| WebSocket message cap | `websocket(..., maxMessageBytes)` (default `0`, unbounded) |
 | Per-phase timeouts | `timeouts.connect` / `.read` / `.total` (default `0`) |
 | TLS version floor/ceiling | `tls.minVersion` / `tls.maxVersion` |
 | TLS cipher restriction | `tls.ciphers` / `tls.cipherSuites` |
@@ -162,6 +163,12 @@ indefinitely, or spin.
   RST past it (`src/navi/proto/h2/conn.nim`).
 - **Oversized chunks / framing.** The HTTP/1.1 chunk size is bounded and HTTP/2
   frame/padding violations raise, as under Tampering.
+- **WebSocket frames / messages.** A single WebSocket frame is capped at 64 MiB
+  (always on) and a reserved opcode or an out-of-range 64-bit length fails the
+  connection (`src/navi/proto/ws.nim`). A *reassembled* message (across continuation
+  frames) is bounded by the **opt-in** `websocket(..., maxMessageBytes)`; past it navi
+  closes with 1009 and raises `WsMessageTooLarge`, so a peer cannot grow one message
+  without bound.
 - **`Retry-After` tarpit.** A `Retry-After` value is honored but clamped to
   `retry.maxDelay` (10 s default), so a server cannot park the client for hours
   (`src/navi/core/retry.nim`).
@@ -175,7 +182,8 @@ indefinitely, or spin.
 
 **Verified by:** `test_h2_hpack.nim` (decoded-list bomb), `test_h2_conn.nim` (DoS
 limits, flow control, padding), `test_entries.nim` and `test_stream_decompress.nim`
-(`maxResponseBytes`), `retry.nim` coverage in `test_async.nim`.
+(`maxResponseBytes`), `test_ws.nim` (frame/message caps, reserved opcode, oversized
+length), `retry.nim` coverage in `test_async.nim`.
 
 ### Elevation of Privilege
 

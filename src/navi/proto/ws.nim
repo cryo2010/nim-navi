@@ -6,9 +6,28 @@
 ## decoder handles both directions, so the same core drives a client and (in
 ## tests) a server.
 
-import std/[strutils, base64, random, times]
+import std/[strutils, base64]
 import checksums/sha1
 import ../core/[url, headers]
+
+# The masking key (RFC 6455 5.3) and the handshake nonce (4.1) must come from a
+# strong entropy source, so draw them from the OS CSPRNG via std/sysrand. sysrand
+# has no JavaScript target, but this module is native-only (the js backend uses the
+# runtime's WebSocket); the `js` branch is a dead-path fallback that only keeps a
+# `nim js` build compiling.
+when defined(js):
+  import std/random
+  var jsRng = initRand(0x6a09e667)
+  proc randomBytes(n: int): string =
+    result = newString(n)
+    for i in 0 ..< n: result[i] = char(jsRng.rand(255))
+else:
+  import std/sysrand
+  proc randomBytes(n: int): string =
+    ## `n` cryptographically-random bytes from the OS CSPRNG.
+    result = newString(n)
+    if n > 0 and not urandom(result.toOpenArrayByte(0, n - 1)):
+      raise newException(IOError, "navi: failed to read OS entropy for WebSocket")
 
 type
   Opcode* = enum
@@ -34,20 +53,17 @@ const
   closeNormal* = 1000'u16
   closeGoingAway* = 1001'u16
   closeProtocolError* = 1002'u16
+  closeMessageTooBig* = 1009'u16   ## RFC 6455 7.4.1: a message exceeded a size limit
   maxFramePayload* = 64 * 1024 * 1024
     ## Reject a single incoming frame larger than this (64 MiB). A 64-bit length
     ## with its high bit set (RFC 6455 5.2 forbids it) would otherwise become a
     ## negative `int` that slips past the bounds check and crashes `newString`.
 
-var rng = initRand(getTime().toUnix xor getTime().nanosecond)
-
 # --- opening handshake ---
 
 proc genKey*(): string =
   ## A fresh random 16-byte Sec-WebSocket-Key, base64-encoded (RFC 6455 4.1).
-  var raw = newString(16)
-  for i in 0 ..< 16: raw[i] = char(rng.rand(255))
-  base64.encode(raw)
+  base64.encode(randomBytes(16))
 
 proc acceptFor*(key: string): string =
   ## The Sec-WebSocket-Accept value for `key`: base64(SHA1(key + GUID)). Used by
@@ -81,8 +97,7 @@ proc encodeFrame*(opcode: Opcode, payload: string, masked = true,
   if masked:
     var key = maskKey
     if key.len != 4:
-      key = newString(4)
-      for i in 0 ..< 4: key[i] = char(rng.rand(255))
+      key = randomBytes(4)
     result.add key
     for i in 0 ..< n:
       result.add char(ord(payload[i]) xor ord(key[i mod 4]))
@@ -171,11 +186,25 @@ type
     kind: WsMessageKind
     buf: string
 
-proc offer*(a: var WsAssembler, f: Frame): WsOutcome =
+  WsMessageTooLarge* = object of CatchableError
+    ## Raised by `offer` when a reassembled message would exceed the caller's
+    ## `maxMessageBytes`. The caller should close with `closeMessageTooBig` (1009).
+
+proc offer*(a: var WsAssembler, f: Frame, maxMessageBytes = 0): WsOutcome =
   ## Feed one decoded frame. Handles fragmentation (text/binary + continuation)
   ## and the control frames: a ping asks for a pong, a close both yields a
   ## `wmClose` message and asks for a close echo. No I/O -- the caller sends any
   ## `reply` and surfaces `message` when `ready`.
+  ##
+  ## `maxMessageBytes` (0 = unlimited) bounds a *reassembled* message across its
+  ## fragments: the per-frame length cap does not, so without it a peer can grow the
+  ## buffer without limit via a stream of continuation frames. When the next frame
+  ## would push the message past the cap, `offer` raises `WsMessageTooLarge` before
+  ## buffering it.
+  template guardSize(add: int) =
+    if maxMessageBytes > 0 and a.buf.len + add > maxMessageBytes:
+      raise newException(WsMessageTooLarge,
+        "navi: WebSocket message exceeds maxMessageBytes (" & $maxMessageBytes & ")")
   case f.opcode
   of opPing:
     result.reply = wrPong
@@ -192,12 +221,15 @@ proc offer*(a: var WsAssembler, f: Frame): WsOutcome =
     result.message = WsMessage(kind: wmClose, closeCode: code,
       data: if f.payload.len > 2: f.payload[2 .. ^1] else: "")
   of opText, opBinary:
+    a.buf.setLen(0)                 # a new message starts here; drop any stale partial
+    guardSize(f.payload.len)
     a.kind = if f.opcode == opText: wmText else: wmBinary
     a.buf = f.payload
     if f.fin:
       result.ready = true
       result.message = WsMessage(kind: a.kind, data: a.buf)
   of opContinuation:
+    guardSize(f.payload.len)
     a.buf.add f.payload
     if f.fin:
       result.ready = true

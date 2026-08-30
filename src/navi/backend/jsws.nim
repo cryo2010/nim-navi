@@ -25,10 +25,17 @@ type
     queue: seq[WsMessage]           ## messages received before a `receive` awaited them
     resolve: proc(m: WsMessage)     ## resolver of a pending `receive`, or nil
     open: bool
+    maxMessageBytes: int            ## cap on a received message; 0 = unlimited
+
+  WsMessageTooLarge* = object of CatchableError
+    ## Raised by `receive` when a message exceeds `maxMessageBytes`. On js the
+    ## runtime has already buffered it (and applies its own limit), so this is an
+    ## API-consistency check with the native backends rather than a memory guard.
 
 const
   closeNormal* = 1000'u16
   closeGoingAway* = 1001'u16
+  closeMessageTooBig* = 1009'u16
 
 # --- native WebSocket bindings ---
 proc jsNewSocket(url: cstring): JsObject {.importjs: "new WebSocket(#)".}
@@ -76,11 +83,11 @@ proc deliver(ws: WebSocket, m: WsMessage) =
   else:
     ws.queue.add(m)
 
-proc openWebSocket*(url: string): Future[WebSocket] {.async.} =
+proc openWebSocket*(url: string, maxMessageBytes = 0): Future[WebSocket] {.async.} =
   ## Construct the native WebSocket and resolve once it opens (or raise on error).
   let raw = jsNewSocket(cstring(url))
   jsSetBinary(raw)
-  let ws = WebSocket(raw: raw)
+  let ws = WebSocket(raw: raw, maxMessageBytes: maxMessageBytes)
   jsAddMessage(raw, proc(ev: JsObject) =
     if dataIsString(ev):
       ws.deliver(WsMessage(kind: wmText, data: $dataAsString(ev)))
@@ -105,13 +112,23 @@ proc send*(ws: WebSocket, data: string, binary = false): Future[void] {.async.} 
 
 proc receive*(ws: WebSocket): Future[WsMessage] {.async.} =
   ## Await the next message. Ping/pong are handled by the runtime; a close
-  ## arrives as `wmClose`.
+  ## arrives as `wmClose`. A message over `maxMessageBytes` closes with 1009 and
+  ## raises `WsMessageTooLarge`.
+  var m: WsMessage
   if ws.queue.len > 0:
-    result = ws.queue[0]
+    m = ws.queue[0]
     ws.queue.delete(0)
   else:
-    result = await newPromise(proc(resolve: proc(m: WsMessage)) =
+    m = await newPromise(proc(resolve: proc(msg: WsMessage)) =
       ws.resolve = resolve)
+  if ws.maxMessageBytes > 0 and m.kind != wmClose and
+     m.data.len > ws.maxMessageBytes:
+    if ws.open:
+      ws.open = false
+      ws.raw.jsClose(int(closeMessageTooBig), "")
+    raise newException(WsMessageTooLarge,
+      "navi: WebSocket message exceeds maxMessageBytes (" & $ws.maxMessageBytes & ")")
+  return m
 
 proc close*(ws: WebSocket, code = closeNormal, reason = ""): Future[void] {.async.} =
   ## Close the connection. Idempotent. Returns a Future to match the native

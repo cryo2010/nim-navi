@@ -98,7 +98,7 @@ discard main()
 - **Proxy:** http absolute-URI, https CONNECT (with Proxy-Authorization), and SOCKS5
 - **Unix domain sockets** (native backends, POSIX): dial a socket path instead of TCP
 - **TLS controls:** custom/in-memory CA, mTLS, version and cipher pinning, SPKI certificate pinning, and a custom verify callback
-- **WebSockets** (RFC 6455) text and binary messages, fragmentation reassembly, and automatic ping/pong
+- **WebSockets** (RFC 6455) text and binary messages, fragmentation reassembly, automatic ping/pong, a message-size cap, and optional keepalive
 
 ## Install
 
@@ -893,6 +893,24 @@ await ws.close()
 is the payload (or the reason on a close); `closeCode` is set on `wmClose`. navi
 answers pings automatically and reassembles fragmented messages, so `receive` always
 yields a whole message. Middleware does not apply to `websocket()`.
+
+Pass `maxMessageBytes` to bound a reassembled message; a peer can otherwise grow a
+single message without limit via continuation frames. When a message exceeds the cap,
+`receive` closes the connection with code 1009 (Message Too Big) and raises
+`WsMessageTooLarge`. It is `0` (unlimited) by default, so set it for untrusted servers.
+
+Pass `keepAlive` (ms) to detect a dead peer: while a `receive` is in progress, navi
+sends a ping after that long with no data and, if another interval passes with still
+nothing back, closes the connection and raises `TimeoutError`. It is `0` (off) by
+default, and is a no-op on `navi/js` (the runtime manages its own keepalive).
+
+```nim
+let ws = api.websocket("wss://example.com/socket",
+                       maxMessageBytes = 8 * 1024 * 1024, keepAlive = 30_000)
+```
+
+The masking key for each client frame and the handshake nonce come from the OS CSPRNG
+(`std/sysrand`), per RFC 6455.
 
 On `navi/js` the WebSocket wraps the runtime's native one, so custom handshake
 `headers` are ignored and the runtime handles ping/pong; the send/receive/close

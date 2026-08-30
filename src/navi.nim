@@ -808,7 +808,8 @@ proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
 
 # --- WebSocket (RFC 6455) ---
 
-export ws.WsMessage, ws.WsMessageKind, ws.closeNormal, ws.closeGoingAway
+export ws.WsMessage, ws.WsMessageKind, ws.closeNormal, ws.closeGoingAway,
+       ws.closeMessageTooBig, ws.WsMessageTooLarge
 
 type
   WebSocket* = ref object
@@ -816,6 +817,9 @@ type
     dec: WsDecoder
     asmb: WsAssembler
     open: bool
+    maxMessageBytes: int      ## cap on a reassembled message; 0 = unlimited
+    keepAlive: int            ## ms between keepalive pings while receiving; 0 = off
+    pingOutstanding: bool      ## a keepalive ping is awaiting any inbound byte
 
 proc toWsUrl(url: string): Url =
   var s = url
@@ -823,10 +827,20 @@ proc toWsUrl(url: string): Url =
   elif s.startsWith("wss://"): s = "https://" & s["wss://".len .. ^1]
   parseUrl(s)
 
-proc websocket*(client: Navi, url: string, headers = initHeaders()): WebSocket =
+proc websocket*(client: Navi, url: string, headers = initHeaders(),
+                maxMessageBytes = 0, keepAlive = 0): WebSocket =
   ## Open a WebSocket connection (RFC 6455). Accepts `ws://` / `wss://` (or
   ## http/https); `wss` uses TLS. Does the HTTP/1.1 Upgrade over the transport and
   ## validates `Sec-WebSocket-Accept`. Use `send`, `receive`, and `close`.
+  ##
+  ## `maxMessageBytes` (0 = unlimited) caps a reassembled message: past it `receive`
+  ## closes with 1009 and raises `WsMessageTooLarge`. Set it for untrusted servers,
+  ## since a peer can otherwise grow one message without bound via continuation frames.
+  ##
+  ## `keepAlive` (ms, 0 = off) sends a ping after that long with no data *while a
+  ## `receive` is in progress*, and raises `TimeoutError` (closing the connection) if
+  ## another interval passes with still nothing back -- so a dead peer is detected
+  ## instead of blocking forever.
   let u = toWsUrl(url)
   let conn = connect(u.host, u.port, u.isTls, client.config.tls,
                      resolveProxy(client.config, u), @[], client.config.connectMs)
@@ -849,7 +863,8 @@ proc websocket*(client: Navi, url: string, headers = initHeaders()): WebSocket =
   if not validate101(buf[0 ..< headEnd], key):
     raise newException(IOError, "navi: websocket upgrade rejected: " &
       buf[0 ..< headEnd].splitLines[0])
-  result = WebSocket(conn: conn, open: true)
+  result = WebSocket(conn: conn, open: true, maxMessageBytes: maxMessageBytes,
+                     keepAlive: keepAlive)
   if buf.len > headEnd:                 # server frames already buffered
     result.dec.feed(buf[headEnd .. ^1])
   handshakeOk = true
@@ -861,18 +876,43 @@ proc send*(ws: WebSocket, data: string, binary = false) =
 proc ping*(ws: WebSocket, data = "") =
   ws.conn.sendAll(encodeFrame(opPing, data))
 
+proc kaRecv(ws: WebSocket): string =
+  ## One read chunk. With keepalive off, a plain (blocking) read. With it on, poll
+  ## for data within the interval; on an idle interval send a ping, and on a second
+  ## idle interval with a ping already outstanding, declare the peer dead.
+  if ws.keepAlive <= 0: return ws.conn.recvSome()
+  while true:
+    if ws.conn.dataWaiting(ws.keepAlive):
+      ws.pingOutstanding = false          # any inbound byte proves liveness
+      return ws.conn.recvSome()
+    if ws.pingOutstanding:                 # pinged last interval, still nothing back
+      ws.open = false
+      try: ws.conn.close() except CatchableError: discard
+      raise newException(TimeoutError, "navi: websocket keepalive timed out")
+    ws.conn.sendAll(encodeFrame(opPing, ""))
+    ws.pingOutstanding = true
+
 proc receive*(ws: WebSocket): WsMessage =
   ## Block until a full message arrives, answering pings and reassembling
   ## fragments. A close returns `wmClose` (and the connection is then closed).
   while true:
     var f: Frame
     while not ws.dec.next(f):
-      let chunk = ws.conn.recvSome()
+      let chunk = ws.kaRecv()
       if chunk.len == 0:
         ws.open = false
         return WsMessage(kind: wmClose, closeCode: closeGoingAway)
       ws.dec.feed(chunk)
-    let o = ws.asmb.offer(f)
+    var o: WsOutcome
+    try:
+      o = ws.asmb.offer(f, ws.maxMessageBytes)
+    except WsMessageTooLarge:
+      if ws.open:      # tell the peer why (1009), then drop the connection
+        try: ws.conn.sendAll(encodeFrame(opClose, closePayload(closeMessageTooBig)))
+        except CatchableError: discard
+        ws.open = false
+        ws.conn.close()
+      raise
     case o.reply
     of wrPong:
       ws.conn.sendAll(encodeFrame(opPong, o.replyPayload))

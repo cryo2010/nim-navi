@@ -17,6 +17,20 @@ onward (pre-1.0, minor versions may include breaking changes).
   trailers; setting them raises). Sync, asyncdispatch, and chronos backends.
 - **HTTP/3 response trailers.** `res.trailers` now also surfaces the trailing HEADERS
   section of an HTTP/3 response, matching the existing HTTP/1.1 and HTTP/2 support.
+- **WebSocket message-size cap.** `websocket(..., maxMessageBytes)` bounds a
+  reassembled message across its fragments (the per-frame 64 MiB cap did not); past
+  it `receive` closes with 1009 and raises `WsMessageTooLarge`. `0` (default) is
+  unlimited. On `navi/js` it is a delivery-time check for parity.
+- **WebSocket keepalive.** `websocket(..., keepAlive)` (ms) pings after an idle
+  interval while a `receive` is in progress and raises `TimeoutError` (closing the
+  connection) if another interval passes with no response, so a dead peer is detected
+  instead of blocking forever. `0` (default) is off; a no-op on `navi/js`.
+
+### Changed
+- WebSocket masking keys and the handshake nonce now come from the OS CSPRNG
+  (`std/sysrand`) instead of a time-seeded `std/random`, matching RFC 6455 5.3's
+  requirement of a strong entropy source (native backends; `navi/js` uses the
+  runtime's WebSocket).
 
 ### Fixed
 - HTTP/3: certificate verification now runs after the handshake completes (checking

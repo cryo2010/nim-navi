@@ -120,10 +120,36 @@ suite "websocket message assembly":
     check o.message.data == "bye"
     check o.reply == wrCloseEcho
 
+  test "the assembler should reject a single frame over maxMessageBytes":
+    var a: WsAssembler
+    expect WsMessageTooLarge:
+      discard a.offer(Frame(fin: true, opcode: opText, payload: "toolong"),
+                      maxMessageBytes = 4)
+
+  test "the assembler should reject a fragmented message that grows past maxMessageBytes":
+    var a: WsAssembler
+    check not a.offer(Frame(fin: false, opcode: opText, payload: "aaaa"),
+                      maxMessageBytes = 6).ready
+    expect WsMessageTooLarge:                    # 4 + 3 = 7 > 6, before buffering
+      discard a.offer(Frame(fin: true, opcode: opContinuation, payload: "bbb"),
+                      maxMessageBytes = 6)
+
+  test "the assembler should accept a message exactly at maxMessageBytes":
+    var a: WsAssembler
+    let o = a.offer(Frame(fin: true, opcode: opText, payload: "12345"),
+                    maxMessageBytes = 5)
+    check o.ready and o.message.data == "12345"
+
+  test "maxMessageBytes of 0 should impose no limit":
+    var a: WsAssembler
+    let o = a.offer(Frame(fin: true, opcode: opText, payload: repeat("x", 100_000)))
+    check o.ready and o.message.data.len == 100_000
+
 # End-to-end: navi's sync WebSocket client against an in-process echo server
 # built from the same sans-io core (server frames unmasked).
 import std/[net, os]
 import navi
+import navi/core/response   # navi's TimeoutError (qualified; std/net has one too)
 
 var wsReady: bool
 
@@ -178,6 +204,68 @@ proc wsEcho(port: int) {.thread.} =
   c.close()
   server.close()
 
+proc wsSilent(port: int) {.thread.} =
+  ## Handshake, then never respond (ignore pings). Reads and discards until the
+  ## client closes -- so a client with keepalive must time out and drop us.
+  var srv = newSocket(buffered = false)
+  srv.setSockOpt(OptReuseAddr, true)
+  srv.bindAddr(Port(port), "127.0.0.1")
+  srv.listen()
+  wsReady = true
+  var c: Socket
+  srv.accept(c)
+  var head = ""
+  while "\r\n\r\n" notin head: head.add c.recv(1)
+  var key = ""
+  for line in head.splitLines:
+    let i = line.find(':')
+    if i > 0 and cmpIgnoreCase(line[0 ..< i].strip, "sec-websocket-key") == 0:
+      key = line[i + 1 .. ^1].strip
+  c.send("HTTP/1.1 101 Switching Protocols\r\n" &
+         "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
+         "Sec-WebSocket-Accept: " & acceptFor(key) & "\r\n\r\n")
+  while c.recv(4096).len > 0: discard    # swallow the pings; never pong
+  c.close(); srv.close()
+
+proc wsPingCounter(port: int) {.thread.} =
+  ## Handshake, pong every ping, and after the second ping send a text message --
+  ## so a client with keepalive stays alive across pings and finally receives it.
+  var srv = newSocket(buffered = false)
+  srv.setSockOpt(OptReuseAddr, true)
+  srv.bindAddr(Port(port), "127.0.0.1")
+  srv.listen()
+  wsReady = true
+  var c: Socket
+  srv.accept(c)
+  var head = ""
+  while "\r\n\r\n" notin head: head.add c.recv(1)
+  var key = ""
+  for line in head.splitLines:
+    let i = line.find(':')
+    if i > 0 and cmpIgnoreCase(line[0 ..< i].strip, "sec-websocket-key") == 0:
+      key = line[i + 1 .. ^1].strip
+  c.send("HTTP/1.1 101 Switching Protocols\r\n" &
+         "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
+         "Sec-WebSocket-Accept: " & acceptFor(key) & "\r\n\r\n")
+  var dec: WsDecoder
+  var pings = 0
+  var running = true
+  while running:
+    var f: Frame
+    while not dec.next(f):
+      let chunk = c.recv(4096)
+      if chunk.len == 0: running = false; break
+      dec.feed(chunk)
+    if not running: break
+    case f.opcode
+    of opPing:
+      c.send(encodeFrame(opPong, f.payload, masked = false))
+      inc pings
+      if pings == 2: c.send(encodeFrame(opText, "alive", masked = false))
+    of opClose: running = false
+    else: discard
+  c.close(); srv.close()
+
 suite "websocket client end to end":
   test "the WebSocket client should handshake, echo text and binary, reassemble fragments, and close":
     const port = 9240
@@ -209,4 +297,48 @@ suite "websocket client end to end":
     check m4.kind == wmClose
     check m4.closeCode == closeNormal
     ws.close()                                 # idempotent: connection already closed
+    joinThread(th)
+
+  test "receive should raise WsMessageTooLarge when a message exceeds maxMessageBytes":
+    const port = 9241
+    wsReady = false
+    var th: Thread[int]
+    createThread(th, wsEcho, port)
+    while not wsReady: sleep(5)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat", maxMessageBytes = 8)
+    ws.send(repeat("x", 100))                  # sending is not capped; the echo is
+    expect WsMessageTooLarge:
+      discard ws.receive()                     # 100-byte echo > 8-byte cap -> raises + 1009
+    ws.close()                                 # idempotent no-op: already dropped on 1009
+    joinThread(th)
+
+suite "websocket keepalive":
+  test "receive should raise TimeoutError when keepalive gets no response":
+    const port = 9242
+    wsReady = false
+    var th: Thread[int]
+    createThread(th, wsSilent, port)
+    while not wsReady: sleep(5)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat", keepAlive = 40)
+    expect response.TimeoutError:
+      discard ws.receive()                     # ping at 40ms, dead at 80ms (no pong)
+    joinThread(th)
+
+  test "keepalive should keep the connection alive across pings until a message arrives":
+    const port = 9243
+    wsReady = false
+    var th: Thread[int]
+    createThread(th, wsPingCounter, port)
+    while not wsReady: sleep(5)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat", keepAlive = 40)
+    let m = ws.receive()                       # pinged twice (each ponged), then "alive"
+    check m.kind == wmText
+    check m.data == "alive"
+    ws.close()
     joinThread(th)

@@ -10,6 +10,8 @@ import navi/proto/ws        # server-side codec helpers
 var wsReady: bool
 var stallReady: bool
 var stallPort: int      # ephemeral port the stall server bound, for the client URL
+var silentReady: bool
+var silentPort: int     # ephemeral port the silent (keepalive) server bound
 
 proc wsStall() {.thread.} =
   ## Accept the connection and read the upgrade request, but never send the 101
@@ -81,6 +83,30 @@ proc wsEcho(port: int) {.thread.} =
   c.close()
   server.close()
 
+proc wsSilent() {.thread.} =
+  ## Handshake, then never respond (ignore pings), reading and discarding until the
+  ## client gives up -- so a client with keepalive must time out and drop us.
+  var server = newSocket(buffered = false)
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(0), "127.0.0.1")     # ephemeral: no cross-iteration collision
+  server.listen()
+  silentPort = server.getLocalAddr()[1].int
+  silentReady = true
+  var c: Socket
+  server.accept(c)
+  var head = ""
+  while "\r\n\r\n" notin head: head.add c.recv(1)
+  var key = ""
+  for line in head.splitLines:
+    let i = line.find(':')
+    if i > 0 and cmpIgnoreCase(line[0 ..< i].strip, "sec-websocket-key") == 0:
+      key = line[i + 1 .. ^1].strip
+  c.send("HTTP/1.1 101 Switching Protocols\r\n" &
+         "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
+         "Sec-WebSocket-Accept: " & acceptFor(key) & "\r\n\r\n")
+  while c.recv(4096).len > 0: discard
+  c.close(); server.close()
+
 suite "chronos websocket client end to end":
   test "the WebSocket client should handshake, echo text and binary, reassemble fragments, and close":
     const port = 9243
@@ -128,6 +154,26 @@ suite "chronos websocket client end to end":
       except CatchableError as e:
         # navi raises its own TimeoutError; match by name to avoid the
         # std/net vs navi ambiguity on the bare type.
+        return (if $e.name == "TimeoutError": "timeout" else: "other:" & $e.name)
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == "timeout"
+
+  test "keepalive should time out when the peer never responds":
+    silentReady = false
+    var th: Thread[void]
+    createThread(th, wsSilent)
+    while not silentReady: os.sleep(5)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $silentPort & "/",
+                                   keepAlive = 40)
+      try:
+        discard await ws.receive()             # ping at 40ms, dead at 80ms (no pong)
+        return "received"
+      except CatchableError as e:
         return (if $e.name == "TimeoutError": "timeout" else: "other:" & $e.name)
 
     let outcome = waitFor run()
