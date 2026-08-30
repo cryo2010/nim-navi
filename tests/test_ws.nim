@@ -224,7 +224,9 @@ proc wsSilent(port: int) {.thread.} =
   c.send("HTTP/1.1 101 Switching Protocols\r\n" &
          "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
          "Sec-WebSocket-Accept: " & acceptFor(key) & "\r\n\r\n")
-  while c.recv(4096).len > 0: discard    # swallow the pings; never pong
+  try:                                   # swallow the pings; never pong. An abrupt
+    while c.recv(4096).len > 0: discard  # client close can raise here rather than
+  except CatchableError: discard         # returning EOF; don't die in-thread (ASan)
   c.close(); srv.close()
 
 proc wsPingCounter(port: int) {.thread.} =

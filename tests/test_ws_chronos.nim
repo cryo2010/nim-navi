@@ -104,7 +104,9 @@ proc wsSilent() {.thread.} =
   c.send("HTTP/1.1 101 Switching Protocols\r\n" &
          "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
          "Sec-WebSocket-Accept: " & acceptFor(key) & "\r\n\r\n")
-  while c.recv(4096).len > 0: discard
+  try:                                   # an abrupt client close can raise here
+    while c.recv(4096).len > 0: discard  # rather than returning EOF; don't die
+  except CatchableError: discard         # in-thread (trips AddressSanitizer's join)
   c.close(); server.close()
 
 suite "chronos websocket client end to end":

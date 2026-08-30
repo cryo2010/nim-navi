@@ -80,7 +80,12 @@ proc wsSilent(port: int) {.thread.} =
   c.send("HTTP/1.1 101 Switching Protocols\r\n" &
          "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
          "Sec-WebSocket-Accept: " & acceptFor(key) & "\r\n\r\n")
-  while c.recv(4096).len > 0: discard
+  # An abrupt client close (the keepalive-death path) can surface as a recv error
+  # rather than EOF; swallow it so the thread never dies by unhandled exception
+  # (which trips AddressSanitizer's join check).
+  try:
+    while c.recv(4096).len > 0: discard
+  except CatchableError: discard
   c.close(); server.close()
 
 suite "async websocket client end to end":
