@@ -300,7 +300,7 @@ suite "websocket client end to end":
     joinThread(th)
 
   test "receive should raise WsMessageTooLarge when a message exceeds maxMessageBytes":
-    const port = 9241
+    const port = 9245   # distinct from every other test file's port (concurrent runs)
     wsReady = false
     var th: Thread[int]
     createThread(th, wsEcho, port)
@@ -329,14 +329,16 @@ suite "websocket keepalive":
     joinThread(th)
 
   test "keepalive should keep the connection alive across pings until a message arrives":
-    const port = 9243
+    const port = 9247   # distinct from every other test file's port (concurrent runs)
     wsReady = false
     var th: Thread[int]
     createThread(th, wsPingCounter, port)
     while not wsReady: sleep(5)
 
     let api = newNavi()
-    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat", keepAlive = 40)
+    # A generous interval: the server must pong within it, and CI thread scheduling
+    # is jittery, so 40ms could false-trip the liveness check on a loaded runner.
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat", keepAlive = 200)
     let m = ws.receive()                       # pinged twice (each ponged), then "alive"
     check m.kind == wmText
     check m.data == "alive"
