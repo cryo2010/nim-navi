@@ -138,4 +138,3 @@ suite "async websocket client end to end":
 
     waitFor run2()
     joinThread(th)
-    joinThread(th)
