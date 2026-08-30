@@ -109,6 +109,54 @@ proc wsSilent() {.thread.} =
   except CatchableError: discard         # in-thread (trips AddressSanitizer's join)
   c.close(); server.close()
 
+proc wsStreamEcho(port: int) {.thread.} =
+  ## Reassembles messages and, on "fragment", replies with a 3-fragment message;
+  ## otherwise echoes the whole message as one frame.
+  var server = newSocket(buffered = false)
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(port), "127.0.0.1")
+  server.listen()
+  wsReady = true
+  var c: Socket
+  server.accept(c)
+  var head = ""
+  while "\r\n\r\n" notin head: head.add c.recv(1)
+  var key = ""
+  for line in head.splitLines:
+    let i = line.find(':')
+    if i > 0 and cmpIgnoreCase(line[0 ..< i].strip, "sec-websocket-key") == 0:
+      key = line[i + 1 .. ^1].strip
+  c.send("HTTP/1.1 101 Switching Protocols\r\n" &
+         "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
+         "Sec-WebSocket-Accept: " & acceptFor(key) & "\r\n\r\n")
+  var dec: WsDecoder
+  var asmb: WsAssembler
+  var running = true
+  while running:
+    var f: Frame
+    while not dec.next(f):
+      let chunk = c.recv(4096)
+      if chunk.len == 0: running = false; break
+      dec.feed(chunk)
+    if not running: break
+    let o = asmb.offer(f)
+    case o.reply
+    of wrPong: c.send(encodeFrame(opPong, o.replyPayload, masked = false))
+    of wrCloseEcho: running = false
+    of wrNone: discard
+    if o.ready:
+      case o.message.kind
+      of wmText:
+        if o.message.data == "fragment":
+          c.send(encodeFrame(opText, "one", masked = false, fin = false))
+          c.send(encodeFrame(opContinuation, "-two", masked = false, fin = false))
+          c.send(encodeFrame(opContinuation, "-three", masked = false, fin = true))
+        else:
+          c.send(encodeFrame(opText, o.message.data, masked = false))
+      of wmBinary: c.send(encodeFrame(opBinary, o.message.data, masked = false))
+      of wmClose: running = false
+  c.close(); server.close()
+
 suite "chronos websocket client end to end":
   test "the WebSocket client should handshake, echo text and binary, reassemble fragments, and close":
     const port = 9243
@@ -181,3 +229,31 @@ suite "chronos websocket client end to end":
     let outcome = waitFor run()
     joinThread(th)
     check outcome == "timeout"
+
+  test "stream()/stream(writer) should read and write a message as fragments":
+    const port = 9252
+    wsReady = false
+    var th: Thread[int]
+    createThread(th, wsStreamEcho, port)
+    while not wsReady: os.sleep(5)
+
+    proc run(): Future[tuple[chunks: seq[string], echoed: string]] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("fragment")
+      let reader = await ws.stream()
+      doAssert reader.kind == wmText
+      var got: seq[string]                       # a local, not `result` (captured by each)
+      reader.each(chunk):
+        got.add chunk
+      ws.stream(writer):
+        for part in @["aa", "bb", "cc"]:
+          await writer.write(part)
+      let echoed = (await ws.receive()).data
+      await ws.close()
+      return (got, echoed)
+
+    let (chunks, echoed) = waitFor run()
+    joinThread(th)
+    check chunks == @["one", "-two", "-three"]
+    check echoed == "aabbcc"

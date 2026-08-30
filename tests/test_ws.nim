@@ -268,6 +268,111 @@ proc wsPingCounter(port: int) {.thread.} =
     else: discard
   c.close(); srv.close()
 
+proc wsStreamEcho(port: int) {.thread.} =
+  ## Reassembles messages (so it can receive a client's streamed/fragmented upload)
+  ## and, on the text trigger "fragment", replies with a 3-fragment message (so the
+  ## client can stream it back in); otherwise echoes the whole message as one frame.
+  var srv = newSocket(buffered = false)
+  srv.setSockOpt(OptReuseAddr, true)
+  srv.bindAddr(Port(port), "127.0.0.1")
+  srv.listen()
+  wsReady = true
+  var c: Socket
+  srv.accept(c)
+  var head = ""
+  while "\r\n\r\n" notin head: head.add c.recv(1)
+  var key = ""
+  for line in head.splitLines:
+    let i = line.find(':')
+    if i > 0 and cmpIgnoreCase(line[0 ..< i].strip, "sec-websocket-key") == 0:
+      key = line[i + 1 .. ^1].strip
+  c.send("HTTP/1.1 101 Switching Protocols\r\n" &
+         "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
+         "Sec-WebSocket-Accept: " & acceptFor(key) & "\r\n\r\n")
+  var dec: WsDecoder
+  var asmb: WsAssembler
+  var running = true
+  while running:
+    var f: Frame
+    while not dec.next(f):
+      let chunk = c.recv(4096)
+      if chunk.len == 0: running = false; break
+      dec.feed(chunk)
+    if not running: break
+    let o = asmb.offer(f)
+    case o.reply
+    of wrPong: c.send(encodeFrame(opPong, o.replyPayload, masked = false))
+    of wrCloseEcho: running = false
+    of wrNone: discard
+    if o.ready:
+      case o.message.kind
+      of wmText:
+        if o.message.data == "fragment":
+          c.send(encodeFrame(opText, "one", masked = false, fin = false))
+          c.send(encodeFrame(opContinuation, "-two", masked = false, fin = false))
+          c.send(encodeFrame(opContinuation, "-three", masked = false, fin = true))
+        else:
+          c.send(encodeFrame(opText, o.message.data, masked = false))
+      of wmBinary: c.send(encodeFrame(opBinary, o.message.data, masked = false))
+      of wmClose: running = false
+  c.close(); srv.close()
+
+suite "websocket streaming":
+  test "stream() should read a fragmented message chunk by chunk":
+    const port = 9248
+    wsReady = false
+    var th: Thread[int]
+    createThread(th, wsStreamEcho, port)
+    while not wsReady: sleep(5)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("fragment")                        # server replies with 3 fragments
+    let reader = ws.stream()
+    check reader.kind == wmText
+    var chunks: seq[string]
+    reader.each(chunk):
+      chunks.add chunk
+    check chunks == @["one", "-two", "-three"]  # one chunk per frame, not reassembled
+    ws.close()
+    joinThread(th)
+
+  test "stream(writer) should send a message as fragments the peer reassembles":
+    const port = 9249
+    wsReady = false
+    var th: Thread[int]
+    createThread(th, wsStreamEcho, port)
+    while not wsReady: sleep(5)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.stream(writer):                          # finish() auto-sent at block exit
+      for part in @["aa", "bb", "cc"]:
+        writer.write(part)
+    let m = ws.receive()                        # server reassembled + echoed it whole
+    check m.kind == wmText
+    check m.data == "aabbcc"
+    ws.close()
+    joinThread(th)
+
+  test "streamBinary(writer) should send a binary fragmented message":
+    const port = 9250
+    wsReady = false
+    var th: Thread[int]
+    createThread(th, wsStreamEcho, port)
+    while not wsReady: sleep(5)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.streamBinary(writer):
+      writer.write("\x00\x01")
+      writer.write("\x02\xff")
+    let m = ws.receive()
+    check m.kind == wmBinary
+    check m.data == "\x00\x01\x02\xff"
+    ws.close()
+    joinThread(th)
+
 suite "websocket client end to end":
   test "the WebSocket client should handshake, echo text and binary, reassemble fragments, and close":
     const port = 9240
