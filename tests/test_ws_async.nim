@@ -5,6 +5,7 @@ import unittest
 import std/[net, os, strutils]
 import navi/asyncdispatch
 import navi/proto/ws        # server-side codec helpers
+import navi/core/response   # navi's TimeoutError (qualified; std/net has one too)
 
 var wsReady: bool
 
@@ -59,6 +60,34 @@ proc wsEcho(port: int) {.thread.} =
   c.close()
   server.close()
 
+proc wsSilent(port: int) {.thread.} =
+  ## Handshake, then never respond (ignore pings), reading and discarding until the
+  ## client gives up -- so a client with keepalive must time out and drop us.
+  var server = newSocket(buffered = false)
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(port), "127.0.0.1")
+  server.listen()
+  wsReady = true
+  var c: Socket
+  server.accept(c)
+  var head = ""
+  while "\r\n\r\n" notin head: head.add c.recv(1)
+  var key = ""
+  for line in head.splitLines:
+    let i = line.find(':')
+    if i > 0 and cmpIgnoreCase(line[0 ..< i].strip, "sec-websocket-key") == 0:
+      key = line[i + 1 .. ^1].strip
+  c.send("HTTP/1.1 101 Switching Protocols\r\n" &
+         "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
+         "Sec-WebSocket-Accept: " & acceptFor(key) & "\r\n\r\n")
+  # An abrupt client close (the keepalive-death path) can surface as a recv error
+  # rather than EOF; swallow it so the thread never dies by unhandled exception
+  # (which trips AddressSanitizer's join check).
+  try:
+    while c.recv(4096).len > 0: discard
+  except CatchableError: discard
+  c.close(); server.close()
+
 suite "async websocket client end to end":
   test "the WebSocket client should handshake, echo text and binary, reassemble fragments, and close":
     const port = 9241
@@ -93,4 +122,19 @@ suite "async websocket client end to end":
       await ws.close()
 
     waitFor run()
+
+  test "keepalive should raise TimeoutError when the peer never responds":
+    const port = 9244
+    wsReady = false
+    var th: Thread[int]
+    createThread(th, wsSilent, port)
+    while not wsReady: os.sleep(5)
+
+    proc run2() {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat", keepAlive = 40)
+      expect response.TimeoutError:
+        discard await ws.receive()             # ping at 40ms, dead at 80ms (no pong)
+
+    waitFor run2()
     joinThread(th)
