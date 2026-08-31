@@ -933,3 +933,152 @@ proc close*(ws: WebSocket, code = closeNormal, reason = "") =
   except CatchableError: discard
   ws.open = false
   ws.conn.close()
+
+# --- WebSocket streaming (a large message, one frame at a time) ---
+
+type
+  WsReader* = ref object
+    ## A message being received incrementally. `kind` is the message type (or
+    ## `wmClose` if a close arrived instead). Consume with `each`/`readChunk`.
+    ws: WebSocket
+    kind*: WsMessageKind
+    first: string            ## the first data frame's payload, buffered by `stream`
+    hasFirst: bool
+    done: bool               ## the fin frame has been consumed
+  WsWriter* = ref object
+    ## A message being sent incrementally. `write` each fragment; the final frame is
+    ## sent by the `stream` block on exit.
+    ws: WebSocket
+    binary: bool
+    started: bool
+
+proc readDataFrame(ws: WebSocket): Frame =
+  ## The next non-control frame (data / continuation / close), answering pings along
+  ## the way; keepalive applies (via `kaRecv`). A transport EOF yields a close frame.
+  while true:
+    var f: Frame
+    while not ws.dec.next(f):
+      let chunk = ws.kaRecv()
+      if chunk.len == 0:
+        ws.open = false
+        return Frame(fin: true, opcode: opClose, payload: "")
+      ws.dec.feed(chunk)
+    case f.opcode
+    of opPing: ws.conn.sendAll(encodeFrame(opPong, f.payload)); continue
+    of opPong: continue
+    else: return f
+
+proc closeOnFrame(ws: WebSocket, f: Frame) =
+  ## Echo a peer close and drop the transport (used when a close interrupts a stream).
+  if ws.open:
+    try: ws.conn.sendAll(encodeFrame(opClose, f.payload))
+    except CatchableError: discard
+    ws.open = false
+    ws.conn.close()
+
+proc openStreamReader(ws: WebSocket): WsReader =
+  ## Impl of the no-arg `ws.stream()`; kept a proc so the public `stream` is a
+  ## template (a proc + template overload would force early symbol resolution of the
+  ## `stream(writer)` block's injected identifier).
+  result = WsReader(ws: ws)
+  let f = ws.readDataFrame()
+  case f.opcode
+  of opText, opBinary:
+    result.kind = if f.opcode == opText: wmText else: wmBinary
+    result.first = f.payload
+    result.hasFirst = true
+    result.done = f.fin
+  of opClose:
+    result.kind = wmClose
+    result.done = true
+    ws.closeOnFrame(f)
+  else:
+    raise newException(IOError, "navi: WebSocket message started with a continuation frame")
+
+proc readChunk*(r: WsReader): string =
+  ## The next chunk of the streamed message (one frame's payload), or "" at its end.
+  if r.hasFirst:
+    r.hasFirst = false
+    return r.first
+  if r.done: return ""
+  let f = r.ws.readDataFrame()
+  case f.opcode
+  of opContinuation:
+    r.done = f.fin
+    return f.payload
+  of opClose:                # a close interrupted the message: truncate and drop
+    r.done = true
+    r.ws.closeOnFrame(f)
+    return ""
+  else:
+    raise newException(IOError, "navi: expected a continuation frame mid-message")
+
+proc drain*(r: WsReader, sink: BodySink) =
+  ## Deliver the message's chunks to `sink`, leaving the WebSocket ready for the next
+  ## message. On a sink error the connection is closed (a half-read message cannot be
+  ## resumed) and the error re-raised. Prefer the `each` template.
+  try:
+    while true:
+      let chunk = r.readChunk()
+      if chunk.len == 0: break
+      sink(chunk)
+  except CatchableError:
+    r.ws.open = false
+    try: r.ws.conn.close()
+    except CatchableError: discard
+    raise
+
+template each*(r: WsReader; chunk, body: untyped): untyped =
+  ## Run `body` for each chunk of the streamed message, with `chunk` bound to it.
+  ## Like `StreamResponse.each`, `body` runs as a proc, so `break`/`continue`/`return`
+  ## cannot escape it; raise to stop early (which closes the connection).
+  r.drain(proc(chunk: string) {.raises: [CatchableError].} = body)
+
+proc write*(w: WsWriter, data: string) =
+  ## Append a fragment to the message being streamed out.
+  if not w.started:
+    w.ws.conn.sendAll(encodeFrame(if w.binary: opBinary else: opText, data, fin = false))
+    w.started = true
+  else:
+    w.ws.conn.sendAll(encodeFrame(opContinuation, data, fin = false))
+
+proc finishWrite(w: WsWriter) =
+  ## Send the terminating fin frame (an empty continuation, or an empty text/binary
+  ## frame for a message with no `write`s).
+  if not w.started:
+    w.ws.conn.sendAll(encodeFrame(if w.binary: opBinary else: opText, "", fin = true))
+  else:
+    w.ws.conn.sendAll(encodeFrame(opContinuation, "", fin = true))
+
+template stream*(ws: WebSocket): WsReader =
+  ## Begin receiving the next message as a stream of chunks (one per frame) instead
+  ## of buffering the whole thing. `kind` is set from the first frame. Consume the
+  ## returned reader with `each` or `readChunk`. `maxMessageBytes` does not apply --
+  ## you bound your own sink.
+  openStreamReader(ws)
+
+template streamOut(ws: WebSocket; writer: untyped; isBinary: bool; body: untyped) =
+  ## Shared body of `stream`/`streamBinary` (called internally, so the block-syntax
+  ## last-arg rule doesn't apply and the `isBinary` middle param is fine here).
+  block:
+    var writer {.inject.} = WsWriter(ws: ws, binary: isBinary)
+    try:
+      body
+      writer.finishWrite()
+    except CatchableError:      # a partial message can't be completed: drop the conn
+      ws.open = false
+      try: ws.conn.close()
+      except CatchableError: discard
+      raise
+
+template stream*(ws: WebSocket; writer, body: untyped): untyped =
+  ## Send the next message as a stream of text fragments: `write` each chunk inside
+  ## the block, and the final (fin) frame is sent automatically on block exit. On an
+  ## exception the partial message cannot be completed, so the connection is closed.
+  ##   ws.stream(writer):
+  ##     for chunk in chunks: writer.write(chunk)
+  streamOut(ws, writer, false, body)
+
+template streamBinary*(ws: WebSocket; writer, body: untyped): untyped =
+  ## Like `stream(writer)`, but the message is binary.
+  streamOut(ws, writer, true, body)

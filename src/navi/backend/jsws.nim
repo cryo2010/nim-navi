@@ -136,3 +136,63 @@ proc close*(ws: WebSocket, code = closeNormal, reason = ""): Future[void] {.asyn
   if not ws.open: return
   ws.open = false
   ws.raw.jsClose(int(code), cstring(reason))
+
+# --- WebSocket streaming (whole-message on js) ---
+# The runtime's WebSocket delivers whole messages and fragments outbound internally,
+# so js cannot stream at the frame level. These keep the `stream`/`each`/`stream(writer)`
+# API compiling and correct, but a read yields the message as a single chunk and a
+# write buffers until the block exits (documented parity limitation).
+
+type
+  WsSink = proc(chunk: string): Future[void]
+  WsReader* = ref object
+    ws: WebSocket
+    kind*: WsMessageKind
+    msg: string
+    consumed: bool
+  WsWriter* = ref object
+    ws: WebSocket
+    binary: bool
+    buf: string
+
+proc openStreamReader(ws: WebSocket): Future[WsReader] {.async.} =
+  let m = await ws.receive()
+  result = WsReader(ws: ws, kind: m.kind, msg: m.data, consumed: m.kind == wmClose)
+
+proc readChunk*(r: WsReader): Future[string] {.async.} =
+  ## The message as a single chunk (js cannot sub-stream), then "".
+  if r.consumed: return ""
+  r.consumed = true
+  return r.msg
+
+proc drain*(r: WsReader, sink: WsSink): Future[void] {.async.} =
+  let c = await r.readChunk()
+  if c.len > 0: await sink(c)
+
+template each*(r: WsReader; chunk, body: untyped): untyped =
+  await r.drain(proc(chunk: string): Future[void] {.async.} = body)
+
+template stream*(ws: WebSocket): untyped =
+  ## Receive the next message as a (single-chunk) stream; see the note above.
+  openStreamReader(ws)
+
+proc write*(w: WsWriter, data: string): Future[void] {.async.} =
+  ## Buffer a fragment; the whole message is sent when the `stream` block exits.
+  w.buf.add data
+
+proc finishWrite(w: WsWriter): Future[void] {.async.} =
+  await w.ws.send(w.buf, binary = w.binary)
+
+template streamOut(ws: WebSocket; writer: untyped; isBinary: bool; body: untyped) =
+  block:
+    var writer {.inject.} = WsWriter(ws: ws, binary: isBinary)
+    body
+    await writer.finishWrite()
+
+template stream*(ws: WebSocket; writer, body: untyped): untyped =
+  ## Send the next message; `write` buffers fragments, sent whole on block exit.
+  streamOut(ws, writer, false, body)
+
+template streamBinary*(ws: WebSocket; writer, body: untyped): untyped =
+  ## Like `stream(writer)`, but the message is binary.
+  streamOut(ws, writer, true, body)

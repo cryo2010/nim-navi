@@ -98,7 +98,7 @@ discard main()
 - **Proxy:** http absolute-URI, https CONNECT (with Proxy-Authorization), and SOCKS5
 - **Unix domain sockets** (native backends, POSIX): dial a socket path instead of TCP
 - **TLS controls:** custom/in-memory CA, mTLS, version and cipher pinning, SPKI certificate pinning, and a custom verify callback
-- **WebSockets** (RFC 6455) text and binary messages, fragmentation reassembly, automatic ping/pong, a message-size cap, and optional keepalive
+- **WebSockets** (RFC 6455) text and binary messages, fragmentation reassembly, per-message streaming, automatic ping/pong, a message-size cap, and optional keepalive
 
 ## Install
 
@@ -911,6 +911,31 @@ let ws = api.websocket("wss://example.com/socket",
 
 The masking key for each client frame and the handshake nonce come from the OS CSPRNG
 (`std/sysrand`), per RFC 6455.
+
+For a large message you can stream it a frame at a time instead of buffering the whole
+thing, mirroring HTTP `stream()`/`bodyStream`. `ws.stream()` returns a reader for the
+next inbound message (`kind` tells you text vs binary); consume it with `each` (one
+chunk per frame). `ws.stream(writer): …` sends the next message as fragments, `write`
+each chunk, and the final frame is sent automatically on block exit (use `streamBinary`
+for a binary message). `maxMessageBytes` does not apply to the streaming read -- you
+bound your own sink.
+
+```nim
+let reader = ws.stream()               # sync; `await ws.stream()` on the async clients
+reader.each(chunk):
+  outFile.write(chunk)
+
+ws.stream(writer):
+  for chunk in source:
+    writer.write(chunk)                # `await writer.write(chunk)` on the async clients
+```
+
+Like `StreamResponse.each`, the reader's `each` body runs as a proc, so `break`/
+`continue`/`return` cannot escape it; raise to stop early (which closes the connection).
+An exception inside a `stream(writer)` block also closes the connection, since a
+half-sent message cannot be completed. On `navi/js` the runtime owns framing, so a
+streamed read yields the message as a single chunk and a streamed write buffers until
+the block exits.
 
 On `navi/js` the WebSocket wraps the runtime's native one, so custom handshake
 `headers` are ignored and the runtime handles ping/pong; the send/receive/close

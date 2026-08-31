@@ -986,3 +986,143 @@ proc close*(ws: WebSocket, code = closeNormal, reason = ""): Future[void] {.asyn
   except CatchableError: discard
   ws.open = false
   await ws.conn.close()
+
+# --- WebSocket streaming (a large message, one frame at a time) ---
+
+type
+  WsReader* = ref object
+    ## A message being received incrementally. Consume with `each`/`readChunk`.
+    ws: WebSocket
+    kind*: WsMessageKind
+    first: string
+    hasFirst: bool
+    done: bool
+  WsWriter* = ref object
+    ## A message being sent incrementally; `write` each fragment.
+    ws: WebSocket
+    binary: bool
+    started: bool
+
+proc readDataFrame(ws: WebSocket): Future[Frame] {.async.} =
+  ## Next non-control frame (data/continuation/close), answering pings; keepalive
+  ## applies via `kaRecv`. A transport EOF yields a close frame.
+  while true:
+    var f: Frame
+    while not ws.dec.next(f):
+      let chunk = await ws.kaRecv()
+      if chunk.len == 0:
+        ws.open = false
+        return Frame(fin: true, opcode: opClose, payload: "")
+      ws.dec.feed(chunk)
+    case f.opcode
+    of opPing: await ws.conn.sendAll(encodeFrame(opPong, f.payload)); continue
+    of opPong: continue
+    else: return f
+
+proc closeOnFrame(ws: WebSocket, f: Frame): Future[void] {.async.} =
+  if ws.open:
+    try: await ws.conn.sendAll(encodeFrame(opClose, f.payload))
+    except CatchableError: discard
+    ws.open = false
+    await ws.conn.close()
+
+proc openStreamReader(ws: WebSocket): Future[WsReader] {.async.} =
+  result = WsReader(ws: ws)
+  let f = await ws.readDataFrame()
+  case f.opcode
+  of opText, opBinary:
+    result.kind = if f.opcode == opText: wmText else: wmBinary
+    result.first = f.payload
+    result.hasFirst = true
+    result.done = f.fin
+  of opClose:
+    result.kind = wmClose
+    result.done = true
+    await ws.closeOnFrame(f)
+  else:
+    raise newException(IOError, "navi: WebSocket message started with a continuation frame")
+
+proc readChunk*(r: WsReader): Future[string] {.async.} =
+  ## The next chunk of the streamed message (one frame's payload), or "" at its end.
+  if r.hasFirst:
+    r.hasFirst = false
+    return r.first
+  if r.done: return ""
+  let f = await r.ws.readDataFrame()
+  case f.opcode
+  of opContinuation:
+    r.done = f.fin
+    return f.payload
+  of opClose:
+    r.done = true
+    await r.ws.closeOnFrame(f)
+    return ""
+  else:
+    raise newException(IOError, "navi: expected a continuation frame mid-message")
+
+proc drain*(r: WsReader, sink: BodySink): Future[void] {.async.} =
+  ## Deliver the message's chunks to `sink`; on a sink error close the connection (a
+  ## half-read message cannot be resumed) and re-raise. Prefer the `each` template.
+  try:
+    while true:
+      let chunk = await r.readChunk()
+      if chunk.len == 0: break
+      # the sink type carries no raises annotation; discharge chronos's strict
+      # effects here (it raises at most CatchableError), as the HTTP drain does.
+      {.cast(gcsafe).}:
+        {.cast(raises: [CatchableError]).}:
+          await sink(chunk)
+  except CatchableError:
+    r.ws.open = false
+    try: await r.ws.conn.close()
+    except CatchableError: discard
+    raise
+
+template each*(r: WsReader; chunk, body: untyped): untyped =
+  ## Run `body` for each chunk of the streamed message. `body` runs as a proc, so
+  ## `break`/`continue`/`return` cannot escape it; raise to stop early. The `await`
+  ## is baked in, so there is none on the `each` line.
+  await r.drain(proc(chunk: string): Future[void] {.async.} = body)
+
+template stream*(ws: WebSocket): untyped =
+  ## Begin receiving the next message as a stream of chunks (one per frame). `kind`
+  ## is set from the first frame. Consume with `each`/`readChunk`. `maxMessageBytes`
+  ## does not apply -- you bound your own sink. Returns a `Future[WsReader]`, so:
+  ##   let reader = await ws.stream()
+  openStreamReader(ws)
+
+proc write*(w: WsWriter, data: string): Future[void] {.async.} =
+  ## Append a fragment to the message being streamed out.
+  if not w.started:
+    await w.ws.conn.sendAll(encodeFrame(if w.binary: opBinary else: opText, data, fin = false))
+    w.started = true
+  else:
+    await w.ws.conn.sendAll(encodeFrame(opContinuation, data, fin = false))
+
+proc finishWrite(w: WsWriter): Future[void] {.async.} =
+  if not w.started:
+    await w.ws.conn.sendAll(encodeFrame(if w.binary: opBinary else: opText, "", fin = true))
+  else:
+    await w.ws.conn.sendAll(encodeFrame(opContinuation, "", fin = true))
+
+template streamOut(ws: WebSocket; writer: untyped; isBinary: bool; body: untyped) =
+  block:
+    var writer {.inject.} = WsWriter(ws: ws, binary: isBinary)
+    try:
+      body
+      await writer.finishWrite()
+    except CatchableError:
+      ws.open = false
+      try: await ws.conn.close()
+      except CatchableError: discard
+      raise
+
+template stream*(ws: WebSocket; writer, body: untyped): untyped =
+  ## Send the next message as a stream of text fragments: `await writer.write(chunk)`
+  ## inside the block; the final (fin) frame is sent on block exit. On an exception
+  ## the partial message cannot be completed, so the connection is closed.
+  streamOut(ws, writer, false, body)
+
+template streamBinary*(ws: WebSocket; writer, body: untyped): untyped =
+  ## Like `stream(writer)`, but the message is binary.
+  streamOut(ws, writer, true, body)

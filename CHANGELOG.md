@@ -25,6 +25,12 @@ onward (pre-1.0, minor versions may include breaking changes).
   interval while a `receive` is in progress and raises `TimeoutError` (closing the
   connection) if another interval passes with no response, so a dead peer is detected
   instead of blocking forever. `0` (default) is off; a no-op on `navi/js`.
+- **WebSocket message streaming.** `ws.stream()` returns a reader for the next inbound
+  message consumed a frame at a time with `each`/`readChunk` (no whole-message
+  buffering); `ws.stream(writer): …` (and `streamBinary`) sends a message as fragments
+  via `writer.write`, closing it automatically at block exit. Mirrors HTTP
+  `stream()`/`bodyStream`. On `navi/js` (which owns framing) a read yields the whole
+  message as one chunk and a write buffers until the block exits.
 
 ### Changed
 - WebSocket masking keys and the handshake nonce now come from the OS CSPRNG
