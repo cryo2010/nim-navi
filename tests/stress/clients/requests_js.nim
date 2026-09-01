@@ -6,6 +6,8 @@
 import navi/js
 import ../common/harness_js
 
+proc jsExit(code: int) {.importjs: "process.exit(#)".}
+
 const verbs = [GET, POST, PUT]
 
 proc stampMw(): NaviMiddleware =
@@ -41,8 +43,11 @@ proc main() {.async.} =
       try:
         let res = await api.request(v, pool.pick() & "/echo", headers = h, body = body)
         counter.tally(res.status)
-      except CatchableError:
+      except CatchableError as e:
         counter.note()
+        # Fail hard: a surfaced transport error is a bug to investigate, not noise.
+        echo label, " FAIL: ", $v, " -> ", e.name, ": ", e.msg
+        jsExit(1)
 
   var futs: seq[Future[void]]
   for api in apis:
