@@ -66,7 +66,8 @@ async function main() {
   }
 
   const workload = envStr('NAVI_WORKLOAD', 'requests');
-  if (workload !== 'requests' && workload !== 'streamDownload' && workload !== 'streamUpload') {
+  const KNOWN = ['requests', 'streamDownload', 'streamUpload', 'sse'];
+  if (!KNOWN.includes(workload)) {
     process.stdout.write(`SKIP\tnode\t${workload} not implemented\n`);
     process.exit(0);
   }
@@ -305,14 +306,89 @@ async function main() {
     });
   }
 
-  // Pick the per-unit function for the requested workload + protocol.
+  // --- workload: sse (subscribe to an infinite text/event-stream) ---
+  // Consume frames incrementally, splitting on the blank-line separator. Record
+  // inter-arrival latency (us since the previous event on this stream) and the
+  // data-payload length. The stream never ends, so stop on the deadline.
+  function sseConsume(streamObj, onDone) {
+    // streamObj: the readable response/stream (version assertion done by caller).
+    return new Promise((resolve, reject) => {
+      let buf = '';
+      let prevMs = -1;      // arrival time of the previous event on this stream
+      let stopped = false;
+      const stop = () => {
+        if (stopped) return;
+        stopped = true;
+        try { onDone(); } catch (_e) { /* ignore teardown races */ }
+        resolve();
+      };
+      streamObj.on('data', (chunk) => {
+        if (stopped) return;
+        buf += chunk.toString('latin1');
+        let sep;
+        while ((sep = buf.indexOf('\n\n')) !== -1) {
+          const frame = buf.slice(0, sep);
+          buf = buf.slice(sep + 2);
+          const nowMs = performance.now();
+          let payloadLen = 0;
+          for (const line of frame.split('\n')) {
+            if (line.startsWith('data:')) payloadLen += line.length - (line.startsWith('data: ') ? 6 : 5);
+          }
+          if (nowMs >= measureStartMs && prevMs >= 0) {
+            record(Math.round((nowMs - prevMs) * 1000));
+            measuredBytes += payloadLen;
+          }
+          prevMs = nowMs;
+          if (nowMs >= deadlineMs) { stop(); return; }
+        }
+      });
+      streamObj.on('end', stop);
+      streamObj.on('error', (e) => { if (!stopped) reject(e); });
+    });
+  }
+
+  function sseH1(base) {
+    const url = base + '/events';
+    return new Promise((resolve, reject) => {
+      const req = https.request(url, { method: 'GET', agent, rejectUnauthorized: false }, (res) => {
+        gateH1(res);
+        sseConsume(res, () => req.destroy()).then(resolve, reject);
+      });
+      req.on('error', reject);
+      req.end();
+    });
+  }
+
+  function sseH2(baseIndex) {
+    const base = bases[baseIndex];
+    return new Promise((resolve, reject) => {
+      const session = connect(base); // one dedicated session per stream/worker
+      const req = session.request({ ':method': 'GET', ':path': '/events' });
+      req.on('response', () => gateH2(session));
+      sseConsume(req, () => { req.close(); session.close(); }).then(resolve, reject);
+      req.on('error', reject);
+    });
+  }
+
+  // Pick the per-unit function for the discrete-transfer workloads.
   let unit;
   if (workload === 'requests') {
     unit = (verb, bi) => (isH2 ? reqH2(verb, bi) : reqH1(verb, bases[bi]));
   } else if (workload === 'streamDownload') {
     unit = (_verb, bi) => (isH2 ? downH2(bi) : downH1(bases[bi]));
-  } else {
+  } else if (workload === 'streamUpload') {
     unit = (_verb, bi) => (isH2 ? upH2(bi) : upH1(bases[bi]));
+  }
+
+  // sse workers each hold one long-lived /events stream until the deadline.
+  async function sseWorker(seed) {
+    const bi = (baseIdx++) % bases.length;
+    try {
+      if (isH2) await sseH2(bi);
+      else await sseH1(bases[bi]);
+    } catch (e) {
+      fail('GET', bases[bi] + '/events', e);
+    }
   }
 
   async function workerLoop(seed) {
@@ -334,8 +410,9 @@ async function main() {
   }
 
   const workerCount = clients * concurrency;
+  const spawn = workload === 'sse' ? sseWorker : workerLoop;
   const workers = [];
-  for (let i = 0; i < workerCount; i++) workers.push(workerLoop(i));
+  for (let i = 0; i < workerCount; i++) workers.push(spawn(i));
   await Promise.all(workers);
 
   for (const s of sessions) { if (s && !s.destroyed) s.close(); }

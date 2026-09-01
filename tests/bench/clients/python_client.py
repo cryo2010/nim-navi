@@ -222,10 +222,38 @@ async def stream_upload_worker(client, i, measure_start, deadline):
             record((time.perf_counter() - t0) * 1e6, STREAM_BYTES)
 
 
+async def sse_worker(client, i, measure_start, deadline):
+    url = pick() + "/events"
+    try:
+        async with client.stream("GET", url) as r:
+            if r.status_code != 200:
+                fail("events status {0}".format(r.status_code))
+            check_version(r)
+            prev = None
+            payload_len = 0
+            async for line in r.aiter_lines():
+                if time.perf_counter() >= deadline:
+                    break  # infinite stream: must break on the deadline
+                if line.startswith("data:"):
+                    payload_len = len(line[5:].lstrip())
+                elif line == "":
+                    # a blank line finalizes one event
+                    now = time.perf_counter()
+                    if prev is not None and now >= measure_start:
+                        record((now - prev) * 1e6, payload_len)
+                    prev = now
+                    payload_len = 0
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        fail("FAIL: {0}".format(e))
+
+
 WORKERS = {
     "requests": requests_worker,
     "streamDownload": stream_download_worker,
     "streamUpload": stream_upload_worker,
+    "sse": sse_worker,
 }
 
 

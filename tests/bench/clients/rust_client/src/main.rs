@@ -95,7 +95,10 @@ fn main() {
         std::process::exit(0);
     }
     let workload = env_str("NAVI_WORKLOAD", "requests");
-    if !matches!(workload.as_str(), "requests" | "streamDownload" | "streamUpload") {
+    if !matches!(
+        workload.as_str(),
+        "requests" | "streamDownload" | "streamUpload" | "sse"
+    ) {
         println!("SKIP\trust\t{} not implemented", workload);
         std::process::exit(0);
     }
@@ -221,8 +224,18 @@ async fn worker(
     deadline: f64,
 ) -> Hist {
     let mut hist = Hist::new(cfg.max_buckets);
-    let mut n = i;
     let mut checked = false;
+
+    // sse records inter-arrival latency itself and breaks on the deadline
+    // mid-stream, so it manages its own histogram rather than the
+    // per-transfer timing wrapper below.
+    if workload == "sse" {
+        let base = pick(&cfg, &rr);
+        sse(&client, &cfg, &base, &mut checked, start, measure_start, deadline, &mut hist).await;
+        return hist;
+    }
+
+    let mut n = i;
     while start.elapsed().as_secs_f64() < deadline {
         let base = pick(&cfg, &rr);
         let t0 = Instant::now();
@@ -363,4 +376,69 @@ async fn stream_upload(
         std::process::exit(1);
     }
     total
+}
+
+/// Subscribe to an infinite SSE stream at {base}/events. Each event is a
+/// blank-line-terminated frame; a "data:" line carries a ~64 byte payload.
+/// Records inter-arrival latency (µs since the previous event in this stream)
+/// during the measured window and accumulates payload bytes. Never buffers the
+/// whole stream; breaks on the deadline (dropping the response aborts it).
+#[allow(clippy::too_many_arguments)]
+async fn sse(
+    client: &reqwest::Client,
+    cfg: &Config,
+    base: &str,
+    checked: &mut bool,
+    start: Instant,
+    measure_start: f64,
+    deadline: f64,
+    hist: &mut Hist,
+) {
+    let url = format!("{}/events", base);
+    let resp = client.get(&url).send().await.unwrap_or_else(|e| fail(e));
+    check_version(cfg, &resp, checked);
+
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+    let mut prev = Instant::now();
+
+    while start.elapsed().as_secs_f64() < deadline {
+        let chunk = match stream.next().await {
+            Some(c) => c.unwrap_or_else(|e| fail(e)),
+            None => break, // stream ended unexpectedly
+        };
+        buf.extend_from_slice(&chunk);
+
+        // Split off every complete frame terminated by a blank line ("\n\n").
+        while let Some(pos) = find_frame_end(&buf) {
+            let frame = buf.drain(..pos + 2).collect::<Vec<u8>>();
+            let now = Instant::now();
+            let payload = sse_data_len(&frame[..pos]);
+            if start.elapsed().as_secs_f64() >= measure_start {
+                hist.record(now.duration_since(prev).as_micros() as u64);
+                hist.bytes += payload as u64;
+            }
+            prev = now;
+            if start.elapsed().as_secs_f64() >= deadline {
+                return;
+            }
+        }
+    }
+}
+
+/// Index of the first "\n\n" frame separator, if any.
+fn find_frame_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\n\n")
+}
+
+/// Total length of the payload carried by all "data:" lines in one frame.
+fn sse_data_len(frame: &[u8]) -> usize {
+    let mut n = 0;
+    for line in frame.split(|&b| b == b'\n') {
+        if let Some(rest) = line.strip_prefix(b"data:") {
+            // Trim a single optional leading space, per the SSE format.
+            n += rest.strip_prefix(b" ").unwrap_or(rest).len();
+        }
+    }
+    n
 }

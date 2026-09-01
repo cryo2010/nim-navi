@@ -165,6 +165,40 @@ func echoHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(payload)
 }
 
+// /events: a text/event-stream that pushes numbered events as fast as the client
+// consumes them (honors Last-Event-ID for resume), so the benchmark measures SSE
+// consumption throughput. Runs until the client disconnects.
+func eventsHandler(w http.ResponseWriter, r *http.Request) {
+	fl, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "no flusher", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	n := 0
+	if lid := r.Header.Get("Last-Event-ID"); lid != "" {
+		if v, err := strconv.Atoi(lid); err == nil {
+			n = v + 1
+		}
+	}
+	data := strings.Repeat("x", 64)
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if _, err := fmt.Fprintf(w, "id: %d\ndata: %s\n\n", n, data); err != nil {
+			return
+		}
+		fl.Flush()
+		n++
+	}
+}
+
 func env(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
@@ -177,6 +211,7 @@ func main() {
 	mux.HandleFunc("/echo", echoHandler)
 	mux.HandleFunc("/upload", uploadHandler)
 	mux.HandleFunc("/download", downloadHandler)
+	mux.HandleFunc("/events", eventsHandler)
 	srv := &http.Server{
 		Addr:    env("NAVI_BENCH_ADDR", "127.0.0.1:8443"),
 		Handler: mux,

@@ -7,12 +7,14 @@
 //   requests       - buffered GET/POST/PUT at /echo; unit = one request.
 //   streamDownload - GET /download, hashed through sha1 without buffering.
 //   streamUpload   - POST /upload, a sha1-hashed streamed body of constant memory.
-// Streaming units are one TRANSFER, and RESULT's last field carries MB/s. Emits one
-// RESULT line; fails hard on any transport error, protocol downgrade, or checksum
-// mismatch.
+//   sse            - GET /events, one infinite text/event-stream per goroutine;
+//                    unit = one event, latency = inter-arrival gap.
+// Streaming/SSE units carry MB/s in RESULT's last field. Emits one RESULT line;
+// fails hard on any transport error, protocol downgrade, or checksum mismatch.
 package main
 
 import (
+	"bufio"
 	"crypto/sha1"
 	"crypto/tls"
 	"encoding/hex"
@@ -176,6 +178,11 @@ func (c *config) run(do transferFn) {
 	}
 	wg.Wait()
 
+	c.emit(hists, bytesEach)
+}
+
+// emit folds the per-goroutine histograms + byte counters and prints the RESULT.
+func (c *config) emit(hists []*histogram, bytesEach []int64) {
 	final := newHistogram()
 	var totalBytes int64
 	for i, h := range hists {
@@ -196,6 +203,73 @@ func (c *config) run(do transferFn) {
 		mbps)
 }
 
+// runSSE fans out one infinite text/event-stream per goroutine and records each
+// event's inter-arrival gap + data-payload size. Latency is measured inside the
+// stream (per event), so it needs its own loop rather than the per-transfer driver.
+func (c *config) runSSE() {
+	var wg sync.WaitGroup
+	hists := make([]*histogram, c.clients*c.concurrency)
+	bytesEach := make([]int64, len(hists))
+	for i := range hists {
+		hists[i] = newHistogram()
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			c.doSSE(hists[idx], &bytesEach[idx])
+		}(i)
+	}
+	wg.Wait()
+	c.emit(hists, bytesEach)
+}
+
+// doSSE opens GET {base}/events and consumes it incrementally with bufio, parsing
+// "id:/data:/blank-line" events without buffering the whole stream. Each complete
+// event records its gap since the previous one (in this stream) and adds the data
+// payload length. Breaks and closes once the measure deadline is reached.
+func (c *config) doSSE(h *histogram, bytes *int64) {
+	url := c.nextBase() + "/events"
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		fail("GET", url, err)
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Accept-Encoding", "identity") // no gzip for an SSE stream
+	if c.cold {
+		req.Close = true
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		fail("GET", url, err)
+	}
+	defer resp.Body.Close()
+	c.gate(resp)
+
+	br := bufio.NewReader(resp.Body)
+	var payloadLen int
+	var prev time.Time // arrival of the previous event in this stream
+	for time.Now().Before(c.deadline) {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			if time.Now().Before(c.deadline) {
+				fail("GET", url, err) // premature end mid-window is a failure
+			}
+			return
+		}
+		switch {
+		case strings.HasPrefix(line, "data: "):
+			payloadLen = len(strings.TrimRight(line[len("data: "):], "\n"))
+		case line == "\n": // blank line finalizes one event
+			now := time.Now()
+			if !prev.IsZero() && !now.Before(c.measureStart) {
+				h.record(now.Sub(prev).Microseconds())
+				*bytes += int64(payloadLen)
+			}
+			prev = now
+			payloadLen = 0
+		}
+	}
+}
+
 func main() {
 	proto := envStr("NAVI_PROTO", "h2")
 	if proto == "h3" {
@@ -204,7 +278,7 @@ func main() {
 	}
 	workload := envStr("NAVI_WORKLOAD", "requests")
 	switch workload {
-	case "requests", "streamDownload", "streamUpload":
+	case "requests", "streamDownload", "streamUpload", "sse":
 	default:
 		fmt.Printf("SKIP\tgo\t%s not implemented\n", workload)
 		os.Exit(0)
@@ -253,6 +327,8 @@ func main() {
 		cfg.run(cfg.doDownload)
 	case "streamUpload":
 		cfg.run(cfg.doUpload)
+	case "sse":
+		cfg.runSSE()
 	}
 }
 
