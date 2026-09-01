@@ -34,6 +34,8 @@ proc worker(cfg: Config, pool: ptr ServerPool, rec: BenchRecorder,
 
 proc main() {.async.} =
   let cfg = loadConfig("std")
+  if cfg.workload != "requests":
+    echo "SKIP\tstd-async\tstd/httpclient reference does requests only"; return
   if cfg.proto != "h1":
     echo "SKIP\tstd-async\tstd/httpclient is HTTP/1.1 only"; return
   var pool = initServerPool(cfg)

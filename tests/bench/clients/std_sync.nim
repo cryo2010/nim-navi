@@ -12,6 +12,8 @@ proc mkClient(): HttpClient =
 
 proc main() =
   let cfg = loadConfig("std")
+  if cfg.workload != "requests":
+    echo "SKIP\tstd-sync\tstd/httpclient reference does requests only"; return
   if cfg.proto != "h1":
     echo "SKIP\tstd-sync\tstd/httpclient is HTTP/1.1 only"; return
   var pool = initServerPool(cfg)

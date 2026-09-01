@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""benchRequests reference client: Python httpx + asyncio (name: python).
+"""bench reference client: Python httpx + asyncio (name: python).
 
-Benchmarks the buffered requests workload (GET/POST/PUT) over HTTP/1.1 or
-HTTP/2, time-boxed, recording latency, and prints ONE tab-separated RESULT
-line. Same contract as the other-language reference clients. HTTP/3 is skipped.
+Dispatches on NAVI_WORKLOAD (default "requests"):
+  - requests:        buffered GET/POST/PUT, latency per request.
+  - streamDownload:  streamed GET, sha1-verified, time per transfer.
+  - streamUpload:    streamed POST, sha1-verified, time per transfer.
+  - other (ws/sse/...): SKIP.
+Time-boxed with warmup/measure windows; prints ONE tab-separated RESULT line.
+Same contract as the other-language reference clients. HTTP/3 is skipped.
 """
 
 import asyncio
+import hashlib
 import math
 import os
 import sys
@@ -39,9 +44,12 @@ WARMUP_SECONDS = env_float("NAVI_WARMUP_SECONDS", 2)
 MODE = env_str("NAVI_MODE", "pooled")
 CLIENTS = env_int("NAVI_CLIENTS", 3)
 CONCURRENCY = env_int("NAVI_CONCURRENCY", 8)
+WORKLOAD = env_str("NAVI_WORKLOAD", "requests")
+STREAM_BYTES = env_int("NAVI_STREAM_BYTES", 1073741824)
 
 COLD = MODE == "cold"
 VERBS = ("GET", "POST", "PUT")
+MIB = 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -53,10 +61,12 @@ MAX_BUCKETS = int(math.floor(math.log2(300000000.0) * 64)) + 1
 # single shared histogram; asyncio is single-threaded so no lock is needed
 counts = [0] * MAX_BUCKETS
 total = 0
+total_bytes = 0
 
 
-def record(us):
-    global total
+def record(us, nbytes=0):
+    global total, total_bytes
+    total_bytes += nbytes
     v = max(1.0, us)
     idx = int(math.floor(math.log2(v) * 64))
     if idx < 0:
@@ -90,7 +100,7 @@ _rr = [0]
 def pick():
     b = BASES[_rr[0] % len(BASES)]
     _rr[0] += 1
-    return b + "/echo"
+    return b
 
 
 # gate the very first successful response against the negotiated protocol
@@ -111,12 +121,12 @@ def check_version(resp):
         sys.exit(1)
 
 
-async def worker(client, i, measure_start, deadline):
+async def requests_worker(client, i, measure_start, deadline):
     n = i
     while time.perf_counter() < deadline:
         verb = VERBS[n % len(VERBS)]
         n += 1
-        url = pick()
+        url = pick() + "/echo"
         kwargs = {}
         if verb in ("POST", "PUT"):
             kwargs["content"] = b"payload-x"
@@ -137,9 +147,96 @@ async def worker(client, i, measure_start, deadline):
             record((time.perf_counter() - t0) * 1e6)
 
 
+def fail(msg):
+    sys.stderr.write("[python] " + msg + "\n")
+    sys.exit(1)
+
+
+async def stream_download_worker(client, i, measure_start, deadline):
+    while time.perf_counter() < deadline:
+        url = pick() + "/download?size={0}".format(STREAM_BYTES)
+        t0 = time.perf_counter()
+        h = hashlib.sha1()
+        got = 0
+        try:
+            async with client.stream("GET", url) as r:
+                if r.status_code != 200:
+                    fail("download status {0}".format(r.status_code))
+                check_version(r)
+                async for chunk in r.aiter_bytes():
+                    h.update(chunk)
+                    got += len(chunk)
+        except SystemExit:
+            raise
+        except Exception as e:  # noqa: BLE001
+            fail("FAIL: {0}".format(e))
+        want = r.headers.get("x-sha1")
+        if h.hexdigest() != want:
+            fail("download sha1: got {0} want {1}".format(h.hexdigest(), want))
+        if time.perf_counter() >= measure_start:
+            record((time.perf_counter() - t0) * 1e6, got)
+
+
+def upload_body(h):
+    """Async generator yielding STREAM_BYTES from a reused 1 MiB block."""
+    block = b"\x5a" * MIB
+
+    async def gen():
+        remaining = STREAM_BYTES
+        while remaining > 0:
+            n = MIB if remaining >= MIB else remaining
+            piece = block if n == MIB else block[:n]
+            h.update(piece)
+            remaining -= n
+            yield piece
+
+    return gen()
+
+
+async def stream_upload_worker(client, i, measure_start, deadline):
+    while time.perf_counter() < deadline:
+        url = pick() + "/upload"
+        t0 = time.perf_counter()
+        h = hashlib.sha1()
+        try:
+            resp = await client.post(
+                url,
+                content=upload_body(h),
+                headers={"content-type": "application/octet-stream"},
+            )
+            if resp.status_code != 200:
+                fail("upload status {0}".format(resp.status_code))
+            check_version(resp)
+            body = resp.json()
+        except SystemExit:
+            raise
+        except Exception as e:  # noqa: BLE001
+            fail("FAIL: {0}".format(e))
+        if body.get("sha1") != h.hexdigest():
+            fail("upload sha1: got {0} want {1}".format(
+                body.get("sha1"), h.hexdigest()))
+        if int(body.get("size", -1)) != STREAM_BYTES:
+            fail("upload size: got {0} want {1}".format(
+                body.get("size"), STREAM_BYTES))
+        if time.perf_counter() >= measure_start:
+            record((time.perf_counter() - t0) * 1e6, STREAM_BYTES)
+
+
+WORKERS = {
+    "requests": requests_worker,
+    "streamDownload": stream_download_worker,
+    "streamUpload": stream_upload_worker,
+}
+
+
 async def main():
     if PROTO == "h3":
         sys.stdout.write("SKIP\tpython\tno reference-client HTTP/3\n")
+        sys.exit(0)
+    worker = WORKERS.get(WORKLOAD)
+    if worker is None:
+        sys.stdout.write(
+            "SKIP\tpython\t{0} not implemented\n".format(WORKLOAD))
         sys.exit(0)
 
     n_workers = CLIENTS * CONCURRENCY
@@ -166,6 +263,7 @@ async def main():
     ops = total
     secs = elapsed
     rps = round(ops / secs) if secs > 0 else 0
+    mbps = total_bytes / secs / 1e6 if secs > 0 else 0.0
     line = "\t".join(
         [
             "RESULT",
@@ -176,7 +274,7 @@ async def main():
             "{0:.3f}".format(percentile(50)),
             "{0:.3f}".format(percentile(99)),
             "{0:.3f}".format(percentile(99.9)),
-            "0.0",
+            "{0:.1f}".format(mbps),
         ]
     )
     sys.stdout.write(line + "\n")

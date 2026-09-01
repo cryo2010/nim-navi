@@ -214,16 +214,15 @@ run_cell() {   # <proto>: run every applicable client for this protocol, print t
       run_client "navi-$be" "$cell" "${NAVI_BIN[$be]}"
     fi
   done
-  # reference clients (h3 is navi-only; each ref self-skips unsupported cells too)
+  # reference clients (h3 is navi-only). Each reads NAVI_WORKLOAD/NAVI_PROTO from the
+  # env and self-skips (prints a SKIP line) any workload/protocol it does not support.
   if [ "$pr" != h3 ]; then
-    [ -n "$GO_BIN" ]    && run_client "go"     "$cell" env NAVI_BENCH_WORKLOAD="$workload" "$GO_BIN"
-    [ -n "$RUST_BIN" ]  && run_client "rust"   "$cell" env NAVI_BENCH_WORKLOAD="$workload" "$RUST_BIN"
+    [ -n "$GO_BIN" ]    && run_client "go"     "$cell" "$GO_BIN"
+    [ -n "$RUST_BIN" ]  && run_client "rust"   "$cell" "$RUST_BIN"
     want_lang node   && [ -f "$here/clients/node_client.js" ]  && run_client "node"   "$cell" env NODE_EXTRA_CA_CERTS="$cert" node "$here/clients/node_client.js"
     want_lang python && [ -f "$here/clients/python_client.py" ] && run_client "python" "$cell" python3 "$here/clients/python_client.py"
-    if [ "$pr" = h1 ]; then
-      [ -n "$STD_SYNC" ]  && run_client "std-sync"  "$cell" "$STD_SYNC"
-      [ -n "$STD_ASYNC" ] && run_client "std-async" "$cell" "$STD_ASYNC"
-    fi
+    [ -n "$STD_SYNC" ]  && run_client "std-sync"  "$cell" "$STD_SYNC"
+    [ -n "$STD_ASYNC" ] && run_client "std-async" "$cell" "$STD_ASYNC"
   fi
   print_table "$cell" "$workload" "$pr"
 }

@@ -11,12 +11,72 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
+	"crypto/sha1"
+	"encoding/hex"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 )
+
+const blockSize = 1 << 20 // 1 MiB streaming block
+
+// One reusable 1 MiB LCG block, streamed repeatedly so /download stays constant
+// memory regardless of size (matches tests/bench/common/streamcontent.nim's bytes,
+// though each side hashes only its own bytes so they need not match).
+var dlBlock = buildBlock()
+
+func buildBlock() []byte {
+	b := make([]byte, blockSize)
+	var x uint32 = 0x12345678
+	for i := range b {
+		x = x*1664525 + 1013904223
+		b[i] = byte(x >> 24)
+	}
+	return b
+}
+
+// /upload: hash the streamed request body incrementally (constant memory), return
+// {"sha1","size"} so the client can verify integrity.
+func uploadHandler(w http.ResponseWriter, r *http.Request) {
+	h := sha1.New()
+	n, _ := io.Copy(h, r.Body)
+	r.Body.Close()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"sha1":"%s","size":%d}`, hex.EncodeToString(h.Sum(nil)), n)
+}
+
+// /download?size=N: stream N bytes as the repeated block, with x-sha1 of the exact
+// stream (computed before the first write, since headers must precede the body).
+func downloadHandler(w http.ResponseWriter, r *http.Request) {
+	size := blockSize
+	if q := r.URL.Query().Get("size"); q != "" {
+		if v, err := strconv.Atoi(q); err == nil {
+			size = v
+		}
+	}
+	full, rem := size/blockSize, size%blockSize
+	h := sha1.New()
+	for i := 0; i < full; i++ {
+		h.Write(dlBlock)
+	}
+	if rem > 0 {
+		h.Write(dlBlock[:rem])
+	}
+	w.Header().Set("x-sha1", hex.EncodeToString(h.Sum(nil)))
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+	for i := 0; i < full; i++ {
+		w.Write(dlBlock)
+	}
+	if rem > 0 {
+		w.Write(dlBlock[:rem])
+	}
+}
 
 // ~8 KiB of varied text: compresses ~3x, so (de)compression is real work.
 var body = buildBody()
@@ -115,6 +175,8 @@ func env(k, def string) string {
 func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/echo", echoHandler)
+	mux.HandleFunc("/upload", uploadHandler)
+	mux.HandleFunc("/download", downloadHandler)
 	srv := &http.Server{
 		Addr:    env("NAVI_BENCH_ADDR", "127.0.0.1:8443"),
 		Handler: mux,

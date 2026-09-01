@@ -1,15 +1,22 @@
-// Go reference client for the navi HTTP bench harness (requests workload).
+// Go reference client for the navi HTTP bench harness.
 //
-// Time-boxed buffered GET/POST/PUT throughput + latency against the local TLS
-// server pool. An unmeasured warmup prelude precedes the measured window; each
-// measured request's wall time lands in a log-bucketed latency histogram whose
-// scheme (floor(log2(us)*64)) matches the Nim/Rust/Node/Python peers so the
-// p50/p99/p999 columns are comparable. Emits one RESULT line; fails hard on any
-// surfaced transport error or protocol downgrade.
+// Three time-boxed workloads share one driver (server pool, TLS, h1/h2 selection
+// + first-response version gate, warmup/measure windows, CLIENTS*CONCURRENCY
+// goroutines, and a log-bucketed latency histogram whose scheme -- floor(log2(us)
+// *64) -- matches the Nim/Rust/Node/Python peers so p50/p99/p999 are comparable):
+//   requests       - buffered GET/POST/PUT at /echo; unit = one request.
+//   streamDownload - GET /download, hashed through sha1 without buffering.
+//   streamUpload   - POST /upload, a sha1-hashed streamed body of constant memory.
+// Streaming units are one TRANSFER, and RESULT's last field carries MB/s. Emits one
+// RESULT line; fails hard on any transport error, protocol downgrade, or checksum
+// mismatch.
 package main
 
 import (
+	"crypto/sha1"
 	"crypto/tls"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -32,6 +39,15 @@ func envStr(k, def string) string {
 func envInt(k string, def int) int {
 	if v := os.Getenv(k); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func envInt64(k string, def int64) int64 {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return n
 		}
 	}
@@ -101,10 +117,96 @@ func (h *histogram) percentileMs(p float64) float64 {
 	return math.Pow(2, (float64(maxBuckets-1)+0.5)/bucketsPerDoubling) / 1000.0
 }
 
+// --- shared driver ---
+
+// config is the resolved run configuration shared by every workload.
+type config struct {
+	bases       []string
+	client      *http.Client
+	expect      string // negotiated HTTP version this cell is pinned to
+	cold        bool
+	clients     int
+	concurrency int
+	streamBytes int64
+
+	measureStart time.Time
+	deadline     time.Time
+	verified     int32  // guards the one-time protocol gate
+	baseIdx      uint64 // shared round-robin cursor across the server pool
+}
+
+func (c *config) nextBase() string {
+	return c.bases[int(atomic.AddUint64(&c.baseIdx, 1))%len(c.bases)]
+}
+
+// gate applies the one-time first-response protocol check; hard-fail on downgrade.
+func (c *config) gate(resp *http.Response) {
+	if atomic.CompareAndSwapInt32(&c.verified, 0, 1) && resp.Proto != c.expect {
+		fmt.Fprintf(os.Stderr, "FAIL: wrong protocol -- expected %s, got %q\n", c.expect, resp.Proto)
+		os.Exit(1)
+	}
+}
+
+// transferFn performs one unit of work and returns the bytes it moved. It runs in
+// both warmup and measured phases; the driver decides whether to record.
+type transferFn func(seed int) (bytes int64)
+
+// run fans out CLIENTS*CONCURRENCY goroutines looping do until the deadline,
+// records each measured transfer's latency + bytes, and emits the RESULT line.
+func (c *config) run(do transferFn) {
+	var wg sync.WaitGroup
+	hists := make([]*histogram, c.clients*c.concurrency)
+	bytesEach := make([]int64, len(hists))
+	for i := range hists {
+		hists[i] = newHistogram()
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			n := idx
+			for time.Now().Before(c.deadline) {
+				t0 := time.Now()
+				b := do(n)
+				n++
+				if !time.Now().Before(c.measureStart) {
+					hists[idx].record(time.Since(t0).Microseconds())
+					bytesEach[idx] += b
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	final := newHistogram()
+	var totalBytes int64
+	for i, h := range hists {
+		final.merge(h)
+		totalBytes += bytesEach[i]
+	}
+
+	elapsed := time.Since(c.measureStart).Seconds()
+	ops := final.total
+	rps, mbps := 0, 0.0
+	if elapsed > 0 {
+		rps = int(float64(ops)/elapsed + 0.5)
+		mbps = float64(totalBytes) / elapsed / 1e6
+	}
+	fmt.Printf("RESULT\tgo\t%d\t%.3f\t%d\t%.3f\t%.3f\t%.3f\t%.1f\n",
+		ops, elapsed, rps,
+		final.percentileMs(50), final.percentileMs(99), final.percentileMs(99.9),
+		mbps)
+}
+
 func main() {
 	proto := envStr("NAVI_PROTO", "h2")
 	if proto == "h3" {
 		fmt.Println("SKIP\tgo\tno reference-client HTTP/3")
+		os.Exit(0)
+	}
+	workload := envStr("NAVI_WORKLOAD", "requests")
+	switch workload {
+	case "requests", "streamDownload", "streamUpload":
+	default:
+		fmt.Printf("SKIP\tgo\t%s not implemented\n", workload)
 		os.Exit(0)
 	}
 
@@ -116,14 +218,6 @@ func main() {
 	}
 	seconds := envFloat("NAVI_SECONDS", 20)
 	warmup := envFloat("NAVI_WARMUP_SECONDS", 2)
-	cold := envStr("NAVI_MODE", "pooled") == "cold"
-	clients := envInt("NAVI_CLIENTS", 3)
-	concurrency := envInt("NAVI_CONCURRENCY", 8)
-
-	bases := make([]string, servers)
-	for i := 0; i < servers; i++ {
-		bases[i] = fmt.Sprintf("https://%s:%d", host, basePort+i)
-	}
 
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
@@ -136,84 +230,154 @@ func main() {
 	} else {
 		tr.ForceAttemptHTTP2 = true
 	}
-	client := &http.Client{Transport: tr}
 
-	verbs := []string{http.MethodGet, http.MethodPost, http.MethodPut}
 	start := time.Now()
-	measureStart := start.Add(time.Duration(warmup * float64(time.Second)))
-	deadline := measureStart.Add(time.Duration(seconds * float64(time.Second)))
+	cfg := &config{
+		client:       &http.Client{Transport: tr},
+		expect:       expect,
+		cold:         envStr("NAVI_MODE", "pooled") == "cold",
+		clients:      envInt("NAVI_CLIENTS", 3),
+		concurrency:  envInt("NAVI_CONCURRENCY", 8),
+		streamBytes:  envInt64("NAVI_STREAM_BYTES", 1073741824),
+		measureStart: start.Add(time.Duration(warmup * float64(time.Second))),
+	}
+	cfg.deadline = cfg.measureStart.Add(time.Duration(seconds * float64(time.Second)))
+	for i := 0; i < servers; i++ {
+		cfg.bases = append(cfg.bases, fmt.Sprintf("https://%s:%d", host, basePort+i))
+	}
 
-	var verified int32 // guards the one-time protocol gate
-	var baseIdx uint64  // shared round-robin cursor across the server pool
+	switch workload {
+	case "requests":
+		cfg.run(cfg.doRequest)
+	case "streamDownload":
+		cfg.run(cfg.doDownload)
+	case "streamUpload":
+		cfg.run(cfg.doUpload)
+	}
+}
 
-	worker := func(h *histogram, seed int) {
-		n := seed
-		for time.Now().Before(deadline) {
-			v := verbs[n%len(verbs)]
-			n++
-			base := bases[int(atomic.AddUint64(&baseIdx, 1))%len(bases)]
-			url := base + "/echo"
+// doRequest: one buffered GET/POST/PUT at /echo, body fully drained.
+func (c *config) doRequest(seed int) int64 {
+	verbs := []string{http.MethodGet, http.MethodPost, http.MethodPut}
+	v := verbs[seed%len(verbs)]
+	url := c.nextBase() + "/echo"
 
-			var body io.Reader
-			if v == http.MethodPost || v == http.MethodPut {
-				body = strings.NewReader("payload-x")
-			}
-			req, err := http.NewRequest(v, url, body)
-			if err != nil {
-				fail(v, url, err)
-			}
-			if body != nil {
-				req.Header.Set("Content-Type", "text/plain")
-			}
-			if cold {
-				req.Close = true // fresh connection per request
-			}
+	var body io.Reader
+	if v == http.MethodPost || v == http.MethodPut {
+		body = strings.NewReader("payload-x")
+	}
+	req, err := http.NewRequest(v, url, body)
+	if err != nil {
+		fail(v, url, err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "text/plain")
+	}
+	if c.cold {
+		req.Close = true // fresh connection per request
+	}
 
-			t0 := time.Now()
-			resp, err := client.Do(req)
-			if err != nil {
-				fail(v, url, err)
-			}
-			if atomic.CompareAndSwapInt32(&verified, 0, 1) && resp.Proto != expect {
-				fmt.Fprintf(os.Stderr, "FAIL: wrong protocol -- expected %s, got %q\n", expect, resp.Proto)
-				os.Exit(1)
-			}
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
+	resp, err := c.client.Do(req)
+	if err != nil {
+		fail(v, url, err)
+	}
+	c.gate(resp)
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return 0
+}
 
-			if !time.Now().Before(measureStart) {
-				h.record(time.Since(t0).Microseconds())
-			}
+// doDownload: GET /download?size=N, streamed through sha1 (never buffered) and
+// checked against the server's x-sha1 header. Returns the copied byte count.
+func (c *config) doDownload(_ int) int64 {
+	url := fmt.Sprintf("%s/download?size=%d", c.nextBase(), c.streamBytes)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		fail("GET", url, err)
+	}
+	if c.cold {
+		req.Close = true
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		fail("GET", url, err)
+	}
+	c.gate(resp)
+	h := sha1.New()
+	n, err := io.Copy(h, resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		fail("GET", url, err)
+	}
+	got := hex.EncodeToString(h.Sum(nil))
+	if want := resp.Header.Get("x-sha1"); got != want {
+		fmt.Fprintf(os.Stderr, "FAIL: download sha1 mismatch %s -> got %s want %s\n", url, got, want)
+		os.Exit(1)
+	}
+	return n
+}
+
+const uploadBlock = 1 << 20 // 1 MiB block reused for constant-memory upload
+
+// doUpload: POST /upload with a streamed body of exactly streamBytes, hashed as
+// it is written; server echoes {"sha1","size"} which must match. Returns bytes sent.
+func (c *config) doUpload(_ int) int64 {
+	url := c.nextBase() + "/upload"
+	total := c.streamBytes
+
+	pr, pw := io.Pipe()
+	h := sha1.New()
+	go func() {
+		block := make([]byte, uploadBlock)
+		for i := range block {
+			block[i] = byte(i)
 		}
-	}
+		remaining := total
+		for remaining > 0 {
+			chunk := int64(len(block))
+			if chunk > remaining {
+				chunk = remaining
+			}
+			h.Write(block[:chunk])
+			if _, err := pw.Write(block[:chunk]); err != nil {
+				pw.CloseWithError(err)
+				return
+			}
+			remaining -= chunk
+		}
+		pw.Close()
+	}()
 
-	var wg sync.WaitGroup
-	hists := make([]*histogram, clients*concurrency)
-	for i := range hists {
-		hists[i] = newHistogram()
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			worker(hists[idx], idx)
-		}(i)
+	req, err := http.NewRequest(http.MethodPost, url, pr)
+	if err != nil {
+		fail("POST", url, err)
 	}
-	wg.Wait()
-
-	final := newHistogram()
-	for _, h := range hists {
-		final.merge(h)
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.ContentLength = total
+	if c.cold {
+		req.Close = true
 	}
-
-	elapsed := time.Since(measureStart).Seconds()
-	ops := final.total
-	rps := 0
-	if elapsed > 0 {
-		rps = int(float64(ops)/elapsed + 0.5)
+	resp, err := c.client.Do(req)
+	if err != nil {
+		fail("POST", url, err)
 	}
-	fmt.Printf("RESULT\tgo\t%d\t%.3f\t%d\t%.3f\t%.3f\t%.3f\t%s\n",
-		ops, elapsed, rps,
-		final.percentileMs(50), final.percentileMs(99), final.percentileMs(99.9),
-		"0.0")
+	c.gate(resp)
+	var out struct {
+		Sha1 string `json:"sha1"`
+		Size int64  `json:"size"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&out)
+	resp.Body.Close()
+	if err != nil {
+		fail("POST", url, err)
+	}
+	want := hex.EncodeToString(h.Sum(nil))
+	if out.Sha1 != want || out.Size != total {
+		fmt.Fprintf(os.Stderr, "FAIL: upload mismatch %s -> sha1 got %s want %s, size got %d want %d\n",
+			url, out.Sha1, want, out.Size, total)
+		os.Exit(1)
+	}
+	return total
 }
 
 func fail(verb, url string, err error) {
