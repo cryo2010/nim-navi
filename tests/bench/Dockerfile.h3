@@ -1,0 +1,71 @@
+# Full cross-language benchmark image: Nim + Go + Rust + Node + Python, plus the
+# HTTP/3 client toolchain (OpenSSL 3.5 + nghttp3 + ngtcp2) and Caddy as the h3
+# front. Used when NAVI_PROTO is h3/all. Large by design; self-contained.
+#
+#   docker build -f tests/bench/Dockerfile.h3 -t navi-bench-h3 .
+#   docker run --rm -e NAVI_WORKLOAD=requests -e NAVI_PROTO=h3 navi-bench-h3
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake curl git ca-certificates xz-utils pkg-config \
+      libssl-dev libpcre3-dev openssl autoconf automake libtool \
+    && rm -rf /var/lib/apt/lists/*
+
+# Go
+ARG GO_VERSION=1.22.5
+RUN arch="$(dpkg --print-architecture)" && \
+    curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${arch}.tar.gz" | tar -C /usr/local -xz
+ENV PATH="/usr/local/go/bin:${PATH}" GOFLAGS=-buildvcs=false GOTOOLCHAIN=local
+
+# Rust (minimal profile)
+RUN curl -fsSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Nim from source (choosenim has no linux_arm64 build).
+ARG NIM_VERSION=2.2.10
+RUN curl -fsSL "https://nim-lang.org/download/nim-${NIM_VERSION}.tar.xz" -o /tmp/nim.tar.xz && \
+    mkdir -p /opt && tar -xJf /tmp/nim.tar.xz -C /opt && rm /tmp/nim.tar.xz && \
+    cd "/opt/nim-${NIM_VERSION}" && sh build.sh && bin/nim c --skipUserCfg koch && \
+    ./koch boot -d:release && ./koch tools
+ENV PATH="/opt/nim-2.2.10/bin:/root/.nimble/bin:${PATH}"
+RUN nimble install -y checksums zippy "chronos@>= 4.0.0"
+
+# Node.js + Python (httpx[http2] for the h2 reference client; websockets for ws).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      nodejs npm python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --no-cache-dir --break-system-packages "httpx[http2]" websockets
+
+# HTTP/3 toolchain (OpenSSL 3.5 + nghttp3 + ngtcp2) + Caddy, from source. Kept
+# separate from the system OpenSSL the other clients use; navi's h3 build finds it
+# via PKG_CONFIG_PATH. No global LD_LIBRARY_PATH (would break system openssl); the
+# navi binary gets an rpath at link time (run.sh).
+ENV OSSL=/opt/ossl NGHTTP3=/opt/nghttp3 NGTCP2=/opt/ngtcp2
+RUN git clone --depth 1 -b openssl-3.5 https://github.com/openssl/openssl /src/openssl \
+ && cd /src/openssl && ./Configure --prefix=$OSSL --libdir=lib \
+ && make -j"$(nproc)" && make install_sw && rm -rf /src/openssl
+RUN git clone --depth 1 --recursive https://github.com/ngtcp2/nghttp3 /src/nghttp3 \
+ && cd /src/nghttp3 && autoreconf -i && ./configure --prefix=$NGHTTP3 --enable-lib-only \
+ && make -j"$(nproc)" && make install && rm -rf /src/nghttp3
+RUN git clone --depth 1 --recursive https://github.com/ngtcp2/ngtcp2 /src/ngtcp2 \
+ && cd /src/ngtcp2 && autoreconf -i \
+ && PKG_CONFIG_PATH=$OSSL/lib/pkgconfig ./configure --prefix=$NGTCP2 --enable-lib-only --with-openssl \
+ && make -j"$(nproc)" && make install && rm -rf /src/ngtcp2
+COPY --from=caddy:2 /usr/bin/caddy /usr/bin/caddy
+ENV PKG_CONFIG_PATH=$OSSL/lib/pkgconfig:$NGHTTP3/lib/pkgconfig:$NGTCP2/lib/pkgconfig
+
+# tc (netem) for the optional lossy-link regime; its own layer after the slow h3
+# builds so adding it does not invalidate them.
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY src ./src
+COPY tests/bench ./tests/bench
+# Pre-build the Rust client (pulls the reqwest crate graph) so `docker run` is fast.
+# Guarded: the client may not exist yet in early phases.
+RUN if [ -f tests/bench/clients/rust_client/Cargo.toml ]; then \
+      cd tests/bench/clients/rust_client && cargo build --release; fi
+
+ENTRYPOINT ["bash", "/app/tests/bench/run.sh"]

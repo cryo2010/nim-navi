@@ -201,15 +201,46 @@ task live, "Live interop against real public servers/CDNs (network; nightly)":
   # Tolerates network noise/server rejections; fails only on a navi protocol bug.
   exec "nim c -r --path:src -d:ssl --hints:off tests/interop/live.nim"
 
-task bench, "Dockerized HTTP client benchmark: navi vs std/httpclient, Go, Rust (needs Docker)":
-  # Builds a Nim+Go+Rust image and runs the TLS+gzip+all-methods comparison, then
-  # a navi h1/h2/h3 x cold/pooled protocol matrix. Set NAVI_BENCH_ITERS to change
-  # the load. `NAVI_BENCH_NETEM=1 nimble bench` adds a lossy/high-latency regime
-  # (needs the NET_ADMIN cap, which is granted below) where h3 pulls ahead of h2.
-  exec "docker build -f bench/Dockerfile -t navi-bench ."
-  exec "docker run --rm --cap-add=NET_ADMIN " &
-       "-e NAVI_BENCH_ITERS -e NAVI_BENCH_COLD_ITERS -e NAVI_BENCH_NETEM " &
-       "-e NAVI_BENCH_CONC -e NAVI_BENCH_NETEM_DELAY -e NAVI_BENCH_NETEM_LOSS navi-bench"
+proc runBench(workload: string) =
+  # Build the bench image and run one workload, passing every NAVI_* knob through.
+  # Mirrors runStress: the h3 image (ngtcp2/nghttp3/OpenSSL-3.5 client toolchain +
+  # Caddy) is used when NAVI_PROTO is h3/all; h1/h2 use the light image. Each cell
+  # prints a ranked throughput+latency table across navi's backends + the reference
+  # clients. NB: nimble does not propagate a task's exit code (nim-lang/nimble#1802),
+  # so a failed cell shows in the output but this exits 0 -- run the docker command
+  # directly, or read the final "== <workload>: all cells ran ==" banner, for
+  # CI-grade pass/fail. `--cap-add=NET_ADMIN` is added only for the netem regime.
+  let proto = getEnv("NAVI_PROTO", "h2")
+  let h3 = proto == "h3" or proto == "all"
+  let dockerfile = if h3: "tests/bench/Dockerfile.h3" else: "tests/bench/Dockerfile"
+  let image = if h3: "navi-bench-h3" else: "navi-bench"
+  let netem = if getEnv("NAVI_NETEM", "0") == "1": "--cap-add=NET_ADMIN " else: ""
+  exec "docker build -f " & dockerfile & " -t " & image & " ."
+  exec "docker run --rm " & netem & "-e NAVI_WORKLOAD=" & workload &
+       " -e NAVI_PROTO -e NAVI_BACKEND -e NAVI_LANGS -e NAVI_SERVERS" &
+       " -e NAVI_SECONDS -e NAVI_WARMUP_SECONDS -e NAVI_MODE -e NAVI_CLIENTS" &
+       " -e NAVI_CONCURRENCY -e NAVI_REQ_COMPRESSION -e NAVI_RESP_COMPRESSION" &
+       " -e NAVI_STREAM_BYTES -e NAVI_REPORT_SECONDS" &
+       " -e NAVI_NETEM -e NAVI_NETEM_DELAY -e NAVI_NETEM_LOSS " & image
+
+task benchRequests, "Bench: buffered request/response throughput + latency, cross-language":
+  runBench("requests")
+task benchWs, "Bench: WebSocket echo throughput + latency, cross-language":
+  runBench("ws")
+task benchSse, "Bench: SSE consume throughput + latency, cross-language":
+  runBench("sse")
+task benchStreamUpload, "Bench: stream upload throughput (MB/s) + latency, cross-language":
+  runBench("streamUpload")
+task benchStreamDownload, "Bench: stream download throughput (MB/s) + latency, cross-language":
+  runBench("streamDownload")
+
+task bench, "Bench smoke: all five workloads, short + small (cross-language comparison tables)":
+  # Discoverability + a fast smoke. Defaults to 10s cells and a 64 MiB stream unless
+  # overridden; set the NAVI_* knobs for a real benchmark, or run a single bench<Workload>.
+  if not existsEnv("NAVI_SECONDS"): putEnv("NAVI_SECONDS", "10")
+  if not existsEnv("NAVI_STREAM_BYTES"): putEnv("NAVI_STREAM_BYTES", "67108864")
+  for w in ["requests", "ws", "sse", "streamUpload", "streamDownload"]:
+    runBench(w)
 
 task wsjs, "navi/js WebSocket runtime test (Node client vs a native server)":
   # Runs the navi/js WebSocket client under Node against a native echo server.
