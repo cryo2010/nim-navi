@@ -45,7 +45,7 @@ proc loadConfig*(backend: string): Config =
     servers: max(1, getInt("NAVI_SERVERS", 5)),
     seconds: getFloat("NAVI_SECONDS", 60.0),
     clients: max(1, getInt("NAVI_CLIENTS", 3)),
-    concurrency: max(1, getInt("NAVI_CONCURRENCY", 32)),
+    concurrency: max(1, getInt("NAVI_CONCURRENCY", 8)),
     reqCompression: getEnv("NAVI_REQ_COMPRESSION", "gzip"),
     respCompression: getEnv("NAVI_RESP_COMPRESSION", "gzip"),
     reportSeconds: max(1, getInt("NAVI_REPORT_SECONDS", 60)),

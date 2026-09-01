@@ -50,12 +50,14 @@ proc step(qc: QuicConnAsync) {.async.} =
 
   # Cap the wait so a lost wake costs at most ~100 ms even on an idle connection.
   # Use sleepAsync (a heap timer) rather than addTimer, which would leak a timerfd
-  # per iteration.
+  # per iteration. The fd-readable callback is registered ONCE (openConnAsync), not
+  # here: a per-step addRead leaks, since asyncdispatch only removes a read callback
+  # when it fires. A wait that ends via the timer or a wake (the streaming pull wakes
+  # on every park) leaves the callback registered forever, so a busy streaming read
+  # accumulates them until the process is OOM-killed.
   let to = min(int(navi_h3_timeout_ms(qc.c)), 100)
   let signal = newFuture[void]("navi.h3.wait")
   qc.wakeup = signal
-  addRead(qc.fd, proc(a: AsyncFD): bool =
-    (if not signal.finished: signal.complete()); true)
   sleepAsync(to).addCallback(proc() =
     (if not signal.finished: signal.complete()))
   await signal
@@ -112,6 +114,12 @@ proc openConnAsync*(host: string, port: int, sni, caFile: string,
                          recvReady: initTable[int64, Future[void]](),
                          alive: true,
                          readerDone: newFuture[void]("navi.h3.readerDone"))
+  # Persistent readable callback (matches chronos's addReader2): completes the
+  # reader's current wait when the socket is readable. Returns false to stay
+  # registered across cycles; dropped by unregister(fd) at teardown. Registering
+  # this per step() instead would leak callbacks and OOM a busy streaming read.
+  addRead(fd, proc(a: AsyncFD): bool =
+    (if qc.wakeup != nil and not qc.wakeup.finished: qc.wakeup.complete()); false)
   try:
     while navi_h3_handshake_done(c) == 0:
       await step(qc)
@@ -199,11 +207,17 @@ proc requestOnConn*(qc: QuicConnAsync, verb, path: string,
 # each cycle, then re-checks the C-side buffers (mirrors the h2 mux's recvReady).
 
 proc waitProgress(qc: QuicConnAsync, sid: int64) {.async.} =
-  ## Park until the reader makes a cycle (headers/body may have advanced).
+  ## Park until the reader makes a cycle (headers/body may have advanced). Unlike
+  ## chronos, we must NOT poke the reader here: wake() completes the reader's wait
+  ## synchronously, so asyncdispatch runs the continuation without returning to
+  ## poll(). The per-cycle sleepAsync fallback timers then never fire (poll is
+  ## starved) and pile up unbounded -- a busy streaming read OOMs in seconds. The
+  ## reader is instead paced by real I/O: the fd-readable callback wakes it when
+  ## body data lands, and its own 100ms fallback bounds an idle wait. (chronos can
+  ## wake here because its `one()` cancels the loser timer; asyncdispatch cannot.)
   let f = newFuture[void]("navi.h3.recv")
   qc.recvReady[sid] = f
   defer: qc.recvReady.del(sid)    # runs on cancellation/exception too, not just success
-  wake(qc)                        # poke the reader so we don't wait its full timer
   await f
 
 proc submitStream*(qc: QuicConnAsync, verb, path: string,

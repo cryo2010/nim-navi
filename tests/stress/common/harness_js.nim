@@ -28,7 +28,7 @@ proc loadJsCfg*(): JsCfg =
     basePort: envInt("NAVI_BASE_PORT", 9443),
     servers: max(1, envInt("NAVI_SERVERS", 5)),
     clients: max(1, envInt("NAVI_CLIENTS", 3)),
-    concurrency: max(1, envInt("NAVI_CONCURRENCY", 32)),
+    concurrency: max(1, envInt("NAVI_CONCURRENCY", 8)),
     reportSeconds: max(1, envInt("NAVI_REPORT_SECONDS", 60)),
     streamBytes: envInt("NAVI_STREAM_BYTES", 1073741824),
     seconds: parseFloat($envJs("NAVI_SECONDS", "60")))

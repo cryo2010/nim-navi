@@ -27,7 +27,7 @@ checksum and fails hard on any mismatch.
 | `SERVERS` | `5` | server instances; requests round-robin across them |
 | `SECONDS` | `60` | runtime per (backend × protocol) cell |
 | `CLIENTS` | `3` | navi clients per backend |
-| `CONCURRENCY` | `32` | in-flight requests per client (async fan-out) |
+| `CONCURRENCY` | `8` | in-flight requests per client (async fan-out) |
 | `REQ_COMPRESSION` | `gzip` | request body: `none` \| `gzip` \| `deflate` (native) |
 | `RESP_COMPRESSION` | `gzip` | response via `x-want-encoding`: `none` \| `gzip` \| `deflate` \| `br` \| `zstd` |
 | `REPORT_SECONDS` | `60` | report cadence |

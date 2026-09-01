@@ -10,13 +10,10 @@
 ## memory stays flat over a long soak. A reporter prints status counts + RSS every
 ## report interval. Transport failures increment an error count and the soak goes on.
 
-import std/[times, tables]
-from std/os import getEnv
+import std/times
 import ../zlibcodec
 import ../common/[config, reporter, servers]
 
-var errLog = initCountTable[string]()   # distinct error name+msg -> count (diagnostic)
-let logErrors = getEnv("NAVI_LOG_ERRORS").len > 0
 when defined(useChronos):
   import navi/chronos
   const backend = "chronos"
@@ -61,8 +58,13 @@ proc worker(api: Navi, cfg: Config, pool: ptr ServerPool,
       counter.tally(res.status)        # then res drops: no body retained
     except CatchableError as e:
       counter.fail()
-      if logErrors:
-        {.cast(gcsafe).}: errLog.inc($v & " " & $e.name & ": " & e.msg)  # single-threaded
+      # Fail hard: a surfaced transport error means navi could not handle the
+      # request (a replayable failure is retried internally and never reaches
+      # here), so treat it as a bug to investigate, not soak noise to tally.
+      {.cast(gcsafe).}:
+        stderr.writeLine cfg.label & " FAIL: " & $v & " " & url & " -> " &
+          $e.name & ": " & e.msg
+      quit(1)
 
 proc reporterLoop(cfg: Config, counter: StatusCounter,
                   start, deadline: float) {.async.} =
@@ -72,10 +74,6 @@ proc reporterLoop(cfg: Config, counter: StatusCounter,
     if epochTime() - last >= cfg.reportSeconds.float:
       last = epochTime()
       report(cfg.label, counter, epochTime() - start)
-      if logErrors:
-        {.cast(gcsafe).}:
-          for msg, cnt in errLog:                 # unsorted: sort() would freeze the table
-            stderr.writeLine "  err[" & $cnt & "] " & msg
 
 proc main() {.async.} =
   let cfg = loadConfig(backend)

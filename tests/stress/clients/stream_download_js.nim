@@ -43,14 +43,17 @@ proc main() {.async.} =
   let start = nowMs()
   let deadline = start + cfg.seconds * 1000.0
   var transfers = 0
-  var bytes = 0                          # cumulative bytes rx, for the reporter
+  # Float, not int: the js backend overflow-checks int at 2^31, and cumulative
+  # bytes crosses 2 GiB within seconds of a soak (~32 x 64 MiB). A JS number holds
+  # the running total exactly well past any realistic soak (2^53 bytes = 8 PiB).
+  var bytes = 0.0                        # cumulative bytes rx, for the reporter
   proc reportMem() =
-    echo "[streamDownload js] ", bytes div (1 shl 20), "MB rx | ", transfers,
+    echo "[streamDownload js] ", int(bytes / 1048576.0), "MB rx | ", transfers,
          " done | RSS ", rssMb(), "MB | heap ", heapUsedMb(), "MB | t=",
          int((nowMs() - start) / 1000.0), "s"
   let timer = setIntervalJs(reportMem, cfg.reportSeconds * 1000)
   while true:
-    bytes += await oneDownload(api, cfg, pool.pick() & "/download?size=" & $cfg.streamBytes)
+    bytes += float(await oneDownload(api, cfg, pool.pick() & "/download?size=" & $cfg.streamBytes))
     inc transfers
     if nowMs() >= deadline: break
   clearIntervalJs(timer)

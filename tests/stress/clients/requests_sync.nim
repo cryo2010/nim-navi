@@ -66,8 +66,14 @@ proc main() =
         let res = api.request(v, url, headers = h, body = body)
         cfg.checkVersion(res.httpVersion)   # hard-fail on a silent protocol downgrade
         counter.tally(res.status)
-      except CatchableError:
+      except CatchableError as e:
         counter.fail()
+        # Fail hard: a surfaced transport error means navi could not handle the
+        # request (replayable failures are retried internally), so it is a bug to
+        # investigate, not soak noise to tally.
+        stderr.writeLine cfg.label & " FAIL: " & $v & " " & url & " -> " &
+          $e.name & ": " & e.msg
+        quit(1)
     if epochTime() - lastReport >= cfg.reportSeconds.float:
       lastReport = epochTime()
       report(cfg.label, counter, epochTime() - start)
