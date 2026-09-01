@@ -9,6 +9,8 @@ reqwest = { version = "0.12", default-features = false, features = ["gzip", "rus
 futures-util = "0.3"
 sha1 = "0.10"
 serde_json = "1"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+rustls = "0.23"
 
 [profile.release]
 opt-level = 3

@@ -66,7 +66,7 @@ async function main() {
   }
 
   const workload = envStr('NAVI_WORKLOAD', 'requests');
-  const KNOWN = ['requests', 'streamDownload', 'streamUpload', 'sse'];
+  const KNOWN = ['requests', 'streamDownload', 'streamUpload', 'sse', 'ws'];
   if (!KNOWN.includes(workload)) {
     process.stdout.write(`SKIP\tnode\t${workload} not implemented\n`);
     process.exit(0);
@@ -391,6 +391,38 @@ async function main() {
     }
   }
 
+  // ws workers each own one WebSocket looping "ping" text-echo round-trips.
+  // WebSocket is an h1 upgrade, so there is no protocol version gate here.
+  // NODE_EXTRA_CA_CERTS trusts the self-signed cert -> no TLS opts needed.
+  function wsWorker() {
+    const bi = (baseIdx++) % bases.length;
+    const url = `wss://${host}:${basePort + bi}/ws`;
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(url);
+      let waiter = null; // resolves with the next inbound message
+      ws.onmessage = (ev) => { if (waiter) { const r = waiter; waiter = null; r(ev.data); } };
+      ws.onerror = () => reject(new Error(`websocket error on ${url}`));
+      ws.onopen = async () => {
+        try {
+          while (performance.now() < deadlineMs) {
+            const t0 = performance.now();
+            const recv = new Promise((res) => { waiter = res; });
+            ws.send('ping');
+            const msg = await recv;
+            if (msg !== 'ping') {
+              process.stderr.write(`FAIL: ws echo mismatch on ${url} -- got ${JSON.stringify(msg)}\n`);
+              process.exit(1);
+            }
+            const nowMs = performance.now();
+            if (nowMs >= measureStartMs) { record(Math.round((nowMs - t0) * 1000)); measuredBytes += 4; }
+          }
+          ws.close();
+          resolve();
+        } catch (e) { reject(e); }
+      };
+    });
+  }
+
   async function workerLoop(seed) {
     let n = seed;
     while (performance.now() < deadlineMs) {
@@ -410,7 +442,7 @@ async function main() {
   }
 
   const workerCount = clients * concurrency;
-  const spawn = workload === 'sse' ? sseWorker : workerLoop;
+  const spawn = workload === 'sse' ? sseWorker : workload === 'ws' ? wsWorker : workerLoop;
   const workers = [];
   for (let i = 0; i < workerCount; i++) workers.push(spawn(i));
   await Promise.all(workers);

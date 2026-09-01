@@ -8,10 +8,13 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
 	"crypto/sha1"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -199,6 +202,117 @@ func eventsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// --- WebSocket echo (RFC 6455, stdlib-only) ---------------------------------
+// WS is an h1 upgrade, so ResponseWriter supports Hijack. Minimal frame codec:
+// client frames are masked (unmasked here), echoed back unmasked; ping->pong;
+// close ends. Handles 7-bit and 16-bit lengths (bench payloads are tiny).
+
+const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+func wsAccept(key string) string {
+	h := sha1.New()
+	h.Write([]byte(key + wsGUID))
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+func wsWriteFrame(buf *bufio.ReadWriter, opcode byte, payload []byte) error {
+	if err := buf.WriteByte(0x80 | opcode); err != nil {
+		return err
+	}
+	n := len(payload)
+	switch {
+	case n < 126:
+		buf.WriteByte(byte(n))
+	case n < 65536:
+		buf.WriteByte(126)
+		var ext [2]byte
+		binary.BigEndian.PutUint16(ext[:], uint16(n))
+		buf.Write(ext[:])
+	default:
+		buf.WriteByte(127)
+		var ext [8]byte
+		binary.BigEndian.PutUint64(ext[:], uint64(n))
+		buf.Write(ext[:])
+	}
+	buf.Write(payload)
+	return buf.Flush()
+}
+
+func wsHandler(w http.ResponseWriter, r *http.Request) {
+	if !strings.Contains(strings.ToLower(r.Header.Get("Upgrade")), "websocket") {
+		http.Error(w, "expected websocket", http.StatusBadRequest)
+		return
+	}
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "no hijack (h2?)", http.StatusInternalServerError)
+		return
+	}
+	conn, buf, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	buf.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n" +
+		"Connection: Upgrade\r\nSec-WebSocket-Accept: " +
+		wsAccept(r.Header.Get("Sec-WebSocket-Key")) + "\r\n\r\n")
+	buf.Flush()
+	for {
+		h0, err := buf.ReadByte()
+		if err != nil {
+			return
+		}
+		h1b, err := buf.ReadByte()
+		if err != nil {
+			return
+		}
+		opcode := h0 & 0x0f
+		masked := h1b&0x80 != 0
+		plen := int(h1b & 0x7f)
+		if plen == 126 {
+			var ext [2]byte
+			if _, err := io.ReadFull(buf, ext[:]); err != nil {
+				return
+			}
+			plen = int(binary.BigEndian.Uint16(ext[:]))
+		} else if plen == 127 {
+			var ext [8]byte
+			if _, err := io.ReadFull(buf, ext[:]); err != nil {
+				return
+			}
+			plen = int(binary.BigEndian.Uint64(ext[:]))
+		}
+		var mask [4]byte
+		if masked {
+			if _, err := io.ReadFull(buf, mask[:]); err != nil {
+				return
+			}
+		}
+		payload := make([]byte, plen)
+		if _, err := io.ReadFull(buf, payload); err != nil {
+			return
+		}
+		if masked {
+			for i := range payload {
+				payload[i] ^= mask[i%4]
+			}
+		}
+		switch opcode {
+		case 0x8: // close
+			wsWriteFrame(buf, 0x8, payload)
+			return
+		case 0x9: // ping -> pong
+			if wsWriteFrame(buf, 0xA, payload) != nil {
+				return
+			}
+		case 0x1, 0x2: // text/binary echo
+			if wsWriteFrame(buf, opcode, payload) != nil {
+				return
+			}
+		}
+	}
+}
+
 func env(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
@@ -212,6 +326,7 @@ func main() {
 	mux.HandleFunc("/upload", uploadHandler)
 	mux.HandleFunc("/download", downloadHandler)
 	mux.HandleFunc("/events", eventsHandler)
+	mux.HandleFunc("/ws", wsHandler)
 	srv := &http.Server{
 		Addr:    env("NAVI_BENCH_ADDR", "127.0.0.1:8443"),
 		Handler: mux,

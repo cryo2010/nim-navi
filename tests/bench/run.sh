@@ -135,6 +135,8 @@ common="--path:$root/src -d:ssl -d:release --hints:off"
 { [ "$proto" = "h3" ] || [ "$proto" = "all" ]; } && common="$common -d:naviHttp3"
 
 case "$proto" in all) protos=(h1 h2 h3) ;; *) protos=("$proto") ;; esac
+# WebSocket is an h1 upgrade (reference WS libs are h1-only), so ws runs h1 only.
+[ "$workload" = ws ] && protos=(h1)
 case "$backend" in all) navi_backends=(sync asyncdispatch chronos js) ;; *) navi_backends=("$backend") ;; esac
 
 want_lang() { case ",$langs," in *,all,*|*",$1,"*) return 0 ;; *) return 1 ;; esac; }

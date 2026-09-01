@@ -9,14 +9,18 @@
 //   streamUpload   - POST /upload, a sha1-hashed streamed body of constant memory.
 //   sse            - GET /events, one infinite text/event-stream per goroutine;
 //                    unit = one event, latency = inter-arrival gap.
-// Streaming/SSE units carry MB/s in RESULT's last field. Emits one RESULT line;
+//   ws             - manual RFC 6455 client (stdlib only) doing text-echo round
+//                    trips over /ws; unit = one round trip.
+// Streaming/SSE/ws units carry MB/s in RESULT's last field. Emits one RESULT line;
 // fails hard on any transport error, protocol downgrade, or checksum mismatch.
 package main
 
 import (
 	"bufio"
+	"crypto/rand"
 	"crypto/sha1"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -123,9 +127,12 @@ func (h *histogram) percentileMs(p float64) float64 {
 
 // config is the resolved run configuration shared by every workload.
 type config struct {
-	bases       []string
+	bases       []string    // "https://host:port" for the http.Client workloads
+	addrs       []string    // "host:port" authority for the raw ws socket
+	host        string      // for the ws Host header / TLS ServerName
 	client      *http.Client
-	expect      string // negotiated HTTP version this cell is pinned to
+	tlsCfg      *tls.Config // reused for the manual ws tls.Dial
+	expect      string      // negotiated HTTP version this cell is pinned to
 	cold        bool
 	clients     int
 	concurrency int
@@ -139,6 +146,10 @@ type config struct {
 
 func (c *config) nextBase() string {
 	return c.bases[int(atomic.AddUint64(&c.baseIdx, 1))%len(c.bases)]
+}
+
+func (c *config) nextAddr() string {
+	return c.addrs[int(atomic.AddUint64(&c.baseIdx, 1))%len(c.addrs)]
 }
 
 // gate applies the one-time first-response protocol check; hard-fail on downgrade.
@@ -270,6 +281,138 @@ func (c *config) doSSE(h *histogram, bytes *int64) {
 	}
 }
 
+// runWS fans out one dialed WebSocket connection per goroutine and records each
+// text-echo round trip. Like SSE, latency is measured inside the connection loop.
+func (c *config) runWS() {
+	var wg sync.WaitGroup
+	hists := make([]*histogram, c.clients*c.concurrency)
+	bytesEach := make([]int64, len(hists))
+	for i := range hists {
+		hists[i] = newHistogram()
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			c.doWS(hists[idx], &bytesEach[idx])
+		}(i)
+	}
+	wg.Wait()
+	c.emit(hists, bytesEach)
+}
+
+// doWS opens one TLS socket, performs a manual RFC 6455 upgrade (GET /ws, 101),
+// then loops masked "ping" text frames and verifies the unmasked echo, recording
+// each round-trip latency + 4 payload bytes. WebSocket is an h1 upgrade so there is
+// no version gate. Stops at the deadline and sends a close frame.
+func (c *config) doWS(h *histogram, bytes *int64) {
+	addr := c.nextAddr()
+	conn, err := tls.Dial("tcp", addr, c.tlsCfg)
+	if err != nil {
+		fail("WS", addr, err)
+	}
+	defer conn.Close()
+
+	var keyRaw [16]byte
+	if _, err := rand.Read(keyRaw[:]); err != nil {
+		fail("WS", addr, err)
+	}
+	key := base64.StdEncoding.EncodeToString(keyRaw[:])
+	handshake := "GET /ws HTTP/1.1\r\n" +
+		"Host: " + c.host + "\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Version: 13\r\n" +
+		"Sec-WebSocket-Key: " + key + "\r\n\r\n"
+	if _, err := conn.Write([]byte(handshake)); err != nil {
+		fail("WS", addr, err)
+	}
+
+	br := bufio.NewReader(conn)
+	statusLine, err := br.ReadString('\n')
+	if err != nil {
+		fail("WS", addr, err)
+	}
+	if !strings.Contains(statusLine, " 101 ") {
+		fmt.Fprintf(os.Stderr, "FAIL: ws %s -> handshake status %q (want 101)\n", addr, strings.TrimSpace(statusLine))
+		os.Exit(1)
+	}
+	for { // drain the rest of the response headers up to the blank line
+		line, err := br.ReadString('\n')
+		if err != nil {
+			fail("WS", addr, err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+
+	for time.Now().Before(c.deadline) {
+		t0 := time.Now()
+		if err := writeMaskedText(conn, "ping"); err != nil {
+			fail("WS", addr, err)
+		}
+		opcode, payload, err := readFrame(br)
+		if err != nil {
+			if time.Now().Before(c.deadline) {
+				fail("WS", addr, err)
+			}
+			break
+		}
+		if opcode != 0x1 || string(payload) != "ping" {
+			fmt.Fprintf(os.Stderr, "FAIL: ws %s -> echo opcode=0x%x payload=%q (want text \"ping\")\n", addr, opcode, payload)
+			os.Exit(1)
+		}
+		if !t0.Before(c.measureStart) {
+			h.record(time.Since(t0).Microseconds())
+			*bytes += 4
+		}
+	}
+	conn.Write([]byte{0x88, 0x80, 0, 0, 0, 0}) // masked, empty close frame (best effort)
+}
+
+// writeMaskedText sends a single-frame masked text message (client frames MUST be
+// masked). Payloads here are <126 bytes so a 7-bit length suffices.
+func writeMaskedText(conn *tls.Conn, s string) error {
+	var mask [4]byte
+	if _, err := rand.Read(mask[:]); err != nil {
+		return err
+	}
+	frame := make([]byte, 0, 6+len(s))
+	frame = append(frame, 0x81)                  // FIN | opcode=0x1 (text)
+	frame = append(frame, byte(0x80|len(s)))     // mask bit | 7-bit length
+	frame = append(frame, mask[:]...)
+	for i := 0; i < len(s); i++ {
+		frame = append(frame, s[i]^mask[i%4])
+	}
+	_, err := conn.Write(frame)
+	return err
+}
+
+// readFrame reads one server (unmasked) frame, returning its opcode and payload.
+// Only 7-bit lengths are handled; server echoes are tiny.
+func readFrame(br *bufio.Reader) (opcode byte, payload []byte, err error) {
+	b0, err := br.ReadByte()
+	if err != nil {
+		return 0, nil, err
+	}
+	b1, err := br.ReadByte()
+	if err != nil {
+		return 0, nil, err
+	}
+	opcode = b0 & 0x0f
+	if b1&0x80 != 0 { // server (RFC 6455) frames must be unmasked
+		return 0, nil, fmt.Errorf("unexpected masked server frame")
+	}
+	length := int(b1 & 0x7f)
+	if length >= 126 {
+		return 0, nil, fmt.Errorf("frame length %d exceeds 7-bit handling", length)
+	}
+	payload = make([]byte, length)
+	if _, err := io.ReadFull(br, payload); err != nil {
+		return 0, nil, err
+	}
+	return opcode, payload, nil
+}
+
 func main() {
 	proto := envStr("NAVI_PROTO", "h2")
 	if proto == "h3" {
@@ -278,7 +421,7 @@ func main() {
 	}
 	workload := envStr("NAVI_WORKLOAD", "requests")
 	switch workload {
-	case "requests", "streamDownload", "streamUpload", "sse":
+	case "requests", "streamDownload", "streamUpload", "sse", "ws":
 	default:
 		fmt.Printf("SKIP\tgo\t%s not implemented\n", workload)
 		os.Exit(0)
@@ -293,9 +436,8 @@ func main() {
 	seconds := envFloat("NAVI_SECONDS", 20)
 	warmup := envFloat("NAVI_WARMUP_SECONDS", 2)
 
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
+	tlsCfg := &tls.Config{InsecureSkipVerify: true}
+	tr := &http.Transport{TLSClientConfig: tlsCfg}
 	expect := "HTTP/2.0"
 	if proto == "h1" {
 		tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
@@ -307,7 +449,9 @@ func main() {
 
 	start := time.Now()
 	cfg := &config{
+		host:         host,
 		client:       &http.Client{Transport: tr},
+		tlsCfg:       tlsCfg,
 		expect:       expect,
 		cold:         envStr("NAVI_MODE", "pooled") == "cold",
 		clients:      envInt("NAVI_CLIENTS", 3),
@@ -318,6 +462,7 @@ func main() {
 	cfg.deadline = cfg.measureStart.Add(time.Duration(seconds * float64(time.Second)))
 	for i := 0; i < servers; i++ {
 		cfg.bases = append(cfg.bases, fmt.Sprintf("https://%s:%d", host, basePort+i))
+		cfg.addrs = append(cfg.addrs, fmt.Sprintf("%s:%d", host, basePort+i))
 	}
 
 	switch workload {
@@ -329,6 +474,8 @@ func main() {
 		cfg.run(cfg.doUpload)
 	case "sse":
 		cfg.runSSE()
+	case "ws":
+		cfg.runWS()
 	}
 }
 

@@ -30,11 +30,12 @@ RUN curl -fsSL "https://nim-lang.org/download/nim-${NIM_VERSION}.tar.xz" -o /tmp
 ENV PATH="/opt/nim-2.2.10/bin:/root/.nimble/bin:${PATH}"
 RUN nimble install -y checksums zippy "chronos@>= 4.0.0"
 
-# Node.js + Python + netem (tc), after the toolchains so their layers stay cached.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      nodejs npm python3 python3-pip iproute2 \
-    && rm -rf /var/lib/apt/lists/* \
-    && pip3 install --no-cache-dir --break-system-packages "httpx[http2]" websockets
+# Node.js 22 (nodesource; the global WebSocket the navi/js + node WS clients need is
+# not in Debian's Node 18) + Python + netem (tc). After the toolchains so cached.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+ && apt-get install -y --no-install-recommends nodejs python3 python3-pip iproute2 \
+ && rm -rf /var/lib/apt/lists/* \
+ && pip3 install --no-cache-dir --break-system-packages "httpx[http2]" websockets
 
 WORKDIR /app
 COPY src ./src

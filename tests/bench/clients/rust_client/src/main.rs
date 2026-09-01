@@ -4,7 +4,8 @@
 //!   - "requests":       buffered GET/POST/PUT workload.
 //!   - "streamDownload": streamed GET /download, sha1-verified.
 //!   - "streamUpload":   streamed POST /upload, sha1-verified.
-//!   - others (ws/sse):  SKIP.
+//!   - "sse":            infinite text/event-stream, inter-arrival latency.
+//!   - "ws":             wss text echo round-trips.
 //!
 //! Each workload is time-boxed with an unmeasured warmup prelude, records
 //! per-unit latency into a shared log-bucketed histogram, and prints ONE
@@ -15,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use sha1::{Digest, Sha1};
 
 // --- Config helpers -------------------------------------------------------
@@ -97,7 +98,7 @@ fn main() {
     let workload = env_str("NAVI_WORKLOAD", "requests");
     if !matches!(
         workload.as_str(),
-        "requests" | "streamDownload" | "streamUpload" | "sse"
+        "requests" | "streamDownload" | "streamUpload" | "sse" | "ws"
     ) {
         println!("SKIP\trust\t{} not implemented", workload);
         std::process::exit(0);
@@ -226,12 +227,17 @@ async fn worker(
     let mut hist = Hist::new(cfg.max_buckets);
     let mut checked = false;
 
-    // sse records inter-arrival latency itself and breaks on the deadline
-    // mid-stream, so it manages its own histogram rather than the
-    // per-transfer timing wrapper below.
+    // sse and ws hold a single long-lived connection, record their own
+    // per-unit latency, and break on the deadline, so they manage their own
+    // histogram rather than the per-transfer timing wrapper below.
     if workload == "sse" {
         let base = pick(&cfg, &rr);
         sse(&client, &cfg, &base, &mut checked, start, measure_start, deadline, &mut hist).await;
+        return hist;
+    }
+    if workload == "ws" {
+        let base = pick(&cfg, &rr);
+        ws(&cfg, &base, start, measure_start, deadline, &mut hist).await;
         return hist;
     }
 
@@ -441,4 +447,107 @@ fn sse_data_len(frame: &[u8]) -> usize {
         }
     }
     n
+}
+
+// --- WebSocket workload ----------------------------------------------------
+
+/// A rustls certificate verifier that accepts any server certificate. This is
+/// intentionally insecure and used only to talk to the benchmark server's
+/// self-signed cert, mirroring reqwest's danger_accept_invalid_certs above.
+#[derive(Debug)]
+struct NoVerify(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// WebSocket text-echo round-trips over wss (an HTTP/1.1 upgrade; no version
+/// gate). Records per-round-trip latency (µs) during the measured window and
+/// adds the 4-byte "ping" payload to the byte accumulator. Breaks on deadline.
+async fn ws(
+    cfg: &Config,
+    base: &str,
+    start: Instant,
+    measure_start: f64,
+    deadline: f64,
+    hist: &mut Hist,
+) {
+    use tokio_tungstenite::tungstenite::Message;
+
+    // wss URL from the https base.
+    let url = format!("{}/ws", base.replacen("https://", "wss://", 1));
+
+    // rustls config that trusts the self-signed server cert.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap_or_else(|e| fail(e))
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
+        .with_no_client_auth();
+    let connector = tokio_tungstenite::Connector::Rustls(Arc::new(config));
+
+    let (mut socket, _resp) = tokio_tungstenite::connect_async_tls_with_config(
+        &url,
+        None,
+        false,
+        Some(connector),
+    )
+    .await
+    .unwrap_or_else(|e| fail(e));
+
+    while start.elapsed().as_secs_f64() < deadline {
+        let t0 = Instant::now();
+        if let Err(e) = socket.send(Message::Text("ping".into())).await {
+            fail(e);
+        }
+        let msg = match socket.next().await {
+            Some(m) => m.unwrap_or_else(|e| fail(e)),
+            None => break, // server closed the connection
+        };
+        match msg {
+            Message::Text(ref t) if t.as_str() == "ping" => {}
+            other => {
+                eprintln!("[rust] ws unexpected reply: {:?}", other);
+                std::process::exit(1);
+            }
+        }
+        if start.elapsed().as_secs_f64() >= measure_start {
+            hist.record(t0.elapsed().as_micros() as u64);
+            hist.bytes += 4;
+        }
+    }
+
+    let _ = socket.send(Message::Close(None)).await;
 }

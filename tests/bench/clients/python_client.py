@@ -14,10 +14,12 @@ import asyncio
 import hashlib
 import math
 import os
+import ssl
 import sys
 import time
 
 import httpx
+import websockets
 
 
 # ---------------------------------------------------------------------------
@@ -249,11 +251,40 @@ async def sse_worker(client, i, measure_start, deadline):
         fail("FAIL: {0}".format(e))
 
 
+def pick_ws():
+    port = BASE_PORT + (_rr[0] % len(BASES))
+    _rr[0] += 1
+    return "wss://{0}:{1}/ws".format(HOST, port)
+
+
+async def ws_worker(client, i, measure_start, deadline):
+    # WebSocket is an HTTP/1.1 upgrade; no version gate. Self-signed TLS.
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    uri = pick_ws()
+    try:
+        async with websockets.connect(uri, ssl=ctx) as ws:
+            while time.perf_counter() < deadline:
+                t0 = time.perf_counter()
+                await ws.send("ping")
+                msg = await ws.recv()
+                if msg != "ping":
+                    fail("ws echo mismatch: got {0!r}".format(msg))
+                if time.perf_counter() >= measure_start:
+                    record((time.perf_counter() - t0) * 1e6, 4)
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        fail("FAIL: {0}".format(e))
+
+
 WORKERS = {
     "requests": requests_worker,
     "streamDownload": stream_download_worker,
     "streamUpload": stream_upload_worker,
     "sse": sse_worker,
+    "ws": ws_worker,
 }
 
 
