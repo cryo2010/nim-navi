@@ -1,11 +1,11 @@
-## Async, multiplexed HTTP/3 driver for the asyncdispatch backend (phase 2h,
-## slice 3). A `QuicConnAsync` carries many concurrent streams over one QUIC
+## Async, multiplexed HTTP/3 driver for the asyncdispatch backend. A
+## `QuicConnAsync` carries many concurrent streams over one QUIC
 ## connection: a single background reader drives the connection's I/O (send /
 ## recv / QUIC timer) and completes each stream's future as it finishes, while
 ## `requestOnConn` submits a stream and awaits it. Imports quic for the FFI and
 ## the {.compile.}/link pragmas. -d:naviHttp3-only.
 when not defined(naviHttp3):
-  {.error: "navi/backend/quic_async is a -d:naviHttp3-only module (HTTP/3 WIP).".}
+  {.error: "navi/backend/quic_async is a -d:naviHttp3-only module.".}
 
 import std/[asyncdispatch, strutils, tables]
 import ./quic

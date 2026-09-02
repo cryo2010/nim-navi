@@ -75,6 +75,30 @@ proc acceptFor*(key: string): string =
 
 # --- frame codec ---
 
+proc applyMask(dst: var string, dstStart: int, src: string, srcStart, n: int,
+               key: array[4, byte]) =
+  ## dst[dstStart+i] = src[srcStart+i] xor key[i mod 4] for i in 0..<n, eight bytes
+  ## at a time (RFC 6455 masking is per-byte; masking every payload byte of every
+  ## client frame is the hot path). The 4-byte key is repeated into a uint64 and
+  ## XORed word-wise; because each chunk starts at a multiple of 8 (a multiple of the
+  ## 4-byte key period) the alignment holds, and copyMem keeps byte order so the
+  ## result is endianness-independent. A scalar tail finishes the last <8 bytes.
+  if n <= 0: return
+  var mask8: array[8, byte]
+  for i in 0 ..< 8: mask8[i] = key[i and 3]
+  var m64: uint64
+  copyMem(addr m64, addr mask8[0], 8)
+  var i = 0
+  while i + 8 <= n:
+    var w: uint64
+    copyMem(addr w, unsafeAddr src[srcStart + i], 8)
+    w = w xor m64
+    copyMem(addr dst[dstStart + i], addr w, 8)
+    i += 8
+  while i < n:
+    dst[dstStart + i] = char(byte(src[srcStart + i]) xor key[i and 3])
+    inc i
+
 proc encodeFrame*(opcode: Opcode, payload: string, masked = true,
                   maskKey = "", fin = true): string =
   ## Serialize one frame. Client callers keep `masked` true; `maskKey` (4 bytes)
@@ -95,12 +119,15 @@ proc encodeFrame*(opcode: Opcode, payload: string, masked = true,
     for shift in countdown(56, 0, 8):
       result.add char((n shr shift) and 0xFF)
   if masked:
-    var key = maskKey
-    if key.len != 4:
-      key = randomBytes(4)
-    result.add key
-    for i in 0 ..< n:
-      result.add char(ord(payload[i]) xor ord(key[i mod 4]))
+    var keyStr = maskKey
+    if keyStr.len != 4:
+      keyStr = randomBytes(4)
+    result.add keyStr
+    var key: array[4, byte]
+    for i in 0 ..< 4: key[i] = byte(keyStr[i])
+    let off = result.len
+    result.setLen(off + n)
+    applyMask(result, off, payload, 0, n, key)
   else:
     result.add payload
 
@@ -131,10 +158,10 @@ proc next*(d: var WsDecoder, f: var Frame): bool =
     raise newException(ValueError,
       "navi: WebSocket frame length is invalid or exceeds the " &
       $maxFramePayload & "-byte limit")
-  var key: array[4, int]
+  var key: array[4, byte]
   if masked:
     if d.buf.len < pos + 4: return false
-    for i in 0 ..< 4: key[i] = ord(d.buf[pos + i])
+    for i in 0 ..< 4: key[i] = byte(d.buf[pos + i])
     pos += 4
   if d.buf.len < pos + length: return false     # payload not fully arrived
   f.fin = (b0 and 0x80) != 0
@@ -151,9 +178,10 @@ proc next*(d: var WsDecoder, f: var Frame): bool =
     else: raise newException(ValueError,
       "navi: reserved WebSocket opcode 0x" & toHex(b0 and 0x0F, 1))
   f.payload = newString(length)
-  for i in 0 ..< length:
-    let b = ord(d.buf[pos + i])
-    f.payload[i] = char(if masked: b xor key[i mod 4] else: b)
+  if masked:
+    applyMask(f.payload, 0, d.buf, pos, length, key)
+  elif length > 0:
+    copyMem(addr f.payload[0], unsafeAddr d.buf[pos], length)
   d.buf.delete(0 ..< pos + length)
   true
 
