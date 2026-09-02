@@ -14,6 +14,11 @@
 ## (the runtime owns connections). Cookies persist automatically: navi keeps a
 ## jar wherever there is no browser cookie store (Node, Deno, Bun, Workers), and
 ## leaves it to the browser otherwise. Nothing to configure.
+##
+## Limitations vs the native backends: `config.http` is ignored (the runtime picks
+## the HTTP version, and may well use h2/h3), and `res.httpVersion` is always `""`
+## because `fetch` does not expose the negotiated version -- cross-backend code that
+## branches on `res.httpVersion` must treat `""` as "unknown", not as HTTP/1.1.
 
 when not defined(js):
   {.error: "navi/js requires the JavaScript backend; compile with `nim js` " &

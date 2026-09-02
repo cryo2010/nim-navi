@@ -11,7 +11,7 @@
 ## via chronos's low-level fd readiness (register2/addReader2) rather than a
 ## StreamTransport (which is TCP-only).
 when not defined(naviHttp3):
-  {.error: "navi/backend/quic_chronos is a -d:naviHttp3-only module (HTTP/3 WIP).".}
+  {.error: "navi/backend/quic_chronos is a -d:naviHttp3-only module.".}
 
 import std/[strutils, tables]
 import pkg/chronos

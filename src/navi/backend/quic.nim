@@ -1,4 +1,4 @@
-## HTTP/3 QUIC transport (phase 2b).
+## HTTP/3 QUIC transport.
 ##
 ## Compiled ONLY in a `-d:naviHttp3` build; no default CI job enables it. It links
 ## ngtcp2 + nghttp3 + the OpenSSL >= 3.5 QUIC crypto binding (via pkg-config) and
@@ -14,7 +14,7 @@
 ## supported; the server certificate and hostname are verified (secure by default).
 
 when not defined(naviHttp3):
-  {.error: "navi/backend/quic is a -d:naviHttp3-only module (HTTP/3 WIP).".}
+  {.error: "navi/backend/quic is a -d:naviHttp3-only module.".}
 
 import std/strutils
 import ../core/altsvc
