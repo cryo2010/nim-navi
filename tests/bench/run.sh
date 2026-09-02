@@ -173,15 +173,17 @@ if want_lang std && [ -f "$here/clients/std_sync.nim" ]; then
   nim c $common -o:"$work/std_async" "$here/clients/std_async.nim" && STD_ASYNC="$work/std_async"
 fi
 
-# run_client <displayname> <cellfile> <cmd...>: run one client, collect its RESULT
-# line (or note a SKIP / crash). A crash without RESULT sets the global fail flag.
+# run_client <language/package> <cellfile> <cmd...>: run one client, collect its
+# RESULT line (or note a SKIP / crash). The RESULT's name field is rewritten to the
+# harness-supplied language/package label, so naming lives here (one source of truth)
+# rather than in each client. A crash without RESULT sets the global fail flag.
 fail=0
 run_client() {
   local name="$1" cell="$2"; shift 2
   local out
   if out="$("$@" 2>&1)"; then
     if echo "$out" | grep -q '^RESULT'; then
-      echo "$out" | grep '^RESULT' >> "$cell"
+      echo "$out" | grep '^RESULT' | awk -v n="$name" 'BEGIN{FS=OFS="\t"}{$2=n;print}' >> "$cell"
     elif echo "$out" | grep -q '^SKIP'; then
       echo "  $name: $(echo "$out" | grep '^SKIP' | cut -f3-)"
     else
@@ -198,12 +200,12 @@ print_table() {   # <cellfile> <workload> <proto>
   echo ""
   echo "== bench: $wl | $pr | ${servers} servers =="
   local max; max="$(sort -t$'\t' -k5 -nr "$cell" | head -1 | cut -f5)"
-  printf "%-14s %11s %8s %11s %9s %9s %9s %9s %6s\n" \
+  printf "%-20s %11s %8s %11s %9s %9s %9s %9s %6s\n" \
     CLIENT REQUESTS "TIME(s)" "REQ/S" p50ms p99ms p999ms "MB/s" REL
-  printf -- "--------------------------------------------------------------------------------------------\n"
+  printf -- "--------------------------------------------------------------------------------------------------\n"
   sort -t$'\t' -k5 -nr "$cell" | while IFS=$'\t' read -r _ name req sec rps p50 p99 p999 mbps; do
     local rel; rel="$(awk -v r="$rps" -v m="$max" 'BEGIN{printf "%.0f", (m>0? r/m*100 : 0)}')"
-    printf "%-14s %11s %8s %11s %9s %9s %9s %9s %5s%%\n" \
+    printf "%-20s %11s %8s %11s %9s %9s %9s %9s %5s%%\n" \
       "$name" "$req" "$sec" "$rps" "$p50" "$p99" "$p999" "$mbps" "$rel"
   done
 }
@@ -217,7 +219,7 @@ run_navi_multi() {   # <displayname> <cellfile> <bin>
   local total=$(( ${NAVI_CLIENTS:-3} * ${NAVI_CONCURRENCY:-8} )); [ "$total" -lt 1 ] && total=1
   local p=$procs; [ "$p" -gt "$total" ] && p=$total; [ "$p" -lt 1 ] && p=1
   local per=$(( (total + p - 1) / p ))          # per-process concurrency (ceil)
-  local base="$work/mp.$name"; local kids=(); local k
+  local base="$work/mp.${name//\//_}"; local kids=(); local k   # name has a /, sanitize for the path
   for ((k=0; k<p; k++)); do
     ( NAVI_CLIENTS=1 NAVI_CONCURRENCY="$per" "$bin" >"$base.$k.out" 2>"$base.$k.err" ) &
     kids+=($!)
@@ -245,25 +247,34 @@ run_cell() {   # <proto>: run every applicable client for this protocol, print t
   for be in "${navi_backends[@]}"; do
     [ -n "${NAVI_BIN[$be]:-}" ] || continue
     export NAVI_BACKEND="$be"
+    # Report each row as <language>/<package>. navi is Nim source (even navi-js, which
+    # is Nim compiled to js), with the backend as the package variant.
+    local dn
+    case "$be" in
+      sync)          dn="nim/navi-sync" ;;
+      asyncdispatch) dn="nim/navi-async" ;;
+      chronos)       dn="nim/navi-chronos" ;;
+      js)            dn="nim/navi-js" ;;
+    esac
     if [ "$be" = js ]; then
-      [ -n "$js_src" ] || { echo "  [navi-js]: skip (no js client for $workload)"; continue; }
-      [ "$pr" = h3 ] && { echo "  [navi-js $pr]: skip js/undici has no HTTP/3"; continue; }
-      run_client "navi-js" "$cell" env NODE_EXTRA_CA_CERTS="$cert" node "$work/${js_src}.js"
+      [ -n "$js_src" ] || { echo "  [$dn]: skip (no js client for $workload)"; continue; }
+      [ "$pr" = h3 ] && { echo "  [$dn $pr]: skip js/undici has no HTTP/3"; continue; }
+      run_client "$dn" "$cell" env NODE_EXTRA_CA_CERTS="$cert" node "$work/${js_src}.js"
+    elif [ "$procs" -le 1 ]; then
+      run_client "$dn" "$cell" "${NAVI_BIN[$be]}"
     else
-      local dn="navi-$be"; [ "$be" = asyncdispatch ] && dn="navi-async"  # match clientName
-      if [ "$procs" -le 1 ]; then run_client "$dn" "$cell" "${NAVI_BIN[$be]}"
-      else run_navi_multi "$dn" "$cell" "${NAVI_BIN[$be]}"; fi
+      run_navi_multi "$dn" "$cell" "${NAVI_BIN[$be]}"
     fi
   done
   # reference clients (h3 is navi-only). Each reads NAVI_WORKLOAD/NAVI_PROTO from the
   # env and self-skips (prints a SKIP line) any workload/protocol it does not support.
   if [ "$pr" != h3 ]; then
-    [ -n "$GO_BIN" ]    && run_client "go"     "$cell" "$GO_BIN"
-    [ -n "$RUST_BIN" ]  && run_client "rust"   "$cell" "$RUST_BIN"
-    want_lang node   && [ -f "$here/clients/node_client.js" ]  && run_client "node"   "$cell" env NODE_EXTRA_CA_CERTS="$cert" node "$here/clients/node_client.js"
-    want_lang python && [ -f "$here/clients/python_client.py" ] && run_client "python" "$cell" python3 "$here/clients/python_client.py"
-    [ -n "$STD_SYNC" ]  && run_client "std-sync"  "$cell" "$STD_SYNC"
-    [ -n "$STD_ASYNC" ] && run_client "std-async" "$cell" "$STD_ASYNC"
+    [ -n "$GO_BIN" ]    && run_client "go/net-http"   "$cell" "$GO_BIN"
+    [ -n "$RUST_BIN" ]  && run_client "rust/reqwest"  "$cell" "$RUST_BIN"
+    want_lang node   && [ -f "$here/clients/node_client.js" ]  && run_client "js/node"      "$cell" env NODE_EXTRA_CA_CERTS="$cert" node "$here/clients/node_client.js"
+    want_lang python && [ -f "$here/clients/python_client.py" ] && run_client "python/httpx" "$cell" python3 "$here/clients/python_client.py"
+    [ -n "$STD_SYNC" ]  && run_client "nim/std-sync"  "$cell" "$STD_SYNC"
+    [ -n "$STD_ASYNC" ] && run_client "nim/std-async" "$cell" "$STD_ASYNC"
   fi
   print_table "$cell" "$workload" "$pr"
 }
