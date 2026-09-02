@@ -1,10 +1,10 @@
 ## HPACK header compression (RFC 7541), sans-io.
 ##
 ## The encoder is stateless: it indexes the static table where it can and
-## otherwise emits literals without indexing (no Huffman on the way out). The
+## otherwise emits literals without indexing. Literal string values are
+## Huffman-coded when that is shorter on the wire (via `huffman.nim`). The
 ## decoder is stateful, maintaining the dynamic table, and handles every
-## representation a server may send. Huffman-coded strings are handled by
-## `huffman.nim`.
+## representation a server may send.
 
 import std/strutils
 import ./huffman
@@ -101,8 +101,16 @@ proc decodeInteger(data: string, i: var int, prefixBits: int): int =
       if (b and 0x80) == 0: break
 
 proc encodeString(s: string): string =
-  result = encodeInteger(s.len, 7) # H bit (0x80) left 0: not Huffman-coded
-  result.add s
+  # Huffman-code the value when it is strictly shorter on the wire (RFC 7541 5.2);
+  # otherwise emit the raw octets. The decoder reads the H bit either way.
+  let hlen = huffmanLength(s)
+  if hlen < s.len:
+    result = encodeInteger(hlen, 7)
+    result[0] = char(uint8(result[0]) or 0x80) # H bit: Huffman-coded
+    result.add huffmanEncode(s)
+  else:
+    result = encodeInteger(s.len, 7)
+    result.add s
 
 proc decodeString(data: string, i: var int): string =
   need(data, i)

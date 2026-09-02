@@ -94,7 +94,7 @@ proc initNaviConfig*(): NaviConfig =
   ## safe defaults (verify on, decompress on, 2 retries, 20 redirects); override
   ## the fields you want, then pass it to `newNavi`.
   NaviConfig(
-    prefixUrl: "", headers: initHeaders(), http: {H1, H2}, tls: defaultTls(),
+    prefixUrl: "", headers: initHeaders(), http: defaultHttpVersions, tls: defaultTls(),
     decompress: true, throwHttpErrors: true, maxRedirects: 20,
     retry: defaultRetryPolicy(), maxResponseBytes: 0,
     auth: Auth(), proxy: "", unixSocket: "",

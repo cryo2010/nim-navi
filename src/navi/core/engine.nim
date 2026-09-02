@@ -574,6 +574,7 @@ template performRequest*(client, req0: typed; cancel: CancelToken = nil): Respon
       inc attempt
       await sleep(backoffMs(attempt, resp, policy))
     enforceMaxResponse(resp, client.config.maxResponseBytes)
+    enforceProtocol(client.config, resp.httpVersion)  # strict: used proto in config.http
     if client.config.wantsThrow and not resp.ok:
       raiseHttpError(req, resp)
     resp

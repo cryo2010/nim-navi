@@ -53,6 +53,26 @@ suite "hpack encode":
     let decoded = dec.decode(enc.encode(@[("Content-Type", "text/plain")]))
     check decoded == @[("content-type", "text/plain")]
 
+  test "the HPACK encoder should Huffman-code a compressible value and round-trip it":
+    let enc = HpackEncoder()
+    var dec = initHpackDecoder()
+    let name = "x-custom"
+    let value = "aaaaaaaaaaaaaaaaaaaa"   # 20 bytes; 'a' is a 5-bit Huffman code
+    let encoded = enc.encode(@[(name, value)])
+    # A literal with both strings raw would be 1 (prefix) + 1+len(name) + 1+len(value)
+    # octets; Huffman must make the actual block strictly smaller.
+    let rawLen = 1 + (1 + name.len) + (1 + value.len)
+    check encoded.len < rawLen
+    check dec.decode(encoded) == @[(name, value)]
+
+  test "the HPACK encoder should leave an incompressible value raw":
+    let enc = HpackEncoder()
+    var dec = initHpackDecoder()
+    # A byte whose Huffman code is 8 bits or longer never shrinks; a run of them
+    # keeps the raw form (H bit clear). Round-tripping still yields the value.
+    let value = "\x00\x01\x02\x03"
+    check dec.decode(enc.encode(@[("x-bin", value)])) == @[("x-bin", value)]
+
 suite "hpack decode rejects malformed input without crashing":
   # A peer controls the header block, so truncated/oversized fields must raise a
   # catchable error, never an IndexDefect/OverflowDefect (found by tests/fuzz).

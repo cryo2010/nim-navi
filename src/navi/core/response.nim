@@ -31,6 +31,12 @@ type
     ## stream id) that the request was not processed. Safe to retry regardless of
     ## method idempotency; the retry layer does so automatically.
 
+  ProtocolError* = object of CatchableError
+    ## Raised when the HTTP version actually used is not one the request allowed
+    ## via `config.http` (strict protocol selection). For example, requesting
+    ## `{H2}` against an origin that only offers HTTP/1.1 raises this instead of
+    ## silently downgrading. Narrow or widen `config.http` to control it.
+
 proc initResponse*(status: int; reason, httpVersion: string; headers: Headers;
                    body: string): Response =
   ## Build a Response with an allocated JSON cache slot. Used by the protocol

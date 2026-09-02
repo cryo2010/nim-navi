@@ -346,11 +346,11 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
           await proxyConnect(fd, host, port, proxy.user, proxy.pass)
         if tls:
           when defined(ssl):
-            # No ALPN over an HTTP-proxy CONNECT tunnel (negotiated lazily); a SOCKS5
-            # tunnel is transparent, so offer the normal ALPN to reach h2.
-            (conn.ctx, conn.ownsCtx) = obtainContext(
-              cfg.contextStore, cfg,
-              if proxy.isSet and proxy.kind == pkHttp: @[] else: alpn)
+            # A CONNECT tunnel (HTTP proxy) and a SOCKS5 tunnel are both transparent
+            # once established: the TLS handshake runs end-to-end to the origin, so
+            # ALPN belongs on it -- offer the normal list to reach h2 (parity with the
+            # sync and chronos backends).
+            (conn.ctx, conn.ownsCtx) = obtainContext(cfg.contextStore, cfg, alpn)
             conn.slot = resumeSlot(cfg, host & ":" & $port)
             conn.ssl = newClientSsl(conn.ctx, fd.SocketHandle, host, conn.slot)
             await driveHandshake(conn.ssl, fd, host)
