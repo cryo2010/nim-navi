@@ -838,9 +838,14 @@ proc toWsUrl(url: string): Url =
 
 proc websocket*(client: Navi, url: string, headers = initHeaders(),
                 maxMessageBytes = 0, keepAlive = 0): WebSocket =
-  ## Open a WebSocket connection (RFC 6455). Accepts `ws://` / `wss://` (or
-  ## http/https); `wss` uses TLS. Does the HTTP/1.1 Upgrade over the transport and
-  ## validates `Sec-WebSocket-Accept`. Use `send`, `receive`, and `close`.
+  ## Open a WebSocket connection (RFC 6455) over an HTTP/1.1 Upgrade. Accepts
+  ## `ws://` / `wss://` (or http/https); `wss` uses TLS. Validates
+  ## `Sec-WebSocket-Accept`. Use `send`, `receive`, and `close`.
+  ##
+  ## The sync backend serves WebSocket over HTTP/1.1 only: h2 Extended CONNECT
+  ## (RFC 8441) needs a background reader, which is inherently async, so a
+  ## `config.http` that excludes H1 (e.g. `{H2}`) raises `ProtocolError` here --
+  ## use `navi/asyncdispatch` or `navi/chronos` for WebSocket over h2.
   ##
   ## `maxMessageBytes` (0 = unlimited) caps a reassembled message: past it `receive`
   ## closes with 1009 and raises `WsMessageTooLarge`. Set it for untrusted servers,
@@ -850,6 +855,12 @@ proc websocket*(client: Navi, url: string, headers = initHeaders(),
   ## `receive` is in progress*, and raises `TimeoutError` (closing the connection) if
   ## another interval passes with still nothing back -- so a dead peer is detected
   ## instead of blocking forever.
+  let httpset = client.config.http
+  if not (httpset.card == 0 or H1 in httpset):
+    raise newException(ProtocolError,
+      "navi: the sync backend serves WebSocket over HTTP/1.1 only; config.http " &
+      $httpset & " excludes H1. Use navi/asyncdispatch or navi/chronos for " &
+      "WebSocket over h2 (RFC 8441 Extended CONNECT).")
   let u = toWsUrl(url)
   let conn = connect(u.host, u.port, u.isTls, client.config.tls,
                      resolveProxy(client.config, u), @[], client.config.connectMs)

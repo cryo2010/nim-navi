@@ -451,3 +451,12 @@ suite "websocket keepalive":
     check m.data == "alive"
     ws.close()
     joinThread(th)
+
+suite "WebSocket transport selection (sync)":
+  test "the sync backend should reject a WebSocket when config.http excludes H1":
+    # h2 Extended CONNECT is async-only; the sync backend is h1-only for ws.
+    var cfg = initNaviConfig()
+    cfg.http = {H2}
+    let api = newNavi(cfg)
+    expect ProtocolError:
+      discard api.websocket("wss://127.0.0.1:1/never")

@@ -257,3 +257,19 @@ suite "chronos websocket client end to end":
     joinThread(th)
     check chunks == @["one", "-two", "-three"]
     check echoed == "aabbcc"
+
+import navi/core/response as resp   # ProtocolError
+
+suite "WebSocket transport selection (chronos)":
+  test "websocket over {H2} on a non-TLS URL should raise ProtocolError":
+    # {H2} excludes h1; h2 needs TLS, so a ws:// (plaintext) target has no usable
+    # transport. `check` runs outside the async proc (chronos strict-raises).
+    proc run(): Future[bool] {.async.} =
+      var cfg = initNaviConfig()
+      cfg.http = {H2}
+      let api = newNavi(cfg)
+      result = false
+      try: discard await api.websocket("ws://127.0.0.1:1/never")
+      except resp.ProtocolError: result = true
+      await api.close()
+    check waitFor run()
