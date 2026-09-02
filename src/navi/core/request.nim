@@ -150,8 +150,14 @@ proc readMs*(opts: NaviConfigBase): int = opts.timeouts.read
 proc totalMs*(opts: NaviConfigBase): int = opts.timeouts.total
   ## Overall request deadline in ms, including retries/redirects; 0 disables.
 proc wantsH2*(opts: NaviConfigBase): bool =
-  ## An unset `http` (empty set) means "negotiate h2 where possible".
-  opts.http.card == 0 or H2 in opts.http
+  ## An unset `http` (empty set) means "negotiate h2 where possible". Also true for
+  ## an h3 request that allows no other bootstrap protocol ({H3} alone): h3 is
+  ## discovered via Alt-Svc on a prior h1/h2 response, and h2 is the better discovery
+  ## leg (more origins advertise `alt-svc` over h2, and it's faster than h1). When h1
+  ## is explicitly allowed (e.g. {H1, H3}) the caller opted into h1, so h2 is not
+  ## forced for them.
+  opts.http.card == 0 or H2 in opts.http or
+    (H3 in opts.http and H1 notin opts.http)
 
 proc wantsH3*(opts: NaviConfigBase): bool =
   ## H3 is opt-in: it must be listed explicitly (an empty `http` set does not

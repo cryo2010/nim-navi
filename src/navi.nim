@@ -104,6 +104,15 @@ proc initNaviConfig*(): NaviConfig =
 proc newNavi*(config = initNaviConfig()): Navi =
   ## Create a client. `config` supplies defaults (prefixUrl, headers, TLS,
   ## middleware, …).
+  when not defined(naviHttp3):
+    # H3 in `http` is a silent no-op without -d:naviHttp3 (h1/h2 only); warn once so
+    # the common "I asked for h3 but never got it" misconfiguration is not silent.
+    var h3BuildWarned {.global.} = false
+    if H3 in config.http and not h3BuildWarned:
+      h3BuildWarned = true
+      stderr.writeLine("navi: config.http includes H3 but this build lacks " &
+        "-d:naviHttp3; HTTP/3 will not be attempted (using h1/h2). Rebuild with " &
+        "-d:naviHttp3 to enable HTTP/3.")
   var cfg = config
   cfg.tls.sessionCache = newTlsStore(cfg.tls)   # always its own cache, so a config
   cfg.tls.contextStore = newTlsCtxStore(cfg.tls) # cloned from another client (e.g.
