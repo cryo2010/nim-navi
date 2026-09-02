@@ -217,7 +217,7 @@ proc runBench(workload: string) =
   let netem = if getEnv("NAVI_NETEM", "0") == "1": "--cap-add=NET_ADMIN " else: ""
   exec "docker build -f " & dockerfile & " -t " & image & " ."
   exec "docker run --rm " & netem & "-e NAVI_WORKLOAD=" & workload &
-       " -e NAVI_PROTO -e NAVI_BACKEND -e NAVI_LANGS -e NAVI_SERVERS" &
+       " -e NAVI_PROTO -e NAVI_BACKEND -e NAVI_LANGS -e NAVI_SERVERS -e NAVI_PROCS" &
        " -e NAVI_SECONDS -e NAVI_WARMUP_SECONDS -e NAVI_MODE -e NAVI_CLIENTS" &
        " -e NAVI_CONCURRENCY -e NAVI_REQ_COMPRESSION -e NAVI_RESP_COMPRESSION" &
        " -e NAVI_STREAM_BYTES -e NAVI_REPORT_SECONDS" &

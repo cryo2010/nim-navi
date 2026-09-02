@@ -16,6 +16,13 @@ workload="${NAVI_WORKLOAD:-requests}"
 proto="${NAVI_PROTO:-h2}"
 backend="${NAVI_BACKEND:-all}"      # navi backends: sync|asyncdispatch|chronos|js|all
 langs="${NAVI_LANGS:-all}"          # reference langs: all|navi|go|rust|node|python|std (csv ok)
+# navi's async backends are single-threaded (one event loop = one core), like Node;
+# you scale them across cores by running one process per core (as you would in
+# production), NOT by threading the client. So navi's native backends run NAVI_PROCS
+# processes in parallel with the total concurrency split across them, and the harness
+# sums their throughput -- an apples-to-apples multi-core comparison with Go/Rust
+# (which use all cores within one process). Default: the machine's core count.
+procs="${NAVI_PROCS:-$(nproc 2>/dev/null || echo 1)}"
 servers="${NAVI_SERVERS:-5}"
 host="${NAVI_HOST:-127.0.0.1}"
 base_port="${NAVI_BASE_PORT:-9443}"
@@ -201,6 +208,36 @@ print_table() {   # <cellfile> <workload> <proto>
   done
 }
 
+# Run a navi native backend across `procs` parallel processes (one event loop per
+# core) with the total concurrency split across them, then aggregate into one row:
+# sum ops/req-per-s/MB-per-s (true multi-core throughput), average the per-stream
+# latency percentiles. p=1 is handled by the caller (plain run_client).
+run_navi_multi() {   # <displayname> <cellfile> <bin>
+  local name="$1" cell="$2" bin="$3"
+  local total=$(( ${NAVI_CLIENTS:-3} * ${NAVI_CONCURRENCY:-8} )); [ "$total" -lt 1 ] && total=1
+  local p=$procs; [ "$p" -gt "$total" ] && p=$total; [ "$p" -lt 1 ] && p=1
+  local per=$(( (total + p - 1) / p ))          # per-process concurrency (ceil)
+  local base="$work/mp.$name"; local kids=(); local k
+  for ((k=0; k<p; k++)); do
+    ( NAVI_CLIENTS=1 NAVI_CONCURRENCY="$per" "$bin" >"$base.$k.out" 2>"$base.$k.err" ) &
+    kids+=($!)
+  done
+  for ((k=0; k<p; k++)); do wait "${kids[k]}" || true; done
+  local got="$base.all"; : > "$got"; local n=0
+  for ((k=0; k<p; k++)); do
+    if grep -q '^RESULT' "$base.$k.out" 2>/dev/null; then
+      grep '^RESULT' "$base.$k.out" >> "$got"; n=$((n+1))
+    else
+      echo "  $name[proc $k]: no RESULT"; tail -3 "$base.$k.out" "$base.$k.err" 2>/dev/null; fail=1
+    fi
+  done
+  [ "$n" -gt 0 ] || { fail=1; return; }
+  awk -F'\t' -v name="$name" '
+    { ops+=$3; if($4>secs)secs=$4; rps+=$5; p50+=$6; p99+=$7; p999+=$8; mbps+=$9; c++ }
+    END { printf "RESULT\t%s\t%d\t%.3f\t%d\t%.3f\t%.3f\t%.3f\t%.1f\n",
+          name, ops, secs, rps, p50/c, p99/c, p999/c, mbps }' "$got" >> "$cell"
+}
+
 run_cell() {   # <proto>: run every applicable client for this protocol, print table
   local pr="$1" cell="$work/cell.$pr"; : > "$cell"
   export NAVI_PROTO="$pr"
@@ -213,7 +250,9 @@ run_cell() {   # <proto>: run every applicable client for this protocol, print t
       [ "$pr" = h3 ] && { echo "  [navi-js $pr]: skip js/undici has no HTTP/3"; continue; }
       run_client "navi-js" "$cell" env NODE_EXTRA_CA_CERTS="$cert" node "$work/${js_src}.js"
     else
-      run_client "navi-$be" "$cell" "${NAVI_BIN[$be]}"
+      local dn="navi-$be"; [ "$be" = asyncdispatch ] && dn="navi-async"  # match clientName
+      if [ "$procs" -le 1 ]; then run_client "$dn" "$cell" "${NAVI_BIN[$be]}"
+      else run_navi_multi "$dn" "$cell" "${NAVI_BIN[$be]}"; fi
     fi
   done
   # reference clients (h3 is navi-only). Each reads NAVI_WORKLOAD/NAVI_PROTO from the
@@ -238,7 +277,7 @@ run_matrix() {
 }
 
 echo ""
-echo "=== navi bench: $workload | protos: ${protos[*]} | langs: $langs | ${servers} servers ==="
+echo "=== navi bench: $workload | protos: ${protos[*]} | langs: $langs | ${servers} servers | navi procs: $procs ==="
 run_matrix
 
 # Optional lossy-link regime (h3 vs h2 head-of-line blocking). Needs iproute2 + NET_ADMIN.
