@@ -10,6 +10,12 @@ import std/[strutils, base64]
 import checksums/sha1
 import ../core/[url, headers]
 
+# SHA-1 for the accept hash: prefer OpenSSL EVP (hardware SHA) when TLS is linked
+# and libcrypto loads (Linux), else the pure-Nim `checksums` above (also the `nim
+# js` path). One hash per handshake, so this is for consistency, not throughput.
+when defined(ssl) and not defined(js):
+  import ../backend/evpdigest
+
 # The masking key (RFC 6455 5.3) and the handshake nonce (4.1) must come from a
 # strong entropy source, so draw them from the OS CSPRNG via std/sysrand. sysrand
 # has no JavaScript target, but this module is native-only (the js backend uses the
@@ -65,13 +71,18 @@ proc genKey*(): string =
   ## A fresh random 16-byte Sec-WebSocket-Key, base64-encoded (RFC 6455 4.1).
   base64.encode(randomBytes(16))
 
+proc sha1Bytes(s: string): string =
+  ## Raw 20-byte SHA-1 of `s`, from EVP (hardware) or the checksums fallback.
+  when defined(ssl) and not defined(js):
+    if evpAvailable(): return evpSha1Raw(s)
+  let digest = Sha1Digest(secureHash(s))
+  result = newString(digest.len)
+  for i in 0 ..< digest.len: result[i] = char(digest[i])
+
 proc acceptFor*(key: string): string =
   ## The Sec-WebSocket-Accept value for `key`: base64(SHA1(key + GUID)). Used by
   ## a server to answer and by the client to validate the 101 response.
-  let digest = Sha1Digest(secureHash(key & wsGuid))
-  var raw = newString(digest.len)
-  for i in 0 ..< digest.len: raw[i] = char(digest[i])
-  base64.encode(raw)
+  base64.encode(sha1Bytes(key & wsGuid))
 
 # --- frame codec ---
 
