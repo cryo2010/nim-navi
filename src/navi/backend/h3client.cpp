@@ -760,9 +760,18 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
     ngtcp2_transport_params params;
     ngtcp2_transport_params_default(&params);
     params.initial_max_streams_uni = 3;
-    params.initial_max_stream_data_bidi_local = 256 * 1024;
-    params.initial_max_stream_data_uni = 256 * 1024;
-    params.initial_max_data = 1024 * 1024;
+    // Receive windows we advertise to the server. The old 256 KiB per-stream / 1 MiB
+    // connection windows forced the server to stop every 256 KiB of a download and
+    // wait for our MAX_STREAM_DATA; any hitch extending/flushing that update stalls
+    // the transfer, and a strict peer (quinn) parks the stream until its ~30s idle
+    // timer. Match the h2 mux's 8 MiB per-stream window so a typical response streams
+    // in a single window (no MAX_STREAM_DATA round-trip at all), with a large
+    // connection window so many concurrent downloads are not connection-gated. The
+    // body is drained incrementally regardless, so this bounds burst size, not the
+    // steady-state buffer.
+    params.initial_max_stream_data_bidi_local = 8 * 1024 * 1024;
+    params.initial_max_stream_data_uni = 1024 * 1024;
+    params.initial_max_data = 256 * 1024 * 1024;
 
     ngtcp2_cid dcid, scid;
     dcid.datalen = 16;
