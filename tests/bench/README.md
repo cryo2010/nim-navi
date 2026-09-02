@@ -29,6 +29,7 @@ verify a SHA-1 and fail hard on mismatch.
 | --- | --- | --- |
 | `NAVI_PROTO` | `h2` | `h1` \| `h2` \| `h3` \| `all` (h3 is navi-only + needs the h3 image) |
 | `NAVI_BACKEND` | `all` | navi backends: `sync` \| `asyncdispatch` \| `chronos` \| `js` \| `all` |
+| `NAVI_PROCS` | (cores) | navi native backends run this many processes in parallel (one event loop per core; total concurrency split across them; throughput summed). Set `1` for single-process. |
 | `NAVI_LANGS` | `all` | reference langs to include: `all` \| `navi` \| `go` \| `rust` \| `node` \| `python` \| `std` (csv) |
 | `NAVI_SERVERS` | `5` | fast Go server instances; clients round-robin across them |
 | `NAVI_SECONDS` | `20` | measured window per cell |
@@ -46,6 +47,20 @@ verify a SHA-1 and fail hard on mismatch.
   skip h3 cells (printed, not silent). h3 is fronted by Caddy (Alt-Svc) like stress.
 - **std/httpclient** is requests + h1 only; **js** cannot stream uploads and has no h3.
 - **WebSocket** is an h1 upgrade, so `benchWs` runs h1 only across all languages.
+
+## Fair comparison
+
+navi's async backends are single-threaded (one event loop per core, like Node/asyncio).
+Two things keep the comparison apples-to-apples with the multi-core Go/Rust clients:
+
+- **Multi-core:** `NAVI_PROCS` (default = cores) runs navi across one process per core
+  and sums their throughput — how you'd actually scale a single-threaded async client.
+- **Hardware hash:** the streaming clients verify integrity with OpenSSL's SHA-1
+  (SHA-NI), matching Go/Rust/Node. Nim's software `checksums/sha1` (~0.8 GB/s) would
+  otherwise bottleneck navi's core and understate its download throughput.
+
+With both, navi's streaming throughput lands in the Go/Rust range; per single stream,
+navi's transport is already competitive (its per-transfer latency beats both).
 
 ## Notes
 

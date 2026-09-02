@@ -71,6 +71,15 @@ async function main() {
     process.stdout.write(`SKIP\tnode\t${workload} not implemented\n`);
     process.exit(0);
   }
+  // Node's http2 client is unreliable streaming a multi-MiB request body: it can
+  // throw a late ClientHttp2Stream._destroy / onStreamClose error after the
+  // response has completed, which is not reliably catchable from userland. Rather
+  // than risk crashing the cell, skip streamUpload over h2 (h3 already skipped
+  // above). streamUpload over h1 works and is kept.
+  if (workload === 'streamUpload' && proto !== 'h1') {
+    process.stdout.write('SKIP\tnode\tstreamUpload over h2 unreliable in node http2\n');
+    process.exit(0);
+  }
 
   const host = envStr('NAVI_HOST', '127.0.0.1');
   const basePort = envInt('NAVI_BASE_PORT', 9443);
@@ -289,6 +298,7 @@ async function main() {
     });
   }
 
+  // Unreachable for streamUpload (skipped for h2 above); kept for completeness.
   function upH2(baseIndex) {
     const base = bases[baseIndex];
     const url = base + '/upload';
