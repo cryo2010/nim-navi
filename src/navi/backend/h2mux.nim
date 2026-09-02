@@ -328,13 +328,18 @@ proc respSnapshot*(mux: H2Mux, sid: uint32): H2Response =
 
 proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: string,
                          bodyStream: BodyProducer = nil,
-                         trailers: seq[(string, string)] = @[]): Future[uint32] {.async.} =
+                         trailers: seq[(string, string)] = @[],
+                         connectTunnel = false): Future[uint32] {.async.} =
   ## Open a sink stream, send the request, and await only until the response
   ## HEADERS arrive; return the stream id with the stream left open and its body
   ## queuing into `recvq` for a later `drainDownload`. The header/body split lets a
   ## pull-based caller inspect status/headers before deciding to drain. The stream
   ## is in `sinkStreams` (gated receive window), so buffered body is bounded until
   ## the drain acks it. Raises on reset/goaway before headers, like `request`.
+  ##
+  ## `connectTunnel` (RFC 8441 Extended CONNECT) sends the header block WITHOUT
+  ## END_STREAM and streams no body, so the send side stays open for full-duplex
+  ## tunnel DATA (see `tunnelSend`). Used for WebSocket-over-h2.
   if not mux.alive:
     raise newException(IOError, "navi: http/2 connection not usable")
   while mux.alive and mux.activeStreams >= mux.h2.maxConcurrentStreams:
@@ -349,7 +354,9 @@ proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: strin
   let sid = mux.h2.openStream()
   mux.h2.setSinkMode(sid)                 # gate the receive window; drainDownload acks it
   mux.sinkStreams.incl sid
-  if bodyStream != nil:
+  if connectTunnel:
+    await mux.send(mux.h2.encodeRequestHead(sid, headers))   # no END_STREAM: send side open
+  elif bodyStream != nil:
     await mux.send(mux.h2.encodeRequestHead(sid, headers))
     await mux.streamBody(sid, bodyStream, trailers)
   else:
@@ -393,6 +400,37 @@ proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: strin
     await ready
     mux.recvReady.del(sid)
   return sid
+
+proc openConnect*(mux: H2Mux, headers: seq[(string, string)]): Future[uint32] {.async.} =
+  ## Open an Extended CONNECT (RFC 8441) tunnel stream and return its id once the
+  ## response headers arrive (send side left open). The caller checks
+  ## `respSnapshot(sid).status == 200`, then uses `tunnelSend` / `tunnelRecv`.
+  return await mux.sendAndReadHeaders(headers, "", connectTunnel = true)
+
+proc tunnelSend*(mux: H2Mux, sid: uint32, data: string) {.async.} =
+  ## Send `data` as DATA frames on a tunnel stream (never END_STREAM), waiting on
+  ## the flow-control window like `streamBody` so buffered memory stays bounded.
+  if not mux.alive: raise newException(IOError, "navi: http/2 connection closed")
+  await mux.send(mux.h2.queueSend(sid, data))
+  while mux.alive and not mux.h2.sendDrained(sid) and not mux.h2.streamDone(sid):
+    let ready = newFuture[void]("h2mux.tunnelsend")
+    mux.sendReady[sid] = ready
+    if mux.h2.sendDrained(sid) or mux.h2.streamDone(sid) or not mux.alive:
+      mux.sendReady.del(sid)
+    else:
+      await ready
+      mux.sendReady.del(sid)
+
+proc tunnelRecv*(mux: H2Mux, sid: uint32): Future[string] =
+  ## One inbound tunnel chunk, or "" once the peer half-closes (drops the stream).
+  mux.readChunk(sid)
+
+proc tunnelClose*(mux: H2Mux, sid: uint32) {.async.} =
+  ## Half-close the send side (END_STREAM) if still open, best-effort. The caller
+  ## then closes the whole mux (a WebSocket owns a dedicated h2 connection).
+  if mux.alive and sid in mux.sinkStreams and not mux.h2.streamDone(sid):
+    try: await mux.send(mux.h2.finishSend(sid))
+    except CatchableError: discard
 
 proc dropStream*(mux: H2Mux, sid: uint32) =
   ## Non-awaiting cleanup of an abandoned (never-drained) sink stream, for a
