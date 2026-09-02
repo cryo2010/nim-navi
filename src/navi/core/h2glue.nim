@@ -22,6 +22,28 @@ proc h2HeaderList*(req: Request): seq[HeaderPair] =
       continue
     result.add((lower, value))
 
+proc h2ConnectHeaderList*(url: Url, protocol: string, extra: Headers): seq[HeaderPair] =
+  ## Pseudo-headers for an Extended CONNECT (RFC 8441): `:method` is CONNECT with a
+  ## `:protocol` (e.g. "websocket"). Unlike a plain CONNECT, `:scheme` and `:path`
+  ## are kept (RFC 8441 4) so the request addresses a resource. This is the
+  ## WebSocket-over-h2 handshake; `extra` carries sec-websocket-version and any
+  ## subprotocol/extension fields (Sec-WebSocket-Key/Accept are NOT used over h2).
+  result.add((":method", "CONNECT"))
+  result.add((":protocol", protocol))
+  result.add((":scheme", if url.isTls: "https" else: "http"))
+  result.add((":path", url.requestTarget))
+  var authority = url.host
+  let p = url.port
+  if not ((url.isTls and p == 443) or (not url.isTls and p == 80)):
+    authority.add(":" & $p)
+  result.add((":authority", authority))
+  for (name, value) in extra.pairs:
+    let lower = name.toLowerAscii
+    if lower in ["host", "connection", "keep-alive", "proxy-connection",
+                 "transfer-encoding", "upgrade"]:
+      continue
+    result.add((lower, value))
+
 proc h2TrailerList*(req: Request): seq[HeaderPair] =
   ## Request trailer fields as HPACK pairs (lowercased names). Pseudo-headers and
   ## fields that are meaningless or forbidden in a trailer section (framing,

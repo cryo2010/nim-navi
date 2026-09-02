@@ -44,6 +44,7 @@ const
   settingsInitialWindowSize* = 0x4'u16
   settingsMaxFrameSize* = 0x5'u16
   settingsMaxHeaderListSize* = 0x6'u16
+  settingsEnableConnectProtocol* = 0x8'u16   ## RFC 8441: peer allows Extended CONNECT
 
   connectionPreface* = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
   defaultMaxFrameSize* = 16384
