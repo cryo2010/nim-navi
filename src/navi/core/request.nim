@@ -3,7 +3,7 @@
 ## Nothing here performs I/O: `buildRequest` merges instance defaults with
 ## per-call arguments into a concrete `Request` that any backend can execute.
 
-import std/[options, json, base64, tables]
+import std/[options, json, base64, tables, strutils]
 from std/uri import encodeQuery
 import ./headers, ./url, ./response, ./multipart, ./version
 import ../backend/api
@@ -149,6 +149,12 @@ proc readMs*(opts: NaviConfigBase): int = opts.timeouts.read
   ## Per-read stall deadline while waiting for a response chunk, in ms; 0 disables.
 proc totalMs*(opts: NaviConfigBase): int = opts.timeouts.total
   ## Overall request deadline in ms, including retries/redirects; 0 disables.
+const defaultHttpVersions* = when defined(naviHttp3): {H1, H2, H3} else: {H1, H2}
+  ## The default `config.http`: every protocol this build can negotiate (h3 only
+  ## in a `-d:naviHttp3` build). Because it lists all of them, strict selection
+  ## (`enforceProtocol`) never raises for a default client -- it only bites once a
+  ## caller narrows the set.
+
 proc wantsH2*(opts: NaviConfigBase): bool =
   ## An unset `http` (empty set) means "negotiate h2 where possible". Also true for
   ## an h3 request that allows no other bootstrap protocol ({H3} alone): h3 is
@@ -164,6 +170,24 @@ proc wantsH3*(opts: NaviConfigBase): bool =
   ## imply it, unlike h2) and is only honored in a `-d:naviHttp3` build. The
   ## native transport upgrades to h3 per origin after Alt-Svc discovery.
   H3 in opts.http
+
+proc enforceProtocol*(opts: NaviConfigBase, httpVersion: string) =
+  ## Strict protocol selection: the HTTP version actually used (`httpVersion`, as
+  ## it appears on `Response.httpVersion`) must be allowed by `opts.http`, else
+  ## raise `ProtocolError`. An empty `http` set allows anything. The one exemption
+  ## is the h3 Alt-Svc discovery leg: when h3 is the *only* requested protocol, an
+  ## h1/h2 bootstrap is required to discover it, so that leg is permitted (the
+  ## upgrade to h3 happens on the following requests).
+  if opts.http.card == 0: return
+  let used =
+    if httpVersion.startsWith("HTTP/3"): H3
+    elif httpVersion.startsWith("HTTP/2"): H2
+    else: H1
+  if used in opts.http: return
+  if opts.http == {H3} and used in {H1, H2}: return
+  raise newException(ProtocolError,
+    "navi: negotiated " & $used & ", which config.http (" & $opts.http &
+    ") does not allow; widen config.http or accept the downgrade")
 
 proc mergeBase*[T: NaviConfigBase](base, overrides: T): T =
   ## Layer `overrides`' addressing/identity fields over `base` for `.extend`,

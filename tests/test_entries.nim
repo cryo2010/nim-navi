@@ -52,6 +52,22 @@ suite "sync entry end to end":
     check res.data["ok"].getBool()
     joinThread(th)
 
+  test "a strict http={H2} request should raise ProtocolError on an h1 origin":
+    # A plaintext origin cannot negotiate h2 (no ALPN), so the request is served
+    # over HTTP/1.1; strict selection (config.http = {H2}) rejects the downgrade.
+    const port = 8972
+    serverReady = false
+    var th: Thread[int]
+    createThread(th, serve, port)
+    while not serverReady: sleep(5)
+
+    var c = initNaviConfig()
+    c.http = {H2}
+    let api = newNavi(c)
+    expect response.ProtocolError:
+      discard api.get("http://127.0.0.1:" & $port & "/")
+    joinThread(th)
+
   test "get should reuse a pooled connection for the same origin":
     var port = 0
     var accepts = 0
