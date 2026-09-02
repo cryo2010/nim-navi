@@ -13,6 +13,12 @@ import std/[strutils, random, times, tables, options]
 import checksums/md5, checksums/sha2
 export options
 
+# Prefer OpenSSL EVP (hardware SHA) when TLS is linked and libcrypto loads
+# (Linux); else the pure-Nim `checksums` above. Digest auth is low-volume (per-401
+# challenge), so this is a consistency/acceleration win, not a hot path.
+when defined(ssl):
+  import ../backend/evpdigest
+
 type
   DigestChallenge* = object
     realm*, nonce*, opaque*, algorithm*, qop*: string
@@ -82,9 +88,14 @@ proc bestChallenge*(wwwAuthenticate: openArray[string]): Option[DigestChallenge]
       best = ch.get
   if bestRank > 0: some(best) else: none(DigestChallenge)
 
-proc md5hex(s: string): string = $toMD5(s)
+proc md5hex(s: string): string =
+  when defined(ssl):
+    if evpAvailable(): return evpMd5Hex(s)
+  $toMD5(s)
 
 proc sha256hex(s: string): string =
+  when defined(ssl):
+    if evpAvailable(): return evpSha256Hex(s)
   var h = initSha_256()
   h.update(s)
   $h.digest()
