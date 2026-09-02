@@ -139,7 +139,16 @@ export NAVI_CERT="$cert" NAVI_HOST="$host" NAVI_BASE_PORT="$base_port"
 export NAVI_WORKLOAD="$workload" NAVI_SERVERS="$servers"
 
 common="--path:$root/src -d:ssl -d:release --hints:off"
-{ [ "$proto" = "h3" ] || [ "$proto" = "all" ]; } && common="$common -d:naviHttp3"
+# For an h3 build, link the native clients with an rpath to the custom OpenSSL 3.5 /
+# ngtcp2 / nghttp3 in /opt so the binary finds them at runtime. The h3 image does NOT
+# set a global LD_LIBRARY_PATH on purpose (it would make the system-OpenSSL reference
+# clients -- Go/Rust/Node/Python -- load the wrong libcrypto); the rpath is baked into
+# navi's binary only. Each --passL is one token (no spaces) so `$common` word-splits
+# safely. (js builds use a separate nim js command and are unaffected.)
+if [ "$proto" = "h3" ] || [ "$proto" = "all" ]; then
+  common="$common -d:naviHttp3 --passL:-Wl,-rpath,/opt/ossl/lib"
+  common="$common --passL:-Wl,-rpath,/opt/nghttp3/lib --passL:-Wl,-rpath,/opt/ngtcp2/lib"
+fi
 
 case "$proto" in all) protos=(h1 h2 h3) ;; *) protos=("$proto") ;; esac
 # WebSocket is an h1 upgrade (reference WS libs are h1-only), so ws runs h1 only.
