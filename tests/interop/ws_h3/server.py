@@ -92,6 +92,7 @@ async def main():
     # enable_webtransport (which makes H3Connection advertise
     # SETTINGS_ENABLE_CONNECT_PROTOCOL=1) requires a datagram frame size.
     cfg.max_datagram_frame_size = 65536
+    cfg.idle_timeout = float(os.environ.get("WS_IDLE_TIMEOUT", "60"))
     cfg.load_cert_chain(os.environ["WS_CERT"], os.environ["WS_KEY"])
     await serve(host, port, configuration=cfg, create_protocol=WsH3Protocol)
     print("WS_H3_SERVER_READY", flush=True)

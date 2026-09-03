@@ -927,12 +927,15 @@ let api = newNavi(cfg)
 let ws = await api.websocket("wss://example.com/socket")
 ```
 
-h2 and h3 Extended CONNECT are supported on `navi/asyncdispatch` and `navi/chronos`.
-The **sync** client is HTTP/1.1-only for WebSocket (Extended CONNECT needs a
-background reader, which is inherently async). If `config.http` allows no usable
-transport (e.g. `{H2}`/`{H3}` on the sync client, or against a server that does not
-accept Extended CONNECT), `websocket()` raises `ProtocolError` rather than silently
-downgrading.
+Availability: **h2** Extended CONNECT is supported on `navi/asyncdispatch` and
+`navi/chronos`. **h3** is supported on all three native clients, including
+**`navi` (sync)** -- a sync h3 WebSocket runs a background pump thread that keeps
+the QUIC connection alive between the blocking `send`/`receive` calls (the API is
+unchanged), so it needs a `--threads:on` build (the default on navi's supported
+Nim). The sync client does not do h2 WebSocket (it has no h2 mux). If `config.http`
+allows no usable transport (e.g. `{H2}` on the sync client, or against a server
+that does not accept Extended CONNECT), `websocket()` raises `ProtocolError` rather
+than silently downgrading.
 
 For a large message you can stream it a frame at a time instead of buffering the whole
 thing, mirroring HTTP `stream()`/`bodyStream`. `ws.stream()` returns a reader for the

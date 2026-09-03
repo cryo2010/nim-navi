@@ -969,16 +969,6 @@ proc websocketH2(client: Navi, u: Url, headers: Headers,
     raise
 
 when defined(naviHttp3):
-  proc wsExtraFields(headers: Headers): seq[(string, string)] =
-    ## User headers for an Extended CONNECT (h3): drop connection-specific fields
-    ## (the pseudo-headers are added in the driver) and add sec-websocket-version.
-    for (k, v) in headers.pairs:
-      let lk = k.toLowerAscii
-      if lk in ["host", "connection", "keep-alive", "proxy-connection",
-                "transfer-encoding", "upgrade"]: continue
-      result.add((lk, v))
-    result.add(("sec-websocket-version", wsVersion))
-
   proc websocketH3(client: Navi, u: Url, headers: Headers,
                    maxMessageBytes, keepAlive: int): Future[WebSocket] {.async.} =
     ## WebSocket over HTTP/3 Extended CONNECT (RFC 9220). Dials a dedicated h3

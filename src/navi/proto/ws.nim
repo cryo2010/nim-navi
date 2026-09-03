@@ -84,6 +84,18 @@ proc acceptFor*(key: string): string =
   ## a server to answer and by the client to validate the 101 response.
   base64.encode(sha1Bytes(key & wsGuid))
 
+proc wsExtraFields*(headers: Headers): seq[(string, string)] =
+  ## The user headers to carry on an Extended CONNECT (h2 RFC 8441 / h3 RFC 9220):
+  ## connection-specific / hop-by-hop fields dropped (the pseudo-headers are added by
+  ## the backend), plus sec-websocket-version. Shared by all backends so the policy
+  ## stays in one place.
+  for (k, v) in headers.pairs:
+    let lk = k.toLowerAscii
+    if lk in ["host", "connection", "keep-alive", "proxy-connection",
+              "transfer-encoding", "upgrade"]: continue
+    result.add((lk, v))
+  result.add(("sec-websocket-version", wsVersion))
+
 # --- frame codec ---
 
 proc applyMask(dst: var string, dstStart: int, src: string, srcStart, n: int,

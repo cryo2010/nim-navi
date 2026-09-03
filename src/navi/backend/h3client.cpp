@@ -34,6 +34,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <deque>
@@ -141,6 +142,10 @@ struct H3Conn {
   bool want_verify = false; // verify the peer certificate after the handshake (see below)
   bool has_abort = false;   // some stream's producer failed; reset it in send_step
   std::unordered_map<int64_t, Stream> streams;   // live streams by id
+  // Self-pipe (RAII: closed with the connection) so another thread can interrupt the
+  // pump's poll() to flush an outbound frame promptly -- the sync WebSocket's pump
+  // thread. navi_h3_wake writes the write end; navi_h3_pump polls the read end.
+  FdGuard wake_r, wake_w;
 
   // Teardown order is deliberate and load-bearing (which is why this is an explicit
   // destructor rather than per-member smart pointers whose order would follow
@@ -652,17 +657,46 @@ int navi_h3_pump(H3Conn *c) {
       return -1;
     }
   if (n < 0) return -1;
-  pollfd pfd{c->fd, POLLIN, 0};
-  int pr = poll(&pfd, 1, static_cast<int>(navi_h3_timeout_ms(c)));
-  if (pr > 0 && (pfd.revents & POLLIN))
-    for (;;) {   // drain EVERY queued datagram this cycle, not just one: a streamed
-      ssize_t r = recv(c->fd, buf.data(), buf.size(), 0);   // upload otherwise advances
-      if (r <= 0) break;                                    // one MAX_STREAM_DATA per
-      if (navi_h3_recv(c, buf.data(), static_cast<std::size_t>(r)) != 0)  // cycle -> crawls
-        return -1;
+  // Also poll the wake pipe (fd -1 if it failed to open -> poll ignores it) so
+  // another thread can interrupt this cycle via navi_h3_wake to flush a send.
+  pollfd pfds[2] = {{c->fd, POLLIN, 0}, {c->wake_r.fd, POLLIN, 0}};
+  int pr = poll(pfds, 2, static_cast<int>(navi_h3_timeout_ms(c)));
+  if (pr > 0) {
+    if (pfds[1].revents & POLLIN) {   // wakeup: drain the pipe (it is edge-agnostic)
+      std::array<std::uint8_t, 64> wb{};
+      while (::read(c->wake_r.fd, wb.data(), wb.size()) > 0) {}
     }
+    if (pfds[0].revents & POLLIN)
+      for (;;) {   // drain EVERY queued datagram this cycle, not just one: a streamed
+        ssize_t r = recv(c->fd, buf.data(), buf.size(), 0);   // upload otherwise advances
+        if (r <= 0) break;                                    // one MAX_STREAM_DATA per
+        if (navi_h3_recv(c, buf.data(), static_cast<std::size_t>(r)) != 0)  // cycle -> crawls
+          return -1;
+      }
+  }
   if (navi_h3_timeout_ms(c) == 0 && navi_h3_handle_timeout(c) != 0) return -1;
   return 0;
+}
+
+// Flush pending outgoing packets without waiting for input -- navi_h3_pump minus the
+// poll/recv. Used at teardown to push a stream FIN / CONNECTION_CLOSE promptly
+// instead of blocking on the QUIC timer.
+int navi_h3_flush(H3Conn *c) {
+  std::array<std::uint8_t, 1500> buf{};
+  ngtcp2_ssize n;
+  while ((n = navi_h3_send(c, buf.data(), buf.size())) > 0)
+    if (send(c->fd, buf.data(), static_cast<std::size_t>(n), 0) < 0) return -1;
+  return n < 0 ? -1 : 0;
+}
+
+// Wake the pump's poll() from another thread so a just-enqueued outbound frame is
+// flushed without waiting for the next QUIC timer. Touches only the pipe, so it is
+// safe to call from a thread other than the one driving ngtcp2/nghttp3.
+void navi_h3_wake(H3Conn *c) {
+  if (c->wake_w.fd < 0) return;
+  const std::uint8_t b = 1;
+  ssize_t n = ::write(c->wake_w.fd, &b, 1);
+  (void)n;   // a full pipe already means a wake is pending; nothing more to do
 }
 
 // Create the nghttp3 client session and bind the control + QPACK streams. Called by
@@ -723,6 +757,17 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
     auto c = std::make_unique<H3Conn>();
     c->authority = std::string(sni) + ":" + port;
     c->fd = udp_connect(host, port, c.get());
+    // Self-pipe for navi_h3_wake (nonblocking, close-on-exec). Best-effort: if it
+    // fails the pump still works, a send just waits for the next QUIC timer wakeup.
+    int wp[2];
+    if (::pipe(wp) == 0) {
+      for (int f : wp) {
+        ::fcntl(f, F_SETFL, ::fcntl(f, F_GETFL, 0) | O_NONBLOCK);
+        ::fcntl(f, F_SETFD, FD_CLOEXEC);
+      }
+      c->wake_r.fd = wp[0];
+      c->wake_w.fd = wp[1];
+    }
     if (c->fd < 0) {
       std::fprintf(stderr, "udp connect failed\n");
       return nullptr;
@@ -834,6 +879,22 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
       return nullptr;
     }
     ngtcp2_conn_set_tls_native_handle(c->conn, c->ossl);
+    // Keepalive so the connection survives app-side idle -- essential for a
+    // long-lived WebSocket, where the app may not send/receive for a while: ngtcp2
+    // emits PINGs at this interval (reset the peer's idle timer), which the pump
+    // flushes. Configurable (NAVI_H3_KEEPALIVE_MS) for tests; 15s is a sane default
+    // comfortably under typical idle timeouts. 0 disables.
+    {
+      unsigned long kaMs = 15000UL;              // default
+      if (const char *kaEnv = std::getenv("NAVI_H3_KEEPALIVE_MS")) {
+        char *end = nullptr;
+        unsigned long v = std::strtoul(kaEnv, &end, 10);
+        if (end != kaEnv && *end == '\0') kaMs = v;   // fully-parsed; else keep default
+      }
+      if (kaMs > 86'400'000UL) kaMs = 86'400'000UL;    // clamp to 1 day (no ns overflow)
+      if (kaMs > 0)
+        ngtcp2_conn_set_keep_alive_timeout(c->conn, kaMs * NGTCP2_MILLISECONDS);
+    }
     return c.release();   // ownership passes to the caller (freed via navi_h3_close)
   } catch (...) {
     return nullptr;
