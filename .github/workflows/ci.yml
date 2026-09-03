@@ -186,6 +186,11 @@ jobs:
           nim-version: "2.2.10"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # The WebSocket-over-h2 Extended CONNECT interop uses a Node h2 TLS server.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       # navi's only required Nim dependency (MD5 for Digest auth); the interop
       # tests build navi via raw `nim` inside tests/interop/run.sh.
       - name: Install checksums
@@ -239,6 +244,12 @@ jobs:
       # it falls back to the system trust store (which lacks that CA).
       - name: Run the private-CA verification test
         run: bash tests/interop/ca_verify.sh
+
+      # WebSocket over HTTP/2 Extended CONNECT (RFC 8441): a Node h2 TLS server
+      # that advertises SETTINGS_ENABLE_CONNECT_PROTOCOL and echoes frames,
+      # driven by the sync, asyncdispatch, and chronos clients (config.http={H2}).
+      - name: Run the WebSocket-over-h2 interop test
+        run: bash tests/interop/ws_h2/run.sh
 
   streaming:
     runs-on: ubuntu-latest
