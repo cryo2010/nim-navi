@@ -115,6 +115,13 @@ struct Stream {
   // NGHTTP3_DATA_FLAG_NO_END_STREAM + nghttp3_conn_submit_trailers). Empty = none.
   std::string req_trailers;
   bool req_trailers_submitted = false;
+  // WebSocket-over-h3 tunnel (RFC 9220 Extended CONNECT). The send side stays open
+  // for full-duplex DATA: `tunnel_tx` holds outbound frames not yet handed to
+  // nghttp3 (the reader pauses with WOULDBLOCK when it is empty, resumed by
+  // navi_h3_tunnel_send), and `tunnel_fin` requests a half-close (flush EOF).
+  bool is_tunnel = false;
+  std::deque<std::string> tunnel_tx;
+  bool tunnel_fin = false;
 };
 
 // One QUIC/h3 connection. RAII: the destructor releases the library objects and
@@ -291,6 +298,19 @@ int on_recv_trailer(nghttp3_conn *, std::int64_t stream_id, std::int32_t,
   return 0;
 }
 
+// The response header section is complete (nghttp3 end_headers). For a final
+// response (>= 200) mark the headers ready now -- crucial for a bodyless 200 such
+// as a WebSocket Extended CONNECT accept (RFC 9220), which carries no DATA and no
+// END_STREAM, so on_recv_data / on_end_stream would never fire to unblock the
+// handshake. Interim 1xx sections (status < 200) are ignored; the final one follows.
+int on_end_headers(nghttp3_conn *, std::int64_t stream_id, int, void *cud, void *) {
+  auto *c = static_cast<H3Conn *>(cud);
+  auto it = c->streams.find(stream_id);
+  if (it != c->streams.end() && it->second.status >= 200)
+    it->second.headers_done = true;
+  return 0;
+}
+
 int on_recv_data(nghttp3_conn *, std::int64_t stream_id, const std::uint8_t *data,
                  std::size_t datalen, void *cud, void *) {
   auto *c = static_cast<H3Conn *>(cud);
@@ -452,6 +472,33 @@ int on_body_acked(nghttp3_conn *, std::int64_t stream_id, std::uint64_t datalen,
     if (f.acked == f.data.size()) out.pop_front();
   }
   return 0;
+}
+
+// Data reader for a WebSocket-over-h3 tunnel (RFC 9220 Extended CONNECT). Unlike a
+// request body, the send side has no natural EOF: it emits queued outbound frames
+// as DATA and otherwise pauses with WOULDBLOCK until navi enqueues more (which calls
+// nghttp3_conn_resume_stream). A half-close (tunnel_fin) flushes EOF. Handed-out
+// chunks live in `out` until acked (freed by on_body_acked), bounding memory.
+nghttp3_ssize read_tunnel(nghttp3_conn *, std::int64_t stream_id, nghttp3_vec *vec,
+                          std::size_t, std::uint32_t *pflags, void *cud, void *) {
+  auto *c = static_cast<H3Conn *>(cud);
+  auto it = c->streams.find(stream_id);
+  if (it == c->streams.end()) { *pflags |= NGHTTP3_DATA_FLAG_EOF; return 0; }
+  Stream &s = it->second;
+  if (s.abort) return NGHTTP3_ERR_WOULDBLOCK;
+  if (s.tunnel_tx.empty()) {
+    if (s.tunnel_fin) { *pflags |= NGHTTP3_DATA_FLAG_EOF; return 0; }
+    return NGHTTP3_ERR_WOULDBLOCK;                 // paused until resume_stream
+  }
+  try {
+    s.out.push_back(BodyChunk{std::move(s.tunnel_tx.front()), 0});
+  } catch (...) {
+    return NGHTTP3_ERR_CALLBACK_FAILURE;
+  }
+  s.tunnel_tx.pop_front();
+  vec[0].base = reinterpret_cast<std::uint8_t *>(const_cast<char *>(s.out.back().data.data()));
+  vec[0].len = s.out.back().data.size();
+  return 1;
 }
 
 int udp_connect(const char *host, const char *port, H3Conn *c) {
@@ -637,8 +684,10 @@ int navi_h3_bind(H3Conn *c) {
   }
   nghttp3_settings settings;
   nghttp3_settings_default(&settings);
+  settings.enable_connect_protocol = 1;   // allow WebSocket Extended CONNECT (RFC 9220)
   nghttp3_callbacks cb{};
   cb.recv_header = on_recv_header;
+  cb.end_headers = on_end_headers;        // headers-ready even for a bodyless 200 (ws tunnel)
   cb.recv_trailer = on_recv_trailer;      // surface response trailers on res.trailers
   cb.recv_data = on_recv_data;
   cb.end_stream = on_end_stream;
@@ -814,6 +863,20 @@ H3Conn *navi_h3_open(const char *host, const char *port, const char *sni,
 // be null (borrowed until the stream completes).
 // `pull` (with `pull_env`) streams the request body from navi on demand; if null,
 // `body`/`body_len` is a buffered body (or none). The two are mutually exclusive.
+// Append a "name\nvalue\n..." header blob (navi's h3 wire format for extra request
+// headers) to `nva` as nghttp3 pairs. The views point into `blob`, which must
+// outlive the submit call (nghttp3 copies the header data during submit).
+void append_header_blob(const char *blob, std::vector<nghttp3_nv> &nva) {
+  if (!blob) return;
+  std::string_view hs{blob};
+  std::size_t start = 0;
+  std::vector<std::string_view> toks;
+  for (std::size_t i = 0; i < hs.size(); ++i)
+    if (hs[i] == '\n') { toks.push_back(hs.substr(start, i - start)); start = i + 1; }
+  for (std::size_t i = 0; i + 1 < toks.size(); i += 2)
+    nva.push_back(make_nv(toks[i], toks[i + 1]));
+}
+
 std::int64_t navi_h3_submit(H3Conn *c, const char *method, const char *path_,
                             const char *req_headers, const char *body,
                             std::size_t body_len, NaviBodyPull pull, void *pull_env,
@@ -833,18 +896,7 @@ std::int64_t navi_h3_submit(H3Conn *c, const char *method, const char *path_,
     nva.push_back(make_nv(":scheme", "https"));
     nva.push_back(make_nv(":authority", c->authority));
     nva.push_back(make_nv(":path", path_));
-    if (req_headers) {
-      std::string_view hs{req_headers};
-      std::size_t start = 0;
-      std::vector<std::string_view> toks;
-      for (std::size_t i = 0; i < hs.size(); ++i)
-        if (hs[i] == '\n') {
-          toks.push_back(hs.substr(start, i - start));
-          start = i + 1;
-        }
-      for (std::size_t i = 0; i + 1 < toks.size(); i += 2)
-        nva.push_back(make_nv(toks[i], toks[i + 1]));
-    }
+    append_header_blob(req_headers, nva);
 
     nghttp3_data_reader dr{};
     const nghttp3_data_reader *drp = nullptr;
@@ -863,6 +915,64 @@ std::int64_t navi_h3_submit(H3Conn *c, const char *method, const char *path_,
   } catch (...) {
     return -1;
   }
+}
+
+// Open a WebSocket-over-h3 tunnel (RFC 9220 Extended CONNECT): a bidi stream whose
+// request is :method=CONNECT + :protocol, left open (no END_STREAM) for full-duplex
+// DATA. Returns the stream id; the caller waits for :status via
+// navi_h3_response_headers, then uses navi_h3_tunnel_send / navi_h3_read_body.
+std::int64_t navi_h3_open_connect(H3Conn *c, const char *path_, const char *req_headers,
+                                  const char *protocol) {
+  try {
+    std::int64_t sid;
+    if (ngtcp2_conn_open_bidi_stream(c->conn, &sid, nullptr) != 0) return -1;
+    Stream &s = c->streams[sid];
+    s.is_tunnel = true;
+
+    std::vector<nghttp3_nv> nva;
+    nva.reserve(8);
+    nva.push_back(make_nv(":method", "CONNECT"));
+    nva.push_back(make_nv(":protocol", protocol));
+    nva.push_back(make_nv(":scheme", "https"));
+    nva.push_back(make_nv(":authority", c->authority));
+    nva.push_back(make_nv(":path", path_));
+    append_header_blob(req_headers, nva);
+
+    nghttp3_data_reader dr{};
+    dr.read_data = read_tunnel;
+    if (nghttp3_conn_submit_request(c->h3, sid, nva.data(), nva.size(), &dr, nullptr) != 0) {
+      c->streams.erase(sid);
+      return -1;
+    }
+    return sid;
+  } catch (...) {
+    return -1;
+  }
+}
+
+// Queue `len` bytes of outbound tunnel DATA and resume the stream so nghttp3 pulls
+// it on the next send cycle (navi pumps the socket afterwards). Returns 0, or -1 on
+// an unknown stream / allocation failure.
+int navi_h3_tunnel_send(H3Conn *c, std::int64_t sid, const char *data, std::size_t len) {
+  auto it = c->streams.find(sid);
+  if (it == c->streams.end()) return -1;
+  try {
+    it->second.tunnel_tx.emplace_back(data, len);
+  } catch (...) {
+    return -1;
+  }
+  nghttp3_conn_resume_stream(c->h3, sid);
+  return 0;
+}
+
+// Half-close the tunnel send side: the reader flushes EOF once the outbound queue
+// drains. Returns 0, or -1 on an unknown stream.
+int navi_h3_tunnel_close(H3Conn *c, std::int64_t sid) {
+  auto it = c->streams.find(sid);
+  if (it == c->streams.end()) return -1;
+  it->second.tunnel_fin = true;
+  nghttp3_conn_resume_stream(c->h3, sid);
+  return 0;
 }
 
 int navi_h3_stream_done(H3Conn *c, std::int64_t sid) {

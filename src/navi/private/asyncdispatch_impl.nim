@@ -848,16 +848,21 @@ export ws.WsMessage, ws.WsMessageKind, ws.closeNormal, ws.closeGoingAway,
        ws.closeMessageTooBig, ws.WsMessageTooLarge
 
 type
-  WsKind = enum wkH1, wkH2
+  WsKind = enum wkH1, wkH2, wkH3
   WsTransport = object
-    ## The duplex byte channel under a WebSocket: an h1 Upgrade connection, or an
-    ## h2 Extended CONNECT tunnel stream (RFC 8441). The frame codec is identical
-    ## on top of either; only sendRaw/recvRaw/closeRaw differ.
+    ## The duplex byte channel under a WebSocket: an h1 Upgrade connection, an h2
+    ## Extended CONNECT tunnel stream (RFC 8441), or an h3 Extended CONNECT tunnel
+    ## stream (RFC 9220). The frame codec is identical on top of any of them; only
+    ## sendRaw/recvRaw/closeRaw differ.
     case kind: WsKind
     of wkH1: conn: Conn
     of wkH2:
       mux: H2Mux
       sid: uint32
+    of wkH3:
+      when defined(naviHttp3):     # the h3 (QUIC) transport type is opt-in
+        qc: QuicConnAsync
+        h3sid: int64
   WebSocket* = ref object
     tr: WsTransport
     dec: WsDecoder
@@ -874,20 +879,30 @@ proc sendRaw(ws: WebSocket, data: string): Future[void] =
   case ws.tr.kind
   of wkH1: ws.tr.conn.sendAll(data)
   of wkH2: ws.tr.mux.tunnelSend(ws.tr.sid, data)
+  of wkH3:
+    when defined(naviHttp3): ws.tr.qc.tunnelSend(ws.tr.h3sid, data)
+    else: raise newException(ValueError, "navi: h3 WebSocket without -d:naviHttp3")
 
 proc recvRaw(ws: WebSocket): Future[string] =
   ## Read the next inbound chunk ("" on EOF / peer half-close).
   case ws.tr.kind
   of wkH1: ws.tr.conn.recvSome()
   of wkH2: ws.tr.mux.tunnelRecv(ws.tr.sid)
+  of wkH3:
+    when defined(naviHttp3): ws.tr.qc.tunnelRecv(ws.tr.h3sid)
+    else: raise newException(ValueError, "navi: h3 WebSocket without -d:naviHttp3")
 
 proc closeRaw(ws: WebSocket): Future[void] {.async.} =
-  ## Close the transport (h2: half-close the stream, then the dedicated mux).
+  ## Close the transport (h2/h3: half-close the stream, then the dedicated conn).
   case ws.tr.kind
   of wkH1: await ws.tr.conn.close()
   of wkH2:
     await ws.tr.mux.tunnelClose(ws.tr.sid)
     await ws.tr.mux.close()
+  of wkH3:
+    when defined(naviHttp3):
+      await ws.tr.qc.tunnelClose(ws.tr.h3sid)
+      await ws.tr.qc.closeConn()
 
 proc toWsUrl(url: string): Url =
   var s = url
@@ -953,14 +968,44 @@ proc websocketH2(client: Navi, u: Url, headers: Headers,
     await mux.close()
     raise
 
+when defined(naviHttp3):
+  proc wsExtraFields(headers: Headers): seq[(string, string)] =
+    ## User headers for an Extended CONNECT (h3): drop connection-specific fields
+    ## (the pseudo-headers are added in the driver) and add sec-websocket-version.
+    for (k, v) in headers.pairs:
+      let lk = k.toLowerAscii
+      if lk in ["host", "connection", "keep-alive", "proxy-connection",
+                "transfer-encoding", "upgrade"]: continue
+      result.add((lk, v))
+    result.add(("sec-websocket-version", wsVersion))
+
+  proc websocketH3(client: Navi, u: Url, headers: Headers,
+                   maxMessageBytes, keepAlive: int): Future[WebSocket] {.async.} =
+    ## WebSocket over HTTP/3 Extended CONNECT (RFC 9220). Dials a dedicated h3
+    ## (QUIC) connection to the origin and opens a CONNECT `:protocol=websocket`
+    ## stream, tunnelling frames as DATA. Sec-WebSocket-Key/Accept are not used.
+    let qc = await openConnAsync(u.host, u.port, u.host, client.config.tls.caFile,
+                                 client.config.tls.verify)
+    try:
+      let (sid, status) = await qc.openConnect(u.requestTarget,
+                                               wsExtraFields(headers), "websocket")
+      if status != 200:            # RFC 9220 / 8441: a 200 accepts the tunnel
+        raise newException(IOError,
+          "navi: WebSocket over h3 rejected with :status " & $status)
+      result = WebSocket(tr: WsTransport(kind: wkH3, qc: qc, h3sid: sid), open: true,
+                         maxMessageBytes: maxMessageBytes, keepAlive: keepAlive)
+    except CatchableError:
+      await qc.closeConn()
+      raise
+
 proc websocket*(client: Navi, url: string,
                 headers = initHeaders(),
                 maxMessageBytes = 0, keepAlive = 0): Future[WebSocket] {.async.} =
   ## Open a WebSocket connection. Accepts `ws://` / `wss://` (or http/https);
   ## `wss` uses TLS. The transport follows `config.http`: h1 Upgrade (RFC 6455) is
-  ## used whenever H1 is allowed (the universal path); to tunnel over HTTP/2
-  ## Extended CONNECT (RFC 8441) instead, exclude H1 (e.g. `config.http = {H2}`).
-  ## Use `send`, `receive`, and `close`.
+  ## used whenever H1 is allowed (the universal path); to tunnel over Extended
+  ## CONNECT instead, exclude H1 -- `config.http = {H2}` for h2 (RFC 8441) or
+  ## `{H3}` for h3 (RFC 9220, needs `-d:naviHttp3`). Use `send`, `receive`, `close`.
   ##
   ## `maxMessageBytes` (0 = unlimited) caps a reassembled message: past it `receive`
   ## closes with 1009 and raises `WsMessageTooLarge`. Set it for untrusted servers,
@@ -976,10 +1021,16 @@ proc websocket*(client: Navi, url: string,
     return await client.websocketH1(u, headers, maxMessageBytes, keepAlive)
   elif H2 in httpset and u.isTls:                    # opt-in h2 (RFC 8441) by excluding H1
     return await client.websocketH2(u, headers, maxMessageBytes, keepAlive)
+  elif H3 in httpset and u.isTls:                    # opt-in h3 (RFC 9220): config.http = {H3}
+    when defined(naviHttp3):
+      return await client.websocketH3(u, headers, maxMessageBytes, keepAlive)
+    else:
+      raise newException(ProtocolError,
+        "navi: WebSocket over h3 requires a -d:naviHttp3 build")
   else:
     raise newException(ProtocolError,
       "navi: config.http " & $httpset & " permits no usable WebSocket transport " &
-      "(h2 needs TLS; h3 WebSocket is not yet supported)")
+      "(h2/h3 need TLS)")
 
 proc send*(ws: WebSocket, data: string, binary = false): Future[void] {.async.} =
   ## Send a text (default) or binary message. Client frames are masked.

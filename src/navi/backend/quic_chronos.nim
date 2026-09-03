@@ -278,6 +278,40 @@ proc freeStream*(qc: QuicConnChronos, sid: int64) =
   if qc.c != nil: navi_h3_stream_free(qc.c, sid)
   qc.recvReady.del(sid)
 
+# --- WebSocket-over-h3 tunnel (RFC 9220 Extended CONNECT) ---------------------
+
+proc openConnect*(qc: QuicConnChronos, path: string, headers: seq[(string, string)],
+                  protocol: string): Future[tuple[sid: int64, status: int]] {.async.} =
+  ## Open an Extended CONNECT tunnel with `:protocol` and await its :status. The
+  ## stream is left open for tunnelSend/tunnelRecv.
+  if not qc.alive: raise newException(QuicError, "navi HTTP/3 connection closed")
+  let reqHdr = encodeH3Fields(headers)
+  let sid = navi_h3_open_connect(qc.c, path.cstring, reqHdr.cstring, protocol.cstring)
+  if sid < 0: raise newException(QuicError, "navi: HTTP/3 Extended CONNECT failed to open")
+  wake(qc)
+  let (status, _) = await qc.awaitHeaders(sid)
+  return (sid, status)
+
+proc tunnelSend*(qc: QuicConnChronos, sid: int64, data: string): Future[void] {.async.} =
+  ## Send `data` as tunnel DATA on `sid` (never END_STREAM); the reader flushes it.
+  if not qc.alive: raise newException(QuicError, "navi HTTP/3 connection closed")
+  var d = data
+  let p = if d.len > 0: cast[pointer](addr d[0]) else: nil
+  if navi_h3_tunnel_send(qc.c, sid, p, csize_t(d.len)) != 0:   # copies d into the driver
+    raise newException(QuicError, "navi: HTTP/3 tunnel send failed")
+  wake(qc)
+
+proc tunnelRecv*(qc: QuicConnChronos, sid: int64): Future[string] =
+  ## The next inbound tunnel chunk, or "" once the peer half-closes.
+  qc.readStreamBody(sid)
+
+proc tunnelClose*(qc: QuicConnChronos, sid: int64) {.async.} =
+  ## Half-close the send side, then drop the stream.
+  if qc.alive and qc.c != nil:
+    discard navi_h3_tunnel_close(qc.c, sid)
+    wake(qc)
+  qc.freeStream(sid)
+
 proc closeConn*(qc: QuicConnChronos): Future[void] {.async.} =
   ## Stop the reader and free the connection. Idempotent.
   if qc.c != nil and qc.alive:
