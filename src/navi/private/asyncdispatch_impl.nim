@@ -867,7 +867,9 @@ type
     tr: WsTransport
     dec: WsDecoder
     asmb: WsAssembler
-    open: bool
+    open: bool                ## the WS protocol is open (not yet closed/closing)
+    closed: bool              ## the transport has been torn down (closeRaw ran); keeps
+                              ## teardown idempotent (h2/h3 own a dedicated connection)
     maxMessageBytes: int      ## cap on a reassembled message; 0 = unlimited
     keepAlive: int            ## ms between keepalive pings while receiving; 0 = off
     pingOutstanding: bool      ## a keepalive ping is awaiting any inbound byte
@@ -893,7 +895,12 @@ proc recvRaw(ws: WebSocket): Future[string] =
     else: raise newException(ValueError, "navi: h3 WebSocket without -d:naviHttp3")
 
 proc closeRaw(ws: WebSocket): Future[void] {.async.} =
-  ## Close the transport (h2/h3: half-close the stream, then the dedicated conn).
+  ## Tear down the transport exactly once (h2/h3: half-close the stream, then the
+  ## dedicated connection). Idempotent, so a peer-close EOF, an explicit close, and
+  ## the streaming error handlers can all call it without a double close of the
+  ## dedicated mux/QUIC connection (which would leak or double-free).
+  if ws.closed: return
+  ws.closed = true
   case ws.tr.kind
   of wkH1: await ws.tr.conn.close()
   of wkH2:
@@ -1056,8 +1063,9 @@ proc receive*(ws: WebSocket): Future[WsMessage] {.async.} =
     var f: Frame
     while not ws.dec.next(f):
       let chunk = await ws.kaRecv()
-      if chunk.len == 0:
-        ws.open = false
+      if chunk.len == 0:                        # peer closed: tear the transport down
+        ws.open = false                        # now (h2/h3: close the dedicated conn)
+        await ws.closeRaw()                    # so it is not leaked when close() no-ops
         return WsMessage(kind: wmClose, closeCode: closeGoingAway)
       ws.dec.feed(chunk)
     var o: WsOutcome
@@ -1083,12 +1091,13 @@ proc receive*(ws: WebSocket): Future[WsMessage] {.async.} =
     if o.ready: return o.message
 
 proc close*(ws: WebSocket, code = closeNormal, reason = ""): Future[void] {.async.} =
-  ## Send a close frame and close the transport (freeing its TLS context).
-  ## Idempotent: a no-op once the socket is already closed.
-  if not ws.open: return
-  try: await ws.sendRaw(encodeFrame(opClose, closePayload(code, reason)))
-  except CatchableError: discard
-  ws.open = false
+  ## Send a close frame (if still open) and tear the transport down. Idempotent: safe
+  ## after a peer-close, which already set open=false and tore down -- the transport
+  ## teardown still runs (once) so an already-closed h2/h3 connection is not leaked.
+  if ws.open:
+    ws.open = false
+    try: await ws.sendRaw(encodeFrame(opClose, closePayload(code, reason)))
+    except CatchableError: discard
   await ws.closeRaw()
 
 # --- WebSocket streaming (a large message, one frame at a time) ---
@@ -1116,6 +1125,7 @@ proc readDataFrame(ws: WebSocket): Future[Frame] {.async.} =
       let chunk = await ws.kaRecv()
       if chunk.len == 0:
         ws.open = false
+        await ws.closeRaw()                    # tear down on EOF (see receive)
         return Frame(fin: true, opcode: opClose, payload: "")
       ws.dec.feed(chunk)
     case f.opcode
