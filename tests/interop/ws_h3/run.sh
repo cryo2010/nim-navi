@@ -25,7 +25,7 @@ i=0; until grep -q WS_H3_SERVER_READY "$tmp/srv.out" 2>/dev/null; do
   sleep 0.1
 done
 
-for backend in client client_chronos; do
+for backend in client client_chronos client_sync; do
   nim c --hints:off --threads:on -d:ssl -d:naviHttp3 --path:"$root/src" \
     -o:"$tmp/$backend" "$here/$backend.nim"
   echo "[$backend]"; WS_PORT="$port" "$tmp/$backend"

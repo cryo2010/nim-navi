@@ -124,8 +124,4 @@ proc skipReason*(c: Config): string =
   if c.backend == "js":
     if c.workload == "streamUpload": return "skip: js cannot stream request bodies"
     if c.proto == "h3": return "skip: js/undici has no HTTP/3"
-  # h3 WebSocket (Extended CONNECT, RFC 9220) needs a background reader, so it is
-  # async-only: the sync backend serves WebSocket over HTTP/1.1 only.
-  if c.workload == "ws" and c.proto == "h3" and c.backend == "sync":
-    return "skip: h3 WebSocket is async/chronos only (sync is h1-only)"
   ""

@@ -18,6 +18,7 @@ proc main() =
 
   var c = initNaviConfig()
   c.tls.caFile = cfg.cert
+  if cfg.proto == "h3": c.http = {H3}   # WebSocket over h3 Extended CONNECT (RFC 9220)
   let api = newNavi(c)
   let ws = api.websocket(wsUrl(pool.pick()))
 

@@ -16,7 +16,7 @@
 when not defined(naviHttp3):
   {.error: "navi/backend/quic is a -d:naviHttp3-only module.".}
 
-import std/strutils
+import std/[strutils, atomics, os]
 import ../core/altsvc
 export altsvc.AltSvcEndpoint
 
@@ -155,6 +155,11 @@ proc navi_h3_tunnel_send*(c: pointer, sid: int64, data: pointer, len: csize_t): 
   {.importc, cdecl.}   ## queue outbound DATA + resume the stream (navi pumps after)
 proc navi_h3_tunnel_close*(c: pointer, sid: int64): cint {.importc, cdecl.}
   ## half-close the send side (flush EOF once the outbound queue drains)
+proc navi_h3_wake*(c: pointer) {.importc, cdecl.}
+  ## interrupt navi_h3_pump's poll from another thread (flush a queued send); only
+  ## touches the wake pipe, so it is safe off the pump thread
+proc navi_h3_flush*(c: pointer): cint {.importc, cdecl.}
+  ## flush pending outgoing packets without blocking on input (teardown)
 
 proc ngtcp2VersionStr*(): string = $ngtcp2_version(0).version_str
 proc nghttp3VersionStr*(): string = $nghttp3_version(0).version_str
@@ -330,3 +335,110 @@ proc h3Get*(host: string, port: int, sni = "", path = "/", caFile = "",
   let c = h3Open(host, port, sni, caFile, verify)
   defer: c.close()
   result = c.get(path)
+
+# --- WebSocket-over-h3, sync (a background pump thread) -----------------------
+# QUIC needs its timers serviced continuously or the connection idle-times-out, but
+# a sync app only calls in during send/receive. So a WebSocket owns a pump thread
+# that drives the connection for its whole life. The thread is the ONLY one that
+# touches the ngtcp2/nghttp3 state (it is not thread-safe); the app thread talks to
+# it through two channels + the wake pipe (navi_h3_wake only touches the pipe). The
+# sync blocking API is unchanged -- this is purely behind the scenes.
+
+type
+  WsH3PumpObj = object
+    conn: pointer                  ## H3Conn*; the pump thread drives it, wsClose frees it
+    sid: int64
+    toApp: Channel[string]         ## inbound frame bytes; "" signals peer-close / error
+    toNet: Channel[string]         ## outbound frame bytes queued by the app thread
+    stop: Atomic[bool]             ## wsClose asks the pump to wind down
+    thr: Thread[ptr WsH3PumpObj]
+  WsH3Pump* = ptr WsH3PumpObj      ## shared (allocShared), not a GC ref: two threads touch it
+
+proc wsPumpLoop(p: ptr WsH3PumpObj) {.thread.} =
+  var buf = newString(64 * 1024)
+  var eof: cint
+  while not p.stop.load():
+    while true:                                  # flush queued outbound frames
+      let (has, data) = p.toNet.tryRecv()
+      if not has: break
+      var d = data
+      let bp = if d.len > 0: cast[pointer](addr d[0]) else: nil
+      discard navi_h3_tunnel_send(p.conn, p.sid, bp, csize_t(d.len))
+    if navi_h3_pump(p.conn) != 0: break          # one cycle; blocks on timer or a wake
+    while true:                                  # drain inbound DATA
+      let n = navi_h3_read_body(p.conn, p.sid, cast[ptr char](addr buf[0]),
+                                csize_t(buf.len), addr eof)
+      if n > 0: p.toApp.send(buf[0 ..< n.int])
+      if eof != 0: p.stop.store(true); break     # peer half-closed
+      if n <= 0: break
+  # Half-close the send side and flush it out without blocking on the QUIC timer; the
+  # app thread frees the conn (in wsClose, after join) so navi_h3_wake can never race
+  # a freed connection.
+  discard navi_h3_tunnel_close(p.conn, p.sid)
+  discard navi_h3_flush(p.conn)
+  p.toApp.send("")                               # unblock a parked wsRecv with eof
+
+proc openWsH3*(host: string, port: int, sni, caFile: string, verify: bool,
+               path: string, headers: seq[(string, string)]):
+               tuple[pump: WsH3Pump, status: int] =
+  ## Open a dedicated h3 connection, do the Extended CONNECT handshake on this
+  ## (single) thread, then hand the connection to a pump thread. Returns the pump
+  ## and the response :status (the caller checks 200).
+  let name = if sni.len > 0: sni else: host
+  let h = navi_h3_open(host.cstring, ($port).cstring, name.cstring,
+                       caFile.cstring, (if verify: 1.cint else: 0.cint))
+  if h == nil: raise newException(QuicError, "navi: HTTP/3 connect failed")
+  let reqHdr = encodeH3Fields(headers)
+  let sid = navi_h3_open_connect(h, path.cstring, reqHdr.cstring, "websocket".cstring)
+  if sid < 0:
+    navi_h3_close(h); raise newException(QuicError, "navi: h3 Extended CONNECT failed")
+  var status: clong
+  var hbuf = newString(16 * 1024)
+  var ready: cint
+  var hlen: csize_t
+  while true:                                    # pump until the response headers land
+    if navi_h3_response_headers(h, sid, addr status, cast[ptr char](addr hbuf[0]),
+                                csize_t(hbuf.len), addr hlen, addr ready) != 0:
+      navi_h3_close(h); raise newException(QuicError, "navi: h3 stream gone")
+    if ready != 0: break
+    if navi_h3_pump(h) != 0:
+      navi_h3_close(h); raise newException(QuicError, "navi: HTTP/3 connection closed")
+  let p = cast[WsH3Pump](allocShared0(sizeof(WsH3PumpObj)))
+  p.conn = h
+  p.sid = sid
+  p.toApp.open()
+  p.toNet.open()
+  p.stop.store(false)
+  createThread(p.thr, wsPumpLoop, p)             # the pump now owns the connection
+  (p, int(status))
+
+proc wsSend*(p: WsH3Pump, data: string) =
+  ## Queue an outbound frame and wake the pump to flush it.
+  p.toNet.send(data)
+  navi_h3_wake(p.conn)
+
+proc wsRecv*(p: WsH3Pump): string =
+  ## Block for the next inbound chunk; "" once the connection has closed.
+  p.toApp.recv()
+
+proc wsDataWaiting*(p: WsH3Pump, ms: int): bool =
+  ## True if an inbound chunk is queued within ~`ms` (coarse poll; for ws keepalive).
+  var left = ms
+  while true:
+    if p.toApp.peek() > 0: return true
+    if left <= 0: return false
+    let step = min(left, 5)
+    sleep(step)
+    left -= step
+
+proc wsClose*(p: WsH3Pump) =
+  ## Stop the pump, join it, then free the connection and shared state. Idempotent
+  ## per WebSocket (the sync ws guards on `open`).
+  if p == nil: return
+  p.stop.store(true)
+  navi_h3_wake(p.conn)
+  joinThread(p.thr)
+  navi_h3_close(p.conn)             # freed here, after the pump has exited
+  p.toApp.close()
+  p.toNet.close()
+  deallocShared(p)
