@@ -62,6 +62,7 @@ type
     connRecvPending: int         ## received bytes not yet acked at the connection level
     peerInitialWindow: int       ## peer's SETTINGS_INITIAL_WINDOW_SIZE
     maxConcurrent: int           ## peer's SETTINGS_MAX_CONCURRENT_STREAMS
+    peerConnectProtocol: bool    ## peer sent SETTINGS_ENABLE_CONNECT_PROTOCOL=1 (RFC 8441)
 
 const
   defaultWindow = 65535          ## HTTP/2 default flow-control window (RFC 9113)
@@ -86,6 +87,10 @@ proc initH2Conn*(maxBody = 0): H2Conn =
 
 proc maxConcurrentStreams*(c: H2Conn): int = c.maxConcurrent
   ## The peer's SETTINGS_MAX_CONCURRENT_STREAMS (int.high if not advertised).
+
+proc peerAllowsConnect*(c: H2Conn): bool = c.peerConnectProtocol
+  ## Whether the peer advertised SETTINGS_ENABLE_CONNECT_PROTOCOL=1, permitting
+  ## Extended CONNECT (RFC 8441) -- the handshake for WebSocket-over-h2.
 
 proc preamble*(c: H2Conn): string =
   ## Connection preface, our SETTINGS (server push disabled, a large per-stream
@@ -294,6 +299,8 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
           c.maxFrameSize = int(value)
         elif id == settingsMaxConcurrentStreams:
           c.maxConcurrent = int(value)
+        elif id == settingsEnableConnectProtocol:
+          c.peerConnectProtocol = value == 1'u32   # RFC 8441: 1 enables Extended CONNECT
         elif id == settingsInitialWindowSize:
           # A value above 2^31-1 is a FLOW_CONTROL_ERROR (RFC 9113 6.5.2); reject
           # it before the delta arithmetic can corrupt every stream's send window.

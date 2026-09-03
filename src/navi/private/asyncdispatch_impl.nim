@@ -848,8 +848,18 @@ export ws.WsMessage, ws.WsMessageKind, ws.closeNormal, ws.closeGoingAway,
        ws.closeMessageTooBig, ws.WsMessageTooLarge
 
 type
+  WsKind = enum wkH1, wkH2
+  WsTransport = object
+    ## The duplex byte channel under a WebSocket: an h1 Upgrade connection, or an
+    ## h2 Extended CONNECT tunnel stream (RFC 8441). The frame codec is identical
+    ## on top of either; only sendRaw/recvRaw/closeRaw differ.
+    case kind: WsKind
+    of wkH1: conn: Conn
+    of wkH2:
+      mux: H2Mux
+      sid: uint32
   WebSocket* = ref object
-    conn: Conn
+    tr: WsTransport
     dec: WsDecoder
     asmb: WsAssembler
     open: bool
@@ -859,28 +869,35 @@ type
     pendingRecv: Future[string]  ## the one in-flight read, kept across keepalive
                                  ## timeouts so a timed-out read is not orphaned
 
+proc sendRaw(ws: WebSocket, data: string): Future[void] =
+  ## Write raw bytes to the underlying transport (an encoded WS frame).
+  case ws.tr.kind
+  of wkH1: ws.tr.conn.sendAll(data)
+  of wkH2: ws.tr.mux.tunnelSend(ws.tr.sid, data)
+
+proc recvRaw(ws: WebSocket): Future[string] =
+  ## Read the next inbound chunk ("" on EOF / peer half-close).
+  case ws.tr.kind
+  of wkH1: ws.tr.conn.recvSome()
+  of wkH2: ws.tr.mux.tunnelRecv(ws.tr.sid)
+
+proc closeRaw(ws: WebSocket): Future[void] {.async.} =
+  ## Close the transport (h2: half-close the stream, then the dedicated mux).
+  case ws.tr.kind
+  of wkH1: await ws.tr.conn.close()
+  of wkH2:
+    await ws.tr.mux.tunnelClose(ws.tr.sid)
+    await ws.tr.mux.close()
+
 proc toWsUrl(url: string): Url =
   var s = url
   if s.startsWith("ws://"): s = "http://" & s["ws://".len .. ^1]
   elif s.startsWith("wss://"): s = "https://" & s["wss://".len .. ^1]
   parseUrl(s)
 
-proc websocket*(client: Navi, url: string,
-                headers = initHeaders(),
-                maxMessageBytes = 0, keepAlive = 0): Future[WebSocket] {.async.} =
-  ## Open a WebSocket connection (RFC 6455). Accepts `ws://` / `wss://` (or
-  ## http/https); `wss` uses TLS. Does the HTTP/1.1 Upgrade over the transport and
-  ## validates `Sec-WebSocket-Accept`. Use `send`, `receive`, and `close`.
-  ##
-  ## `maxMessageBytes` (0 = unlimited) caps a reassembled message: past it `receive`
-  ## closes with 1009 and raises `WsMessageTooLarge`. Set it for untrusted servers,
-  ## since a peer can otherwise grow one message without bound via continuation frames.
-  ##
-  ## `keepAlive` (ms, 0 = off) sends a ping after that long with no data *while a
-  ## `receive` is in progress*, and raises `TimeoutError` (closing the connection) if
-  ## another interval passes with still nothing back -- so a dead peer is detected
-  ## instead of awaiting forever.
-  let u = toWsUrl(url)
+proc websocketH1(client: Navi, u: Url, headers: Headers,
+                 maxMessageBytes, keepAlive: int): Future[WebSocket] {.async.} =
+  ## WebSocket over an HTTP/1.1 Upgrade (RFC 6455): the universal transport.
   let conn = await connect(u.host, u.port, u.isTls, client.config.tls,
                            resolveProxy(client.config, u), @[],
                            client.config.connectMs)
@@ -899,29 +916,86 @@ proc websocket*(client: Navi, url: string,
     if not validate101(buf[0 ..< headEnd], key):
       raise newException(IOError, "navi: websocket upgrade rejected: " &
         buf[0 ..< headEnd].splitLines[0])
-    result = WebSocket(conn: conn, open: true, maxMessageBytes: maxMessageBytes,
-                       keepAlive: keepAlive)
+    result = WebSocket(tr: WsTransport(kind: wkH1, conn: conn), open: true,
+                       maxMessageBytes: maxMessageBytes, keepAlive: keepAlive)
     if buf.len > headEnd:
       result.dec.feed(buf[headEnd .. ^1])
   except CatchableError:
     await conn.close()
     raise
 
+proc websocketH2(client: Navi, u: Url, headers: Headers,
+                 maxMessageBytes, keepAlive: int): Future[WebSocket] {.async.} =
+  ## WebSocket over HTTP/2 Extended CONNECT (RFC 8441). Dials a dedicated h2
+  ## connection (ALPN "h2"), opens a CONNECT stream with `:protocol=websocket`,
+  ## and tunnels frames as DATA. Sec-WebSocket-Key/Accept are not used over h2.
+  let conn = await connect(u.host, u.port, u.isTls, client.config.tls,
+                           resolveProxy(client.config, u), @["h2", "http/1.1"],
+                           client.config.connectMs)
+  if conn.protocol != "h2":
+    let got = if conn.protocol.len > 0: conn.protocol else: "http/1.1"
+    await conn.close()
+    raise newException(ProtocolError,
+      "navi: WebSocket over h2 requested but the server negotiated " & got)
+  let mux = await newH2Mux(conn, client.config.maxResponseBytes,
+                           client.config.wantsDecompress)
+  try:
+    var reqHeaders = headers
+    reqHeaders["sec-websocket-version"] = wsVersion
+    let sid = await mux.openConnect(h2ConnectHeaderList(u, "websocket", reqHeaders))
+    let status = mux.respSnapshot(sid).status
+    if status != 200:            # RFC 8441: a 2xx (200) accepts the tunnel
+      raise newException(IOError,
+        "navi: WebSocket over h2 rejected with :status " & $status)
+    result = WebSocket(tr: WsTransport(kind: wkH2, mux: mux, sid: sid), open: true,
+                       maxMessageBytes: maxMessageBytes, keepAlive: keepAlive)
+  except CatchableError:
+    await mux.close()
+    raise
+
+proc websocket*(client: Navi, url: string,
+                headers = initHeaders(),
+                maxMessageBytes = 0, keepAlive = 0): Future[WebSocket] {.async.} =
+  ## Open a WebSocket connection. Accepts `ws://` / `wss://` (or http/https);
+  ## `wss` uses TLS. The transport follows `config.http`: h1 Upgrade (RFC 6455) is
+  ## used whenever H1 is allowed (the universal path); to tunnel over HTTP/2
+  ## Extended CONNECT (RFC 8441) instead, exclude H1 (e.g. `config.http = {H2}`).
+  ## Use `send`, `receive`, and `close`.
+  ##
+  ## `maxMessageBytes` (0 = unlimited) caps a reassembled message: past it `receive`
+  ## closes with 1009 and raises `WsMessageTooLarge`. Set it for untrusted servers,
+  ## since a peer can otherwise grow one message without bound via continuation frames.
+  ##
+  ## `keepAlive` (ms, 0 = off) sends a ping after that long with no data *while a
+  ## `receive` is in progress*, and raises `TimeoutError` (closing the connection) if
+  ## another interval passes with still nothing back -- so a dead peer is detected
+  ## instead of awaiting forever.
+  let u = toWsUrl(url)
+  let httpset = client.config.http
+  if httpset.card == 0 or H1 in httpset:             # h1 is the universal ws transport
+    return await client.websocketH1(u, headers, maxMessageBytes, keepAlive)
+  elif H2 in httpset and u.isTls:                    # opt-in h2 (RFC 8441) by excluding H1
+    return await client.websocketH2(u, headers, maxMessageBytes, keepAlive)
+  else:
+    raise newException(ProtocolError,
+      "navi: config.http " & $httpset & " permits no usable WebSocket transport " &
+      "(h2 needs TLS; h3 WebSocket is not yet supported)")
+
 proc send*(ws: WebSocket, data: string, binary = false): Future[void] {.async.} =
   ## Send a text (default) or binary message. Client frames are masked.
-  await ws.conn.sendAll(encodeFrame(if binary: opBinary else: opText, data))
+  await ws.sendRaw(encodeFrame(if binary: opBinary else: opText, data))
 
 proc ping*(ws: WebSocket, data = ""): Future[void] {.async.} =
-  await ws.conn.sendAll(encodeFrame(opPing, data))
+  await ws.sendRaw(encodeFrame(opPing, data))
 
 proc kaRecv(ws: WebSocket): Future[string] {.async.} =
   ## One read chunk. With keepalive off, a plain read. With it on, a single
   ## outstanding read is kept in `pendingRecv` (so a timed-out read is never
   ## orphaned to steal the next bytes): on an idle interval send a ping, and on a
   ## second idle interval with a ping still unanswered, declare the peer dead.
-  if ws.keepAlive <= 0: return await ws.conn.recvSome()
+  if ws.keepAlive <= 0: return await ws.recvRaw()
   while true:
-    if ws.pendingRecv == nil: ws.pendingRecv = ws.conn.recvSome()
+    if ws.pendingRecv == nil: ws.pendingRecv = ws.recvRaw()
     if await withTimeout(ws.pendingRecv, ws.keepAlive):
       let chunk = ws.pendingRecv.read()     # completed (re-raises a read error)
       ws.pendingRecv = nil
@@ -929,9 +1003,9 @@ proc kaRecv(ws: WebSocket): Future[string] {.async.} =
       return chunk
     if ws.pingOutstanding:                   # pinged last interval, still nothing back
       ws.open = false
-      try: await ws.conn.close() except CatchableError: discard
+      try: await ws.closeRaw() except CatchableError: discard
       raise newException(TimeoutError, "navi: websocket keepalive timed out")
-    await ws.conn.sendAll(encodeFrame(opPing, ""))
+    await ws.sendRaw(encodeFrame(opPing, ""))
     ws.pingOutstanding = true
 
 proc receive*(ws: WebSocket): Future[WsMessage] {.async.} =
@@ -950,20 +1024,20 @@ proc receive*(ws: WebSocket): Future[WsMessage] {.async.} =
       o = ws.asmb.offer(f, ws.maxMessageBytes)
     except WsMessageTooLarge:
       if ws.open:      # tell the peer why (1009), then drop the connection
-        try: await ws.conn.sendAll(encodeFrame(opClose, closePayload(closeMessageTooBig)))
+        try: await ws.sendRaw(encodeFrame(opClose, closePayload(closeMessageTooBig)))
         except CatchableError: discard
         ws.open = false
-        await ws.conn.close()
+        await ws.closeRaw()
       raise
     case o.reply
     of wrPong:
-      await ws.conn.sendAll(encodeFrame(opPong, o.replyPayload))
+      await ws.sendRaw(encodeFrame(opPong, o.replyPayload))
     of wrCloseEcho:
       if ws.open:
-        try: await ws.conn.sendAll(encodeFrame(opClose, o.replyPayload))
+        try: await ws.sendRaw(encodeFrame(opClose, o.replyPayload))
         except CatchableError: discard
         ws.open = false
-        await ws.conn.close()
+        await ws.closeRaw()
     of wrNone: discard
     if o.ready: return o.message
 
@@ -971,10 +1045,10 @@ proc close*(ws: WebSocket, code = closeNormal, reason = ""): Future[void] {.asyn
   ## Send a close frame and close the transport (freeing its TLS context).
   ## Idempotent: a no-op once the socket is already closed.
   if not ws.open: return
-  try: await ws.conn.sendAll(encodeFrame(opClose, closePayload(code, reason)))
+  try: await ws.sendRaw(encodeFrame(opClose, closePayload(code, reason)))
   except CatchableError: discard
   ws.open = false
-  await ws.conn.close()
+  await ws.closeRaw()
 
 # --- WebSocket streaming (a large message, one frame at a time) ---
 
@@ -1004,16 +1078,16 @@ proc readDataFrame(ws: WebSocket): Future[Frame] {.async.} =
         return Frame(fin: true, opcode: opClose, payload: "")
       ws.dec.feed(chunk)
     case f.opcode
-    of opPing: await ws.conn.sendAll(encodeFrame(opPong, f.payload)); continue
+    of opPing: await ws.sendRaw(encodeFrame(opPong, f.payload)); continue
     of opPong: continue
     else: return f
 
 proc closeOnFrame(ws: WebSocket, f: Frame): Future[void] {.async.} =
   if ws.open:
-    try: await ws.conn.sendAll(encodeFrame(opClose, f.payload))
+    try: await ws.sendRaw(encodeFrame(opClose, f.payload))
     except CatchableError: discard
     ws.open = false
-    await ws.conn.close()
+    await ws.closeRaw()
 
 proc openStreamReader(ws: WebSocket): Future[WsReader] {.async.} =
   result = WsReader(ws: ws)
@@ -1059,7 +1133,7 @@ proc drain*(r: WsReader, sink: BodySink): Future[void] {.async.} =
       await sink(chunk)
   except CatchableError:
     r.ws.open = false
-    try: await r.ws.conn.close()
+    try: await r.ws.closeRaw()
     except CatchableError: discard
     raise
 
@@ -1079,16 +1153,16 @@ template stream*(ws: WebSocket): untyped =
 proc write*(w: WsWriter, data: string): Future[void] {.async.} =
   ## Append a fragment to the message being streamed out.
   if not w.started:
-    await w.ws.conn.sendAll(encodeFrame(if w.binary: opBinary else: opText, data, fin = false))
+    await w.ws.sendRaw(encodeFrame(if w.binary: opBinary else: opText, data, fin = false))
     w.started = true
   else:
-    await w.ws.conn.sendAll(encodeFrame(opContinuation, data, fin = false))
+    await w.ws.sendRaw(encodeFrame(opContinuation, data, fin = false))
 
 proc finishWrite(w: WsWriter): Future[void] {.async.} =
   if not w.started:
-    await w.ws.conn.sendAll(encodeFrame(if w.binary: opBinary else: opText, "", fin = true))
+    await w.ws.sendRaw(encodeFrame(if w.binary: opBinary else: opText, "", fin = true))
   else:
-    await w.ws.conn.sendAll(encodeFrame(opContinuation, "", fin = true))
+    await w.ws.sendRaw(encodeFrame(opContinuation, "", fin = true))
 
 template streamOut(ws: WebSocket; writer: untyped; isBinary: bool; body: untyped) =
   block:
@@ -1098,7 +1172,7 @@ template streamOut(ws: WebSocket; writer: untyped; isBinary: bool; body: untyped
       await writer.finishWrite()
     except CatchableError:
       ws.open = false
-      try: await ws.conn.close()
+      try: await ws.closeRaw()
       except CatchableError: discard
       raise
 

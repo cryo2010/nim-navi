@@ -216,3 +216,18 @@ suite "async websocket client end to end":
 
     waitFor run3()
     joinThread(th)
+
+suite "WebSocket transport selection (asyncdispatch)":
+  test "websocket over {H2} on a non-TLS URL should raise ProtocolError":
+    # {H2} excludes h1; h2 needs TLS, so a ws:// (plaintext) target has no usable
+    # transport -> ProtocolError before any connection is attempted.
+    proc run() {.async.} =
+      var cfg = initNaviConfig()
+      cfg.http = {H2}
+      let api = newNavi(cfg)
+      var raised = false
+      try: discard await api.websocket("ws://127.0.0.1:1/never")
+      except ProtocolError: raised = true
+      check raised
+      await api.close()
+    waitFor run()
