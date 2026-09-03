@@ -124,4 +124,9 @@ proc skipReason*(c: Config): string =
   if c.backend == "js":
     if c.workload == "streamUpload": return "skip: js cannot stream request bodies"
     if c.proto == "h3": return "skip: js/undici has no HTTP/3"
+  # Sync h3 WebSocket is driven by a background pump thread, so a --threads:off build
+  # cannot run it (websocketH3 raises); skip rather than hard-fail the cell.
+  when not compileOption("threads"):
+    if c.workload == "ws" and c.proto == "h3" and c.backend == "sync":
+      return "skip: sync h3 WebSocket needs a --threads:on build"
   ""

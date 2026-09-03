@@ -832,14 +832,17 @@ type
     of wkH3:
       when defined(naviHttp3):
         pump: WsH3Pump
-  WebSocket* = ref object
+  WebSocketObj = object
     tr: WsTransport
     dec: WsDecoder
     asmb: WsAssembler
-    open: bool
+    open: bool                ## the WS protocol is open (not yet closed/closing)
+    closed: bool              ## the transport has been torn down (closeRaw ran); keeps
+                              ## teardown idempotent and lets =destroy skip a done pump
     maxMessageBytes: int      ## cap on a reassembled message; 0 = unlimited
     keepAlive: int            ## ms between keepalive pings while receiving; 0 = off
     pingOutstanding: bool      ## a keepalive ping is awaiting any inbound byte
+  WebSocket* = ref WebSocketObj
 
 proc sendRaw(ws: WebSocket, data: string) =
   ## Write raw bytes to the transport (an encoded WS frame).
@@ -866,12 +869,32 @@ proc dataWaitingRaw(ws: WebSocket, ms: int): bool =
     else: false
 
 proc closeRaw(ws: WebSocket) =
-  ## Close the transport (h3: stop + join the pump thread, then free the connection).
+  ## Tear down the transport exactly once (h3: stop + join the pump thread, then free
+  ## the connection). Idempotent, so every close path -- explicit close, a peer-close
+  ## EOF, and the streaming error handlers -- can call it freely without a double
+  ## joinThread / free.
+  if ws.closed: return
+  ws.closed = true
   case ws.tr.kind
   of wkH1: ws.tr.conn.close()
   of wkH3:
     when defined(naviHttp3): wsClose(ws.tr.pump)
     else: discard
+
+proc `=destroy`(o: var WebSocketObj) =
+  ## Backstop: a WebSocket dropped without close() still releases its transport. For
+  ## h3 that means joining the pump thread and freeing the connection + shared state
+  ## (a raw pointer the GC will not reclaim); h1's Conn frees its own fd via `=destroy`
+  ## of the field below. Best-effort and idempotent (skips a transport already torn
+  ## down by closeRaw).
+  when defined(naviHttp3):
+    if o.tr.kind == wkH3 and not o.closed:
+      o.closed = true
+      try: wsClose(o.tr.pump)
+      except CatchableError: discard
+  `=destroy`(o.tr)          # h1: destructs the Conn value, closing its fd
+  `=destroy`(o.dec)
+  `=destroy`(o.asmb)
 
 proc toWsUrl(url: string): Url =
   var s = url
@@ -910,16 +933,6 @@ proc websocketH1(client: Navi, u: Url, headers: Headers,
   handshakeOk = true
 
 when defined(naviHttp3):
-  proc wsExtraFields(headers: Headers): seq[(string, string)] =
-    ## User headers for an Extended CONNECT (h3): drop connection-specific fields
-    ## (the pseudo-headers are added in the driver) and add sec-websocket-version.
-    for (k, v) in headers.pairs:
-      let lk = k.toLowerAscii
-      if lk in ["host", "connection", "keep-alive", "proxy-connection",
-                "transfer-encoding", "upgrade"]: continue
-      result.add((lk, v))
-    result.add(("sec-websocket-version", wsVersion))
-
   proc websocketH3(client: Navi, u: Url, headers: Headers,
                    maxMessageBytes, keepAlive: int): WebSocket =
     ## WebSocket over HTTP/3 Extended CONNECT (RFC 9220). The connection is driven
@@ -933,7 +946,7 @@ when defined(naviHttp3):
     else:
       let (pump, status) = openWsH3(u.host, u.port, u.host, client.config.tls.caFile,
                                     client.config.tls.verify, u.requestTarget,
-                                    wsExtraFields(headers))
+                                    wsExtraFields(headers), client.config.connectMs)
       if status != 200:            # RFC 9220 / 8441: a 200 accepts the tunnel
         wsClose(pump)
         raise newException(IOError,
@@ -1003,8 +1016,9 @@ proc receive*(ws: WebSocket): WsMessage =
     var f: Frame
     while not ws.dec.next(f):
       let chunk = ws.kaRecv()
-      if chunk.len == 0:
-        ws.open = false
+      if chunk.len == 0:                       # peer closed: tear the transport down
+        ws.open = false                        # now (h3: join the pump) so it is not
+        ws.closeRaw()                          # leaked when the caller's close() no-ops
         return WsMessage(kind: wmClose, closeCode: closeGoingAway)
       ws.dec.feed(chunk)
     var o: WsOutcome
@@ -1030,12 +1044,13 @@ proc receive*(ws: WebSocket): WsMessage =
     if o.ready: return o.message
 
 proc close*(ws: WebSocket, code = closeNormal, reason = "") =
-  ## Send a close frame and close the transport (freeing its TLS context).
-  ## Idempotent: a no-op once the socket is already closed.
-  if not ws.open: return
-  try: ws.sendRaw(encodeFrame(opClose, closePayload(code, reason)))
-  except CatchableError: discard
-  ws.open = false
+  ## Send a close frame (if still open) and tear the transport down. Idempotent: safe
+  ## to call after a peer-close, which already set open=false and tore down -- the
+  ## transport teardown still runs (once) so an already-closed h3 pump is not leaked.
+  if ws.open:
+    ws.open = false
+    try: ws.sendRaw(encodeFrame(opClose, closePayload(code, reason)))
+    except CatchableError: discard
   ws.closeRaw()
 
 # --- WebSocket streaming (a large message, one frame at a time) ---
@@ -1065,6 +1080,7 @@ proc readDataFrame(ws: WebSocket): Frame =
       let chunk = ws.kaRecv()
       if chunk.len == 0:
         ws.open = false
+        ws.closeRaw()                          # tear down on EOF (see receive)
         return Frame(fin: true, opcode: opClose, payload: "")
       ws.dec.feed(chunk)
     case f.opcode

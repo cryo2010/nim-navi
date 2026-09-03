@@ -885,8 +885,13 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
     // flushes. Configurable (NAVI_H3_KEEPALIVE_MS) for tests; 15s is a sane default
     // comfortably under typical idle timeouts. 0 disables.
     {
-      const char *kaEnv = std::getenv("NAVI_H3_KEEPALIVE_MS");
-      unsigned long kaMs = kaEnv ? std::strtoul(kaEnv, nullptr, 10) : 15000UL;
+      unsigned long kaMs = 15000UL;              // default
+      if (const char *kaEnv = std::getenv("NAVI_H3_KEEPALIVE_MS")) {
+        char *end = nullptr;
+        unsigned long v = std::strtoul(kaEnv, &end, 10);
+        if (end != kaEnv && *end == '\0') kaMs = v;   // fully-parsed; else keep default
+      }
+      if (kaMs > 86'400'000UL) kaMs = 86'400'000UL;    // clamp to 1 day (no ns overflow)
       if (kaMs > 0)
         ngtcp2_conn_set_keep_alive_timeout(c->conn, kaMs * NGTCP2_MILLISECONDS);
     }
