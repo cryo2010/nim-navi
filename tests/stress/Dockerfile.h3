@@ -41,6 +41,7 @@ WORKDIR /navi
 COPY . .
 RUN nimble install -y checksums "chronos@>= 4.0.0"
 RUN pip3 install --no-cache-dir --break-system-packages \
-      -r tests/stress/server/requirements.txt
+      -r tests/stress/server/requirements.txt \
+      aioquic   # h3 WebSocket (RFC 9220) origin for the ws+h3 stress cell
 
 ENTRYPOINT ["bash", "tests/stress/run.sh"]

@@ -57,6 +57,27 @@ start_servers() {
     printf 'keep_alive_max_requests = %s\n' "${NAVI_KEEPALIVE_MAX:-1000000000}"
     printf 'keep_alive_timeout = %s\n' "${NAVI_KEEPALIVE_TIMEOUT:-3600}"
   } >"$hcfg"
+  if [ "$p" = "h3" ] && [ "$workload" = "ws" ]; then
+    # WebSocket over h3 (RFC 9220 Extended CONNECT) is terminated natively by an
+    # aioquic server -- Caddy's reverse_proxy does not bridge an h3 Extended CONNECT
+    # to a backend WebSocket. Each server echoes ws frames over its CONNECT stream.
+    command -v python3 >/dev/null || { echo "python3 required for h3 ws"; return 1; }
+    for ((i=0; i<servers; i++)); do
+      port=$((base_port + i))
+      WS_HOST="$host" WS_PORT="$port" WS_CERT="$cert" WS_KEY="$key" \
+        setsid python3 "$root/tests/interop/ws_h3/server.py" >"$work/srv-$i.log" 2>&1 &
+      pids+=($!)
+    done
+    for ((i=0; i<servers; i++)); do
+      local ok=""
+      for _ in $(seq 1 150); do
+        grep -q WS_H3_SERVER_READY "$work/srv-$i.log" 2>/dev/null && { ok=1; break; }
+        sleep 0.2
+      done
+      [ -n "$ok" ] || { echo "aioquic ws-h3 server $i did not start"; cat "$work/srv-$i.log"; return 1; }
+    done
+    return 0
+  fi
   if [ "$p" = "h3" ]; then
     command -v caddy >/dev/null || { echo "caddy required for h3 (use the h3 image)"; return 1; }
     local caddyfile="$work/Caddyfile"

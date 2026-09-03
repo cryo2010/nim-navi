@@ -147,6 +147,15 @@ proc navi_h3_read_body*(c: pointer, sid: int64, buf: ptr char, cap: csize_t,
 proc navi_h3_stream_free*(c: pointer, sid: int64) {.importc, cdecl.}
   ## drop a stream (after eof+reset check, or to abandon a handle)
 
+# WebSocket-over-h3 tunnel (RFC 9220 Extended CONNECT): open a CONNECT stream with a
+# :protocol, then push outbound frames as DATA and drain inbound via navi_h3_read_body.
+proc navi_h3_open_connect*(c: pointer, path, reqHeaders, protocol: cstring): int64
+  {.importc, cdecl.}   ## CONNECT + :protocol stream id (send side left open), or -1
+proc navi_h3_tunnel_send*(c: pointer, sid: int64, data: pointer, len: csize_t): cint
+  {.importc, cdecl.}   ## queue outbound DATA + resume the stream (navi pumps after)
+proc navi_h3_tunnel_close*(c: pointer, sid: int64): cint {.importc, cdecl.}
+  ## half-close the send side (flush EOF once the outbound queue drains)
+
 proc ngtcp2VersionStr*(): string = $ngtcp2_version(0).version_str
 proc nghttp3VersionStr*(): string = $nghttp3_version(0).version_str
 
