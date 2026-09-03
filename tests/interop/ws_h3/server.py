@@ -86,13 +86,14 @@ class WsH3Protocol(QuicConnectionProtocol):
 
 
 async def main():
+    host = os.environ.get("WS_HOST", "127.0.0.1")
     port = int(os.environ.get("WS_PORT", "4433"))
     cfg = QuicConfiguration(is_client=False, alpn_protocols=["h3"])
     # enable_webtransport (which makes H3Connection advertise
     # SETTINGS_ENABLE_CONNECT_PROTOCOL=1) requires a datagram frame size.
     cfg.max_datagram_frame_size = 65536
     cfg.load_cert_chain(os.environ["WS_CERT"], os.environ["WS_KEY"])
-    await serve("127.0.0.1", port, configuration=cfg, create_protocol=WsH3Protocol)
+    await serve(host, port, configuration=cfg, create_protocol=WsH3Protocol)
     print("WS_H3_SERVER_READY", flush=True)
     await asyncio.Future()
 

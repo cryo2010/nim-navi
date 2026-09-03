@@ -912,6 +912,28 @@ let ws = api.websocket("wss://example.com/socket",
 The masking key for each client frame and the handshake nonce come from the OS CSPRNG
 (`std/sysrand`), per RFC 6455.
 
+`websocket()` follows `config.http`. An HTTP/1.1 Upgrade (RFC 6455) is the universal
+transport and is used whenever `H1` is allowed -- including the default -- so the
+common case is unchanged. To tunnel the WebSocket over Extended CONNECT instead,
+exclude `H1` so a newer protocol is the only choice: `config.http = {H2}` for HTTP/2
+(RFC 8441) or `{H3}` for HTTP/3 (RFC 9220, needs `-d:naviHttp3`). Over h2/h3 the
+handshake uses the `:protocol` pseudo-header (no `Sec-WebSocket-Key`/`Accept`); the
+frame protocol on top is identical.
+
+```nim
+var cfg = initNaviConfig()
+cfg.http = {H3}                          # WebSocket over h3 Extended CONNECT
+let api = newNavi(cfg)
+let ws = await api.websocket("wss://example.com/socket")
+```
+
+h2 and h3 Extended CONNECT are supported on `navi/asyncdispatch` and `navi/chronos`.
+The **sync** client is HTTP/1.1-only for WebSocket (Extended CONNECT needs a
+background reader, which is inherently async). If `config.http` allows no usable
+transport (e.g. `{H2}`/`{H3}` on the sync client, or against a server that does not
+accept Extended CONNECT), `websocket()` raises `ProtocolError` rather than silently
+downgrading.
+
 For a large message you can stream it a frame at a time instead of buffering the whole
 thing, mirroring HTTP `stream()`/`bodyStream`. `ws.stream()` returns a reader for the
 next inbound message (`kind` tells you text vs binary); consume it with `each` (one

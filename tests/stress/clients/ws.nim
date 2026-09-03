@@ -64,6 +64,7 @@ proc main() {.async.} =
 
   var c = initNaviConfig()
   c.tls.caFile = cfg.cert
+  if cfg.proto == "h3": c.http = {H3}   # WebSocket over h3 Extended CONNECT (RFC 9220)
   let api = newNavi(c)
 
   # Open the sockets first (sequentially), so the soak that follows isn't racing
