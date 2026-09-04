@@ -33,6 +33,26 @@ suite "h2 Extended CONNECT (RFC 8441)":
       discard c.feed(encodeSettingsAck())
       check not c.sawPeerSettings
 
+  test "a non-SETTINGS preface sets connError without sawPeerSettings (handshake fails fast)":
+    # The WebSocket-over-h2 SETTINGS-wait loop reads until sawPeerSettings, but must
+    # raise on a fatal connection error instead of spinning on a dead-but-open peer.
+    # A preface violation is the reachable pre-SETTINGS fatal, so the loop's
+    # `connError` guard must see it while sawPeerSettings stays false.
+    let c = initH2Conn()
+    discard c.feed(encodePing(newString(8)))    # RFC 9113 3.4: first frame must be SETTINGS
+    check not c.sawPeerSettings
+    check c.connError.len > 0
+
+  test "a GOAWAY after the tunnel stream opens marks it done (CONNECT-headers wait fails fast)":
+    # The CONNECT-headers wait loop must exit on a terminal connection state, not
+    # block; streamDone folds in GOAWAY/fatal, so it flips once the peer goes away.
+    let c = initH2Conn()
+    discard c.feed(encodeSettings({settingsEnableConnectProtocol: 1'u32}))
+    let sid = c.openStream()
+    check not c.streamDone(sid)
+    discard c.feed(encodeGoAway(0, errNoError))
+    check c.streamDone(sid)
+
   test "h2ConnectHeaderList should build the RFC 8441 pseudo-headers":
     let u = parseUrl("https://example.com/chat")
     let hs = h2ConnectHeaderList(u, "websocket",

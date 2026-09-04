@@ -44,6 +44,9 @@ type
     alive: bool
     readerDone: Future[void] ## completed once the reader has exited and the
                              ## transport is closed, so `close` can join it
+    settingsSeen: Future[void]  ## completed once the peer's initial SETTINGS is seen
+                                ## (or the reader exits), so an Extended CONNECT can gate
+                                ## on ENABLE_CONNECT_PROTOCOL before sending (RFC 8441)
     readerFut: Future[void]  ## the reader task itself, held so `close` can
                              ## `cancelAndWait` it (reaping its parked read cleanly)
     closing: bool            ## set by `close`, so the reader defers the transport
@@ -180,6 +183,8 @@ proc reader(mux: H2Mux) {.async.} =
       if chunk.len == 0: break                 # peer closed
       let toSend = mux.h2.feed(chunk)
       if toSend.len > 0: await mux.send(toSend)   # includes a GOAWAY on a conn error
+      if mux.h2.sawPeerSettings and not mux.settingsSeen.finished:
+        mux.settingsSeen.complete()               # unblocks a waiting Extended CONNECT
       mux.queueBodies()                           # move sink-stream body into recvq
       mux.wakeRecvers()                           # let sink drains pull new body + ack
       mux.dispatch()                              # complete finished buffered streams
@@ -196,7 +201,8 @@ proc reader(mux: H2Mux) {.async.} =
     mux.failAll("navi: http/2 connection closed")
     try: await be.close(mux.transport)   # the reader owns the transport close
     except CatchableError: discard
-    if not mux.readerDone.finished: mux.readerDone.complete()
+    if not mux.settingsSeen.finished: mux.settingsSeen.complete()  # unblock a pending
+    if not mux.readerDone.finished: mux.readerDone.complete()      # openConnect (dead conn)
 
 proc newH2Mux*(transport: be.Conn, maxBody = 0, decompress = false): Future[H2Mux] {.async.} =
   ## Take ownership of a freshly connected h2 transport, send the preface, and
@@ -204,6 +210,7 @@ proc newH2Mux*(transport: be.Conn, maxBody = 0, decompress = false): Future[H2Mu
   let mux = H2Mux(transport: transport, h2: initH2Conn(maxBody), alive: true,
                   decompress: decompress,
                   readerDone: newFuture[void]("h2mux.readerDone"),
+                  settingsSeen: newFuture[void]("h2mux.settingsSeen"),
                   waiters: initTable[uint32, Future[H2Response]](),
                   sendReady: initTable[uint32, Future[void]](),
                   sinkStreams: initHashSet[uint32](),
@@ -233,6 +240,7 @@ proc close*(mux: H2Mux) {.async.} =
   if mux.readerFut != nil and not mux.readerFut.finished:
     try: await mux.readerFut           # it observes EOF and returns; no cancellation
     except CatchableError: discard
+  if not mux.settingsSeen.finished: mux.settingsSeen.complete()  # unblock a pending openConnect
   if not mux.readerDone.finished: mux.readerDone.complete()
 
 proc streamBody(mux: H2Mux, sid: uint32, bodyStream: BodyProducer,
@@ -429,6 +437,15 @@ proc openConnect*(mux: H2Mux, headers: seq[(string, string)]): Future[uint32] {.
   ## Open an Extended CONNECT (RFC 8441) tunnel stream and return its id once the
   ## response headers arrive (send side left open). The caller checks
   ## `respSnapshot(sid).status == 200`, then uses `tunnelSend` / `tunnelRecv`.
+  ## Waits for the peer's SETTINGS and requires ENABLE_CONNECT_PROTOCOL first
+  ## (RFC 8441), so an origin that does not support it fails fast and clearly.
+  await mux.settingsSeen
+  if not mux.alive:
+    raise newException(IOError, "navi: http/2 connection closed")
+  if not mux.h2.peerAllowsConnect:
+    raise newException(ProtocolError,
+      "navi: server does not support WebSocket over HTTP/2 " &
+      "(no SETTINGS_ENABLE_CONNECT_PROTOCOL); use an h1 WebSocket")
   return await mux.sendAndReadHeaders(headers, "", connectTunnel = true)
 
 proc tunnelSend*(mux: H2Mux, sid: uint32, data: string) {.async.} =

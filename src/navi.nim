@@ -1013,7 +1013,7 @@ proc websocketH2(client: Navi, u: Url, headers: Headers,
   ## socket drives one full-duplex stream without contending with other requests.
   let conn = connect(u.host, u.port, u.isTls, client.config.tls,
                      resolveProxy(client.config, u), @["h2", "http/1.1"],
-                     client.config.connectMs)
+                     client.config.connectMs, client.config.readMs, client.config.totalMs)
   var handshakeOk = false
   defer:
     if not handshakeOk:
@@ -1035,6 +1035,9 @@ proc websocketH2(client: Navi, u: Url, headers: Headers,
       raise newException(IOError, "navi: websocket h2 handshake closed by peer")
     let toSend = h2.feed(chunk)
     if toSend.len > 0: conn.sendAll(toSend)
+    if h2.connError.len > 0 or h2.goneAway:   # fatal preface / early GOAWAY: fail fast,
+      raise newException(ProtocolError,        # never spin on a dead-but-open connection
+        "navi: websocket h2 handshake failed before the server's SETTINGS")
   if not h2.peerAllowsConnect:
     raise newException(ProtocolError,
       "navi: server does not support WebSocket over HTTP/2 " &
@@ -1044,13 +1047,15 @@ proc websocketH2(client: Navi, u: Url, headers: Headers,
   let sid = h2.openStream()
   conn.sendAll(h2.encodeRequestHead(sid, h2ConnectHeaderList(u, "websocket", extra)))
   while not h2.headersReady(sid):        # await the CONNECT response headers
-    if h2.streamReset(sid):
-      raise newException(IOError, "navi: websocket h2 tunnel reset before it opened")
     let chunk = conn.recvSome()
     if chunk.len == 0:
       raise newException(IOError, "navi: websocket h2 handshake closed by peer")
     let toSend = h2.feed(chunk)
     if toSend.len > 0: conn.sendAll(toSend)
+    if h2.streamReset(sid):
+      raise newException(IOError, "navi: websocket h2 tunnel reset before it opened")
+    if h2.streamDone(sid):               # fatal conn error or GOAWAY before the 200
+      raise newException(IOError, "navi: websocket h2 tunnel closed before it opened")
   let status = h2.respSnapshot(sid).status
   if status != 200:                      # RFC 8441: a 200 accepts the tunnel
     raise newException(IOError,
