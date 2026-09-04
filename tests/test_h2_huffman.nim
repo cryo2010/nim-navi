@@ -35,3 +35,13 @@ suite "huffman encode":
   test "the Huffman codec should round-trip mixed ASCII":
     let s = "GET /path?x=1&y=2 HTTP/2 Bearer.Token_09"
     check huffmanDecode(huffmanEncode(s)) == s
+
+suite "huffman decode validation (RFC 7541 5.2)":
+  test "over-long padding (a whole extra byte) is rejected":
+    # A complete value plus a full extra 0xFF byte is > 7 bits of padding.
+    expect ValueError:
+      discard huffmanDecode(hex("f1e3c2e5f23a6ba0ab90f4ff") & "\xff")
+
+  test "an all-ones stream (EOS symbol / invalid padding) is rejected":
+    expect ValueError:
+      discard huffmanDecode("\xff\xff\xff\xff")
