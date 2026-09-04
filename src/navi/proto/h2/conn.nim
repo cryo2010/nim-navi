@@ -56,6 +56,7 @@ type
     maxBodyBytes: int            ## cap on a response body; 0 disables (maxResponseBytes)
     streams: Table[uint32, Stream]
     sawFirstFrame: bool          ## the server's first frame must be SETTINGS (the preface)
+    sawSettings: bool            ## the peer's initial (non-ACK) SETTINGS has been processed
     fatal: string                ## non-empty once a connection error tore the conn down
     goneAway*: bool
     goAwayLastId: uint32
@@ -92,6 +93,13 @@ proc maxConcurrentStreams*(c: H2Conn): int = c.maxConcurrent
 proc peerAllowsConnect*(c: H2Conn): bool = c.peerConnectProtocol
   ## Whether the peer advertised SETTINGS_ENABLE_CONNECT_PROTOCOL=1, permitting
   ## Extended CONNECT (RFC 8441) -- the handshake for WebSocket-over-h2.
+
+proc sawPeerSettings*(c: H2Conn): bool = c.sawSettings
+  ## Whether the peer's initial (non-ACK) SETTINGS frame has been processed. A
+  ## client can read frames until this is true to learn the peer's capabilities
+  ## deterministically -- e.g. `peerAllowsConnect` before an Extended CONNECT --
+  ## instead of guessing from an idle socket. SETTINGS is the peer's mandatory
+  ## first frame (RFC 9113 3.4), so this flips on the first feed that carries it.
 
 proc preamble*(c: H2Conn): string =
   ## Connection preface, our SETTINGS (server push disabled, a large per-stream
@@ -295,6 +303,7 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
   case f.typ
   of uint8(ftSettings):
     if (f.flags and flagAck) == 0:
+      c.sawSettings = true                       # the peer's initial settings are in
       for (id, value) in parseSettings(f.payload):
         if id == settingsMaxFrameSize and value >= 16384'u32:
           c.maxFrameSize = int(value)
