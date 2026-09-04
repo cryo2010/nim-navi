@@ -977,7 +977,8 @@ proc websocketH1(client: Navi, u: Url, headers: Headers,
                  maxMessageBytes, keepAlive: int): WebSocket =
   ## WebSocket over an HTTP/1.1 Upgrade (RFC 6455): the universal transport.
   let conn = connect(u.host, u.port, u.isTls, client.config.tls,
-                     resolveProxy(client.config, u), @[], client.config.connectMs)
+                     resolveProxy(client.config, u), @[],
+                     client.config.connectMs, client.config.readMs, client.config.totalMs)
   # Close the connection unless the handshake completes -- a send/recv error mid
   # handshake would otherwise leak the socket (and its SSL_CTX for wss).
   var handshakeOk = false
