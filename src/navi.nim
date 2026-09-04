@@ -711,8 +711,10 @@ proc transportGroup(client: Navi, items: seq[BatchItem],
     var completed = 0
 
     proc openMore() =
-      ## Open as many queued requests as the peer's stream limit allows now.
-      while sidK.len < h2.maxConcurrentStreams and opened < members.len:
+      ## Open as many queued requests as the peer's stream limit allows now. Stop once
+      ## the peer sent GOAWAY: a stream above its last-stream-id would be ignored (RFC
+      ## 9113 6.8), so leave the rest for a retry on a fresh connection.
+      while not h2.goneAway and sidK.len < h2.maxConcurrentStreams and opened < members.len:
         let sid = h2.openStream()
         sidK[sid] = opened
         transport.sendAll(h2.encodeRequest(sid, h2HeaderList(items[members[opened]].req),

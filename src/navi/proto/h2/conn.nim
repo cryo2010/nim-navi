@@ -325,8 +325,15 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
     block:
       c.sawSettings = true                       # the peer's initial settings are in
       for (id, value) in parseSettings(f.payload):
-        if id == settingsMaxFrameSize and value >= 16384'u32:
+        if id == settingsMaxFrameSize:
+          if value < 16384'u32 or value > 16777215'u32:   # RFC 9113 6.5.2: [2^14, 2^24-1]
+            c.connFail(errProtocolError, "SETTINGS_MAX_FRAME_SIZE out of range", outbuf)
+            return
           c.maxFrameSize = int(value)
+        elif id == settingsEnablePush:
+          if value > 1'u32:                               # RFC 9113 6.5.2: must be 0 or 1
+            c.connFail(errProtocolError, "SETTINGS_ENABLE_PUSH must be 0 or 1", outbuf)
+            return
         elif id == settingsMaxConcurrentStreams:
           c.maxConcurrent = int(value)
         elif id == settingsEnableConnectProtocol:
@@ -364,10 +371,18 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
   of uint8(ftHeaders), uint8(ftContinuation):
     if f.streamId == 0:                          # RFC 9113 6.2/6.10: never on stream 0
       c.connFail(errProtocolError, "HEADERS/CONTINUATION on stream 0", outbuf); return
+    let s = c.streams.getOrDefault(f.streamId)
+    # A HEADERS opening a server-initiated (even) or never-allocated (idle, at/above
+    # nextId) stream is illegal for a client (RFC 9113 5.1.1); a late frame on an
+    # already-completed odd stream below nextId (s == nil) stays tolerated. The 6.10
+    # gate already rejects a stray CONTINUATION, so this guards HEADERS only.
+    if f.typ == uint8(ftHeaders) and s == nil and
+       (f.streamId mod 2 == 0'u32 or f.streamId >= c.nextId):
+      c.connFail(errProtocolError, "HEADERS on an idle or server-initiated stream", outbuf)
+      return
     # Open (or close) the header block per END_HEADERS, so the 6.10 gate above knows
     # whether a CONTINUATION must follow -- tracked even for an unknown stream.
     c.contHeaderStream = if (f.flags and flagEndHeaders) != 0: 0'u32 else: f.streamId
-    let s = c.streams.getOrDefault(f.streamId)
     if s != nil and not s.reset:
       var frag = f.payload
       if f.typ == uint8(ftHeaders):
@@ -382,9 +397,12 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
             return
           frag = frag[5 ..< frag.len]
       s.hdrBuf.add frag
-      if s.hdrBuf.len > maxHeaderListBytes:       # CONTINUATION flood: bound and RST
-        outbuf.add encodeRstStream(f.streamId, errEnhanceYourCalm)
-        s.reset = true; s.ended = true; s.hdrBuf.setLen(0)
+      if s.hdrBuf.len > maxHeaderListBytes:       # CONTINUATION flood (CVE-2024-27316):
+        # fail the whole connection, not just the stream. An undecoded header block
+        # can't be skipped without desyncing the connection-wide HPACK table, and a
+        # stream RST would leave the 6.10 gate armed -- so GOAWAY, as Go/nghttp2 do.
+        c.connFail(errEnhanceYourCalm, "header block exceeds the size cap", outbuf)
+        return
       else:
         if f.typ == uint8(ftHeaders):
           s.hdrEndStream = (f.flags and flagEndStream) != 0

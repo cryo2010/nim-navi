@@ -128,8 +128,8 @@ suite "h2 client DoS limits":
     var toSend = c.feed(encodeHeaders(id, repeat("A", 16000), endStream = false, endHeaders = false))
     for _ in 0 ..< 16:                     # 16 x 16000 = 256000 > 128 KiB cap
       toSend.add c.feed(encodeContinuation(id, repeat("B", 16000), endHeaders = false))
-    check c.streamReset(id)                # bounded and reset, not OOM
-    check firstFrameOfType(toSend, ftRstStream)
+    check c.connError.len > 0              # bounded, and fails the connection (GOAWAY) --
+    check firstFrameOfType(toSend, ftGoAway)   # an undecoded block can't be skipped safely
 
   test "the h2 client should RST a response body when it exceeds maxResponseBytes":
     let c = newServerConn(maxBody = 10)       # 10-byte cap
@@ -686,3 +686,39 @@ suite "h2 frame validation (RFC 9113)":
     toSend.add c.feed(encodeData(id, "x", endStream = false))   # DATA before the CONTINUATION
     check c.connError.len > 0
     check firstFrameOfType(toSend, ftGoAway)
+
+  test "a SETTINGS_MAX_FRAME_SIZE above 2^24-1 is a connection error":
+    let c = newServerConn()
+    let toSend = c.feed(encodeSettings({settingsMaxFrameSize: 0x1000000'u32}))  # 2^24
+    check c.connError.len > 0
+    check firstFrameOfType(toSend, ftGoAway)
+
+  test "a SETTINGS_MAX_FRAME_SIZE below 2^14 is a connection error":
+    let c = newServerConn()
+    check c.feed(encodeSettings({settingsMaxFrameSize: 16383'u32})).len > 0
+    check c.connError.len > 0
+
+  test "a SETTINGS_ENABLE_PUSH other than 0 or 1 is a connection error":
+    let c = newServerConn()
+    let toSend = c.feed(encodeSettings({settingsEnablePush: 2'u32}))
+    check c.connError.len > 0
+    check firstFrameOfType(toSend, ftGoAway)
+
+  test "HEADERS on a server-initiated (even) stream is a connection error":
+    let c = newServerConn()
+    let toSend = c.feed(encodeHeaders(2'u32, "x", endStream = false, endHeaders = true))
+    check c.connError.len > 0
+    check firstFrameOfType(toSend, ftGoAway)
+
+  test "HEADERS on an idle (never-opened) stream is a connection error":
+    let c = newServerConn()
+    let toSend = c.feed(encodeHeaders(7'u32, "x", endStream = false, endHeaders = true))
+    check c.connError.len > 0
+
+  test "a late frame on an already-completed stream is tolerated (not a connection error)":
+    let c = newServerConn()
+    let id = c.openStream()                 # id=1; nextId becomes 3
+    discard c.feed(serverResponse(id, "200", @[], "hi"))
+    discard c.takeResponse(id)              # completes and removes the stream
+    discard c.feed(encodeHeaders(id, "x", endStream = true, endHeaders = true))  # id=1 < nextId
+    check c.connError.len == 0
