@@ -3,12 +3,16 @@
 ## responses. Request-body compression is skipped (the js runtime owns its codec).
 ## The runner trusts the self-signed cert via NODE_EXTRA_CA_CERTS.
 
+import std/strutils
 import navi/js
 import ../common/harness_js
 
-proc jsExit(code: int) {.importjs: "process.exit(#)".}
-
-const verbs = [GET, POST, PUT]
+const verbs = [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS]
+# Text-only body shapes (js sends the body as a string via TextEncoder, so a raw
+# binary body would be mangled): empty, tiny, either side of the 16 KiB frame
+# boundary, past the 64 KiB window, and highly compressible.
+let jsBodies = @["", "payload", repeat("a", 16383), repeat("b", 16385),
+                 repeat("c", 65536), repeat("z", 262144)]
 
 proc stampMw(): NaviMiddleware =
   result = proc(ctx: NaviContext) {.async.} =
@@ -34,18 +38,28 @@ proc main() {.async.} =
   proc worker(api: Navi, i: int) {.async.} =
     var n = i
     while nowMs() < deadline:
-      let v = verbs[n mod verbs.len]; inc n
+      let v = verbs[n mod verbs.len]
+      let plain = jsBodies[n mod jsBodies.len]
+      let bodied = v in {POST, PUT, PATCH}
+      inc n
       var h = initHeaders()
-      var body = ""
-      if v in {POST, PUT}:
-        body = "payload-" & $v
-        h["content-type"] = "text/plain"
+      if bodied: h["content-type"] = "text/plain"
       try:
-        let res = await api.request(v, pool.pick() & "/echo", headers = h, body = body)
+        let res = await api.request(v, pool.pick() & "/echo", headers = h,
+                                    body = (if bodied: plain else: ""))
+        if res.status != 200:
+          echo label, " FAIL: ", $v, " -> status ", res.status; jsExit(1)
+        if res.headers.get("x-echo-method") != $v:
+          echo label, " FAIL: ", $v, " echoed method '", res.headers.get("x-echo-method"), "'"; jsExit(1)
+        if res.headers.get("x-echo-stress") != "1":
+          echo label, " FAIL: ", $v, " middleware header not echoed"; jsExit(1)
+        let expectBody = if bodied and v != HEAD: plain else: ""
+        if res.body != expectBody:
+          echo label, " FAIL: ", $v, " body mismatch (expected ", expectBody.len,
+               " got ", res.body.len, ")"; jsExit(1)
         counter.tally(res.status)
       except CatchableError as e:
         counter.note()
-        # Fail hard: a surfaced transport error is a bug to investigate, not noise.
         echo label, " FAIL: ", $v, " -> ", e.name, ": ", e.msg
         jsExit(1)
 
@@ -56,6 +70,9 @@ proc main() {.async.} =
   for f in futs: await f
   clearIntervalJs(timer)
 
+  if counter.ops == 0:
+    echo label, " FAIL: no request completed"
+    jsExit(1)
   counter.report(label, start)
   echo "== requests js ", cfg.proto, " passed (", counter.ops, " ops) =="
 

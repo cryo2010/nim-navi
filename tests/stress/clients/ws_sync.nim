@@ -5,6 +5,7 @@
 import std/times
 import ../common/[config, reporter, servers]
 import navi
+include ../common/httpset
 
 proc wsUrl(base: string): string =
   "wss://" & base["https://".len .. ^1] & "/ws"
@@ -18,7 +19,7 @@ proc main() =
 
   var c = initNaviConfig()
   c.tls.caFile = cfg.cert
-  if cfg.proto == "h3": c.http = {H3}   # WebSocket over h3 Extended CONNECT (RFC 9220)
+  c.http = httpVersions(cfg.proto)   # pin the ws transport: {H1} upgrade / {H2} / {H3}
   let api = newNavi(c)
   let ws = api.websocket(wsUrl(pool.pick()))
 
@@ -41,7 +42,10 @@ proc main() =
       report(cfg.label, counter, epochTime() - start)
   ws.close()
 
+  if counter.ops == 0:
+    stderr.writeLine cfg.label & " FAIL: no WebSocket round-trip completed"
+    quit(1)
   report(cfg.label & " final", counter, epochTime() - start)
-  echo "== ws sync passed (", counter.ops, " round-trips) =="
+  echo "== ws sync ", cfg.proto, " passed (", counter.ops, " round-trips) =="
 
 main()

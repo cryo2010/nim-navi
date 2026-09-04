@@ -11,7 +11,7 @@
 ## the read's future and crashes the dispatcher at teardown ("No handles or timers
 ## registered"). Reporter prints every interval.
 
-import std/times
+import std/[times, strutils]
 import ../common/[config, reporter, servers]
 when defined(useChronos):
   import navi/chronos
@@ -21,12 +21,29 @@ else:
   const backend = "asyncdispatch"
 include ../common/httpset
 
-proc worker(s: SseStream, counter: StatusCounter, gate: ptr VersionGate,
-            deadline: float) {.async.} =
+proc failHard(cfg: Config, msg: string) =
+  {.cast(gcsafe).}:
+    stderr.writeLine cfg.label & " FAIL: " & msg
+  quit(1)
+
+proc worker(cfg: Config, s: SseStream, counter: StatusCounter,
+            gate: ptr VersionGate, deadline: float) {.async.} =
+  var lastId = 0
   try:
     s.each(ev):
       counter.tally(200)
       gate[].sample(s.httpVersion)        # track the negotiated version (h3 after upgrade)
+      # Verify Last-Event-ID resume: the server numbers events monotonically and
+      # resumes at last+1 after each periodic drop, so a gap or duplicate id (across
+      # a reconnect) is a resume bug, not soak noise.
+      if ev.id.len > 0:
+        let id = try: parseInt(ev.id) except ValueError: -1
+        if id < 0:
+          cfg.failHard("non-numeric SSE id '" & ev.id & "'")
+        if lastId != 0 and id != lastId + 1:
+          cfg.failHard("SSE id discontinuity: expected " & $(lastId + 1) &
+            ", got " & $id & " (Last-Event-ID resume broken)")
+        lastId = id
       if epochTime() >= deadline: break   # self-terminate: events flow continuously
   except CatchableError:
     counter.fail()
@@ -64,11 +81,12 @@ proc main() {.async.} =
   let deadline = start + cfg.seconds
   var gate = initVersionGate(cfg)
   var futs: seq[Future[void]]
-  for s in streams: futs.add worker(s, counter, addr gate, deadline)
+  for s in streams: futs.add worker(cfg, s, counter, addr gate, deadline)
   futs.add reporterLoop(cfg, counter, start, deadline)
   for f in futs: await f
   gate.finish()   # hard-fail if the pinned protocol (h2/h3) was never negotiated
 
+  if counter.ops == 0: cfg.failHard("no SSE event consumed")
   report(cfg.label & " final", counter, epochTime() - start)
   echo "== sse ", backend, " ", cfg.proto, " passed (", counter.ops, " events) =="
 

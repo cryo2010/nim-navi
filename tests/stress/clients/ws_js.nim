@@ -43,6 +43,7 @@ proc main() {.async.} =
   for f in futs: await f
   clearIntervalJs(timer)
 
+  if counter.ops == 0: (echo "[ws js] FAIL: no WebSocket round-trip completed"; jsExit(1))
   counter.report("[ws js]", start)
   echo "== ws js passed (", counter.ops, " round-trips) =="
 

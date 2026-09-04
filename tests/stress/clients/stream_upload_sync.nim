@@ -8,12 +8,14 @@ import ../common/[config, reporter, servers, streamcontent]
 import navi
 include ../common/httpset
 
-let blk = fillBlock()
+let blkBase = fillBlock()
 
 proc oneUpload(api: Navi, cfg: Config, url: string) =
   var st = newSha1State()
   var remaining = cfg.streamBytes
   var sent = 0
+  var idx = 0
+  var blk = blkBase   # local mutable copy so each block can be index-stamped
   var lastReport = epochTime()
   var h = initHeaders()
   h["content-type"] = "application/octet-stream"
@@ -23,6 +25,7 @@ proc oneUpload(api: Navi, cfg: Config, url: string) =
       if remaining <= 0: return ""
       let n = min(blockSize, remaining)
       remaining -= n
+      stampBlock(blk, idx); inc idx   # distinct per block: server catches a reorder/dup
       let chunk = if n == blockSize: blk else: blk[0 ..< n]
       st.update(chunk)
       sent += n
