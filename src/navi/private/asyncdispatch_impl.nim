@@ -922,7 +922,7 @@ proc websocketH1(client: Navi, u: Url, headers: Headers,
   ## WebSocket over an HTTP/1.1 Upgrade (RFC 6455): the universal transport.
   let conn = await connect(u.host, u.port, u.isTls, client.config.tls,
                            resolveProxy(client.config, u), @[],
-                           client.config.connectMs)
+                           client.config.connectMs, client.config.readMs)
   let key = genKey()
   # Close the connection on any handshake failure (its close is async, so this
   # uses try/except rather than defer).
