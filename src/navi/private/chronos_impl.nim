@@ -1022,7 +1022,7 @@ proc doWebsocket(client: Navi, url: string,
   else:
     raise newException(ProtocolError,
       "navi: config.http " & $httpset & " permits no usable WebSocket transport " &
-      "(h2 needs TLS; h3 WebSocket is not yet supported)")
+      "(h2/h3 need TLS)")
 
 proc websocket*(client: Navi, url: string,
                 headers = initHeaders(),

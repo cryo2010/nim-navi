@@ -10,8 +10,9 @@
 ##   3. feeds received bytes into `feed(...)` (returns control bytes to send)
 ##      until `streamDone(id)`, then `takeResponse(id)`
 ##
-## Request headers/bodies are assumed to fit the peer's limits (no send-side
-## flow-control blocking yet); the full control-frame set is handled.
+## Send-side flow control is honored: outbound DATA frames respect the stream and
+## connection send windows and pause for a WINDOW_UPDATE; the full control-frame
+## set is handled.
 
 import std/[strutils, tables]
 import ./frame, ./hpack
