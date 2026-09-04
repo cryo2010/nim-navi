@@ -52,10 +52,22 @@ start_servers() {
   #    (a 1 GiB transfer) or an idle pooled connection between transfers is dropped
   #    mid-flight, which without a client retry crashes the transfer.
   # Raise both (override with NAVI_KEEPALIVE_MAX / NAVI_KEEPALIVE_TIMEOUT).
+  #
+  # Recycling variant: NAVI_RECYCLE=1 instead LOWERS the limits so the server sends
+  # GOAWAY / idle-closes pooled connections mid-soak -- exercising navi's connection
+  # recycle + retry path (untested by the steady-state defaults). The stream workloads
+  # already retry transient recycles; a soak with `NAVI_RECYCLE=1 nimble stress...`
+  # points it at every workload. Both knobs still override the recycling defaults.
+  local ka_max="${NAVI_KEEPALIVE_MAX:-1000000000}"
+  local ka_to="${NAVI_KEEPALIVE_TIMEOUT:-3600}"
+  if [ "${NAVI_RECYCLE:-0}" != "0" ]; then
+    ka_max="${NAVI_KEEPALIVE_MAX:-200}"      # recycle each connection after ~200 requests
+    ka_to="${NAVI_KEEPALIVE_TIMEOUT:-2}"     # and idle-close after 2s
+  fi
   local hcfg="$work/hypercorn.toml"
   {
-    printf 'keep_alive_max_requests = %s\n' "${NAVI_KEEPALIVE_MAX:-1000000000}"
-    printf 'keep_alive_timeout = %s\n' "${NAVI_KEEPALIVE_TIMEOUT:-3600}"
+    printf 'keep_alive_max_requests = %s\n' "$ka_max"
+    printf 'keep_alive_timeout = %s\n' "$ka_to"
   } >"$hcfg"
   if [ "$p" = "h3" ] && [ "$workload" = "ws" ]; then
     # WebSocket over h3 (RFC 9220 Extended CONNECT) is terminated natively by an
@@ -211,6 +223,12 @@ for be in "${backends[@]}"; do
     # fall back to a slow proxied h1/h2 path against the Caddy h3 front, not real h3.
     if [ "$be" = js ] && [ "$pr" = h3 ]; then
       echo "[$workload $pr $be] skip: js/undici has no HTTP/3"; continue
+    fi
+    # navi/js can't pin undici's HTTP version and can't verify which was negotiated,
+    # so h1 and h2 js cells would be identical, unchecked runs. Collapse to one js
+    # cell (h1) rather than imply protocol coverage we don't have.
+    if [ "$be" = js ] && [ "$pr" != h1 ]; then
+      echo "[$workload $pr $be] skip: js/undici protocol not selectable; h1 js is the js coverage"; continue
     fi
     # start fresh servers per protocol (h1/h2 vs h3 differ), run the cell, stop them.
     # On a failed start, stop_servers first so a partially-started cell does not leak

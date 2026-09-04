@@ -56,6 +56,24 @@ proc label*(c: Config): string =
   ## The tag prefixed to every report line, e.g. "[requests h2 chronos]".
   "[" & c.workload & " " & c.proto & " " & c.backend & "]"
 
+proc stressBodies*(): seq[string] =
+  ## A rotation of request/response body shapes for the echo workload, so the
+  ## buffered path exercises more than one tiny string. Each is fixed content so the
+  ## echo can be byte-verified. Covers: empty (Content-Length 0 / END_STREAM), tiny,
+  ## small binary, either side of the 16 KiB h2 DATA-frame boundary, past the 64 KiB
+  ## initial flow-control window (forces WINDOW_UPDATE), a larger buffered body, and
+  ## a highly-compressible body (big compression ratio -> inflate output-buffer path).
+  result = @[
+    "",                                    # empty
+    "payload",                             # tiny text
+    "\x00\x01\x02\xfd\xfe\xff binary",     # small binary
+    repeat("a", 16383),                    # just under the 16 KiB frame boundary
+    repeat("b", 16385),                    # just over it (second DATA frame)
+    repeat("c", 65536),                    # past the 64 KiB initial send window
+    repeat("z", 262144)]                   # 256 KiB, highly compressible
+
+proc bodiedVerbNames*(): seq[string] = @["POST", "PUT", "PATCH"]
+
 proc expectedVersion*(c: Config): string =
   ## The exact HTTP version a version-pinned cell must negotiate on every request. A
   ## cell exists to exercise one protocol, so any upgrade OR downgrade to a different
@@ -124,6 +142,11 @@ proc skipReason*(c: Config): string =
   if c.backend == "js":
     if c.workload == "streamUpload": return "skip: js cannot stream request bodies"
     if c.proto == "h3": return "skip: js/undici has no HTTP/3"
+    # navi/js can't pin undici's HTTP version and the js backend can't verify which
+    # was negotiated, so an h1 and an h2 js cell would run identical, unchecked code.
+    # Collapse to one js cell (h1) rather than imply protocol coverage we don't have.
+    if c.proto != "h1":
+      return "skip: js/undici protocol not selectable by navi; the h1 js cell is the js coverage"
   # Sync h3 WebSocket is driven by a background pump thread, so a --threads:off build
   # cannot run it (websocketH3 raises); skip rather than hard-fail the cell.
   when not compileOption("threads"):

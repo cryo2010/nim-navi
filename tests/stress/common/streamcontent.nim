@@ -19,6 +19,16 @@ proc fillBlock*(): string =
     x = x * 1664525'u32 + 1013904223'u32
     result[i] = char(x shr 24)
 
+proc stampBlock*(blk: var string, idx: int) =
+  ## Write the block index into the first 8 bytes so the repeated 1 MiB blocks are
+  ## no longer byte-identical. A whole-block reorder or duplication on the wire then
+  ## changes the SHA-1 (otherwise invisible, since every block would hash the same).
+  ## Constant-memory: the caller reuses one block and re-stamps it per chunk.
+  var v = uint64(idx)
+  for k in countdown(7, 0):
+    blk[k] = char(v and 0xff'u64)
+    v = v shr 8
+
 proc hex*(st: var Sha1State): string =
   ## Finalize to a lowercase hex digest.
   ($SecureHash(st.finalize())).toLowerAscii

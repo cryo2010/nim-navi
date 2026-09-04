@@ -11,6 +11,7 @@ proc rssMb*(): int {.importjs: "Math.round(process.memoryUsage().rss / 1048576)"
 proc heapUsedMb*(): int {.importjs: "Math.round(process.memoryUsage().heapUsed / 1048576)".}
 proc setIntervalJs*(cb: proc (), ms: int): int {.importjs: "setInterval(#, #)".}
 proc clearIntervalJs*(id: int) {.importjs: "clearInterval(#)".}
+proc jsExit*(code: int) {.importjs: "process.exit(#)".}
 
 type JsCfg* = object
   host*, proto*: string
