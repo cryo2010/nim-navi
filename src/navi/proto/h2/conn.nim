@@ -57,6 +57,8 @@ type
     streams: Table[uint32, Stream]
     sawFirstFrame: bool          ## the server's first frame must be SETTINGS (the preface)
     sawSettings: bool            ## the peer's initial (non-ACK) SETTINGS has been processed
+    contHeaderStream: uint32     ## while non-zero, a header block is open on this stream and
+                                 ## only a CONTINUATION on it may follow (RFC 9113 6.10)
     fatal: string                ## non-empty once a connection error tore the conn down
     goneAway*: bool
     goAwayLastId: uint32
@@ -300,9 +302,27 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
     if f.typ != uint8(ftSettings):
       c.connFail(errProtocolError, "server preface: first frame not SETTINGS", outbuf)
       return
+  # RFC 9113 6.10: once a HEADERS lacks END_HEADERS, ONLY a CONTINUATION on that
+  # same stream may follow until END_HEADERS -- any other frame (or one on another
+  # stream) is a connection error. A CONTINUATION with no open block is likewise.
+  if c.contHeaderStream != 0:
+    if f.typ != uint8(ftContinuation) or f.streamId != c.contHeaderStream:
+      c.connFail(errProtocolError, "expected CONTINUATION on the open header block", outbuf)
+      return
+  elif f.typ == uint8(ftContinuation):
+    c.connFail(errProtocolError, "CONTINUATION with no open header block", outbuf)
+    return
   case f.typ
   of uint8(ftSettings):
-    if (f.flags and flagAck) == 0:
+    if f.streamId != 0:                          # RFC 9113 6.5: SETTINGS is connection-level
+      c.connFail(errProtocolError, "SETTINGS on a non-zero stream", outbuf); return
+    if (f.flags and flagAck) != 0:
+      if f.payload.len != 0:                     # RFC 9113 6.5: an ACK carries no payload
+        c.connFail(errFrameSizeError, "SETTINGS ACK with a payload", outbuf)
+      return
+    if f.payload.len mod 6 != 0:                 # RFC 9113 6.5: length is a multiple of 6
+      c.connFail(errFrameSizeError, "SETTINGS length not a multiple of 6", outbuf); return
+    block:
       c.sawSettings = true                       # the peer's initial settings are in
       for (id, value) in parseSettings(f.payload):
         if id == settingsMaxFrameSize and value >= 16384'u32:
@@ -326,18 +346,27 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
             c.flushSend(sid, s, outbuf)
       outbuf.add encodeSettingsAck()
   of uint8(ftPing):
+    if f.streamId != 0:                          # RFC 9113 6.7: PING is connection-level
+      c.connFail(errProtocolError, "PING on a non-zero stream", outbuf); return
+    if f.payload.len != 8:                        # RFC 9113 6.7: exactly 8 octets
+      c.connFail(errFrameSizeError, "PING length not 8", outbuf); return
     if (f.flags and flagAck) == 0:
       outbuf.add encodePing(f.payload, ack = true)
   of uint8(ftGoAway):
-    # A GOAWAY carries at least an 8-byte lastStreamId+errorCode (RFC 9113 6.8).
-    # Guard the read: the frame decoder delivers any length, and readU32 on a
-    # short payload would index out of bounds.
-    if f.payload.len < 4:
+    # A GOAWAY is at least 8 octets: lastStreamId (4) + errorCode (4), RFC 9113 6.8.
+    if f.streamId != 0:                          # RFC 9113 6.8: GOAWAY is connection-level
+      c.connFail(errProtocolError, "GOAWAY on a non-zero stream", outbuf); return
+    if f.payload.len < 8:
       c.connFail(errFrameSizeError, "GOAWAY frame too short", outbuf)
       return
     c.goneAway = true
     c.goAwayLastId = readU32(f.payload, 0) and 0x7fffffff'u32
   of uint8(ftHeaders), uint8(ftContinuation):
+    if f.streamId == 0:                          # RFC 9113 6.2/6.10: never on stream 0
+      c.connFail(errProtocolError, "HEADERS/CONTINUATION on stream 0", outbuf); return
+    # Open (or close) the header block per END_HEADERS, so the 6.10 gate above knows
+    # whether a CONTINUATION must follow -- tracked even for an unknown stream.
+    c.contHeaderStream = if (f.flags and flagEndHeaders) != 0: 0'u32 else: f.streamId
     let s = c.streams.getOrDefault(f.streamId)
     if s != nil and not s.reset:
       var frag = f.payload
@@ -368,6 +397,8 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
             c.connFail(errCompressionError, e.msg, outbuf)
             return
   of uint8(ftData):
+    if f.streamId == 0:                          # RFC 9113 6.1: DATA is never on stream 0
+      c.connFail(errProtocolError, "DATA on stream 0", outbuf); return
     # Every DATA payload -- pad length byte and padding included (RFC 9113 6.9.1)
     # -- counts against the connection flow-control window, even on a stream we
     # have reset or never opened. Skipping that leaks the window and eventually
@@ -394,19 +425,29 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
     elif f.payload.len > 0:
       c.replenishConn(f.payload.len, outbuf)     # reset/unknown stream: keep the conn window in sync
   of uint8(ftRstStream):
+    if f.streamId == 0:                          # RFC 9113 6.4: RST_STREAM never on stream 0
+      c.connFail(errProtocolError, "RST_STREAM on stream 0", outbuf); return
+    if f.payload.len != 4:                        # RFC 9113 6.4: exactly 4 octets
+      c.connFail(errFrameSizeError, "RST_STREAM length not 4", outbuf); return
     let s = c.streams.getOrDefault(f.streamId)
     if s != nil:
-      if f.payload.len >= 4 and readU32(f.payload, 0) == errRefusedStream:
+      if readU32(f.payload, 0) == errRefusedStream:
         s.refused = true                       # not processed -> safe to retry
       s.reset = true
       s.ended = true
   of uint8(ftWindowUpdate):
-    # WINDOW_UPDATE is exactly 4 bytes (RFC 9113 6.9); a short frame is a
-    # FRAME_SIZE_ERROR, not an out-of-bounds read.
-    if f.payload.len < 4:
-      c.connFail(errFrameSizeError, "WINDOW_UPDATE frame too short", outbuf)
+    if f.payload.len != 4:                       # RFC 9113 6.9: exactly 4 octets
+      c.connFail(errFrameSizeError, "WINDOW_UPDATE length not 4", outbuf)
       return
     let inc = int(readU32(f.payload, 0) and 0x7fffffff'u32)
+    if inc == 0:                                 # RFC 9113 6.9: a 0 increment is illegal --
+      if f.streamId == 0:                        # connection error, or a stream error (RST)
+        c.connFail(errProtocolError, "WINDOW_UPDATE increment 0 on the connection", outbuf)
+      else:
+        outbuf.add encodeRstStream(f.streamId, errProtocolError)
+        let s = c.streams.getOrDefault(f.streamId)
+        if s != nil: s.reset = true; s.ended = true
+      return
     if f.streamId == 0:                        # connection-level: release all streams
       # A window that would exceed 2^31-1 is a FLOW_CONTROL_ERROR (RFC 9113 6.9.1);
       # rejecting it also prevents `connSendWindow` from overflowing to a negative.
