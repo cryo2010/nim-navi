@@ -953,7 +953,7 @@ proc websocketH2(client: Navi, u: Url, headers: Headers,
   ## and tunnels frames as DATA. Sec-WebSocket-Key/Accept are not used over h2.
   let conn = await connect(u.host, u.port, u.isTls, client.config.tls,
                            resolveProxy(client.config, u), @["h2", "http/1.1"],
-                           client.config.connectMs)
+                           client.config.connectMs, client.config.readMs)
   if conn.protocol != "h2":
     let got = if conn.protocol.len > 0: conn.protocol else: "http/1.1"
     await conn.close()
