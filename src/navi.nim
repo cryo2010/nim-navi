@@ -1025,19 +1025,16 @@ proc websocketH2(client: Navi, u: Url, headers: Headers,
       "navi: WebSocket over h2 requested but the server negotiated " & got)
   let h2 = initH2Conn(client.config.maxResponseBytes)
   conn.sendAll(h2.preamble())
-  # The server's SETTINGS is its mandatory first frame and carries
-  # ENABLE_CONNECT_PROTOCOL. Read frames until it lands (RFC 8441 forbids sending
-  # Extended CONNECT before it), stopping once the peer is idle so an origin that
-  # does not support it fails fast instead of blocking.
-  var settleReads = 0
-  while not h2.peerAllowsConnect and settleReads < 16:
+  # RFC 8441 forbids sending an Extended CONNECT before the peer's SETTINGS
+  # (which carries ENABLE_CONNECT_PROTOCOL) has been seen. Read until that initial
+  # SETTINGS lands -- a deterministic signal, not an idle guess -- then require the
+  # capability, so an origin that does not support it fails fast and clearly.
+  while not h2.sawPeerSettings:
     let chunk = conn.recvSome()
     if chunk.len == 0:
       raise newException(IOError, "navi: websocket h2 handshake closed by peer")
     let toSend = h2.feed(chunk)
     if toSend.len > 0: conn.sendAll(toSend)
-    inc settleReads
-    if not conn.dataWaiting(0): break
   if not h2.peerAllowsConnect:
     raise newException(ProtocolError,
       "navi: server does not support WebSocket over HTTP/2 " &

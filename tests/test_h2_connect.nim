@@ -20,6 +20,19 @@ suite "h2 Extended CONNECT (RFC 8441)":
       discard c.feed(encodeSettings({settingsEnableConnectProtocol: 0'u32}))
       check not c.peerAllowsConnect
 
+  test "sawPeerSettings should flip only once the peer's initial SETTINGS lands":
+    block:                                    # nothing fed yet
+      let c = initH2Conn()
+      check not c.sawPeerSettings
+    block:                                    # the peer's non-ACK SETTINGS
+      let c = initH2Conn()
+      discard c.feed(encodeSettings([]))
+      check c.sawPeerSettings
+    block:                                    # a bare SETTINGS ACK is not the peer's settings
+      let c = initH2Conn()
+      discard c.feed(encodeSettingsAck())
+      check not c.sawPeerSettings
+
   test "h2ConnectHeaderList should build the RFC 8441 pseudo-headers":
     let u = parseUrl("https://example.com/chat")
     let hs = h2ConnectHeaderList(u, "websocket",
