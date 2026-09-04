@@ -453,10 +453,19 @@ suite "websocket keepalive":
     joinThread(th)
 
 suite "WebSocket transport selection (sync)":
-  test "the sync backend should reject a WebSocket when config.http excludes H1":
-    # h2 Extended CONNECT is async-only; the sync backend is h1-only for ws.
+  test "the sync backend should reject an h2 WebSocket without TLS":
+    # h2 Extended CONNECT (RFC 8441) is a wss-only tunnel; a plaintext ws:// with
+    # H1 excluded leaves no usable transport, so it raises before connecting.
     var cfg = initNaviConfig()
     cfg.http = {H2}
     let api = newNavi(cfg)
     expect ProtocolError:
-      discard api.websocket("wss://127.0.0.1:1/never")
+      discard api.websocket("ws://127.0.0.1:1/never")
+
+  test "the sync backend should reject an h3 WebSocket without TLS":
+    # h3 Extended CONNECT (RFC 9220) likewise needs wss; non-TLS has no transport.
+    var cfg = initNaviConfig()
+    cfg.http = {H3}
+    let api = newNavi(cfg)
+    expect ProtocolError:
+      discard api.websocket("ws://127.0.0.1:1/never")

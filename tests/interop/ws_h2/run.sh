@@ -1,7 +1,7 @@
 #!/bin/sh
 # WebSocket-over-HTTP/2 Extended CONNECT (RFC 8441) interop: a Node h2 TLS server
 # that advertises SETTINGS_ENABLE_CONNECT_PROTOCOL and echoes WebSocket frames,
-# driven by the navi async and chronos clients with config.http = {H2}. Needs
+# driven by the navi sync, async, and chronos clients with config.http = {H2}. Needs
 # `node`, `openssl`, and a Nim toolchain (chronos installed); run it in
 # Linux/Docker (navi's TLS can't dlopen libcrypto on a bare macOS host). Example:
 # nimlang/nim image + `apt-get install nodejs openssl` + `nimble install chronos`.
@@ -18,7 +18,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -keyout "$tmp/key.pem" -out "$tmp/cert
 ( cd "$tmp" && cp "$here/server.js" . && WS_PORT="$port" node server.js ) & srv=$!
 i=0; until [ "$i" -gt 100 ]; do i=$((i+1)); sleep 0.1; done
 
-for backend in client client_chronos; do
+for backend in client_sync client client_chronos; do
   nim c --hints:off --threads:on -d:ssl --path:"$root/src" -o:"$tmp/$backend" "$here/$backend.nim"
   echo "[$backend]"; WS_PORT="$port" "$tmp/$backend"
 done
