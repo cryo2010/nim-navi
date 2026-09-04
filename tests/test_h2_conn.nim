@@ -122,13 +122,12 @@ suite "h2 client DoS limits":
   test "the h2 client should RST a CONTINUATION flood instead of buffering unbounded headers":
     let c = newServerConn()
     let id = c.openStream()
-    # A HEADERS frame with END_STREAM but never END_HEADERS, then a flood of
-    # CONTINUATION frames -- the shape of the HTTP/2 CONTINUATION flood.
-    var flood = encodeHeaders(id, repeat("A", 16000), endStream = false, endHeaders = false)
-    var control = ""
+    # A HEADERS frame that never sets END_HEADERS, then a flood of CONTINUATION
+    # frames on the same stream -- the shape of the HTTP/2 CONTINUATION flood. The
+    # HEADERS opens the block first (RFC 9113 6.10), so the flood is what trips the cap.
+    var toSend = c.feed(encodeHeaders(id, repeat("A", 16000), endStream = false, endHeaders = false))
     for _ in 0 ..< 16:                     # 16 x 16000 = 256000 > 128 KiB cap
-      control.add c.feed(encodeContinuation(id, repeat("B", 16000), endHeaders = false))
-    let toSend = c.feed(flood) & control
+      toSend.add c.feed(encodeContinuation(id, repeat("B", 16000), endHeaders = false))
     check c.streamReset(id)                # bounded and reset, not OOM
     check firstFrameOfType(toSend, ftRstStream)
 
@@ -617,3 +616,73 @@ suite "h2 response length validation":
     discard c.feed(headersFrame(id, @[(":status", "200"), ("content-length", "100")], true))
     check c.streamDone(id)
     check not c.streamLengthMismatch(id)
+
+suite "h2 frame validation (RFC 9113)":
+  test "a SETTINGS length not a multiple of 6 is a connection error":
+    let c = newServerConn()
+    let toSend = c.feed(encodeFrame(ftSettings, 0, 0, "\x00\x01\x00"))   # 3-byte payload
+    check c.connError.len > 0
+    check firstFrameOfType(toSend, ftGoAway)
+
+  test "a SETTINGS ACK carrying a payload is a connection error":
+    let c = newServerConn()
+    let toSend = c.feed(encodeFrame(ftSettings, flagAck, 0, "\x00\x01\x00\x00\x00\x00"))
+    check c.connError.len > 0
+    check firstFrameOfType(toSend, ftGoAway)
+
+  test "a SETTINGS on a non-zero stream is a connection error":
+    let c = newServerConn()
+    let toSend = c.feed(encodeFrame(ftSettings, 0, 1'u32, ""))
+    check c.connError.len > 0
+
+  test "a PING with a length other than 8 is a connection error":
+    let c = newServerConn()
+    let toSend = c.feed(encodeFrame(ftPing, 0, 0, "short"))
+    check c.connError.len > 0
+    check firstFrameOfType(toSend, ftGoAway)
+
+  test "a PING on a non-zero stream is a connection error":
+    let c = newServerConn()
+    let toSend = c.feed(encodeFrame(ftPing, 0, 1'u32, "\x00\x00\x00\x00\x00\x00\x00\x00"))
+    check c.connError.len > 0
+
+  test "DATA on stream 0 is a connection error":
+    let c = newServerConn()
+    let toSend = c.feed(encodeFrame(ftData, 0, 0, "x"))
+    check c.connError.len > 0
+    check firstFrameOfType(toSend, ftGoAway)
+
+  test "a WINDOW_UPDATE increment of 0 on the connection is a connection error":
+    let c = newServerConn()
+    let toSend = c.feed(encodeWindowUpdate(0, 0))
+    check c.connError.len > 0
+    check firstFrameOfType(toSend, ftGoAway)
+
+  test "a WINDOW_UPDATE increment of 0 on a stream resets that stream":
+    let c = newServerConn()
+    let id = c.openStream()
+    let toSend = c.feed(encodeWindowUpdate(id, 0))
+    check c.streamReset(id)
+    check firstFrameOfType(toSend, ftRstStream)
+    check c.connError.len == 0                 # a stream error, not a connection error
+
+  test "a RST_STREAM with a length other than 4 is a connection error":
+    let c = newServerConn()
+    let id = c.openStream()
+    let toSend = c.feed(encodeFrame(ftRstStream, 0, id, "\x00\x00\x00"))
+    check c.connError.len > 0
+
+  test "a CONTINUATION with no open header block is a connection error":
+    let c = newServerConn()
+    let id = c.openStream()
+    let toSend = c.feed(encodeContinuation(id, "x", endHeaders = true))
+    check c.connError.len > 0
+    check firstFrameOfType(toSend, ftGoAway)
+
+  test "a frame interleaved inside an open header block is a connection error":
+    let c = newServerConn()
+    let id = c.openStream()
+    var toSend = c.feed(encodeHeaders(id, "partial", endStream = false, endHeaders = false))
+    toSend.add c.feed(encodeData(id, "x", endStream = false))   # DATA before the CONTINUATION
+    check c.connError.len > 0
+    check firstFrameOfType(toSend, ftGoAway)

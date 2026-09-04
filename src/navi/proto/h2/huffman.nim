@@ -97,19 +97,27 @@ proc huffmanDecode*(data: string): string {.gcsafe.} =
   # (chronos async) context is safe.
   {.cast(gcsafe).}:
     var node = decodeTree
+    var padBits = 0          # bits walked since the last completed symbol
+    var padAllOnes = true    # were all of them 1 (the EOS code is all 1s)?
     for ch in data:
       let b = uint8(ch)
       for k in countdown(7, 0):
         let bit = int((b shr k) and 1)
+        if bit == 0: padAllOnes = false
+        inc padBits
         node = node.child[bit]
         if node == nil:
           raise newException(ValueError, "hpack: invalid Huffman code")
         if node.sym >= 0:
           result.add char(node.sym)
           node = decodeTree
-    # A dangling partial path is the 1-bit EOS padding; anything else is malformed.
-    if node != decodeTree and node.child[1] == nil and node.child[0] != nil:
-      raise newException(ValueError, "hpack: truncated Huffman code")
+          padBits = 0
+          padAllOnes = true
+    # RFC 7541 5.2: a leftover partial code is only valid as EOS padding -- at most 7
+    # bits, all 1s. A longer run (or one with a 0 bit) means over-long padding or an
+    # encoded EOS symbol (whose all-1s path holds no leaf, so it overruns 7 bits).
+    if node != decodeTree and (padBits > 7 or not padAllOnes):
+      raise newException(ValueError, "hpack: invalid Huffman padding")
 
 proc huffmanEncode*(s: string): string =
   var acc: uint64 = 0
