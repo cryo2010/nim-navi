@@ -525,3 +525,37 @@ suite "websocket frame validation (RFC 6455)":
     var a: WsAssembler
     let o = a.offer(Frame(fin: true, opcode: opClose, payload: closePayload(closeNormal)))
     check o.ready and o.message.closeCode == closeNormal
+
+  test "maxMessageBytes should not carry one message's size into the next":
+    var a: WsAssembler                    # regression: a.buf was not cleared between messages
+    check a.offer(Frame(fin: true, opcode: opText, payload: "aaaaaa"),
+                  maxMessageBytes = 8).ready
+    let o = a.offer(Frame(fin: true, opcode: opText, payload: "bbbbbb"), maxMessageBytes = 8)
+    check o.ready and o.message.data == "bbbbbb"
+
+  test "the assembler should reject invalid UTF-8 in a text message":
+    var a: WsAssembler
+    expect ValueError:
+      discard a.offer(Frame(fin: true, opcode: opText, payload: "\xff\xfe"))
+
+  test "the assembler should accept valid multibyte UTF-8 in a text message":
+    var a: WsAssembler
+    let o = a.offer(Frame(fin: true, opcode: opText, payload: "caf\xc3\xa9"))  # "café"
+    check o.ready and o.message.data == "caf\xc3\xa9"
+
+  test "the assembler should not UTF-8-validate a binary message":
+    var a: WsAssembler
+    let o = a.offer(Frame(fin: true, opcode: opBinary, payload: "\xff\xfe\x00"))
+    check o.ready and o.message.data == "\xff\xfe\x00"
+
+  test "the assembler should reject invalid UTF-8 in a text message split across fragments":
+    var a: WsAssembler
+    check not a.offer(Frame(fin: false, opcode: opText, payload: "ok")).ready
+    expect ValueError:
+      discard a.offer(Frame(fin: true, opcode: opContinuation, payload: "\xff"))
+
+  test "the assembler should reject invalid UTF-8 in a close reason":
+    var a: WsAssembler
+    expect ValueError:
+      discard a.offer(Frame(fin: true, opcode: opClose,
+                            payload: closePayload(closeNormal, "\xff")))

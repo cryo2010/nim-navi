@@ -251,6 +251,49 @@ type
     ## Raised by `offer` when a reassembled message would exceed the caller's
     ## `maxMessageBytes`. The caller should close with `closeMessageTooBig` (1009).
 
+proc isValidUtf8(s: string): bool =
+  ## Strict UTF-8 well-formedness (RFC 3629): rejects overlong encodings, surrogate
+  ## code points (U+D800..U+DFFF), values above U+10FFFF, and bad continuation bytes.
+  ## Used to fail a text message or close reason that is not valid UTF-8 (RFC 6455 8.1).
+  var i = 0
+  while i < s.len:
+    let b = uint8(s[i])
+    template cont(k: int): bool =
+      i + k < s.len and (uint8(s[i + k]) and 0xC0'u8) == 0x80'u8
+    if b < 0x80'u8:
+      inc i
+    elif b >= 0xC2'u8 and b <= 0xDF'u8:                       # 2-byte
+      if not cont(1): return false
+      i += 2
+    elif b == 0xE0'u8:                                        # 3-byte, no overlong
+      if i + 2 >= s.len or uint8(s[i+1]) < 0xA0'u8 or uint8(s[i+1]) > 0xBF'u8 or not cont(2):
+        return false
+      i += 3
+    elif b >= 0xE1'u8 and b <= 0xEC'u8:
+      if not cont(1) or not cont(2): return false
+      i += 3
+    elif b == 0xED'u8:                                        # 3-byte, exclude surrogates
+      if i + 2 >= s.len or uint8(s[i+1]) < 0x80'u8 or uint8(s[i+1]) > 0x9F'u8 or not cont(2):
+        return false
+      i += 3
+    elif b >= 0xEE'u8 and b <= 0xEF'u8:
+      if not cont(1) or not cont(2): return false
+      i += 3
+    elif b == 0xF0'u8:                                        # 4-byte, no overlong
+      if i + 3 >= s.len or uint8(s[i+1]) < 0x90'u8 or uint8(s[i+1]) > 0xBF'u8 or
+         not cont(2) or not cont(3): return false
+      i += 4
+    elif b >= 0xF1'u8 and b <= 0xF3'u8:
+      if not cont(1) or not cont(2) or not cont(3): return false
+      i += 4
+    elif b == 0xF4'u8:                                        # 4-byte, up to U+10FFFF
+      if i + 3 >= s.len or uint8(s[i+1]) < 0x80'u8 or uint8(s[i+1]) > 0x8F'u8 or
+         not cont(2) or not cont(3): return false
+      i += 4
+    else:                                                     # 0x80-0xC1, 0xF5-0xFF
+      return false
+  true
+
 proc validCloseCode(code: uint16): bool =
   ## RFC 6455 7.4: close codes valid on the wire. 1004/1005/1006 and 1015 are
   ## reserved (never sent); 1000-1014 otherwise are registered, and 3000-4999 are
@@ -274,6 +317,13 @@ proc offer*(a: var WsAssembler, f: Frame, maxMessageBytes = 0,
     if maxMessageBytes > 0 and a.buf.len + add > maxMessageBytes:
       raise newException(WsMessageTooLarge,
         "navi: WebSocket message exceeds maxMessageBytes (" & $maxMessageBytes & ")")
+  template finishMessage() =
+    ## Complete the reassembled data message. A text message must be valid UTF-8
+    ## (RFC 6455 8.1); a binary message is delivered as-is.
+    if a.kind == wmText and not isValidUtf8(a.buf):
+      raise newException(ValueError, "navi: invalid UTF-8 in a WebSocket text message")
+    result.ready = true
+    result.message = WsMessage(kind: a.kind, data: a.buf)
   if rejectMasked and f.masked:     # RFC 6455 5.1: a server->client frame must not be masked
     raise newException(ValueError, "navi: masked WebSocket frame received from server")
   case f.opcode
@@ -290,20 +340,22 @@ proc offer*(a: var WsAssembler, f: Frame, maxMessageBytes = 0,
       code = uint16((ord(f.payload[0]) shl 8) or ord(f.payload[1]))
       if not validCloseCode(code):
         raise newException(ValueError, "navi: invalid WebSocket close code " & $code)
+    let reason = if f.payload.len > 2: f.payload[2 .. ^1] else: ""
+    if not isValidUtf8(reason):     # RFC 6455 8.1: the close reason must be valid UTF-8
+      raise newException(ValueError, "navi: invalid UTF-8 in a WebSocket close reason")
     result.reply = wrCloseEcho
     result.replyPayload = f.payload
     result.ready = true
-    result.message = WsMessage(kind: wmClose, closeCode: code,
-      data: if f.payload.len > 2: f.payload[2 .. ^1] else: "")
+    result.message = WsMessage(kind: wmClose, closeCode: code, data: reason)
   of opText, opBinary:
     if a.fragmented:                # RFC 6455 5.4: a new data frame mid-fragmentation
       raise newException(ValueError, "navi: new WebSocket data frame during a fragmented message")
-    guardSize(f.payload.len)
+    a.buf.setLen(0)                 # a new message starts; the prior one's bytes must not
+    guardSize(f.payload.len)        # count against maxMessageBytes here
     a.kind = if f.opcode == opText: wmText else: wmBinary
     a.buf = f.payload
     if f.fin:
-      result.ready = true
-      result.message = WsMessage(kind: a.kind, data: a.buf)
+      finishMessage()
     else:
       a.fragmented = true
   of opContinuation:
@@ -313,8 +365,7 @@ proc offer*(a: var WsAssembler, f: Frame, maxMessageBytes = 0,
     a.buf.add f.payload
     if f.fin:
       a.fragmented = false
-      result.ready = true
-      result.message = WsMessage(kind: a.kind, data: a.buf)
+      finishMessage()
 
 proc hostHeader(u: Url): string =
   result = u.host
