@@ -469,3 +469,59 @@ suite "WebSocket transport selection (sync)":
     let api = newNavi(cfg)
     expect ProtocolError:
       discard api.websocket("ws://127.0.0.1:1/never")
+
+suite "websocket frame validation (RFC 6455)":
+  test "the decoder should reject a frame with a reserved bit set":
+    var d: WsDecoder
+    var f: Frame
+    d.feed("\xC1\x00")                 # FIN + RSV1 + text, unmasked, len 0
+    expect ValueError: discard d.next(f)
+
+  test "the decoder should reject a control frame larger than 125 bytes":
+    var d: WsDecoder
+    var f: Frame
+    d.feed("\x89\x7e\x00\xc8" & repeat("\x00", 200))   # PING, 16-bit len 200
+    expect ValueError: discard d.next(f)
+
+  test "the decoder should reject a fragmented control frame":
+    var d: WsDecoder
+    var f: Frame
+    d.feed("\x09\x00")                 # PING with FIN clear
+    expect ValueError: discard d.next(f)
+
+  test "the assembler should reject a masked server frame when told to":
+    var a: WsAssembler
+    expect ValueError:
+      discard a.offer(Frame(fin: true, opcode: opText, payload: "hi", masked: true),
+                      rejectMasked = true)
+
+  test "the assembler should accept a masked frame when not rejecting (server-role use)":
+    var a: WsAssembler
+    let o = a.offer(Frame(fin: true, opcode: opText, payload: "hi", masked: true))
+    check o.ready and o.message.data == "hi"
+
+  test "the assembler should reject a continuation with no message in progress":
+    var a: WsAssembler
+    expect ValueError:
+      discard a.offer(Frame(fin: true, opcode: opContinuation, payload: "x"))
+
+  test "the assembler should reject a new data frame during a fragmented message":
+    var a: WsAssembler
+    check not a.offer(Frame(fin: false, opcode: opText, payload: "aa")).ready
+    expect ValueError:
+      discard a.offer(Frame(fin: true, opcode: opText, payload: "bb"))
+
+  test "the assembler should reject a close frame with a 1-byte payload":
+    var a: WsAssembler
+    expect ValueError:
+      discard a.offer(Frame(fin: true, opcode: opClose, payload: "\x03"))
+
+  test "the assembler should reject an invalid close code":
+    var a: WsAssembler
+    expect ValueError:
+      discard a.offer(Frame(fin: true, opcode: opClose, payload: closePayload(1005'u16)))
+
+  test "the assembler should accept a valid close code":
+    var a: WsAssembler
+    let o = a.offer(Frame(fin: true, opcode: opClose, payload: closePayload(closeNormal)))
+    check o.ready and o.message.closeCode == closeNormal

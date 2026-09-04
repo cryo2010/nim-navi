@@ -48,6 +48,7 @@ type
     fin*: bool
     opcode*: Opcode
     payload*: string
+    masked*: bool      ## whether the received frame was masked (a server frame must not be)
 
   WsDecoder* = object
     buf: string
@@ -163,6 +164,8 @@ proc next*(d: var WsDecoder, f: var Frame): bool =
   if d.buf.len < 2: return false
   let b0 = ord(d.buf[0])
   let b1 = ord(d.buf[1])
+  if (b0 and 0x70) != 0:        # RFC 6455 5.2: RSV1/2/3 must be 0 (no extension negotiated)
+    raise newException(ValueError, "navi: WebSocket reserved bit (RSV) set")
   let masked = (b1 and 0x80) != 0
   var length = b1 and 0x7F
   var pos = 2
@@ -188,6 +191,7 @@ proc next*(d: var WsDecoder, f: var Frame): bool =
     pos += 4
   if d.buf.len < pos + length: return false     # payload not fully arrived
   f.fin = (b0 and 0x80) != 0
+  f.masked = masked
   # Map the 4-bit opcode explicitly: Opcode has holes (0x3-0x7 and 0xB-0xF are
   # reserved), so a blind int-to-enum conversion is unsafe. A reserved opcode
   # must fail the connection (RFC 6455 5.2).
@@ -200,6 +204,11 @@ proc next*(d: var WsDecoder, f: var Frame): bool =
     of 0xA: opPong
     else: raise newException(ValueError,
       "navi: reserved WebSocket opcode 0x" & toHex(b0 and 0x0F, 1))
+  if f.opcode in {opClose, opPing, opPong}:     # RFC 6455 5.5: control frames must be
+    if length > 125:                            # <= 125 bytes and never fragmented
+      raise newException(ValueError, "navi: WebSocket control frame over 125 bytes")
+    if not f.fin:
+      raise newException(ValueError, "navi: fragmented WebSocket control frame")
   f.payload = newString(length)
   if masked:
     applyMask(f.payload, 0, d.buf, pos, length, key)
@@ -236,12 +245,21 @@ type
   WsAssembler* = object      ## reassembles fragmented messages across frames
     kind: WsMessageKind
     buf: string
+    fragmented: bool         ## a data message is open (a fin=false frame started it)
 
   WsMessageTooLarge* = object of CatchableError
     ## Raised by `offer` when a reassembled message would exceed the caller's
     ## `maxMessageBytes`. The caller should close with `closeMessageTooBig` (1009).
 
-proc offer*(a: var WsAssembler, f: Frame, maxMessageBytes = 0): WsOutcome =
+proc validCloseCode(code: uint16): bool =
+  ## RFC 6455 7.4: close codes valid on the wire. 1004/1005/1006 and 1015 are
+  ## reserved (never sent); 1000-1014 otherwise are registered, and 3000-4999 are
+  ## for registered/private use. Matches Node `ws`'s isValidStatusCode.
+  (code >= 1000'u16 and code <= 1014'u16 and code notin [1004'u16, 1005'u16, 1006'u16]) or
+  (code >= 3000'u16 and code <= 4999'u16)
+
+proc offer*(a: var WsAssembler, f: Frame, maxMessageBytes = 0,
+            rejectMasked = false): WsOutcome =
   ## Feed one decoded frame. Handles fragmentation (text/binary + continuation)
   ## and the control frames: a ping asks for a pong, a close both yields a
   ## `wmClose` message and asks for a close echo. No I/O -- the caller sends any
@@ -256,6 +274,8 @@ proc offer*(a: var WsAssembler, f: Frame, maxMessageBytes = 0): WsOutcome =
     if maxMessageBytes > 0 and a.buf.len + add > maxMessageBytes:
       raise newException(WsMessageTooLarge,
         "navi: WebSocket message exceeds maxMessageBytes (" & $maxMessageBytes & ")")
+  if rejectMasked and f.masked:     # RFC 6455 5.1: a server->client frame must not be masked
+    raise newException(ValueError, "navi: masked WebSocket frame received from server")
   case f.opcode
   of opPing:
     result.reply = wrPong
@@ -263,26 +283,36 @@ proc offer*(a: var WsAssembler, f: Frame, maxMessageBytes = 0): WsOutcome =
   of opPong:
     discard
   of opClose:
+    if f.payload.len == 1:          # RFC 6455 5.5.1: a close body is empty or >= 2 bytes
+      raise newException(ValueError, "navi: WebSocket close frame with a 1-byte payload")
     var code = closeNormal
     if f.payload.len >= 2:
       code = uint16((ord(f.payload[0]) shl 8) or ord(f.payload[1]))
+      if not validCloseCode(code):
+        raise newException(ValueError, "navi: invalid WebSocket close code " & $code)
     result.reply = wrCloseEcho
     result.replyPayload = f.payload
     result.ready = true
     result.message = WsMessage(kind: wmClose, closeCode: code,
       data: if f.payload.len > 2: f.payload[2 .. ^1] else: "")
   of opText, opBinary:
-    a.buf.setLen(0)                 # a new message starts here; drop any stale partial
+    if a.fragmented:                # RFC 6455 5.4: a new data frame mid-fragmentation
+      raise newException(ValueError, "navi: new WebSocket data frame during a fragmented message")
     guardSize(f.payload.len)
     a.kind = if f.opcode == opText: wmText else: wmBinary
     a.buf = f.payload
     if f.fin:
       result.ready = true
       result.message = WsMessage(kind: a.kind, data: a.buf)
+    else:
+      a.fragmented = true
   of opContinuation:
+    if not a.fragmented:            # RFC 6455 5.4: continuation with no message in progress
+      raise newException(ValueError, "navi: WebSocket continuation with no open message")
     guardSize(f.payload.len)
     a.buf.add f.payload
     if f.fin:
+      a.fragmented = false
       result.ready = true
       result.message = WsMessage(kind: a.kind, data: a.buf)
 

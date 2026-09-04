@@ -1160,7 +1160,7 @@ proc receive*(ws: WebSocket): WsMessage =
       ws.dec.feed(chunk)
     var o: WsOutcome
     try:
-      o = ws.asmb.offer(f, ws.maxMessageBytes)
+      o = ws.asmb.offer(f, ws.maxMessageBytes, rejectMasked = true)
     except WsMessageTooLarge:
       if ws.open:      # tell the peer why (1009), then drop the connection
         try: ws.sendRaw(encodeFrame(opClose, closePayload(closeMessageTooBig)))
