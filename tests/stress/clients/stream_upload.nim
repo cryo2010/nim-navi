@@ -18,8 +18,6 @@ else:
   const backend = "asyncdispatch"
 include ../common/httpset
 
-let blk = fillBlock()
-
 type Progress = ref object
   bytes: int          ## cumulative bytes sent across all transfers
   transfers: int      ## completed+verified transfers
@@ -29,6 +27,8 @@ proc oneUpload(api: Navi, cfg: Config, prog: Progress, url: string) {.async.} =
   var st = newSha1State()
   var remaining = cfg.streamBytes
   var sent = 0
+  var idx = 0
+  var blk = fillBlock()   # local (gcsafe under chronos); re-stamped per block below
   var h = initHeaders()
   h["content-type"] = "application/octet-stream"
 
@@ -37,6 +37,7 @@ proc oneUpload(api: Navi, cfg: Config, prog: Progress, url: string) {.async.} =
       if remaining <= 0: return ""
       let n = min(blockSize, remaining)
       remaining -= n
+      stampBlock(blk, idx); inc idx   # distinct per block: server catches a reorder/dup
       let chunk = if n == blockSize: blk else: blk[0 ..< n]
       st.update(chunk)
       sent += n

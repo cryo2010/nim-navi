@@ -4,7 +4,10 @@
 ## text+binary echo round-trips on each until the deadline. A completed round-trip
 ## tallies as 200; an error tallies as a failure and that socket stops. Nothing is
 ## retained beyond the current frame, so memory stays flat. Reporter prints every
-## interval. WebSocket is an h1 upgrade, so PROTO is not a dimension here.
+## interval. PROTO IS a dimension: the transport is pinned via config.http, so an
+## h1 cell uses the RFC 6455 Upgrade, an h2 cell RFC 8441 Extended CONNECT, and an
+## h3 cell RFC 9220 -- and websocket() raises (failing the cell) if the pinned
+## transport can't carry it, so a silent downgrade can't pass green.
 
 import std/[times, strutils]
 from std/os import getEnv
@@ -17,6 +20,7 @@ when defined(useChronos):
 else:
   import navi/asyncdispatch
   const backend = "asyncdispatch"
+include ../common/httpset
 
 proc wsUrl(base: string): string =
   "wss://" & base["https://".len .. ^1] & "/ws"
@@ -64,7 +68,7 @@ proc main() {.async.} =
 
   var c = initNaviConfig()
   c.tls.caFile = cfg.cert
-  if cfg.proto == "h3": c.http = {H3}   # WebSocket over h3 Extended CONNECT (RFC 9220)
+  c.http = httpVersions(cfg.proto)   # pin the ws transport: {H1} upgrade / {H2} / {H3}
   let api = newNavi(c)
 
   # Open the sockets first (sequentially), so the soak that follows isn't racing
@@ -80,7 +84,10 @@ proc main() {.async.} =
   futs.add reporterLoop(cfg, counter, start, deadline)
   for f in futs: await f
 
+  if counter.ops == 0:                 # a cell that did no round-trips is not a pass
+    stderr.writeLine cfg.label & " FAIL: no WebSocket round-trip completed"
+    quit(1)
   report(cfg.label & " final", counter, epochTime() - start)
-  echo "== ws ", backend, " passed (", counter.ops, " round-trips) =="
+  echo "== ws ", backend, " ", cfg.proto, " passed (", counter.ops, " round-trips) =="
 
 waitFor main()
