@@ -724,6 +724,7 @@ type
     baseRetryMs: int
     retryMs: int
     maxRetryMs: int
+    idleTimeoutMs: int    ## bound on a single read / (re)open wait; 0 = unbounded
     handle: StreamResponse
     parser: SseParser
     started: bool
@@ -752,7 +753,7 @@ proc sse*(client: Navi, target: string, verb = GET,
           headers = initHeaders(), body = "",
           params: seq[(string, string)] = @[],
           lastEventId = "", reconnect = true,
-          retryMs = 3000, maxRetryMs = 30_000,
+          retryMs = 3000, maxRetryMs = 30_000, idleTimeoutMs = 45_000,
           cancel: CancelToken = nil): Future[SseStream] {.async.} =
   ## Open a Server-Sent Events stream. The initial response is validated up front (a
   ## non-200 or non `text/event-stream` response raises). Consume events with `next`
@@ -761,6 +762,14 @@ proc sse*(client: Navi, target: string, verb = GET,
   ## retry: with backoff to `maxRetryMs` -- unless `reconnect` is false. `verb`/
   ## `body`/headers allow POST-SSE and auth. The underlying stream runs with the
   ## size cap and read/total timeouts off and shares the client's cookie jar.
+  ##
+  ## `idleTimeoutMs` bounds how long a single read or (re)open may block before the
+  ## stream is treated as wedged and reconnected (resending Last-Event-ID), so a
+  ## parked read cannot hang forever -- the failure mode when all timeouts are off
+  ## and reconnect only runs after a read returns (over a stalled HTTP/2 mux). Any
+  ## byte -- including a keep-alive `:` comment -- resets it, so a live-but-quiet
+  ## stream is not disturbed; set 0 to disable (only for a server known to go silent
+  ## for long stretches without sending keep-alives).
   var cfg = client.config
   cfg.maxResponseBytes = 0
   cfg.timeouts.read = 0
@@ -771,9 +780,12 @@ proc sse*(client: Navi, target: string, verb = GET,
   let s = SseStream(
     client: newNavi(cfg), verb: verb, target: target, headers: h, params: params,
     cancel: cancel, reconnect: reconnect, baseRetryMs: retryMs, retryMs: retryMs,
-    maxRetryMs: maxRetryMs, parser: initSseParser(lastEventId))
+    maxRetryMs: maxRetryMs, idleTimeoutMs: idleTimeoutMs, parser: initSseParser(lastEventId))
   s.client.jar = client.jar          # share cookies with the caller
-  await s.openConn()
+  let openFut = s.openConn()
+  if idleTimeoutMs > 0 and not await withTimeout(openFut, idleTimeoutMs):
+    raise newException(IOError, "navi: SSE connect timed out after " & $idleTimeoutMs & " ms")
+  await openFut                      # complete (or surface openConn's own error)
   s.started = true
   return s
 
@@ -810,7 +822,10 @@ proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
       await sleepAsync(min(s.retryMs, s.maxRetryMs))
       if s.closed: return none(SseEvent)    # closed during the backoff: do not reconnect
       try:
-        await s.openConn()
+        let openFut = s.openConn()
+        if s.idleTimeoutMs > 0 and not await withTimeout(openFut, s.idleTimeoutMs):
+          raise newException(IOError, "navi: SSE reconnect timed out")
+        await openFut
         s.retryMs = s.baseRetryMs
       except CatchableError:
         if s.closed: return none(SseEvent)
@@ -818,7 +833,16 @@ proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
         continue
     var chunk = ""
     try:
-      chunk = await s.handle.readChunk()
+      let readFut = s.handle.readChunk()
+      # Bound the read so a wedged mux (a parked read that never returns or raises)
+      # is caught here and driven back through reconnect+backoff, instead of hanging
+      # forever. Any byte, incl. a keep-alive comment, completes readFut and resets
+      # the bound, so a live-but-quiet stream is untouched.
+      if s.idleTimeoutMs > 0 and not await withTimeout(readFut, s.idleTimeoutMs):
+        s.handle = nil
+        if not s.reconnect: return none(SseEvent)
+        continue
+      chunk = await readFut
     except CatchableError:
       s.handle = nil
       if not s.reconnect: raise
