@@ -240,54 +240,61 @@ type
   DecoderKind = enum dkZlib, dkBrotli, dkZstd
   StreamDecoderObj = object
     done: bool
+    scratch: string          ## reused decode-output buffer (grown once, not per chunk)
     case kind: DecoderKind
     of dkZlib: zs: ZStream
     of dkBrotli: brs: BrotliState
     of dkZstd: zds: ZstdDStream
   StreamDecoder* = ref StreamDecoderObj
 
+const decodeScratchSize = 16384
+
+proc addBytes(dst: var string, src: string, n: int) {.inline.} =
+  ## Append the first `n` bytes of `src` to `dst` in place, no intermediate slice.
+  if n <= 0: return
+  let old = dst.len
+  dst.setLen(old + n)
+  copyMem(addr dst[old], unsafeAddr src[0], n)
+
 proc `=destroy`(d: var StreamDecoderObj) =
+  # A custom `=destroy` suppresses the compiler's field destruction, so the managed
+  # `scratch` string must be freed explicitly or it leaks (one buffer per decoder).
+  `=destroy`(d.scratch)
   case d.kind
   of dkZlib: discard inflateEnd(addr d.zs)
   of dkBrotli: (if d.brs != nil: brotliDestroy(d.brs))
   of dkZstd: (if d.zds != nil: discard zstdFree(d.zds))
 
 proc newZlibDecoder(windowBits: cint): StreamDecoder =
-  result = StreamDecoder(kind: dkZlib)
+  result = StreamDecoder(kind: dkZlib, scratch: newString(decodeScratchSize))
   if inflateInit2(addr result.zs, windowBits, "1", cint(sizeof(ZStream))) != zOk:
     raise newException(ValueError, "navi: zlib inflateInit failed")
 
 proc updateZlib(d: StreamDecoder, input: openArray[byte]): string =
   if d.done or input.len == 0: return ""
-  var inbuf = newString(input.len)            # stable pointer for the FFI call
-  copyMem(addr inbuf[0], unsafeAddr input[0], input.len)
-  d.zs.nextIn = cast[ptr uint8](addr inbuf[0])
-  d.zs.availIn = cuint(inbuf.len)
-  var chunk = newString(16384)
+  # `input` is a contiguous, GC-owned buffer that is stable for this synchronous
+  # call, so point the FFI straight at it -- no throwaway copy.
+  d.zs.nextIn = cast[ptr uint8](unsafeAddr input[0])
+  d.zs.availIn = cuint(input.len)
   while true:
-    d.zs.nextOut = cast[ptr uint8](addr chunk[0])
-    d.zs.availOut = cuint(chunk.len)
+    d.zs.nextOut = cast[ptr uint8](addr d.scratch[0])
+    d.zs.availOut = cuint(d.scratch.len)
     let ret = inflate(addr d.zs, zNoFlush)
     if ret != zOk and ret != zStreamEnd:
       raise newException(ValueError, "navi: malformed compressed body")
-    let produced = chunk.len - int(d.zs.availOut)
-    if produced > 0: result.add chunk[0 ..< produced]
+    result.addBytes(d.scratch, d.scratch.len - int(d.zs.availOut))
     if ret == zStreamEnd: d.done = true; break
     if d.zs.availIn == 0: break                # all of this chunk consumed
 
 proc updateBrotli(d: StreamDecoder, input: openArray[byte]): string =
   if d.done or input.len == 0: return ""
-  var inbuf = newString(input.len)
-  copyMem(addr inbuf[0], unsafeAddr input[0], input.len)
-  var availIn = csize_t(inbuf.len)
-  var nextIn = cast[ptr uint8](addr inbuf[0])
-  var chunk = newString(16384)
+  var availIn = csize_t(input.len)
+  var nextIn = cast[ptr uint8](unsafeAddr input[0])
   while true:
-    var availOut = csize_t(chunk.len)
-    var nextOut = cast[ptr uint8](addr chunk[0])
+    var availOut = csize_t(d.scratch.len)
+    var nextOut = cast[ptr uint8](addr d.scratch[0])
     let r = brotliStream(d.brs, availIn, nextIn, availOut, nextOut, nil)
-    let produced = chunk.len - int(availOut)
-    if produced > 0: result.add chunk[0 ..< produced]
+    result.addBytes(d.scratch, d.scratch.len - int(availOut))
     if r == brSuccess: d.done = true; break
     if r == brNeedOutput: continue             # output full, keep draining
     if r < brSuccess: raise newException(ValueError, "navi: malformed brotli body")
@@ -295,16 +302,15 @@ proc updateBrotli(d: StreamDecoder, input: openArray[byte]): string =
 
 proc updateZstd(d: StreamDecoder, input: openArray[byte]): string =
   if d.done or input.len == 0: return ""
-  var inbuf = newString(input.len)
-  copyMem(addr inbuf[0], unsafeAddr input[0], input.len)
-  var inb = ZstdBuffer(buf: addr inbuf[0], size: csize_t(inbuf.len), pos: 0)
-  var chunk = newString(16384)
+  var inb = ZstdBuffer(buf: cast[typeof(ZstdBuffer().buf)](unsafeAddr input[0]),
+                       size: csize_t(input.len), pos: 0)
   while inb.pos < inb.size:
-    var outb = ZstdBuffer(buf: addr chunk[0], size: csize_t(chunk.len), pos: 0)
+    var outb = ZstdBuffer(buf: cast[typeof(ZstdBuffer().buf)](addr d.scratch[0]),
+                          size: csize_t(d.scratch.len), pos: 0)
     let r = zstdStream(d.zds, outb, inb)
     if zstdIsError(r) != 0:
       raise newException(ValueError, "navi: malformed zstd body")
-    if outb.pos > 0: result.add chunk[0 ..< int(outb.pos)]
+    result.addBytes(d.scratch, int(outb.pos))
     if r == 0: d.done = true; break            # a full frame completed
     if outb.pos == 0: break                     # no progress: needs more input
 
@@ -326,12 +332,12 @@ proc newStreamDecoder*(encoding: string): StreamDecoder =
     loadBrotli()                       # resolve the lazily-bound symbols first
     let s = brotliCreate(nil, nil, nil)
     if s == nil: raise newException(ValueError, "navi: brotli init failed")
-    StreamDecoder(kind: dkBrotli, brs: s)
+    StreamDecoder(kind: dkBrotli, brs: s, scratch: newString(decodeScratchSize))
   of "zstd":
     loadZstd()
     let s = zstdCreate()
     if s == nil: raise newException(ValueError, "navi: zstd init failed")
-    StreamDecoder(kind: dkZstd, zds: s)
+    StreamDecoder(kind: dkZstd, zds: s, scratch: newString(decodeScratchSize))
   else:
     nil
 
