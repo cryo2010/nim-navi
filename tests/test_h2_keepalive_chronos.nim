@@ -8,7 +8,7 @@
 ## The peer runs on its own thread with blocking sockets, off navi's event loop.
 import unittest
 import pkg/chronos
-import std/[net, nativesockets, times]
+import std/[net, times]
 import navi/backend/chronos as be
 import navi/backend/h2mux_chronos
 import navi/backend/api            # TlsConfig / ProxyTarget
@@ -18,16 +18,20 @@ const
   clientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"        # 24 bytes, precedes the frames
   pingAck = "\x00\x00\x08\x06\x01\x00\x00\x00\x00"          # PING+ACK header (len=8), then payload
 
-type PeerArg = tuple[fd: int, answerPings: bool]
+type PeerArg = tuple[port: int, answerPings: bool]
 
 proc runPeer(arg: PeerArg) {.thread.} =
-  ## Accept one client, send SETTINGS, then read forever. When `answerPings` is set,
-  ## reply PING+ACK to every PING (still never delivering the response); otherwise
-  ## stay a blackhole. Exits when navi closes the connection.
-  let listener = newSocket(arg.fd.SocketHandle, AF_INET, SOCK_STREAM, IPPROTO_TCP,
-                           buffered = false)
+  ## Own the whole listener on this thread so no socket fd is shared across threads
+  ## (a shared fd would be closed by the owning thread's Socket destructor at scope
+  ## exit, out from under the other). Accept one client, send SETTINGS, then read
+  ## forever; when `answerPings` is set, reply PING+ACK to every PING (still never
+  ## delivering the response), otherwise stay a blackhole. Exits when navi closes.
+  let listener = newSocket(buffered = false)   # unbuffered: buffered recv batches and
+  listener.setSockOpt(OptReuseAddr, true)       # stalls the PING/ACK exchange (deadlock)
+  listener.bindAddr(Port(arg.port))
+  listener.listen()
   var client: Socket
-  listener.accept(client)
+  listener.accept(client)                        # inherits the listener's unbuffered mode
   client.setSockOpt(OptNoDelay, true)
   client.send(settingsFrame)
   var rest: string                # unparsed bytes after the preface
@@ -49,13 +53,10 @@ proc runPeer(arg: PeerArg) {.thread.} =
       if arg.answerPings and ftype == 0x6 and (flags and 0x1) == 0:  # a PING, not an ACK
         client.send(pingAck & payload)
   client.close()
+  listener.close()
 
 proc startPeer(t: var Thread[PeerArg], port: int, answerPings: bool) =
-  let listener = newSocket()
-  listener.setSockOpt(OptReuseAddr, true)
-  listener.bindAddr(Port(port))
-  listener.listen()
-  createThread(t, runPeer, (listener.getFd().int, answerPings))
+  createThread(t, runPeer, (port, answerPings))
 
 proc requestTornDown(mux: H2Mux): Future[bool] {.async.} =
   ## True when the request fails (the connection was torn down); never raises.
@@ -68,8 +69,17 @@ proc requestTornDown(mux: H2Mux): Future[bool] {.async.} =
     result = true
 
 proc connectMux(port: int): Future[H2Mux] {.async.} =
-  let conn = await be.connect("127.0.0.1", port, false, TlsConfig(), ProxyTarget())
-  result = await newH2Mux(conn, keepAliveMs = 200)
+  ## Retry until the peer thread has bound and is listening (it now owns the
+  ## listener, so the port may not be up the instant this is called).
+  var lastErr: ref CatchableError
+  for _ in 0 ..< 100:
+    try:
+      let conn = await be.connect("127.0.0.1", port, false, TlsConfig(), ProxyTarget())
+      return await newH2Mux(conn, keepAliveMs = 200)
+    except CatchableError as e:
+      lastErr = e
+      await sleepAsync(chronos.milliseconds(20))
+  raise lastErr
 
 var blackholeThread, pingThread: Thread[PeerArg]
 
