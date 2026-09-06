@@ -115,8 +115,8 @@ when defined(ssl):
         else: raise newException(IOError, "navi: SSL_write failed")
 
   proc sslRead(c: Conn): Future[string] {.async.} =
-    ## One chunk of up to 4096 bytes; "" means the peer closed.
-    result = newString(4096)
+    ## One chunk of up to `naviReadBufSize` bytes; "" means the peer closed.
+    result = newString(naviReadBufSize)
     while true:
       # If `close` ran while we were parked on waitRead, the SSL is already freed.
       # Raise rather than reading through the dangling pointer (a UAF crash) -- and
@@ -389,14 +389,14 @@ proc sendAll*(c: Conn, data: string): Future[void] {.async.} =
   await send(c.fd, data)
 
 proc recvSome*(c: Conn): Future[string] {.async.} =
-  ## One chunk of up to 4096 bytes; "" means the peer closed. Bounded by `readMs`
-  ## (the per-read stall timeout) when set; on expiry the pending read is abandoned
-  ## and TimeoutError is raised.
+  ## One chunk of up to `naviReadBufSize` bytes; "" means the peer closed. Bounded by
+  ## `readMs` (the per-read stall timeout) when set; on expiry the pending read is
+  ## abandoned and TimeoutError is raised.
   var readFut: Future[string]
   when defined(ssl):
-    readFut = if not c.ssl.isNil: sslRead(c) else: recv(c.fd, 4096)
+    readFut = if not c.ssl.isNil: sslRead(c) else: recv(c.fd, naviReadBufSize)
   else:
-    readFut = recv(c.fd, 4096)
+    readFut = recv(c.fd, naviReadBufSize)
   if c.readMs > 0 and not await withTimeout(readFut, c.readMs):
     raise newException(response.TimeoutError,
                        "navi: read timed out after " & $c.readMs & " ms")

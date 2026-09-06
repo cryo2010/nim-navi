@@ -97,8 +97,8 @@ proc feed*(d: var FrameDecoder, data: openArray[char]) =
     d.pos = 0
   let start = d.buf.len
   d.buf.setLen(start + data.len)
-  for i in 0 ..< data.len:
-    d.buf[start + i] = data[i]
+  if data.len > 0:
+    copyMem(addr d.buf[start], unsafeAddr data[0], data.len)
 
 proc frameSizeError*(d: FrameDecoder): bool = d.frameSizeError
   ## A peer frame declared a length over `defaultMaxFrameSize` (FRAME_SIZE_ERROR).
