@@ -237,8 +237,7 @@ proc feed*(p: var H1Parser, data: openArray[char]) =
   if data.len > 0:
     let start = p.buf.len
     p.buf.setLen(start + data.len)
-    for i in 0 ..< data.len:
-      p.buf[start + i] = data[i]
+    copyMem(addr p.buf[start], unsafeAddr data[0], data.len)
   while p.step(): discard
 
 proc eof*(p: var H1Parser) =
