@@ -66,6 +66,11 @@ type
     connect*: int   ## TCP connect + TLS handshake (establishment)
     read*: int      ## stall waiting for a response chunk (per-read idle)
     total*: int     ## whole request, including retries/redirects
+    h2KeepAlive*: int  ## HTTP/2 PING keepalive interval (ms) for a connection with
+                       ## active streams: after this long idle, PING the peer; if a
+                       ## second interval passes with no frame at all, treat the
+                       ## connection as dead and close it (so wedged streams fail over
+                       ## instead of hanging). 0 disables. Native backends only.
 
   NaviConfigBase* = object of RootObj
     ## Backend-agnostic client defaults, applied to every request and inheritable
@@ -149,6 +154,9 @@ proc readMs*(opts: NaviConfigBase): int = opts.timeouts.read
   ## Per-read stall deadline while waiting for a response chunk, in ms; 0 disables.
 proc totalMs*(opts: NaviConfigBase): int = opts.timeouts.total
   ## Overall request deadline in ms, including retries/redirects; 0 disables.
+proc h2KeepAliveMs*(opts: NaviConfigBase): int = opts.timeouts.h2KeepAlive
+  ## HTTP/2 PING keepalive interval in ms for a connection with active streams; 0
+  ## disables. Detects a dead/wedged connection (no PONG) so its streams fail over.
 const defaultHttpVersions* = when defined(naviHttp3): {H1, H2, H3} else: {H1, H2}
   ## The default `config.http`: every protocol this build can negotiate (h3 only
   ## in a `-d:naviHttp3` build). Because it lists all of them, strict selection
