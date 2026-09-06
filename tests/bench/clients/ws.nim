@@ -1,10 +1,12 @@
-## benchWs, async backends (navi-async / navi-chronos). Opens `clients` x
-## `concurrency` persistent WebSockets and loops text echo round-trips, recording
-## per-round-trip latency + bytes (round-trips/s + MB/s) over a timed window.
-## WebSocket is an h1 upgrade, so PROTO is not a dimension (run.sh runs ws at h1).
+## benchWs, async backends (navi-async / navi-chronos). Scales across cores with one
+## navi client per THREAD (not one process per core): each thread opens `concurrency`
+## persistent WebSockets on its own event loop and loops text echo round-trips,
+## recording per-round-trip latency + bytes. The process merges the threads into one
+## RESULT (round-trips/s + MB/s). WebSocket is an h1 upgrade, so PROTO is not a
+## dimension (run.sh runs ws at h1).
 
 import std/[times, monotimes]
-import ../common/[config, reporter, servers]
+import ../common/[config, reporter, servers, runner]
 when defined(useChronos):
   import navi/chronos
   const backend = "chronos"
@@ -37,27 +39,29 @@ proc worker(ws: WebSocket, cfg: Config, rec: BenchRecorder,
   try: await ws.close()
   except CatchableError: discard
 
-proc main() {.async.} =
+proc wsThread(a: ptr BenchThread) {.thread, nimcall.} =
+  # Each thread owns its own navi client, sockets and event loop, and navi keeps no
+  # shared mutable globals, so the only gcsafe complaints are false positives from
+  # navi's indirect callback calls (e.g. BodyProducer); assert safety for the body.
+  {.gcsafe.}:
+    let cfg = a.cfg
+    var pool = initServerPool(cfg)
+    var c = initNaviConfig()
+    c.tls.caFile = cfg.cert
+    let api = newNavi(c)
+    var socks: seq[WebSocket]
+    for _ in 0 ..< a.concurrency:
+      socks.add waitFor api.websocket(wsUrl(pool.pick()))
+    let rec = newBenchRecorder()
+    var futs: seq[Future[void]]
+    for ws in socks: futs.add worker(ws, cfg, rec, a.measureStart, a.deadline)
+    for f in futs: waitFor f
+    a.rec = rec
+
+proc main() =
   let cfg = loadConfig(backend)
   let reason = cfg.skipReason
   if reason.len > 0: echo cfg.label, " ", reason; return
-  var pool = initServerPool(cfg)
-  var c = initNaviConfig()
-  c.tls.caFile = cfg.cert
-  let api = newNavi(c)
+  runThreaded(cfg, clientName, wsThread)
 
-  var socks: seq[WebSocket]
-  for _ in 0 ..< cfg.clients * cfg.concurrency:
-    socks.add await api.websocket(wsUrl(pool.pick()))
-
-  let rec = newBenchRecorder()
-  let start = epochTime()
-  let measureStart = start + cfg.warmupSeconds
-  let deadline = measureStart + cfg.seconds
-  var futs: seq[Future[void]]
-  for ws in socks: futs.add worker(ws, cfg, rec, measureStart, deadline)
-  for f in futs: await f
-
-  emitResult(clientName, rec, cfg.seconds)
-
-waitFor main()
+main()

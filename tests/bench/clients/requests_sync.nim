@@ -1,11 +1,12 @@
-## benchRequests, sync backend (`import navi`; name: navi-sync). Single in-flight by
-## nature: loops the clients round-robin firing GET/POST/PUT at /echo across the
-## pool until the deadline, timing each measured request. Same warmup + cold-mode +
-## fail-hard as the async client, minus the fan-out (sync has no concurrency).
+## benchRequests, sync backend (`import navi`; name: navi-sync). Single in-flight per
+## thread by nature (sync has no fan-out), scaled across cores with one navi client
+## per THREAD: each thread loops GET/POST/PUT at /echo across the pool until the
+## deadline, timing each measured request; the process merges the threads into one
+## RESULT. Same warmup + cold-mode + fail-hard as the async client.
 
 import std/[times, monotimes]
 import ../zlibcodec
-import ../common/[config, reporter, servers]
+import ../common/[config, reporter, servers, runner]
 import navi
 include ../common/httpset
 
@@ -23,30 +24,25 @@ proc mkClient(cfg: Config): Navi =
   c.middleware = @[stampMw()]
   newNavi(c)
 
-proc main() =
-  let cfg = loadConfig("sync")
-  let reason = cfg.skipReason
-  if reason.len > 0: echo cfg.label, " ", reason; return
-  var pool = initServerPool(cfg)
-  var apis: seq[Navi]
-  for _ in 0 ..< cfg.clients: apis.add mkClient(cfg)
+proc reqThread(a: ptr BenchThread) {.thread, nimcall.} =
+  # One blocking navi client per thread; navi keeps no shared mutable globals, so the
+  # gcsafe complaints are false positives from indirect callbacks (middleware).
+  {.gcsafe.}:
+    let cfg = a.cfg
+    var pool = initServerPool(cfg)
+    let api = mkClient(cfg)
 
-  let expect = cfg.expectedVersion
-  if expect.len > 0:
-    for api in apis:
+    let expect = cfg.expectedVersion
+    if expect.len > 0:
       for base in pool.all():
         for _ in 0 ..< 3:
           try:
             if api.request(GET, base & "/echo").httpVersion == expect: break
           except CatchableError: break
 
-  let rec = newBenchRecorder()
-  let start = epochTime()
-  let measureStart = start + cfg.warmupSeconds
-  let deadline = measureStart + cfg.seconds
-  var n = 0
-  while epochTime() < deadline:
-    for api in apis:
+    let rec = newBenchRecorder()
+    var n = a.id                          # stagger the verb rotation across threads
+    while epochTime() < a.deadline:
       let v = verbs[n mod verbs.len]; inc n
       let url = pool.pick() & "/echo"
       var h = initHeaders()
@@ -64,14 +60,19 @@ proc main() =
       try:
         let res = api.request(v, url, headers = h, body = body)
         cfg.checkVersion(res.httpVersion)
-        if epochTime() >= measureStart:
+        if epochTime() >= a.measureStart:
           rec.record((getMonoTime() - t0).inMicroseconds)
       except CatchableError as e:
         rec.fail()
         stderr.writeLine cfg.label & " FAIL: " & $v & " " & url & " -> " &
           $e.name & ": " & e.msg
         quit(1)
+    a.rec = rec
 
-  emitResult("navi-sync", rec, cfg.seconds)
+proc main() =
+  let cfg = loadConfig("sync")
+  let reason = cfg.skipReason
+  if reason.len > 0: echo cfg.label, " ", reason; return
+  runThreaded(cfg, "navi-sync", reqThread)
 
 main()
