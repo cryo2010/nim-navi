@@ -16,6 +16,7 @@
 
 import std/[asyncdispatch, tables, deques, sets]
 import ../proto/h2/conn
+from ../proto/h2/frame import encodePing   # keepalive PING (a non-stream control frame)
 import ../core/response          # for ResponseTooLargeError
 import ../core/request           # for BodyProducer
 import ../core/decompress        # for streaming response decompression
@@ -48,6 +49,10 @@ type
     settingsSeen: Future[void]  ## completed once the peer's initial SETTINGS is seen
                                 ## (or the reader exits), so an Extended CONNECT can gate
                                 ## on ENABLE_CONNECT_PROTOCOL before sending (RFC 8441)
+    keepAliveMs: int            ## PING keepalive interval (0 = off); see `keepAlive`
+    sawFrameSinceTick: bool     ## the reader saw an inbound frame since the last
+                                ## keepalive tick (any frame proves liveness)
+    pingOutstanding: bool       ## a keepalive PING is awaiting any inbound frame
 
 proc activeStreams(mux: H2Mux): int =
   ## Streams counting against the peer's MAX_CONCURRENT_STREAMS: buffered
@@ -166,6 +171,34 @@ const goAwayGraceMs = 30_000
   ## only by an optional read timeout). Reset on every received datagram, so a slow-
   ## but-live server draining its in-flight work is unaffected.
 
+const h2KeepAlivePayload = "navi-kpa"   # 8 opaque PING bytes; any inbound frame answers
+
+proc keepAlive(mux: H2Mux) {.async.} =
+  ## Once per interval (not per chunk): if a connection with active streams has gone a
+  ## whole interval with no inbound frame, PING it; if the next interval is still
+  ## silent, treat the connection as dead and tear it down so its streams fail over.
+  ## Any inbound frame -- not only a PING ACK -- counts as liveness (the reader sets
+  ## `sawFrameSinceTick`), so this tracks a live transport, not a responsive app.
+  ## Waking on `readerDone` too lets it exit promptly when the connection closes.
+  try:
+    while mux.alive:
+      await (sleepAsync(mux.keepAliveMs) or mux.readerDone)
+      if not mux.alive or mux.readerDone.finished: break
+      if mux.sawFrameSinceTick:
+        mux.sawFrameSinceTick = false
+        mux.pingOutstanding = false          # a frame arrived this interval: alive
+      elif mux.activeStreams == 0:
+        mux.pingOutstanding = false           # nothing to protect: idle without pinging
+      elif mux.pingOutstanding:               # pinged last interval, still silent: dead
+        mux.alive = false
+        be.shutdownConn(mux.transport)        # wake the reader; it fails streams + closes
+        break
+      else:
+        await mux.send(encodePing(h2KeepAlivePayload))
+        mux.pingOutstanding = true
+  except CatchableError:
+    discard   # a failed send/transport tears down via the reader; nothing to do here
+
 proc reader(mux: H2Mux) {.async.} =
   try:
     while mux.alive:
@@ -174,6 +207,7 @@ proc reader(mux: H2Mux) {.async.} =
         if not await withTimeout(recvFut, goAwayGraceMs): break  # peer went silent
       let chunk = await recvFut
       if chunk.len == 0: break                 # peer closed
+      mux.sawFrameSinceTick = true             # inbound bytes: liveness for the keepalive
       let toSend = mux.h2.feed(chunk)
       if toSend.len > 0: await mux.send(toSend)   # includes a GOAWAY on a conn error
       if mux.h2.sawPeerSettings and not mux.settingsSeen.finished:
@@ -192,11 +226,12 @@ proc reader(mux: H2Mux) {.async.} =
   if not mux.settingsSeen.finished: mux.settingsSeen.complete()  # unblock a pending
   if not mux.readerDone.finished: mux.readerDone.complete()      # openConnect (dead conn)
 
-proc newH2Mux*(transport: be.Conn, maxBody = 0, decompress = false): Future[H2Mux] {.async.} =
+proc newH2Mux*(transport: be.Conn, maxBody = 0, decompress = false,
+               keepAliveMs = 0): Future[H2Mux] {.async.} =
   ## Take ownership of a freshly connected h2 transport, send the preface, and
   ## start the background reader.
   let mux = H2Mux(transport: transport, h2: initH2Conn(maxBody), alive: true,
-                  decompress: decompress,
+                  decompress: decompress, keepAliveMs: keepAliveMs,
                   readerDone: newFuture[void]("h2mux.readerDone"),
                   settingsSeen: newFuture[void]("h2mux.settingsSeen"),
                   waiters: initTable[uint32, Future[H2Response]](),
@@ -208,6 +243,7 @@ proc newH2Mux*(transport: be.Conn, maxBody = 0, decompress = false): Future[H2Mu
                   pendingSlots: initDeque[Future[void]]())
   await be.sendAll(transport, mux.h2.preamble())
   asyncCheck reader(mux)
+  if keepAliveMs > 0: asyncCheck keepAlive(mux)
   result = mux
 
 proc canReuse*(mux: H2Mux): bool = mux.alive and mux.h2.canReuse

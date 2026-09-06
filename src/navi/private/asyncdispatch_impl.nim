@@ -67,7 +67,7 @@ proc initNaviConfig*(): NaviConfig =
     retry: defaultRetryPolicy(), maxResponseBytes: 0,
     auth: Auth(), proxy: "", unixSocket: "",
     maxIdleConns: 0, maxIdleConnsPerHost: 0, idleConnTimeout: 0,
-    timeouts: Timeouts(), middleware: @[])
+    timeouts: Timeouts(h2KeepAlive: defaultH2KeepAliveMs), middleware: @[])
 
 proc newNavi*(config = initNaviConfig()): Navi =
   when not defined(naviHttp3):
@@ -203,7 +203,8 @@ proc transportInner(client: Navi, req: Request, sink: BodySink): Future[Response
                                client.config.connectMs, client.config.readMs)
       if conn.protocol == "h2":
         let mux = await newH2Mux(conn, client.config.maxResponseBytes,
-                                 client.config.wantsDecompress)
+                                 client.config.wantsDecompress,
+                                 client.config.h2KeepAliveMs)
         client.muxes[origin] = mux
         client.pendingMux.del(origin)
         pending.complete(mux)
@@ -494,7 +495,8 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
                                client.config.tls, proxyTarget, alpn,
                                client.config.connectMs, client.config.readMs)
       if conn.protocol == "h2":
-        let mux = await newH2Mux(conn, client.config.maxResponseBytes, decompress)
+        let mux = await newH2Mux(conn, client.config.maxResponseBytes, decompress,
+                                 client.config.h2KeepAliveMs)
         client.muxes[origin] = mux
         client.pendingMux.del(origin)
         pending.complete(mux)
@@ -984,7 +986,8 @@ proc websocketH2(client: Navi, u: Url, headers: Headers,
     raise newException(ProtocolError,
       "navi: WebSocket over h2 requested but the server negotiated " & got)
   let mux = await newH2Mux(conn, client.config.maxResponseBytes,
-                           client.config.wantsDecompress)
+                           client.config.wantsDecompress,
+                           client.config.h2KeepAliveMs)
   try:
     var reqHeaders = headers
     reqHeaders["sec-websocket-version"] = wsVersion
