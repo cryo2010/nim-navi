@@ -13,58 +13,11 @@
 ## event loop avoids the single-loop scheduling coupling that would otherwise stall
 ## the request/PING/ACK exchange the ping-answering case depends on.
 import unittest
-import std/[asyncdispatch, net, times]
+import std/[asyncdispatch, times]
 import navi/backend/asyncdispatch as be
 import navi/backend/h2mux
 import navi/backend/api            # TlsConfig / ProxyTarget
-
-const
-  settingsFrame = "\x00\x00\x00\x04\x00\x00\x00\x00\x00"
-    ## a valid empty SETTINGS frame (len=0, type=0x4, stream=0): proves a real h2
-    ## peer before it goes dark, so a teardown is the keepalive's doing, not a
-    ## malformed-first-frame error.
-  clientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"   # 24 bytes, precedes the frames
-  pingAck = "\x00\x00\x08\x06\x01\x00\x00\x00\x00"     # PING+ACK header (len=8), then payload
-
-type PeerArg = tuple[port: int, answerPings: bool]
-
-proc runPeer(arg: PeerArg) {.thread.} =
-  ## Own the whole listener (create/bind/listen/accept) on this thread so no socket
-  ## fd is shared across threads: sharing one would let the owning thread's Socket
-  ## destructor close the fd out from under the other (ARC/ORC close it at scope
-  ## exit). Accept one client, send SETTINGS, then read forever; when `answerPings`
-  ## is set, reply PING+ACK to every PING (still never delivering the response),
-  ## otherwise stay a blackhole. Exits when navi closes the connection.
-  let listener = newSocket(buffered = false)   # unbuffered: buffered recv batches and
-  listener.setSockOpt(OptReuseAddr, true)       # stalls the PING/ACK exchange (deadlock)
-  listener.bindAddr(Port(arg.port), "127.0.0.1")  # loopback only (CI sandbox denies 0.0.0.0)
-  listener.listen()
-  var client: Socket
-  listener.accept(client)                        # inherits the listener's unbuffered mode
-  client.send(settingsFrame)
-  var rest: string                # unparsed bytes after the preface
-  var prefaceDropped = false
-  while true:
-    let data = client.recv(4096)
-    if data.len == 0: break
-    rest.add data
-    if not prefaceDropped:
-      if rest.len < clientPreface.len: continue
-      rest = rest[clientPreface.len .. ^1]
-      prefaceDropped = true
-    while rest.len >= 9:                                # parse whole frames
-      let length = (rest[0].int shl 16) or (rest[1].int shl 8) or rest[2].int
-      if rest.len < 9 + length: break
-      let (ftype, flags) = (rest[3].int, rest[4].int)
-      let payload = rest[9 ..< 9 + length]
-      rest = rest[9 + length .. ^1]
-      if arg.answerPings and ftype == 0x6 and (flags and 0x1) == 0:  # a PING, not an ACK
-        client.send(pingAck & payload)
-  client.close()
-  listener.close()
-
-proc startPeer(t: var Thread[PeerArg], port: int, answerPings: bool) =
-  createThread(t, runPeer, (port, answerPings))
+import ./support_h2peer            # blocking-socket blackhole / ping-answering peer
 
 proc requestTornDown(mux: H2Mux): Future[bool] {.async.} =
   ## True when the request fails (the connection was torn down); never raises, so a

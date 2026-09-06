@@ -52,9 +52,9 @@ type
                              ## `cancelAndWait` it (reaping its parked read cleanly)
     closing: bool            ## set by `close`, so the reader defers the transport
                              ## teardown to it rather than racing on a cancelled await
-    keepAliveMs: int            ## PING keepalive interval (0 = off); see `nextChunk`
-    pendingRecv: Future[string] ## the single outstanding transport read, kept across
-                                ## ping intervals so a timed-out wait never loses bytes
+    keepAliveMs: int            ## PING keepalive interval (0 = off); see `keepAlive`
+    sawFrameSinceTick: bool     ## the reader saw an inbound frame since the last
+                                ## keepalive tick (any frame proves liveness)
     pingOutstanding: bool       ## a keepalive PING is awaiting any inbound frame
 
 proc activeStreams(mux: H2Mux): int =
@@ -180,42 +180,44 @@ const goAwayGraceMs = 30_000
 
 const h2KeepAlivePayload = "navi-kpa"   # 8 opaque PING bytes; any inbound frame answers
 
-proc nextChunk(mux: H2Mux): Future[string] {.async.} =
-  ## The reader's next transport chunk, keepalive-aware. A single outstanding read is
-  ## kept in `pendingRecv` and the wait is retried across ping intervals, so a
-  ## timed-out wait never abandons the read (no lost bytes). "" means the peer closed
-  ## or -- when a keepalive PING goes a whole interval unanswered -- that the
-  ## connection is dead; the reader then tears it down and fails its streams over.
-  if mux.pendingRecv == nil: mux.pendingRecv = be.recvSome(mux.transport)
-  # Graceful shutdown: bound the post-GOAWAY drain (takes precedence over keepalive).
-  if mux.h2.goneAway and mux.activeStreams > 0:
-    if not await withTimeout(mux.pendingRecv, goAwayGraceMs.milliseconds):
-      mux.pendingRecv = nil; return ""       # withTimeout cancelled the parked read
-    result = mux.pendingRecv.read(); mux.pendingRecv = nil; return
-  if mux.keepAliveMs <= 0:
-    result = await mux.pendingRecv; mux.pendingRecv = nil; return
-  while true:
-    # race, not withTimeout: on a timeout we must keep the read alive, not cancel it.
-    let timer = sleepAsync(mux.keepAliveMs.milliseconds)
-    discard await race(mux.pendingRecv, timer)
-    if mux.pendingRecv.finished:
-      await timer.cancelAndWait()
-      result = mux.pendingRecv.read(); mux.pendingRecv = nil
-      mux.pingOutstanding = false             # any inbound frame proves liveness
-      return
-    if mux.activeStreams == 0:
-      mux.pingOutstanding = false             # nothing to protect: idle without pinging
-      continue
-    if mux.pingOutstanding:                    # pinged last interval, still silent: dead
-      await mux.pendingRecv.cancelAndWait(); mux.pendingRecv = nil; return ""
-    await mux.send(encodePing(h2KeepAlivePayload))
-    mux.pingOutstanding = true
+proc keepAlive(mux: H2Mux) {.async.} =
+  ## Once per interval (not per chunk): if a connection with active streams has gone a
+  ## whole interval with no inbound frame, PING it; if the next interval is still
+  ## silent, treat the connection as dead and tear it down so its streams fail over.
+  ## Any inbound frame -- not only a PING ACK -- counts as liveness (the reader sets
+  ## `sawFrameSinceTick`), so this tracks a live transport, not a responsive app.
+  ## Racing the tick against `readerDone` lets it exit promptly when the connection
+  ## closes (and cancels the pending timer, so no chronos leak).
+  try:
+    while mux.alive:
+      let timer = sleepAsync(mux.keepAliveMs.milliseconds)
+      discard await race(timer, mux.readerDone)
+      if not timer.finished: await timer.cancelAndWait()
+      if not mux.alive or mux.readerDone.finished: break
+      if mux.sawFrameSinceTick:
+        mux.sawFrameSinceTick = false
+        mux.pingOutstanding = false          # a frame arrived this interval: alive
+      elif mux.activeStreams == 0:
+        mux.pingOutstanding = false           # nothing to protect: idle without pinging
+      elif mux.pingOutstanding:               # pinged last interval, still silent: dead
+        mux.alive = false
+        be.shutdownConn(mux.transport)        # wake the reader; it fails streams + closes
+        break
+      else:
+        await mux.send(encodePing(h2KeepAlivePayload))
+        mux.pingOutstanding = true
+  except CatchableError:
+    discard   # a failed send/transport tears down via the reader; nothing to do here
 
 proc reader(mux: H2Mux) {.async.} =
   try:
     while mux.alive:
-      let chunk = await mux.nextChunk()
-      if chunk.len == 0: break                 # peer closed, or keepalive: dead
+      let recvFut = be.recvSome(mux.transport)
+      if mux.h2.goneAway and mux.activeStreams > 0:
+        if not await withTimeout(recvFut, goAwayGraceMs.milliseconds): break
+      let chunk = await recvFut
+      if chunk.len == 0: break                 # peer closed
+      mux.sawFrameSinceTick = true             # inbound bytes: liveness for the keepalive
       let toSend = mux.h2.feed(chunk)
       if toSend.len > 0: await mux.send(toSend)   # includes a GOAWAY on a conn error
       if mux.h2.sawPeerSettings and not mux.settingsSeen.finished:
@@ -256,6 +258,7 @@ proc newH2Mux*(transport: be.Conn, maxBody = 0, decompress = false,
                   pendingSlots: initDeque[Future[void]]())
   await be.sendAll(transport, mux.h2.preamble())
   mux.readerFut = reader(mux)   # held (not asyncSpawn'd) so close can cancelAndWait it
+  if keepAliveMs > 0: asyncSpawn keepAlive(mux)  # self-exits when readerDone completes
   result = mux
 
 proc canReuse*(mux: H2Mux): bool = mux.alive and mux.h2.canReuse

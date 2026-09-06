@@ -67,7 +67,7 @@ proc initNaviConfig*(): NaviConfig =
     retry: defaultRetryPolicy(), maxResponseBytes: 0,
     auth: Auth(), proxy: "", unixSocket: "",
     maxIdleConns: 0, maxIdleConnsPerHost: 0, idleConnTimeout: 0,
-    timeouts: Timeouts(h2KeepAlive: 20_000), middleware: @[])
+    timeouts: Timeouts(h2KeepAlive: defaultH2KeepAliveMs), middleware: @[])
 
 proc newNavi*(config = initNaviConfig()): Navi =
   when not defined(naviHttp3):
