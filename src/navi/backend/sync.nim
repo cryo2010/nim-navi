@@ -454,7 +454,7 @@ proc recvSome*(c: Conn): string =
   ## stall limit -- capped by the time left to the overall deadline -- then reads
   ## what is available in a single read (no fill-the-buffer loop). Raises navi's
   ## TimeoutError on a per-read stall or an expired total deadline.
-  result = newString(4096)
+  result = newString(naviReadBufSize)
   var waitMs = c.readMs
   if c.bounded:
     let remaining = (c.deadline - getMonoTime()).inMilliseconds.int

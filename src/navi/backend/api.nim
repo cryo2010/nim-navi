@@ -13,6 +13,11 @@
 ## TLS is negotiated inside `connect` based on the `tls` flag, so the engine
 ## stays transport- and scheme-agnostic.
 
+const naviReadBufSize* = 65536
+  ## Socket read chunk size in bytes. Draining the socket in 64 KiB reads instead of
+  ## 4 KiB cuts read syscalls, per-read allocations, and framing/parse/decode passes
+  ## ~16x on a fast stream -- the dominant throughput lever for downloads and SSE.
+
 type
   TlsVersion* = enum
     ## A TLS protocol version for `TlsConfig.minVersion` / `maxVersion`.

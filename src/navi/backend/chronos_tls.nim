@@ -31,7 +31,7 @@ when defined(ssl):
       writeLock: AsyncLock  ## serialize SSL_write + wbio drains so concurrent streams
                             ## (and post-handshake output) never interleave on the wire
 
-  const tlsBufSize = 16384
+  const tlsBufSize = 65536   # drain multiple TLS records per read (see naviReadBufSize)
 
   proc sslPtr*(t: ChronosTls): SslPtr = t.sslp
     ## The underlying SSL, for `negotiatedProtocol` / `verifyPeer` after handshake.
