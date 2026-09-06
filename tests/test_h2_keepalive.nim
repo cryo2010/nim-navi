@@ -37,11 +37,10 @@ proc runPeer(arg: PeerArg) {.thread.} =
   ## otherwise stay a blackhole. Exits when navi closes the connection.
   let listener = newSocket(buffered = false)   # unbuffered: buffered recv batches and
   listener.setSockOpt(OptReuseAddr, true)       # stalls the PING/ACK exchange (deadlock)
-  listener.bindAddr(Port(arg.port))
+  listener.bindAddr(Port(arg.port), "127.0.0.1")  # loopback only (CI sandbox denies 0.0.0.0)
   listener.listen()
   var client: Socket
   listener.accept(client)                        # inherits the listener's unbuffered mode
-  client.setSockOpt(OptNoDelay, true)
   client.send(settingsFrame)
   var rest: string                # unparsed bytes after the preface
   var prefaceDropped = false
