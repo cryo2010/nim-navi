@@ -33,8 +33,9 @@ type
                              ## (bounds streamed input to O(n), not O(n^2))
     ready: Deque[SseEvent]   ## dispatched events awaiting `next`
     evType: string           ## current event's type buffer
-    dataLines: seq[string]   ## current event's data buffer
-    dataBytes: int           ## running size of `dataLines`, to bound one event
+    data: string             ## current event's data, `data:` lines joined with "\n"
+    hasData: bool            ## whether any `data:` line was seen (fires even if empty)
+    dataBytes: int           ## running size of `data`, to bound one event
     lastId: string           ## persistent last event id (survives dispatch)
     retry: int               ## last `retry:` value seen, or -1
     atStart: bool            ## until the first byte, to strip a leading BOM
@@ -47,14 +48,15 @@ proc initSseParser*(lastEventId = ""): SseParser =
 proc dispatch(p: var SseParser) =
   ## End of an event (a blank line). Fire it only if it accumulated data; either
   ## way reset the per-event buffers. The last-id buffer persists across events.
-  if p.dataLines.len == 0:
+  if not p.hasData:
     p.evType.setLen(0)
     return
   p.ready.addLast SseEvent(
     event: (if p.evType.len == 0: "message" else: p.evType),
-    data: p.dataLines.join("\n"), id: p.lastId, retry: p.retry)
+    data: p.data, id: p.lastId, retry: p.retry)
   p.evType.setLen(0)
-  p.dataLines.setLen(0)
+  p.data.setLen(0)                            # reuse the buffer's capacity next event
+  p.hasData = false
   p.dataBytes = 0
 
 proc processLine(p: var SseParser, line: string) =
@@ -69,7 +71,9 @@ proc processLine(p: var SseParser, line: string) =
   case field
   of "event": p.evType = val
   of "data":
-    p.dataLines.add val
+    if p.hasData: p.data.add '\n'            # separator between successive data lines
+    p.data.add val
+    p.hasData = true
     p.dataBytes += val.len + 1               # +1 for the "\n" join separator
     if p.dataBytes > maxSseEventBytes:
       raise newException(ValueError,
@@ -105,7 +109,10 @@ proc feed*(p: var SseParser, text: string) =
       inc i; lineStart = i
     else: inc i
   if lineStart > 0:
-    p.buf = p.buf[lineStart .. ^1]            # keep only the unterminated tail
+    # Drop the consumed prefix in place (no realloc): setLen(0) when a feed ends
+    # exactly on a terminator (the steady state), else memmove the small tail down.
+    if lineStart >= p.buf.len: p.buf.setLen(0)
+    else: p.buf.delete(0 ..< lineStart)
     p.scanned = 0                             # the small tail is rescanned next feed
   else:
     p.scanned = i                             # no terminator yet; don't rescan this run
@@ -130,7 +137,8 @@ proc reset*(p: var SseParser) =
   p.buf.setLen(0)
   p.scanned = 0
   p.evType.setLen(0)
-  p.dataLines.setLen(0)
+  p.data.setLen(0)
+  p.hasData = false
   p.dataBytes = 0
   p.ready.clear()
   p.atStart = true
