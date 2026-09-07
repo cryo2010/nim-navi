@@ -5,7 +5,7 @@
 ## mismatch). Records per-transfer latency + bytes for MB/s over a time-boxed window.
 
 import std/[times, monotimes, json]
-import ../common/[config, reporter, servers, streamcontent]
+import ../common/[config, reporter, servers, streamcontent, runner]
 when defined(useChronos):
   import navi/chronos
   const backend = "chronos"
@@ -63,33 +63,34 @@ proc mkClient(cfg: Config): Navi =
   c.tls.caFile = cfg.cert
   newNavi(c)
 
-proc main() {.async.} =
-  let cfg = loadConfig(backend)
-  let reason = cfg.skipReason
-  if reason.len > 0: echo cfg.label, " ", reason; return
-  var pool = initServerPool(cfg)
-  var apis: seq[Navi]
-  for _ in 0 ..< cfg.clients: apis.add mkClient(cfg)
+proc ulThread(a: ptr BenchThread) {.thread, nimcall.} =
+  # One navi client per thread on its own event loop; navi keeps no shared mutable
+  # globals, so the gcsafe complaints are false positives from indirect callbacks
+  # (and the read-only `blk` shared across threads).
+  {.gcsafe.}:
+    let cfg = a.cfg
+    var pool = initServerPool(cfg)
+    let api = mkClient(cfg)
 
-  let expect = cfg.expectedVersion
-  if expect.len > 0:
-    for api in apis:
+    let expect = cfg.expectedVersion
+    if expect.len > 0:
       for base in pool.all():
         for _ in 0 ..< 3:
           try:
-            if (await api.request(GET, base & "/echo")).httpVersion == expect: break
+            if (waitFor api.request(GET, base & "/echo")).httpVersion == expect: break
           except CatchableError: break
 
-  let rec = newBenchRecorder()
-  let start = epochTime()
-  let measureStart = start + cfg.warmupSeconds
-  let deadline = measureStart + cfg.seconds
-  var futs: seq[Future[void]]
-  for api in apis:
-    for _ in 0 ..< cfg.concurrency:
-      futs.add worker(api, cfg, addr pool, rec, measureStart, deadline)
-  for f in futs: await f
+    let rec = newBenchRecorder()
+    var futs: seq[Future[void]]
+    for _ in 0 ..< a.concurrency:
+      futs.add worker(api, cfg, addr pool, rec, a.measureStart, a.deadline)
+    for f in futs: waitFor f
+    a.rec = rec
 
-  emitResult(clientName, rec, cfg.seconds)
+proc main() =
+  let cfg = loadConfig(backend)
+  let reason = cfg.skipReason
+  if reason.len > 0: echo cfg.label, " ", reason; return
+  runThreaded(cfg, clientName, ulThread)
 
-waitFor main()
+main()

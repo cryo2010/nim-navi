@@ -330,10 +330,16 @@ when defined(ssl):
     SSL_SESS_CACHE_CLIENT = 0x0001
     SSL_SESS_CACHE_NO_INTERNAL_STORE = 0x0200
 
-  var slotExIdx {.global.}: cint = -1
+  # Per-thread (threadvar): each thread registers its own ex-data index and uses it
+  # for the SSL objects it owns, so the lazy init never races across threads (works
+  # under plain orc with one navi client per thread). threadvars can't carry an
+  # initializer, so a companion flag stands in for the old `-1` "unset" sentinel.
+  var slotExIdx {.threadvar.}: cint
+  var slotExIdxReady {.threadvar.}: bool
   proc ensureExIdx() =
-    if slotExIdx < 0:
+    if not slotExIdxReady:
       slotExIdx = CRYPTO_get_ex_new_index(CRYPTO_EX_INDEX_SSL, 0, nil, nil, nil, nil)
+      slotExIdxReady = true
 
   proc onNewSession(ssl: SslPtr, session: pointer): cint {.cdecl.} =
     ## Called by OpenSSL when a resumable session becomes available; we take

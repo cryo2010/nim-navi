@@ -11,7 +11,7 @@
 
 import std/[times, monotimes]
 import ../zlibcodec
-import ../common/[config, reporter, servers]
+import ../common/[config, reporter, servers, runner]
 when defined(useChronos):
   import navi/chronos
   const backend = "chronos"
@@ -65,35 +65,35 @@ proc worker(api: Navi, cfg: Config, pool: ptr ServerPool, rec: BenchRecorder,
         $e.name & ": " & e.msg
       quit(1)
 
-proc main() {.async.} =
-  let cfg = loadConfig(backend)
-  let reason = cfg.skipReason
-  if reason.len > 0: echo cfg.label, " ", reason; return
-  var pool = initServerPool(cfg)
-  var apis: seq[Navi]
-  for _ in 0 ..< cfg.clients: apis.add mkClient(cfg)
+proc reqThread(a: ptr BenchThread) {.thread, nimcall.} =
+  # One navi client per thread on its own event loop; navi keeps no shared mutable
+  # globals, so the gcsafe complaints are false positives from indirect callbacks.
+  {.gcsafe.}:
+    let cfg = a.cfg
+    var pool = initServerPool(cfg)
+    let api = mkClient(cfg)
 
-  # Warm up per-origin protocol discovery (h3 needs an Alt-Svc round trip) so the
-  # measured window is pinned to the negotiated protocol from the first request.
-  let expect = cfg.expectedVersion
-  if expect.len > 0:
-    for api in apis:
+    # Warm up per-origin protocol discovery (h3 needs an Alt-Svc round trip) so the
+    # measured window is pinned to the negotiated protocol from the first request.
+    let expect = cfg.expectedVersion
+    if expect.len > 0:
       for base in pool.all():
         for _ in 0 ..< 3:
           try:
-            if (await api.request(GET, base & "/echo")).httpVersion == expect: break
+            if (waitFor api.request(GET, base & "/echo")).httpVersion == expect: break
           except CatchableError: break
 
-  let rec = newBenchRecorder()
-  let start = epochTime()
-  let measureStart = start + cfg.warmupSeconds
-  let deadline = measureStart + cfg.seconds
-  var futs: seq[Future[void]]
-  for api in apis:
-    for i in 0 ..< cfg.concurrency:
-      futs.add worker(api, cfg, addr pool, rec, measureStart, deadline, i)
-  for f in futs: await f
+    let rec = newBenchRecorder()
+    var futs: seq[Future[void]]
+    for i in 0 ..< a.concurrency:
+      futs.add worker(api, cfg, addr pool, rec, a.measureStart, a.deadline, i)
+    for f in futs: waitFor f
+    a.rec = rec
 
-  emitResult(clientName, rec, cfg.seconds)
+proc main() =
+  let cfg = loadConfig(backend)
+  let reason = cfg.skipReason
+  if reason.len > 0: echo cfg.label, " ", reason; return
+  runThreaded(cfg, clientName, reqThread)
 
-waitFor main()
+main()

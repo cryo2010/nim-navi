@@ -5,7 +5,7 @@
 ## pinned protocol is never negotiated (h3 SSE begins on h2 until the Alt-Svc upgrade).
 
 import std/[times, monotimes]
-import ../common/[config, reporter, servers]
+import ../common/[config, reporter, servers, runner]
 when defined(useChronos):
   import navi/chronos
   const backend = "chronos"
@@ -38,29 +38,28 @@ proc mkClient(cfg: Config): Navi =
   c.tls.caFile = cfg.cert
   newNavi(c)
 
-proc main() {.async.} =
+proc sseThread(a: ptr BenchThread) {.thread, nimcall.} =
+  # One navi client per thread on its own event loop; navi keeps no shared mutable
+  # globals, so the gcsafe complaints are false positives from indirect callbacks.
+  {.gcsafe.}:
+    let cfg = a.cfg
+    var pool = initServerPool(cfg)
+    let api = mkClient(cfg)
+    var streams: seq[SseStream]
+    for _ in 0 ..< a.concurrency:
+      streams.add waitFor api.sse(pool.pick() & "/events", retryMs = 20, maxRetryMs = 100)
+    let rec = newBenchRecorder()
+    var gate = initVersionGate(cfg)
+    var futs: seq[Future[void]]
+    for s in streams: futs.add worker(s, rec, addr gate, a.measureStart, a.deadline)
+    for f in futs: waitFor f
+    gate.finish()
+    a.rec = rec
+
+proc main() =
   let cfg = loadConfig(backend)
   let reason = cfg.skipReason
   if reason.len > 0: echo cfg.label, " ", reason; return
-  var pool = initServerPool(cfg)
-  var apis: seq[Navi]
-  for _ in 0 ..< cfg.clients: apis.add mkClient(cfg)
+  runThreaded(cfg, clientName, sseThread)
 
-  var streams: seq[SseStream]
-  for api in apis:
-    for _ in 0 ..< cfg.concurrency:
-      streams.add await api.sse(pool.pick() & "/events", retryMs = 20, maxRetryMs = 100)
-
-  let rec = newBenchRecorder()
-  let start = epochTime()
-  let measureStart = start + cfg.warmupSeconds
-  let deadline = measureStart + cfg.seconds
-  var gate = initVersionGate(cfg)
-  var futs: seq[Future[void]]
-  for s in streams: futs.add worker(s, rec, addr gate, measureStart, deadline)
-  for f in futs: await f
-  gate.finish()
-
-  emitResult(clientName, rec, cfg.seconds)
-
-waitFor main()
+main()

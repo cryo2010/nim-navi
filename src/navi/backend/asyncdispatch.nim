@@ -59,7 +59,9 @@ type
       ownsCtx: bool     ## true only for an unshared ctx `close` must destroy
       slot: SessionSlot ## keeps the resumption link alive for the SSL's lifetime
 
-var openedConnections*: int  ## diagnostic: TCP connections opened by this backend
+var openedConnections* {.threadvar.}: int
+  ## diagnostic: TCP connections opened by this backend, counted per thread (one navi
+  ## client runs per thread, so a plain global would race; readers are single-threaded)
 
 # --- fd readiness ------------------------------------------------------
 

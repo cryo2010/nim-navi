@@ -101,9 +101,9 @@ type
                         totalOut: pointer): cint {.cdecl, gcsafe, raises: [].}
 
 var
-  brotliCreate: BrotliCreateFn
-  brotliDestroy: BrotliDestroyFn
-  brotliStream: BrotliStreamFn
+  brotliCreate {.threadvar.}: BrotliCreateFn
+  brotliDestroy {.threadvar.}: BrotliDestroyFn
+  brotliStream {.threadvar.}: BrotliStreamFn
 
 proc loadCodec(dll: string): LibHandle =
   ## Load `dll` by name, falling back to common absolute locations. On macOS the
@@ -127,7 +127,7 @@ proc loadBrotli() =
   ## Resolve libbrotlidec's decode symbols on first use. Raises a clear error if
   ## the library is not present (rather than crashing the whole process at start,
   ## which an eager `dynlib` pragma would).
-  {.cast(gcsafe).}:      # module-global fn pointers; navi is single-threaded
+  {.cast(gcsafe).}:      # per-thread fn pointers (threadvar): resolved once per thread
     if brotliCreate != nil: return
     let lib = loadCodec(brotliDll)
     if lib == nil:
@@ -190,14 +190,14 @@ type
   ZstdIsErrorFn = proc(code: csize_t): cuint {.cdecl, gcsafe, raises: [].}
 
 var
-  zstdCreate: ZstdCreateFn
-  zstdFree: ZstdFreeFn
-  zstdStream: ZstdStreamFn
-  zstdIsError: ZstdIsErrorFn
+  zstdCreate {.threadvar.}: ZstdCreateFn
+  zstdFree {.threadvar.}: ZstdFreeFn
+  zstdStream {.threadvar.}: ZstdStreamFn
+  zstdIsError {.threadvar.}: ZstdIsErrorFn
 
 proc loadZstd() =
   ## Resolve libzstd's decode symbols on first use; a clear error if absent.
-  {.cast(gcsafe).}:      # module-global fn pointers; navi is single-threaded
+  {.cast(gcsafe).}:      # per-thread fn pointers (threadvar): resolved once per thread
     if zstdCreate != nil: return
     let lib = loadCodec(zstdDll)
     if lib == nil:

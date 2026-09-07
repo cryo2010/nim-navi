@@ -69,10 +69,12 @@ proc initNaviConfig*(): NaviConfig =
     maxIdleConns: 0, maxIdleConnsPerHost: 0, idleConnTimeout: 0,
     timeouts: Timeouts(h2KeepAlive: defaultH2KeepAliveMs), middleware: @[])
 
+when not defined(naviHttp3):
+  var h3BuildWarned {.threadvar.}: bool   # per-thread once-flag (a shared global races)
+
 proc newNavi*(config = initNaviConfig()): Navi =
   when not defined(naviHttp3):
     # H3 in `http` is a silent no-op without -d:naviHttp3 (h1/h2 only); warn once.
-    var h3BuildWarned {.global.} = false
     if H3 in config.http and not h3BuildWarned:
       h3BuildWarned = true
       stderr.writeLine("navi: config.http includes H3 but this build lacks " &
