@@ -57,6 +57,11 @@ Two things keep the comparison apples-to-apples with the multi-core Go/Rust clie
   single process (one event loop per thread) and merges their throughput — a
   single-process, all-cores comparison, matching how Go/Rust use every core in one
   process. Set `NAVI_THREADS=1` to measure single-core (per-event-loop) efficiency.
+  The native clients are built with `--mm:atomicArc`: with one client per thread,
+  refs shared across threads (process-global tables such as the HPACK Huffman decode
+  tree) need atomic reference counting, and it drops the cycle collector (fine for a
+  time-boxed run). This is the honest cost of the one-client-per-thread deployment
+  the bench models; a one-process-per-core deployment would use plain `orc` instead.
 - **Hardware hash:** the streaming clients verify integrity with OpenSSL's SHA-1
   (SHA-NI), matching Go/Rust/Node. Nim's software `checksums/sha1` (~0.8 GB/s) would
   otherwise bottleneck navi's core and understate its download throughput.

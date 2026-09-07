@@ -138,7 +138,13 @@ esac
 export NAVI_CERT="$cert" NAVI_HOST="$host" NAVI_BASE_PORT="$base_port"
 export NAVI_WORKLOAD="$workload" NAVI_SERVERS="$servers" NAVI_THREADS="$threads"
 
-common="--path:$root/src -d:ssl -d:release --threads:on --hints:off"
+# --mm:atomicArc: the native clients run one navi client per thread in one process,
+# so refs shared across threads (e.g. process-global tables like the HPACK Huffman
+# decode tree) need atomic reference counting; plain orc's non-atomic refcounts race
+# and corrupt the heap. atomicArc also drops the cycle collector, which is fine for a
+# time-boxed bench. (The old one-process-per-core model shared nothing, so it didn't
+# need this.)
+common="--path:$root/src -d:ssl -d:release --threads:on --mm:atomicArc --hints:off"
 # For an h3 build, link the native clients with an rpath to the custom OpenSSL 3.5 /
 # ngtcp2 / nghttp3 in /opt so the binary finds them at runtime. The h3 image does NOT
 # set a global LD_LIBRARY_PATH on purpose (it would make the system-OpenSSL reference
