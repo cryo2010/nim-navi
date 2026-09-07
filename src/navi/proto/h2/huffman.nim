@@ -74,50 +74,54 @@ const codes: array[0 .. 256, HuffCode] = [
 
 const eosSymbol = 256
 
-type Node = ref object
-  sym: int          ## 0..255 for a leaf, -1 for an internal node
-  child: array[2, Node]
+type FlatNode = object
+  sym: int              ## 0..255 for a leaf, -1 for an internal node
+  child: array[2, int]  ## index into `decodeTable`, -1 for no child
 
-proc buildTree(): Node =
-  result = Node(sym: -1)
+proc buildDecodeTable(): seq[FlatNode] =
+  ## Build the prefix tree as a flat index table (node 0 is the root). Runs at
+  ## compile time to seed the `const decodeTable`.
+  result = @[FlatNode(sym: -1, child: [-1, -1])]
   for sym in 0 .. 255:
     let (code, bits) = codes[sym]
-    var node = result
+    var idx = 0
     for k in countdown(bits - 1, 0):
       let bit = int((code shr k) and 1)
-      if node.child[bit] == nil:
-        node.child[bit] = Node(sym: -1)
-      node = node.child[bit]
-    node.sym = sym
+      if result[idx].child[bit] == -1:
+        result.add FlatNode(sym: -1, child: [-1, -1])
+        result[idx].child[bit] = result.high
+      idx = result[idx].child[bit]
+    result[idx].sym = sym
 
-let decodeTree = buildTree()
+const decodeTable = buildDecodeTable()
+  ## The Huffman prefix tree, flattened to a `const` value table with children as
+  ## indices. Unlike a `ref`-node tree it lives in read-only data and is never
+  ## reference-counted, so many threads can each decode against it concurrently
+  ## (safe under any memory manager, incl. non-atomic orc).
 
 proc huffmanDecode*(data: string): string {.gcsafe.} =
-  # `decodeTree` is built once and never mutated, so reading it from a gcsafe
-  # (chronos async) context is safe.
-  {.cast(gcsafe).}:
-    var node = decodeTree
-    var padBits = 0          # bits walked since the last completed symbol
-    var padAllOnes = true    # were all of them 1 (the EOS code is all 1s)?
-    for ch in data:
-      let b = uint8(ch)
-      for k in countdown(7, 0):
-        let bit = int((b shr k) and 1)
-        if bit == 0: padAllOnes = false
-        inc padBits
-        node = node.child[bit]
-        if node == nil:
-          raise newException(ValueError, "hpack: invalid Huffman code")
-        if node.sym >= 0:
-          result.add char(node.sym)
-          node = decodeTree
-          padBits = 0
-          padAllOnes = true
-    # RFC 7541 5.2: a leftover partial code is only valid as EOS padding -- at most 7
-    # bits, all 1s. A longer run (or one with a 0 bit) means over-long padding or an
-    # encoded EOS symbol (whose all-1s path holds no leaf, so it overruns 7 bits).
-    if node != decodeTree and (padBits > 7 or not padAllOnes):
-      raise newException(ValueError, "hpack: invalid Huffman padding")
+  var idx = 0                # current node; 0 is the root
+  var padBits = 0            # bits walked since the last completed symbol
+  var padAllOnes = true      # were all of them 1 (the EOS code is all 1s)?
+  for ch in data:
+    let b = uint8(ch)
+    for k in countdown(7, 0):
+      let bit = int((b shr k) and 1)
+      if bit == 0: padAllOnes = false
+      inc padBits
+      idx = decodeTable[idx].child[bit]
+      if idx == -1:
+        raise newException(ValueError, "hpack: invalid Huffman code")
+      if decodeTable[idx].sym >= 0:
+        result.add char(decodeTable[idx].sym)
+        idx = 0
+        padBits = 0
+        padAllOnes = true
+  # RFC 7541 5.2: a leftover partial code is only valid as EOS padding -- at most 7
+  # bits, all 1s. A longer run (or one with a 0 bit) means over-long padding or an
+  # encoded EOS symbol (whose all-1s path holds no leaf, so it overruns 7 bits).
+  if idx != 0 and (padBits > 7 or not padAllOnes):
+    raise newException(ValueError, "hpack: invalid Huffman padding")
 
 proc huffmanEncode*(s: string): string =
   var acc: uint64 = 0

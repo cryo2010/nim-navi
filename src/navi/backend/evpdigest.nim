@@ -23,14 +23,16 @@ type
               {.cdecl, gcsafe, raises: [].}
 
 var
-  loaded: bool
-  ok: bool
-  ctxNew: NewFn
-  ctxFree: FreeFn
-  md5Md, sha1Md, sha256Md: MdFn
-  digestInit: InitFn
-  digestUpdate: UpdateFn
-  digestFinal: FinalFn
+  loaded {.threadvar.}: bool         ## per-thread: each thread resolves its own copy,
+  ok {.threadvar.}: bool             ## so first-use resolution never races (works under
+  ctxNew {.threadvar.}: NewFn        ## plain orc, one navi client per thread)
+  ctxFree {.threadvar.}: FreeFn
+  md5Md {.threadvar.}: MdFn
+  sha1Md {.threadvar.}: MdFn
+  sha256Md {.threadvar.}: MdFn
+  digestInit {.threadvar.}: InitFn
+  digestUpdate {.threadvar.}: UpdateFn
+  digestFinal {.threadvar.}: FinalFn
 
 proc ensureLoaded() {.gcsafe.} =
   {.cast(gcsafe).}:
