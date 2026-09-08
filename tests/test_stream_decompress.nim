@@ -44,6 +44,30 @@ suite "incremental decoder across chunk boundaries":
     check feedSliced("gzip", member & member & member, 7) ==
       """{"ok":true}{"ok":true}{"ok":true}"""
 
+suite "CappedDecoder (the shared decode-and-cap helper)":
+  let gz = hexToBytes("1f8b0800000000000003ab56cacf56b22a292a4dad0500905fd4a70b000000")
+
+  test "it decodes a gzip body fed in slices":
+    var cd = initCappedDecoder(decompress = true, cap = 0)
+    var got = ""
+    var i = 0
+    while i < gz.len:
+      let n = min(4, gz.len - i)
+      got.add cd.feed(gz[i ..< i + n], "gzip")
+      i += n
+    check got == """{"ok":true}"""
+
+  test "with decompress = false it passes bytes through unchanged":
+    var cd = initCappedDecoder(decompress = false, cap = 0)
+    check cd.feed("raw bytes", "gzip") == "raw bytes"   # encoding ignored
+    check cd.feed("", "gzip") == ""                      # empty stays empty
+
+  test "it raises ResponseTooLargeError once the decoded total passes the cap":
+    var cd = initCappedDecoder(decompress = false, cap = 5)
+    check cd.feed("abc", "") == "abc"                    # 3 <= 5
+    expect ResponseTooLargeError:
+      discard cd.feed("def", "")                         # 3 + 3 = 6 > 5
+
 suite "stream() decompresses the response body":
   test "stream should deliver a gzip body to the sink decoded":
     const port = 9230

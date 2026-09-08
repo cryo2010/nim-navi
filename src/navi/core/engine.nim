@@ -90,32 +90,20 @@ template h1DrainBody*(transport, parser, sink, keep, decompress, cap: typed) =
   mixin await, recvSome, BodySink
   block:
     let streaming = not sink.isNil
-    var dec: StreamDecoder = nil
-    var decReady = false                    # decoder chosen once headers are in
-    var seen = 0
+    var cd = initCappedDecoder(decompress, cap)   # lazy decoder + running size cap
     template deliver() =
       if streaming:
-        let raw = parser.takeBody()
-        if raw.len > 0:
-          if not decReady:
-            dec = if decompress: newStreamDecoder(parser.contentEncoding()) else: nil
-            decReady = true
-          let decoded =
-            if dec != nil: dec.update(raw.toOpenArrayByte(0, raw.high)) else: raw
-          if decoded.len > 0:
-            seen += decoded.len
-            if cap > 0 and seen > cap:
-              raise newException(ResponseTooLargeError,
-                "navi: response exceeded maxResponseBytes")
-            # single-threaded client; the sink need not be gcsafe (see sendRequest).
-            # `decoded` is navi's native body type (`string`), which the sink also
-            # takes, so its last use here moves the buffer straight into the sink
-            # (into the async env on the async backends) with no copy. The raises
-            # cast discharges chronos's strict-raises obligation on the portable
-            # (annotation-free) sink type, as the middleware path does.
-            {.cast(gcsafe).}:
-              {.cast(raises: [CatchableError]).}:
-                await sink(decoded)
+        let decoded = cd.feed(parser.takeBody(), parser.contentEncoding())
+        if decoded.len > 0:
+          # single-threaded client; the sink need not be gcsafe (see sendRequest).
+          # `decoded` is navi's native body type (`string`), which the sink also
+          # takes, so its last use here moves the buffer straight into the sink
+          # (into the async env on the async backends) with no copy. The raises
+          # cast discharges chronos's strict-raises obligation on the portable
+          # (annotation-free) sink type, as the middleware path does.
+          {.cast(gcsafe).}:
+            {.cast(raises: [CatchableError]).}:
+              await sink(decoded)
     deliver()                               # body read alongside the headers
     while not parser.finished:
       let chunk = await recvSome(transport)
@@ -267,31 +255,18 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
     # is `await`ed, so a slow sink stalls this read loop and, in turn, the peer
     # (backpressure). On the buffered path `takeBody` is never called, so the whole
     # body accumulates in the connection as before.
-    var dec: StreamDecoder = nil
-    var decReady = false
-    var seen = 0
+    var cd = initCappedDecoder(decompress, cap)
     while not h2.streamDone(sid):
       let chunk = await recvSome(transport)
       if chunk.len == 0: break
       let toSend = h2.feed(chunk)
       if toSend.len > 0: await sendAll(transport, toSend)
       if not sink.isNil:
-        let raw = h2.takeBody(sid)
-        if raw.len > 0:
-          if not decReady:
-            dec = if decompress: newStreamDecoder(h2.respHeader(sid, "content-encoding"))
-                  else: nil
-            decReady = true
-          let decoded =
-            if dec != nil: dec.update(raw.toOpenArrayByte(0, raw.high)) else: raw
-          if decoded.len > 0:
-            seen += decoded.len
-            if cap > 0 and seen > cap:
-              raise newException(ResponseTooLargeError,
-                "navi: response exceeded maxResponseBytes")
-            {.cast(gcsafe).}:
-              {.cast(raises: [CatchableError]).}:
-                await sink(decoded)     # native body type -> moved in, no copy
+        let decoded = cd.feed(h2.takeBody(sid), h2.respHeader(sid, "content-encoding"))
+        if decoded.len > 0:
+          {.cast(gcsafe).}:
+            {.cast(raises: [CatchableError]).}:
+              await sink(decoded)     # native body type -> moved in, no copy
     let wasReset = h2.streamReset(sid)
     let tooLarge = h2.streamTooLarge(sid)
     let unprocessed = h2.streamUnprocessed(sid)
@@ -366,26 +341,13 @@ template h2DrainBody*(transport, h2, sid, sink, decompress, cap: typed) =
   ## `h2Stream`. Drops the stream when done. `sink` must be non-nil (pull path).
   mixin await, sendAll, recvSome, BodySink
   block:
-    var dec: StreamDecoder = nil
-    var decReady = false
-    var seen = 0
+    var cd = initCappedDecoder(decompress, cap)
     template deliver() =
-      let raw = h2.takeBody(sid)
-      if raw.len > 0:
-        if not decReady:
-          dec = if decompress: newStreamDecoder(h2.respHeader(sid, "content-encoding"))
-                else: nil
-          decReady = true
-        let decoded =
-          if dec != nil: dec.update(raw.toOpenArrayByte(0, raw.high)) else: raw
-        if decoded.len > 0:
-          seen += decoded.len
-          if cap > 0 and seen > cap:
-            raise newException(ResponseTooLargeError,
-              "navi: response exceeded maxResponseBytes")
-          {.cast(gcsafe).}:
-            {.cast(raises: [CatchableError]).}:
-              await sink(decoded)     # native body type -> moved in, no copy
+      let decoded = cd.feed(h2.takeBody(sid), h2.respHeader(sid, "content-encoding"))
+      if decoded.len > 0:
+        {.cast(gcsafe).}:
+          {.cast(raises: [CatchableError]).}:
+            await sink(decoded)     # native body type -> moved in, no copy
     deliver()                         # body read alongside the headers
     while not h2.streamDone(sid):
       let chunk = await recvSome(transport)
