@@ -8,6 +8,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$root/tests/interop/_win.sh"   # navi_certgen / navi_subj / navi_rmtree
 proto="${1:?usage: streaming.sh <http1|http2> <upload|download>}"
 dir="${2:?usage: streaming.sh <http1|http2> <upload|download>}"
 command -v openssl >/dev/null || { echo "openssl required"; exit 127; }
@@ -20,9 +21,7 @@ head -c 3145728 /dev/urandom > "$work/payload.bin"   # 3 MiB, > the h2 flow-cont
 
 if [ "$proto" = "http2" ]; then
   command -v nghttpd >/dev/null || { echo "nghttpd required (nghttp2-server)"; exit 127; }
-  openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-    -keyout "$work/key.pem" -out "$work/cert.pem" -subj "/CN=127.0.0.1" \
-    -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" >/dev/null 2>&1
+  navi_certgen "$work/key.pem" "$work/cert.pem" 127.0.0.1 "IP:127.0.0.1,DNS:localhost"
   mkdir -p "$work/htdocs"; cp "$work/payload.bin" "$work/htdocs/download"
   port=9443
   nghttpd -m 2 -d "$work/htdocs" --echo-upload "$port" \

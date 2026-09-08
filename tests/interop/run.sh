@@ -8,6 +8,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$root/tests/interop/_win.sh"   # navi_certgen / navi_subj / navi_rmtree
 port="${NGHTTPD_PORT:-18443}"
 padded_port="${NGHTTPD_PADDED_PORT:-18444}"
 
@@ -36,9 +37,7 @@ wait_ready() {
 }
 
 # self-signed cert for localhost (also exercises navi's caFile verification)
-openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-  -keyout "$work/key.pem" -out "$work/cert.pem" \
-  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" >/dev/null 2>&1
+navi_certgen "$work/key.pem" "$work/cert.pem" localhost "DNS:localhost"
 
 mkdir -p "$work/htdocs"
 printf 'hello from nghttpd\n' > "$work/htdocs/small.txt"

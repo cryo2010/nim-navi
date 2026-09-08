@@ -25,8 +25,7 @@ cd "$work"
 
 port=9457
 
-openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-  -keyout ca.key -out ca.pem -subj "$(navi_subj CN=navi-test-CA)" >/dev/null 2>&1
+navi_certgen ca.key ca.pem navi-test-CA
 
 openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr \
   -subj "$(navi_subj CN=127.0.0.1)" >/dev/null 2>&1

@@ -19,9 +19,7 @@ cleanup() {
 trap cleanup EXIT
 
 p12=9480; p13=9481
-openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-  -keyout "$work/key.pem" -out "$work/cert.pem" -subj "$(navi_subj CN=127.0.0.1)" \
-  -addext "subjectAltName=IP:127.0.0.1" >/dev/null 2>&1
+navi_certgen "$work/key.pem" "$work/cert.pem" 127.0.0.1 "IP:127.0.0.1"
 
 # One server offers only the AES256 TLS 1.2 cipher; the other only the AES256
 # TLS 1.3 ciphersuite.

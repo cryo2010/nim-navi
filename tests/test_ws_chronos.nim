@@ -2,168 +2,18 @@
 ## built from the same sans-io core (server frames unmasked).
 
 import unittest
-import std/[net, os, strutils]
+import std/os
 import pkg/chronos
 import navi/chronos
-import navi/proto/ws        # server-side codec helpers
+import navi/proto/ws        # WebSocket message types (WsMessage, wmText, closeNormal, ...)
+import ./support_ws         # shared WebSocket test servers (WsSrv / startWs*)
 
-var wsReady: bool
-var stallReady: bool
-var stallPort: int      # ephemeral port the stall server bound, for the client URL
-var silentReady: bool
-var silentPort: int     # ephemeral port the silent (keepalive) server bound
-
-proc wsStall() {.thread.} =
-  ## Accept the connection and read the upgrade request, but never send the 101
-  ## response, so the client's open blocks until its timeout fires.
-  var server = newSocket(buffered = false)
-  server.setSockOpt(OptReuseAddr, true)
-  server.bindAddr(Port(0), "127.0.0.1")     # ephemeral: no cross-iteration collision
-  server.listen()
-  stallPort = server.getLocalAddr()[1].int
-  stallReady = true
-  var c: Socket
-  server.accept(c)
-  var head = ""
-  try:
-    while "\r\n\r\n" notin head: head.add c.recv(1)
-  except CatchableError: discard
-  os.sleep(2000)   # hold past the client's timeout, then tear down
-  c.close()
-  server.close()
-
-proc wsEcho(port: int) {.thread.} =
-  # Unbuffered so recv returns available bytes instead of blocking for a full
-  # buffer (which deadlocks on small frames).
-  var server = newSocket(buffered = false)
-  server.setSockOpt(OptReuseAddr, true)
-  server.bindAddr(Port(port), "127.0.0.1")
-  server.listen()
-  wsReady = true
-  var c: Socket
-  server.accept(c)
-
-  var head = ""
-  while "\r\n\r\n" notin head: head.add c.recv(1)
-  var key = ""
-  for line in head.splitLines:
-    let i = line.find(':')
-    if i > 0 and cmpIgnoreCase(line[0 ..< i].strip, "sec-websocket-key") == 0:
-      key = line[i + 1 .. ^1].strip
-  c.send("HTTP/1.1 101 Switching Protocols\r\n" &
-         "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
-         "Sec-WebSocket-Accept: " & acceptFor(key) & "\r\n\r\n")
-
-  var dec: WsDecoder
-  var running = true
-  while running:
-    var f: Frame
-    while not dec.next(f):
-      let chunk = c.recv(4096)
-      if chunk.len == 0: running = false; break
-      dec.feed(chunk)
-    if not running: break
-    case f.opcode
-    of opText:
-      if f.payload == "please fragment":
-        c.send(encodeFrame(opText, "frag", masked = false, fin = false))
-        c.send(encodeFrame(opContinuation, "-ment", masked = false, fin = true))
-      elif f.payload == "bye":
-        c.send(encodeFrame(opClose, closePayload(closeNormal), masked = false))
-        running = false
-      else:
-        c.send(encodeFrame(opText, f.payload, masked = false))
-    of opBinary:
-      c.send(encodeFrame(opBinary, f.payload, masked = false))
-    of opPing:
-      c.send(encodeFrame(opPong, f.payload, masked = false))
-    of opClose:
-      running = false
-    else: discard
-  c.close()
-  server.close()
-
-proc wsSilent() {.thread.} =
-  ## Handshake, then never respond (ignore pings), reading and discarding until the
-  ## client gives up -- so a client with keepalive must time out and drop us.
-  var server = newSocket(buffered = false)
-  server.setSockOpt(OptReuseAddr, true)
-  server.bindAddr(Port(0), "127.0.0.1")     # ephemeral: no cross-iteration collision
-  server.listen()
-  silentPort = server.getLocalAddr()[1].int
-  silentReady = true
-  var c: Socket
-  server.accept(c)
-  var head = ""
-  while "\r\n\r\n" notin head: head.add c.recv(1)
-  var key = ""
-  for line in head.splitLines:
-    let i = line.find(':')
-    if i > 0 and cmpIgnoreCase(line[0 ..< i].strip, "sec-websocket-key") == 0:
-      key = line[i + 1 .. ^1].strip
-  c.send("HTTP/1.1 101 Switching Protocols\r\n" &
-         "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
-         "Sec-WebSocket-Accept: " & acceptFor(key) & "\r\n\r\n")
-  try:                                   # an abrupt client close can raise here
-    while c.recv(4096).len > 0: discard  # rather than returning EOF; don't die
-  except CatchableError: discard         # in-thread (trips AddressSanitizer's join)
-  c.close(); server.close()
-
-proc wsStreamEcho(port: int) {.thread.} =
-  ## Reassembles messages and, on "fragment", replies with a 3-fragment message;
-  ## otherwise echoes the whole message as one frame.
-  var server = newSocket(buffered = false)
-  server.setSockOpt(OptReuseAddr, true)
-  server.bindAddr(Port(port), "127.0.0.1")
-  server.listen()
-  wsReady = true
-  var c: Socket
-  server.accept(c)
-  var head = ""
-  while "\r\n\r\n" notin head: head.add c.recv(1)
-  var key = ""
-  for line in head.splitLines:
-    let i = line.find(':')
-    if i > 0 and cmpIgnoreCase(line[0 ..< i].strip, "sec-websocket-key") == 0:
-      key = line[i + 1 .. ^1].strip
-  c.send("HTTP/1.1 101 Switching Protocols\r\n" &
-         "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
-         "Sec-WebSocket-Accept: " & acceptFor(key) & "\r\n\r\n")
-  var dec: WsDecoder
-  var asmb: WsAssembler
-  var running = true
-  while running:
-    var f: Frame
-    while not dec.next(f):
-      let chunk = c.recv(4096)
-      if chunk.len == 0: running = false; break
-      dec.feed(chunk)
-    if not running: break
-    let o = asmb.offer(f)
-    case o.reply
-    of wrPong: c.send(encodeFrame(opPong, o.replyPayload, masked = false))
-    of wrCloseEcho: running = false
-    of wrNone: discard
-    if o.ready:
-      case o.message.kind
-      of wmText:
-        if o.message.data == "fragment":
-          c.send(encodeFrame(opText, "one", masked = false, fin = false))
-          c.send(encodeFrame(opContinuation, "-two", masked = false, fin = false))
-          c.send(encodeFrame(opContinuation, "-three", masked = false, fin = true))
-        else:
-          c.send(encodeFrame(opText, o.message.data, masked = false))
-      of wmBinary: c.send(encodeFrame(opBinary, o.message.data, masked = false))
-      of wmClose: running = false
-  c.close(); server.close()
 
 suite "chronos websocket client end to end":
   test "the WebSocket client should handshake, echo text and binary, reassemble fragments, and close":
-    const port = 9243
-    wsReady = false   # reset so a looped run waits for THIS server, not a stale flag
-    var th: Thread[int]
-    createThread(th, wsEcho, port)
-    while not wsReady: os.sleep(5)
+    var th: Thread[WsSrv]
+    var port: int
+    startWsEcho(th, port)
 
     # Checks live in the sync body: chronos's strict exception tracking rejects
     # unittest's `check` (which can raise) inside an {.async.} proc.
@@ -189,10 +39,9 @@ suite "chronos websocket client end to end":
     check m[3].kind == wmClose and m[3].closeCode == closeNormal
 
   test "the WebSocket client should time out on open when the server never completes the handshake":
-    stallReady = false   # reset so a looped run waits for THIS server, not a stale flag
-    var th: Thread[void]
-    createThread(th, wsStall)
-    while not stallReady: os.sleep(5)
+    var th: Thread[WsSrv]
+    var stallPort: int
+    startWsStall(th, stallPort)
 
     proc run(): Future[string] {.async.} =
       var cfg = initNaviConfig()
@@ -211,10 +60,9 @@ suite "chronos websocket client end to end":
     check outcome == "timeout"
 
   test "keepalive should time out when the peer never responds":
-    silentReady = false
-    var th: Thread[void]
-    createThread(th, wsSilent)
-    while not silentReady: os.sleep(5)
+    var th: Thread[WsSrv]
+    var silentPort: int
+    startWsSilent(th, silentPort)
 
     proc run(): Future[string] {.async.} =
       let api = newNavi()
@@ -231,11 +79,9 @@ suite "chronos websocket client end to end":
     check outcome == "timeout"
 
   test "stream()/stream(writer) should read and write a message as fragments":
-    const port = 9252
-    wsReady = false
-    var th: Thread[int]
-    createThread(th, wsStreamEcho, port)
-    while not wsReady: os.sleep(5)
+    var th: Thread[WsSrv]
+    var port: int
+    startWsStreamEcho(th, port)
 
     proc run(): Future[tuple[chunks: seq[string], echoed: string]] {.async.} =
       let api = newNavi()

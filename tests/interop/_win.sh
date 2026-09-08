@@ -54,3 +54,8 @@ navi_rmtree() {
   fi
   return 0
 }
+
+# Shared TLS helpers (navi_certgen / navi_wait_tls). Sourced here so every script
+# that already sources _win.sh picks them up without a second source line. Placed
+# last, after navi_subj is defined (the helpers call it at runtime).
+. "$(dirname "${BASH_SOURCE[0]}")/_tls.sh"

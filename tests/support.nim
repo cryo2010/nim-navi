@@ -534,3 +534,4 @@ proc startCache*(th: var Thread[CacheSrv], c: var CacheSrv) =
   c.ready = addr ready
   createThread(th, serveCache, c)
   while not ready: sleep(5)
+

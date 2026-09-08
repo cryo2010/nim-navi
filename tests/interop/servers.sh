@@ -6,6 +6,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$root/tests/interop/_win.sh"   # navi_certgen / navi_subj / navi_rmtree
 here="$root/tests/interop/servers"
 compose="docker compose -f $here/docker-compose.yml"
 
@@ -21,10 +22,8 @@ trap cleanup EXIT
 
 # Self-signed cert. DNS:127.0.0.1 (not just the IP SAN) so chronos's BearSSL,
 # which matches the connect host against dNSName SANs, accepts the loopback IP.
-openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-  -keyout "$NAVI_CERTDIR/key.pem" -out "$NAVI_CERTDIR/cert.pem" \
-  -subj "/CN=localhost" \
-  -addext "subjectAltName=DNS:localhost,DNS:127.0.0.1,IP:127.0.0.1" >/dev/null 2>&1
+navi_certgen "$NAVI_CERTDIR/key.pem" "$NAVI_CERTDIR/cert.pem" localhost \
+  "DNS:localhost,DNS:127.0.0.1,IP:127.0.0.1"
 # openssl writes the key 0600. Over a Linux bind mount that preserves host perms,
 # h2o (which runs as an unprivileged container user) then can't read it. This is a
 # throwaway 1-day self-signed key, so make it world-readable.
