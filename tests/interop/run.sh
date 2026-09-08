@@ -8,6 +8,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$root/tests/interop/_win.sh"   # navi_certgen / navi_subj / navi_rmtree
 port="${NGHTTPD_PORT:-18443}"
 padded_port="${NGHTTPD_PADDED_PORT:-18444}"
 

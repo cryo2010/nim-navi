@@ -6,6 +6,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$root/tests/interop/_win.sh"   # navi_certgen / navi_subj / navi_rmtree
 here="$root/tests/interop/httpbin"
 compose="docker compose -f $here/docker-compose.yml"
 

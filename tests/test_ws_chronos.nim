@@ -6,7 +6,7 @@ import std/os
 import pkg/chronos
 import navi/chronos
 import navi/proto/ws        # WebSocket message types (WsMessage, wmText, closeNormal, ...)
-import ./support            # shared WebSocket test servers (WsSrv / startWs*)
+import ./support_ws         # shared WebSocket test servers (WsSrv / startWs*)
 
 
 suite "chronos websocket client end to end":

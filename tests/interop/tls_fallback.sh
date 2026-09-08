@@ -6,6 +6,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$root/tests/interop/_win.sh"   # navi_certgen / navi_subj / navi_rmtree
 command -v openssl >/dev/null || { echo "openssl required"; exit 127; }
 command -v python3 >/dev/null || { echo "python3 required"; exit 127; }
 

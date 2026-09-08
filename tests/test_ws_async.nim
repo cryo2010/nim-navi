@@ -6,7 +6,7 @@ import std/os
 import navi/asyncdispatch
 import navi/proto/ws        # WebSocket message types (wmText, closeNormal, ...)
 import navi/core/response   # navi's TimeoutError (qualified; std/net has one too)
-import ./support            # shared WebSocket test servers (WsSrv / startWs*)
+import ./support_ws         # shared WebSocket test servers (WsSrv / startWs*)
 
 suite "async websocket client end to end":
   test "the WebSocket client should handshake, echo text and binary, reassemble fragments, and close":

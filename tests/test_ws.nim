@@ -3,7 +3,8 @@
 import unittest
 import std/[base64, strutils]
 import navi/proto/ws
-import ./support   # hexToBytes
+import ./support      # hexToBytes
+import ./support_ws   # shared WebSocket test servers (WsSrv / startWs*)
 
 suite "websocket handshake":
   test "the handshake should compute the accept key from the client key (RFC 6455 1.3)":

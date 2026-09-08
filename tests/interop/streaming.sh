@@ -8,6 +8,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
+. "$root/tests/interop/_win.sh"   # navi_certgen / navi_subj / navi_rmtree
 proto="${1:?usage: streaming.sh <http1|http2> <upload|download>}"
 dir="${2:?usage: streaming.sh <http1|http2> <upload|download>}"
 command -v openssl >/dev/null || { echo "openssl required"; exit 127; }
