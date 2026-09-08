@@ -118,7 +118,7 @@ when defined(ssl):
 
   proc sslRead(c: Conn): Future[string] {.async.} =
     ## One chunk of up to `naviReadBufSize` bytes; "" means the peer closed.
-    result = newString(naviReadBufSize)
+    result = newStringUninit(naviReadBufSize)   # overwritten by SSL_read then setLen: no zero-fill
     while true:
       # If `close` ran while we were parked on waitRead, the SSL is already freed.
       # Raise rather than reading through the dangling pointer (a UAF crash) -- and

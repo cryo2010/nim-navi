@@ -43,8 +43,16 @@ proc serializeRequest*(req: Request): string =
 const chunkTerminator* = "0\r\n\r\n"
 
 proc encodeChunk*(data: string): string =
-  ## One HTTP/1.1 chunked-transfer frame. `data` must be non-empty.
-  fmt"{data.len:X}" & "\r\n" & data & "\r\n"
+  ## One HTTP/1.1 chunked-transfer frame: `<hex-size>\r\n<data>\r\n`. `data` must be
+  ## non-empty. Built into a single preallocated buffer (the payload is copied once)
+  ## rather than chained `&` temporaries, since this runs per chunk of a streamed
+  ## upload.
+  let hex = fmt"{data.len:X}"
+  result = newStringOfCap(hex.len + data.len + 4)
+  result.add hex
+  result.add "\r\n"
+  result.add data
+  result.add "\r\n"
 
 proc finalChunk*(req: Request): string =
   ## The terminating zero-length chunk plus any request trailer fields (RFC 9110
@@ -64,6 +72,10 @@ type
   H1Parser* = object
     state: H1State
     buf: string
+    pos: int                ## read cursor into `buf`: bytes consumed but not yet
+                            ## dropped. Consuming advances `pos`; `feed` compacts the
+                            ## consumed prefix in one shift (like h2's FrameDecoder),
+                            ## avoiding an O(lines x bodyBytes) front-`delete` memmove.
     bodyMode: H1BodyMode
     remaining: int          ## bytes left in current length-delimited span
     status: int
@@ -110,10 +122,11 @@ proc headersReady*(p: H1Parser): bool {.inline.} =
 
 proc takeLine(p: var H1Parser, line: var string): bool =
   ## Pop one CRLF-terminated line from the buffer, if a full line is present.
-  let idx = p.buf.find("\r\n")
+  ## Scans from the read cursor; consuming only advances `pos` (no memmove).
+  let idx = p.buf.find("\r\n", start = p.pos)
   if idx < 0: return false
-  line = p.buf[0 ..< idx]
-  p.buf.delete(0 .. idx + 1)
+  line = p.buf[p.pos ..< idx]
+  p.pos = idx + 2
   true
 
 proc parseStatusLine(p: var H1Parser, line: string) =
@@ -185,19 +198,20 @@ proc step(p: var H1Parser): bool =
         p.headers.add(line[0 ..< colon].strip(), line[colon + 1 .. ^1].strip())
     true
   of stBody:
+    let avail = p.buf.len - p.pos
     case p.bodyMode
     of bmLength:
-      let take = min(p.remaining, p.buf.len)
+      let take = min(p.remaining, avail)
       if take == 0: return false
-      p.emitBody(p.buf[0 ..< take])
-      p.buf.delete(0 ..< take)
+      p.emitBody(p.buf[p.pos ..< p.pos + take])
+      p.pos += take
       dec p.remaining, take
       if p.remaining == 0: p.state = stDone
       true
     of bmUntilClose:
-      if p.buf.len == 0: return false
-      p.emitBody(p.buf)
-      p.buf.setLen(0)
+      if avail == 0: return false
+      p.emitBody(p.buf[p.pos ..< p.buf.len])
+      p.pos = p.buf.len
       false # need EOF to terminate; drained for now
     else: false
   of stChunkSize:
@@ -214,14 +228,14 @@ proc step(p: var H1Parser): bool =
     p.state = if p.remaining == 0: stTrailers else: stChunkData
     true
   of stChunkData:
-    if p.buf.len < p.remaining + 2: return false # need data + trailing CRLF
+    if p.buf.len - p.pos < p.remaining + 2: return false # need data + trailing CRLF
     # RFC 9112 7.1: chunk-data is terminated by CRLF. Verify it instead of blindly
     # consuming two bytes -- a missing CRLF is a framing desync that would otherwise
     # deliver a corrupted body and could leave the pooled connection poisoned.
-    if p.buf[p.remaining] != '\r' or p.buf[p.remaining + 1] != '\n':
+    if p.buf[p.pos + p.remaining] != '\r' or p.buf[p.pos + p.remaining + 1] != '\n':
       raise newException(ValueError, "h1: chunk data not terminated by CRLF")
-    p.emitBody(p.buf[0 ..< p.remaining])
-    p.buf.delete(0 ..< p.remaining + 2)
+    p.emitBody(p.buf[p.pos ..< p.pos + p.remaining])
+    p.pos += p.remaining + 2
     p.state = stChunkSize
     true
   of stTrailers:
@@ -239,6 +253,10 @@ proc step(p: var H1Parser): bool =
 
 proc feed*(p: var H1Parser, data: openArray[char]) =
   ## Supply received bytes and drive the state machine as far as it can go.
+  if p.pos > 0:                          # drop the consumed prefix in one shift
+    if p.pos >= p.buf.len: p.buf.setLen(0)
+    else: p.buf = p.buf[p.pos .. ^1]
+    p.pos = 0
   if data.len > 0:
     let start = p.buf.len
     p.buf.setLen(start + data.len)

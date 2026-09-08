@@ -49,6 +49,8 @@ proc inflate(strm: ptr ZStream, flush: cint): cint
   {.cdecl, importc: "inflate", dynlib: zlibDll.}
 proc inflateEnd(strm: ptr ZStream): cint
   {.cdecl, importc: "inflateEnd", dynlib: zlibDll.}
+proc inflateReset(strm: ptr ZStream): cint
+  {.cdecl, importc: "inflateReset", dynlib: zlibDll.}
 
 proc checkDecompressLimit(produced, limit: int) =
   ## Abort a buffered decode the moment its output passes `maxResponseBytes`
@@ -57,6 +59,13 @@ proc checkDecompressLimit(produced, limit: int) =
   if limit > 0 and produced > limit:
     raise newException(ResponseTooLargeError,
       "navi: decompressed response exceeds maxResponseBytes (" & $limit & ")")
+
+proc addBytes(dst: var string, src: string, n: int) {.inline.} =
+  ## Append the first `n` bytes of `src` to `dst` in place, no intermediate slice.
+  if n <= 0: return
+  let old = dst.len
+  dst.setLen(old + n)
+  copyMem(addr dst[old], unsafeAddr src[0], n)
 
 proc inflateBytes(src: string, windowBits: cint, limit: int): string =
   if src.len == 0: return ""
@@ -76,9 +85,17 @@ proc inflateBytes(src: string, windowBits: cint, limit: int): string =
       raise newException(ValueError, "navi: malformed compressed body")
     let produced = chunk.len - int(strm.availOut)
     if produced > 0:
-      result.add chunk[0 ..< produced]
+      result.addBytes(chunk, produced)
       checkDecompressLimit(result.len, limit)
-    if ret == zStreamEnd: break
+    if ret == zStreamEnd:
+      # A gzip body may be several concatenated members (RFC 1952); zlib returns
+      # Z_STREAM_END at each boundary. If input remains, reset and decode the next
+      # member instead of stopping at the first (curl/Go do the same). Trailing
+      # bytes that are not a valid member then surface as a malformed body.
+      if strm.availIn == 0: break
+      if inflateReset(addr strm) != zOk:
+        raise newException(ValueError, "navi: zlib inflateReset failed")
+      continue
     if strm.availIn == 0 and produced == 0: break  # truncated: stop, no progress
 
 # --- brotli (libbrotlidec), streaming decode ---
@@ -158,7 +175,7 @@ proc decodeBrotli(src: string, limit: int): string =
     let r = brotliStream(s, availIn, nextIn, availOut, nextOut, nil)
     let produced = chunk.len - int(availOut)
     if produced > 0:
-      result.add chunk[0 ..< produced]
+      result.addBytes(chunk, produced)
       checkDecompressLimit(result.len, limit)
     if r == brSuccess: break
     if r == brNeedOutput: continue        # buffer full, keep draining
@@ -224,7 +241,7 @@ proc decodeZstd(src: string, limit: int): string =
     if zstdIsError(r) != 0:
       raise newException(ValueError, "navi: malformed zstd body")
     if output.pos > 0:
-      result.add chunk[0 ..< int(output.pos)]
+      result.addBytes(chunk, int(output.pos))
       checkDecompressLimit(result.len, limit)
     if r == 0 and input.pos >= input.size: break          # all frames decoded
     if output.pos == 0 and input.pos >= input.size: break  # truncated, no progress
@@ -248,13 +265,6 @@ type
   StreamDecoder* = ref StreamDecoderObj
 
 const decodeScratchSize = 16384
-
-proc addBytes(dst: var string, src: string, n: int) {.inline.} =
-  ## Append the first `n` bytes of `src` to `dst` in place, no intermediate slice.
-  if n <= 0: return
-  let old = dst.len
-  dst.setLen(old + n)
-  copyMem(addr dst[old], unsafeAddr src[0], n)
 
 proc `=destroy`(d: var StreamDecoderObj) =
   # A custom `=destroy` suppresses the compiler's field destruction, so the managed
@@ -283,7 +293,15 @@ proc updateZlib(d: StreamDecoder, input: openArray[byte]): string =
     if ret != zOk and ret != zStreamEnd:
       raise newException(ValueError, "navi: malformed compressed body")
     result.addBytes(d.scratch, d.scratch.len - int(d.zs.availOut))
-    if ret == zStreamEnd: d.done = true; break
+    if ret == zStreamEnd:
+      # Multi-member gzip (RFC 1952): reset and decode any following member rather
+      # than latching `done`. A member can end exactly on a chunk boundary
+      # (availIn == 0); the next member (if any) then arrives in a later chunk and
+      # the reset state decodes it, instead of being silently truncated.
+      if inflateReset(addr d.zs) != zOk:
+        raise newException(ValueError, "navi: zlib inflateReset failed")
+      if d.zs.availIn == 0: break
+      continue
     if d.zs.availIn == 0: break                # all of this chunk consumed
 
 proc updateBrotli(d: StreamDecoder, input: openArray[byte]): string =
