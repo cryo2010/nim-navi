@@ -84,6 +84,35 @@ suite "cookie domain and path matching (RFC 6265)":
     let jar = stored("a=1; Expires=Sun Nov  6 08:49:37 1994", "http://x.test/")
     check jar.replayed("http://x.test/") == ""
 
+suite "cookie rejection must not evict a stored cookie (#239)":
+  # RFC 6265 5.3: a Set-Cookie that must be wholly ignored (a Domain the request
+  # host is not within, or a name-prefix violation) must leave the store untouched.
+  # A delete (Max-Age<=0 / past Expires), by contrast, correctly evicts.
+  proc jarWith(setCookie, fromUrl: string): CookieJar =
+    result = stored("session=good", fromUrl)   # seed a stored cookie
+    storeCookies(result, parseUrl(fromUrl), setCookieResp(setCookie))
+
+  test "a Set-Cookie with an unrelated Domain must not evict the stored cookie":
+    let jar = jarWith("session=x; Domain=other.test", "http://x.test/")
+    check jar.replayed("http://x.test/") == "session=good"   # not logged out
+
+  test "a __Host- prefix violation must not evict the matching stored cookie":
+    # Seed a valid __Host- cookie, then send a __Host- cookie of the same name that
+    # carries a Domain (a prefix violation -> reject). It matches the stored cookie
+    # by (name, domain, path), so the old pre-check eviction would drop it.
+    let jar = stored("__Host-a=good; Secure; Path=/", "https://x.test/")
+    storeCookies(jar, parseUrl("https://x.test/"),
+                 setCookieResp("__Host-a=x; Secure; Path=/; Domain=x.test"))
+    check jar.replayed("https://x.test/") == "__Host-a=good"
+
+  test "a Max-Age<=0 delete for the same cookie still evicts it":
+    let jar = jarWith("session=x; Max-Age=0", "http://x.test/")
+    check jar.replayed("http://x.test/") == ""             # expiry deletes as before
+
+  test "a valid replacement still overwrites the stored cookie":
+    let jar = jarWith("session=new; Max-Age=3600", "http://x.test/")
+    check jar.replayed("http://x.test/") == "session=new"
+
 suite "cookie replay ordering (RFC 6265 5.4)":
   test "cookies with longer paths should be sent before shorter ones":
     # Store shortest-path first so insertion order is the opposite of the wanted

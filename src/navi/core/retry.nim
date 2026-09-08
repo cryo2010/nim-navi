@@ -23,7 +23,15 @@ proc retryAfterMs(resp: Response): int =
   ## 07:28:00 GMT"), per RFC 9110; a past date clamps to 0.
   let raw = resp.headers.get("retry-after").strip
   if raw.len == 0: return -1
-  try: return parseInt(raw) * 1000
+  try:
+    let secs = parseInt(raw)
+    if secs < 0: return -1            # a negative delta-seconds is malformed
+    # Clamp before multiplying: a value that parses as int64 but overflows the
+    # `* 1000` (anything above ~9.2e15) would raise OverflowDefect -- not a
+    # CatchableError, so it would escape every handler and crash the process
+    # (a remotely triggerable crash from one header). The min(cap, ...) bound in
+    # backoffMs then clamps the (still large) result to the policy's maxDelay.
+    return min(secs, high(int) div 1000) * 1000
   except ValueError: discard
   try:
     let at = parse(raw, "ddd, dd MMM yyyy HH:mm:ss 'GMT'", utc())

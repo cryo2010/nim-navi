@@ -17,6 +17,12 @@ type
     secure: bool
     hostOnly: bool           ## no Domain attribute: match the exact host only
     expires: Option[Time]    ## absolute expiry; none means a session cookie
+  SetCookieVerdict = enum
+    ## What to do with a parsed Set-Cookie. `scStore` replaces/adds the cookie;
+    ## `scDelete` evicts a matching stored cookie (Max-Age<=0 / past Expires);
+    ## `scReject` leaves the store untouched (RFC 6265 5.3: a Domain the request
+    ## host is not within, or a `__Host-`/`__Secure-` prefix violation).
+    scStore, scDelete, scReject
   CookieJar* = ref object
     cookies: seq[Cookie]
 
@@ -68,11 +74,11 @@ proc prefixAllows(c: Cookie, secureContext: bool): bool =
     return secureContext and c.secure
   true
 
-proc parseSetCookie(line, host, reqPath: string, secureContext: bool): (Cookie, bool) =
-  ## Parse one Set-Cookie. Returns (cookie, discard?) where discard is set when
-  ## the cookie is already expired, its Domain attribute is not one the request
-  ## host is within, or it violates its `__Host-`/`__Secure-` name prefix (so it
-  ## must not be stored).
+proc parseSetCookie(line, host, reqPath: string, secureContext: bool): (Cookie, SetCookieVerdict) =
+  ## Parse one Set-Cookie. Returns (cookie, verdict): `scReject` when the cookie
+  ## must be wholly ignored (its Domain attribute is not one the request host is
+  ## within, or a `__Host-`/`__Secure-` prefix violation), `scDelete` when it is
+  ## already expired (so a matching stored cookie is evicted), else `scStore`.
   var c = Cookie(hostOnly: true, domain: host.toLowerAscii,
                  path: defaultPath(reqPath))
   var maxAge = none(int)
@@ -93,7 +99,8 @@ proc parseSetCookie(line, host, reqPath: string, secureContext: bool): (Cookie, 
         if d.len > 0:
           # RFC 6265 5.3.5-6: a server may only scope a cookie to a domain the
           # request host is within; reject otherwise. (No public-suffix check.)
-          if not domainMatches(host, d): return (c, true)
+          # Rejected, not deleted: the store must be left untouched.
+          if not domainMatches(host, d): return (c, scReject)
           c.domain = d
           c.hostOnly = false
       of "path": (if val.startsWith("/"): c.path = val)
@@ -106,15 +113,17 @@ proc parseSetCookie(line, host, reqPath: string, secureContext: bool): (Cookie, 
     inc i
   # Max-Age takes precedence over Expires when both are present.
   let now = getTime()
-  var discardIt = false
+  var verdict = scStore
   if maxAge.isSome:
-    if maxAge.get <= 0: discardIt = true
+    if maxAge.get <= 0: verdict = scDelete
     else: c.expires = some(now + initDuration(seconds = maxAge.get))
   elif expiresAt.isSome:
-    if expiresAt.get <= now: discardIt = true
+    if expiresAt.get <= now: verdict = scDelete
     else: c.expires = expiresAt
-  if not prefixAllows(c, secureContext): discardIt = true
-  (c, discardIt)
+  # A prefix violation is a rejection (ignore entirely), which takes precedence
+  # over a delete: such a Set-Cookie must never touch the store.
+  if not prefixAllows(c, secureContext): verdict = scReject
+  (c, verdict)
 
 proc live(c: Cookie, now: Time): bool =
   c.expires.isNone or c.expires.get > now
@@ -126,11 +135,14 @@ proc matchesHost(c: Cookie, host: string): bool =
 proc storeCookies*(jar: CookieJar, url: Url, resp: Response) =
   for (name, value) in resp.headers.pairs:
     if cmpIgnoreCase(name, "set-cookie") != 0: continue
-    let (c, discardIt) = parseSetCookie(value, url.host, url.path, url.isTls)
+    let (c, verdict) = parseSetCookie(value, url.host, url.path, url.isTls)
     if c.name.len == 0: continue   # a nameless cookie is ignored
+    if verdict == scReject: continue   # RFC 6265 5.3: ignore, leave the store as is
+    # Evict any matching stored cookie for both the store (replace) and delete
+    # (expired) cases; a rejection above never reaches here.
     jar.cookies.keepItIf(not (it.name == c.name and it.domain == c.domain and
                               it.path == c.path))
-    if not discardIt:
+    if verdict == scStore:
       jar.cookies.add c
 
 proc applyCookies*(jar: CookieJar, req: var Request) =

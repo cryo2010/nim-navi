@@ -540,6 +540,7 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
   ## and middleware is not applied. Redirect/digest hops are closed. Consume the
   ## returned handle with `each`/`drain`, or `close` it to skip the body.
   var rreq = buildRequest(client.config, verb, target, headers, params = params)
+  let digestOrigin = originKey(rreq.url)   # digest creds only for this origin
   var hops = 0
   let limit = client.config.redirectLimit
   while true:
@@ -576,7 +577,12 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
             except Exception: discard)
       else: discard
     storeCookies(client.jar, rreq.url, handle.resp)
+    # Origin check keeps digest credentials from being answered to a cross-origin
+    # redirect target (redirectRequest strips Authorization on a cross-origin hop,
+    # so without it the "no authorization header" test would pass and digest would
+    # bypass that protection); mirrors the buffered path's maybeDigest.
     if handle.status == 401 and client.config.auth.kind == akDigest and
+       originKey(rreq.url) == digestOrigin and
        not rreq.headers.contains("authorization"):
       let chal = bestChallenge(handle.headers.getAll("www-authenticate"))
       if chal.isSome:
