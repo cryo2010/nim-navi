@@ -59,9 +59,12 @@ type
     sawSettings: bool            ## the peer's initial (non-ACK) SETTINGS has been processed
     contHeaderStream: uint32     ## while non-zero, a header block is open on this stream and
                                  ## only a CONTINUATION on it may follow (RFC 9113 6.10)
+    discardHdr: string           ## header-block fragment being assembled for a reset/unknown
+                                 ## stream, decoded-then-discarded to keep HPACK in sync
     fatal: string                ## non-empty once a connection error tore the conn down
     goneAway*: bool
     goAwayLastId: uint32
+    goAwayErr: uint32            ## GOAWAY error code; NO_ERROR is a graceful shutdown
     connSendWindow: int          ## connection-level send window (shared by streams)
     connRecvPending: int         ## received bytes not yet acked at the connection level
     peerInitialWindow: int       ## peer's SETTINGS_INITIAL_WINDOW_SIZE
@@ -234,15 +237,21 @@ proc replenishConn(c: H2Conn, n: int, outbuf: var string) =
     outbuf.add encodeWindowUpdate(0, uint32(c.connRecvPending))
     c.connRecvPending = 0
 
+proc replenishStream(c: H2Conn, sid: uint32, s: Stream, n: int, outbuf: var string) =
+  ## Give back STREAM-level receive-window credit for `n` consumed bytes, batched:
+  ## emit a WINDOW_UPDATE only once the unacked total crosses the threshold. The
+  ## connection window is the caller's responsibility.
+  s.recvPending += n
+  if s.recvPending >= streamReplenish:
+    outbuf.add encodeWindowUpdate(sid, uint32(s.recvPending))
+    s.recvPending = 0
+
 proc replenishRecv(c: H2Conn, sid: uint32, s: Stream, n: int, outbuf: var string) =
   ## Give back stream- and connection-level receive-window credit for `n` consumed
   ## bytes on an active stream, batched: emit a WINDOW_UPDATE only once the unacked
   ## total crosses the threshold, so a large download costs a handful of control
   ## frames instead of one per DATA frame.
-  s.recvPending += n
-  if s.recvPending >= streamReplenish:
-    outbuf.add encodeWindowUpdate(sid, uint32(s.recvPending))
-    s.recvPending = 0
+  c.replenishStream(sid, s, n, outbuf)
   c.replenishConn(n, outbuf)
 
 proc applyHeaders(c: H2Conn, s: Stream) =
@@ -368,6 +377,7 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
       return
     c.goneAway = true
     c.goAwayLastId = readU32(f.payload, 0) and 0x7fffffff'u32
+    c.goAwayErr = readU32(f.payload, 4)
   of uint8(ftHeaders), uint8(ftContinuation):
     if f.streamId == 0:                          # RFC 9113 6.2/6.10: never on stream 0
       c.connFail(errProtocolError, "HEADERS/CONTINUATION on stream 0", outbuf); return
@@ -383,19 +393,20 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
     # Open (or close) the header block per END_HEADERS, so the 6.10 gate above knows
     # whether a CONTINUATION must follow -- tracked even for an unknown stream.
     c.contHeaderStream = if (f.flags and flagEndHeaders) != 0: 0'u32 else: f.streamId
+    var frag = f.payload
+    if f.typ == uint8(ftHeaders):
+      # Only HEADERS carries padding / priority; a CONTINUATION is a raw
+      # fragment. Strip the pad byte + trailing padding, then the 5-byte
+      # priority block (stream dependency + weight), so what is left is the
+      # header block fragment HPACK expects. Done for every stream (including a
+      # reset/unknown one) so the fragment fed to HPACK is correct.
+      if (f.flags and flagPadded) != 0 and not c.unpad(f, frag, outbuf): return
+      if (f.flags and flagPriority) != 0:
+        if frag.len < 5:
+          c.connFail(errProtocolError, "HEADERS priority block truncated", outbuf)
+          return
+        frag = frag[5 ..< frag.len]
     if s != nil and not s.reset:
-      var frag = f.payload
-      if f.typ == uint8(ftHeaders):
-        # Only HEADERS carries padding / priority; a CONTINUATION is a raw
-        # fragment. Strip the pad byte + trailing padding, then the 5-byte
-        # priority block (stream dependency + weight), so what is left is the
-        # header block fragment HPACK expects.
-        if (f.flags and flagPadded) != 0 and not c.unpad(f, frag, outbuf): return
-        if (f.flags and flagPriority) != 0:
-          if frag.len < 5:
-            c.connFail(errProtocolError, "HEADERS priority block truncated", outbuf)
-            return
-          frag = frag[5 ..< frag.len]
       s.hdrBuf.add frag
       if s.hdrBuf.len > maxHeaderListBytes:       # CONTINUATION flood (CVE-2024-27316):
         # fail the whole connection, not just the stream. An undecoded header block
@@ -414,6 +425,24 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
           except ValueError as e:
             c.connFail(errCompressionError, e.msg, outbuf)
             return
+    else:
+      # Reset or already-deleted (cancelled / never-opened) stream. HPACK is
+      # stateful: EVERY header block on the connection must still be decoded to
+      # keep the shared dynamic table in sync (RFC 7541), or a later indexed
+      # reference on a reused connection resolves to the wrong pair -- silently
+      # misattributed headers, or a spurious COMPRESSION_ERROR. So decode the
+      # block and discard the result; only delivery is skipped. Buffer across
+      # CONTINUATION frames the same way, decoding on END_HEADERS.
+      c.discardHdr.add frag
+      if c.discardHdr.len > maxHeaderListBytes:    # CONTINUATION flood: GOAWAY, as above
+        c.connFail(errEnhanceYourCalm, "header block exceeds the size cap", outbuf)
+        return
+      if (f.flags and flagEndHeaders) != 0:
+        try: discard c.dec.decode(c.discardHdr)
+        except ValueError as e:
+          c.connFail(errCompressionError, e.msg, outbuf)
+          return
+        c.discardHdr.setLen(0)
   of uint8(ftData):
     if f.streamId == 0:                          # RFC 9113 6.1: DATA is never on stream 0
       c.connFail(errProtocolError, "DATA on stream 0", outbuf); return
@@ -434,8 +463,15 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
       else:
         if f.payload.len > 0:
           if s.sinkMode:
-            # Hold the stream window until the sink consumes (via ackRecv); still
-            # replenish the shared connection window so other streams don't stall.
+            # Hold the stream window for the BODY bytes until the sink consumes
+            # them (via ackRecv); still replenish the shared connection window so
+            # other streams don't stall. The padding overhead (pad length byte +
+            # padding) is debited from the stream window too (RFC 9113 6.9.1) but
+            # is never delivered to the sink, so ackRecv would never return it --
+            # return it to the stream window now, or the window leaks (1 + padLen)
+            # per padded frame and the download eventually stalls at window 0.
+            let padOverhead = f.payload.len - data.len
+            if padOverhead > 0: c.replenishStream(f.streamId, s, padOverhead, outbuf)
             c.replenishConn(f.payload.len, outbuf)
           else:
             c.replenishRecv(f.streamId, s, f.payload.len, outbuf)
@@ -505,7 +541,16 @@ proc connError*(c: H2Conn): string = c.fatal
 
 proc streamDone*(c: H2Conn, streamId: uint32): bool =
   ## True when the stream has ended (or been reset), or the connection is gone.
-  if c.goneAway or c.fatal.len > 0: return true
+  ## A GOAWAY(NO_ERROR) is a graceful shutdown: streams with id <= goAwayLastId
+  ## will still be completed by the peer (RFC 9113 6.8), so they are NOT treated
+  ## as done here -- the driver keeps reading until END_STREAM, or the connection
+  ## actually drops (surfaced as a truncation). Only streams above goAwayLastId,
+  ## or any stream once the GOAWAY carries a non-NO_ERROR code (abrupt teardown),
+  ## are terminal. The unprocessed-check in `streamUnprocessed` uses the same
+  ## boundary. A fatal connection error is always terminal.
+  if c.fatal.len > 0: return true
+  if c.goneAway and (streamId > c.goAwayLastId or c.goAwayErr != errNoError):
+    return true
   let s = c.streams.getOrDefault(streamId)
   s != nil and s.ended
 
@@ -600,10 +645,7 @@ proc ackRecv*(c: H2Conn, streamId: uint32, n: int): string =
   ## are never starved.) Returns the WINDOW_UPDATE bytes to send, if any.
   let s = c.streams.getOrDefault(streamId)
   if s == nil: return
-  s.recvPending += n
-  if s.recvPending >= streamReplenish:
-    result.add encodeWindowUpdate(streamId, uint32(s.recvPending))
-    s.recvPending = 0
+  c.replenishStream(streamId, s, n, result)
 
 proc takeResponse*(c: H2Conn, streamId: uint32): H2Response =
   ## Return the stream's response and drop the stream.

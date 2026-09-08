@@ -542,6 +542,65 @@ suite "h2 gated receive window (sink backpressure)":
     let out1 = c.feedBody(sid, overThreshold)
     check hasStreamWindowUpdate(out1, sid)          # eager: emitted during feed, no ack needed
 
+  test "a sinkMode stream returns padding overhead to the stream window immediately (#241)":
+    # Padded DATA debits the peer's stream window by the WHOLE payload (pad length
+    # byte + padding included, RFC 9113 6.9.1), but ackRecv only ever returns the
+    # body bytes the sink consumes. The padding overhead must be handed back to the
+    # stream window as it arrives -- otherwise it leaks (1 + padLen) per frame and
+    # the advertised window drifts to 0, stalling the download. Here NO ackRecv is
+    # made, so the only credit that can produce a stream WINDOW_UPDATE is the
+    # padding overhead. The pad-length field is a single octet, so padding is capped
+    # at 255 bytes/frame (overhead 256); cross the 4 MiB stream-replenish threshold.
+    let c = newServerConn()
+    let sid = c.openStream()
+    discard c.encodeRequest(sid, head, "")
+    c.respond200(sid)
+    c.setSinkMode(sid)
+    var srv = ""
+    for _ in 0 ..< (4 * 1024 * 1024 div 256 + 64):   # padding overhead > 4 MiB
+      srv.add paddedData(sid, "x", padLen = 255, endStream = false)
+    let toSend = c.feed(srv)
+    check hasStreamWindowUpdate(toSend, sid)          # padding credit returned despite no ack
+
+suite "h2 graceful GOAWAY does not truncate in-flight streams (#240)":
+  # RFC 9113 6.8: on GOAWAY(NO_ERROR) a gracefully shutting-down server still
+  # completes streams with id <= lastStreamId. `streamDone` must not report those
+  # as done just because `goneAway` is set, or the driver stops reading and returns
+  # a truncated body (silent when there is no Content-Length).
+  proc respond(c: H2Conn, id: uint32) =
+    discard c.feed(encodeHeaders(id, HpackEncoder().encode(@[(":status", "200")]),
+                                 endStream = false, endHeaders = true))
+  const goAwayNoErrLast1 = "\x00\x00\x00\x01\x00\x00\x00\x00"   # lastId=1, NO_ERROR
+  const goAwayProtoLast1 = "\x00\x00\x00\x01\x00\x00\x00\x01"   # lastId=1, PROTOCOL_ERROR
+
+  test "a covered stream keeps reading after GOAWAY(NO_ERROR) and finishes intact":
+    let c = newServerConn()
+    let id = c.openStream()                       # id 1 <= lastId 1
+    c.respond(id)
+    discard c.feed(encodeData(id, "part1", endStream = false))
+    discard c.feed(encodeFrame(ftGoAway, 0, 0, goAwayNoErrLast1))
+    check not c.streamDone(id)                    # still in flight: must not truncate
+    discard c.feed(encodeData(id, "part2", endStream = true))
+    check c.streamDone(id)                         # completes normally on END_STREAM
+    check c.takeResponse(id).body == "part1part2"  # full body, nothing dropped
+
+  test "a stream above lastId is terminal (and unprocessed) under GOAWAY(NO_ERROR)":
+    let c = newServerConn()
+    discard c.openStream()                        # id 1
+    let b = c.openStream()                        # id 3 > lastId 1
+    c.respond(b)
+    discard c.feed(encodeFrame(ftGoAway, 0, 0, goAwayNoErrLast1))
+    check c.streamDone(b)
+    check c.streamUnprocessed(b)
+
+  test "a covered stream is terminal under GOAWAY with a non-NO_ERROR code":
+    let c = newServerConn()
+    let id = c.openStream()                       # id 1 <= lastId 1, but abrupt teardown
+    c.respond(id)
+    discard c.feed(encodeData(id, "part", endStream = false))
+    discard c.feed(encodeFrame(ftGoAway, 0, 0, goAwayProtoLast1))
+    check c.streamDone(id)
+
 proc hasGoAway(s: string): bool =
   for f in allFrames(s):
     if f.typ == uint8(ftGoAway): return true
@@ -720,5 +779,37 @@ suite "h2 frame validation (RFC 9113)":
     let id = c.openStream()                 # id=1; nextId becomes 3
     discard c.feed(serverResponse(id, "200", @[], "hi"))
     discard c.takeResponse(id)              # completes and removes the stream
-    discard c.feed(encodeHeaders(id, "x", endStream = true, endHeaders = true))  # id=1 < nextId
+    # A real peer's trailing HEADERS is a valid HPACK block: it is decoded (to keep
+    # the connection-wide dynamic table in sync, #235) and discarded, not skipped.
+    discard c.feed(encodeHeaders(id, (HpackEncoder()).encode(@[("x", "1")]),
+                                 endStream = true, endHeaders = true))  # id=1 < nextId
     check c.connError.len == 0
+
+  test "a late HEADERS block on a completed stream still updates the HPACK table (#235)":
+    # The whole point of #235: a header block on a reset/gone stream must still be
+    # decoded so the shared dynamic table stays in sync. Here the block on the gone
+    # stream adds an entry with incremental indexing; a later block on a live stream
+    # references that entry by its dynamic index (62, the first dynamic slot). If the
+    # gone-stream block were skipped (the bug), the decoder's table would lack the
+    # entry and the index would resolve wrong or raise COMPRESSION_ERROR.
+    #
+    # The stock encoder only emits static-indexed / literal-without-indexing fields,
+    # so we hand-build the raw HPACK: a literal-with-incremental-indexing field
+    # (0x40, new name) and an indexed field (0x80 | index).
+    proc litIncr(name, value: string): string =
+      result = "\x40" & char(name.len) & name & char(value.len) & value
+    proc indexed(idx: int): string = $char(0x80 or idx)
+    let c = newServerConn()
+    let id1 = c.openStream()
+    discard c.feed(serverResponse(id1, "200", @[], "hi"))
+    discard c.takeResponse(id1)             # stream removed (gone); adds nothing to the table
+    # Late block on the gone stream inserts ("x-trace", "abc") at dynamic index 62.
+    discard c.feed(encodeHeaders(id1, litIncr("x-trace", "abc"),
+                                 endStream = true, endHeaders = true))
+    check c.connError.len == 0
+    # New live stream: :status 200 (static index 8) then the dynamic reference (62).
+    let id2 = c.openStream()
+    discard c.feed(encodeHeaders(id2, indexed(8) & indexed(62),
+                                 endStream = true, endHeaders = true))
+    check c.connError.len == 0
+    check c.respHeader(id2, "x-trace") == "abc"

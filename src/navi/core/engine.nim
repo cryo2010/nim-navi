@@ -468,19 +468,28 @@ template poolTransport*(client, req, sink: typed): Response =
                                     client.config.connectMs, client.config.readMs,
                                     client.config.totalMs)
       var npc = PooledConn[typeof(transport)](transport: transport)
-      if transport.protocol == "h2":
-        npc.h2 = initH2Conn(client.config.maxResponseBytes)
-        await sendAll(transport, npc.h2.preamble())
-        resp = h2Stream(transport, npc.h2, rq, sink,
-                        client.config.wantsDecompress, client.config.maxResponseBytes)
-        if not (npc.h2.canReuse and pushIdle(client.pool, key, npc)):
-          await close(transport)
-      else:
-        var keep = false
-        resp = h1Exchange(transport, rq, sink, keep,
+      var keep = false
+      # Guard the exchange so a failure (e.g. h1Exchange raising IOError on a
+      # truncated body, or the h2 preamble/stream raising) closes the just-opened
+      # transport before re-raising, instead of leaking the fd/TLS handle. Without
+      # this, each retry attempt would leak another connection. The pool/close
+      # decision runs once afterwards so a successfully pooled connection is not
+      # double-closed. Mirrors the pooled branch's cleanup.
+      try:
+        if transport.protocol == "h2":
+          npc.h2 = initH2Conn(client.config.maxResponseBytes)
+          await sendAll(transport, npc.h2.preamble())
+          resp = h2Stream(transport, npc.h2, rq, sink,
                           client.config.wantsDecompress, client.config.maxResponseBytes)
-        if not (keep and pushIdle(client.pool, key, npc)):
-          await close(transport)
+          keep = npc.h2.canReuse
+        else:
+          resp = h1Exchange(transport, rq, sink, keep,
+                            client.config.wantsDecompress, client.config.maxResponseBytes)
+      except CatchableError:
+        await close(transport)
+        raise
+      if not (keep and pushIdle(client.pool, key, npc)):
+        await close(transport)
     resp
 
 template run(client, req, sink: typed): Response =
@@ -505,7 +514,12 @@ template maybeDigest(client, rreq, resp, digestOrigin: typed) =
   ## first condition tests). Expands inline so the retry's `await`s run in the
   ## caller's async proc.
   mixin BodySink
+  # A streamed body (`bodyStream`) is never retried: its producer was pulled to
+  # EOF on the first attempt and cannot rewind, so a digest replay would send a
+  # truncated (empty) body. Return the 401 to the caller instead (mirrors the
+  # retry layer's guard and the 307/308 guard in followRedirects).
   if resp.status == 401 and client.config.auth.kind == akDigest and
+     rreq.bodyStream == nil and
      not rreq.headers.contains("authorization") and
      originKey(rreq.url) == digestOrigin:
     let chal = bestChallenge(resp.headers.getAll("www-authenticate"))
@@ -531,6 +545,13 @@ template followRedirects(client, startReq, resp: typed) =
     decodeBody(resp, client.config)
     let location = resp.headers.get("location")
     if limit > 0 and hops < limit and isRedirect(resp.status) and location.len > 0:
+      # 307/308 preserve the method and body (redirect.nim). A streamed body
+      # (`bodyStream`) can't be rewound after the first attempt pulled its
+      # producer, so auto-following would send a truncated body. Return the
+      # redirect response to the caller instead. (301/302/303 rewrite to a
+      # bodyless GET, so they carry no stream to replay.)
+      if rreq.bodyStream != nil and (resp.status == 307 or resp.status == 308):
+        break
       rreq = redirectRequest(rreq, resp.status, location)
       inc hops
     else:

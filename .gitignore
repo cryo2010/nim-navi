@@ -26,6 +26,7 @@ tests/test_ws
 tests/test_request
 tests/test_charset
 tests/test_redirect
+tests/test_retry
 tests/test_trailers
 tests/test_socks
 tests/test_pool

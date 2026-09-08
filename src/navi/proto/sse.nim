@@ -90,11 +90,17 @@ proc processLine(p: var SseParser, line: string) =
 
 proc feed*(p: var SseParser, text: string) =
   ## Feed a chunk of decoded text. Complete events become available via `next`.
-  var s = text
-  if p.atStart and s.len >= 3 and s[0] == '\xEF' and s[1] == '\xBB' and s[2] == '\xBF':
-    s = s[3 .. ^1]                            # strip a single leading UTF-8 BOM
-  p.atStart = false
-  p.buf.add s
+  p.buf.add text
+  if p.atStart:
+    # A leading UTF-8 BOM (EF BB BF) must be stripped, but the first feed may carry
+    # fewer than 3 bytes: wait until enough have accumulated to decide, rather than
+    # clearing `atStart` early and leaving the BOM in the stream (which would break
+    # the first event's field-name match). Nothing is scanned until then anyway --
+    # a 1-2 byte prefix can't complete a line.
+    if p.buf.len < 3: return
+    if p.buf[0] == '\xEF' and p.buf[1] == '\xBB' and p.buf[2] == '\xBF':
+      p.buf = p.buf[3 .. ^1]                  # strip a single leading UTF-8 BOM
+    p.atStart = false
   var i = p.scanned                           # resume; earlier bytes had no terminator
   var lineStart = 0
   while i < p.buf.len:

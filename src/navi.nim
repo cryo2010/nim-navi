@@ -364,6 +364,7 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
   ## their bodies discarded (their connections closed). Consume the returned handle
   ## with `each`/`drain`, or `close` it if you decide not to read the body.
   var rreq = buildRequest(client.config, verb, target, headers, params = params)
+  let digestOrigin = originKey(rreq.url)   # digest creds only for this origin
   var hops = 0
   let limit = client.config.redirectLimit
   while true:
@@ -397,8 +398,13 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
           except Exception: discard)   # best-effort finalizer: never propagate
     storeCookies(client.jar, rreq.url, handle.resp)
     # 401 Digest challenge: re-open with an Authorization header (mirrors the
-    # buffered path's maybeDigest), discarding the challenge body.
+    # buffered path's maybeDigest), discarding the challenge body. The origin
+    # check keeps digest credentials from being answered to a cross-origin
+    # redirect target: redirectRequest strips Authorization on a cross-origin
+    # hop, so without this the "no authorization header" test would pass and
+    # digest would bypass that protection.
     if handle.status == 401 and client.config.auth.kind == akDigest and
+       originKey(rreq.url) == digestOrigin and
        not rreq.headers.contains("authorization"):
       let chal = bestChallenge(handle.headers.getAll("www-authenticate"))
       if chal.isSome:
