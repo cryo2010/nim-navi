@@ -24,9 +24,7 @@ port=9466
 badip="127.0.0.2"
 python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.2",0)); s.close()' 2>/dev/null || badip="::1"
 
-openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-  -keyout "$work/key.pem" -out "$work/cert.pem" -subj "/CN=127.0.0.1" \
-  -addext "subjectAltName=DNS:127.0.0.1,IP:127.0.0.1" >/dev/null 2>&1
+navi_certgen "$work/key.pem" "$work/cert.pem" 127.0.0.1 "DNS:127.0.0.1,IP:127.0.0.1"
 
 # Good TLS server on 127.0.0.1: completes the handshake and answers 200.
 python3 - "$work/cert.pem" "$work/key.pem" "$port" >/dev/null 2>&1 <<'PY' &

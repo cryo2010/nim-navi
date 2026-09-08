@@ -19,9 +19,7 @@ cleanup() {
 trap cleanup EXIT
 
 p12=9470; p13=9471
-openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-  -keyout "$work/key.pem" -out "$work/cert.pem" -subj "$(navi_subj CN=127.0.0.1)" \
-  -addext "subjectAltName=IP:127.0.0.1" >/dev/null 2>&1
+navi_certgen "$work/key.pem" "$work/cert.pem" 127.0.0.1 "IP:127.0.0.1"
 
 # -www answers a GET with a status page; -tls1_2 / -tls1_3 pin the server version.
 openssl s_server -key "$work/key.pem" -cert "$work/cert.pem" \
@@ -33,14 +31,7 @@ s13=$!
 
 for spec in "$p12:-tls1_2" "$p13:-tls1_3"; do
   port="${spec%%:*}"; ver="${spec##*:}"
-  ready=""
-  for _ in $(seq 1 60); do
-    if echo | openssl s_client -connect "127.0.0.1:$port" "$ver" 2>/dev/null | grep -q "BEGIN CERT"; then
-      ready=1; break
-    fi
-    sleep 0.2
-  done
-  [ -n "$ready" ] || { echo "TLS server not ready on 127.0.0.1:$port"; exit 1; }
+  navi_wait_tls "127.0.0.1:$port" "$ver" || { echo "TLS server not ready on 127.0.0.1:$port"; exit 1; }
 done
 
 export NAVI_TV_PORT12="$p12" NAVI_TV_PORT13="$p13"

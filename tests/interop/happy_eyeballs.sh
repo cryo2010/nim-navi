@@ -15,9 +15,7 @@ trap cleanup EXIT
 
 port=9475
 blackhole=192.0.2.1
-openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-  -keyout "$work/key.pem" -out "$work/cert.pem" -subj "/CN=127.0.0.1" \
-  -addext "subjectAltName=IP:127.0.0.1" >/dev/null 2>&1
+navi_certgen "$work/key.pem" "$work/cert.pem" 127.0.0.1 "IP:127.0.0.1"
 
 openssl s_server -key "$work/key.pem" -cert "$work/cert.pem" \
   -accept "$port" -www -quiet >/dev/null 2>&1 &
