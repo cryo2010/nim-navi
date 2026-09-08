@@ -51,6 +51,26 @@ suite "h1 parse":
                      "3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n")
     check r.body == "abcde"
 
+  test "the h1 parser should decode a multi-chunk body fed one byte at a time":
+    # Stresses the read-cursor + feed compaction (the pos-cursor rewrite): every
+    # feed carries a single byte, so line/chunk boundaries land mid-buffer and the
+    # consumed prefix is compacted repeatedly.
+    let raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" &
+              "5\r\nhello\r\n6\r\n world\r\n1\r\n!\r\n0\r\n\r\n"
+    var p = initH1Parser()
+    for ch in raw:
+      p.feed($ch)
+    check p.finished
+    check p.toResponse().body == "hello world!"
+
+  test "the h1 parser should read a length body split across many feeds":
+    var p = initH1Parser()
+    let head = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n"
+    for ch in head: p.feed($ch)
+    for ch in "0123456789": p.feed($ch)
+    check p.finished
+    check p.toResponse().body == "0123456789"
+
   test "the h1 parser should read a body until connection close when no length is given":
     let r = parseAll("HTTP/1.1 200 OK\r\n\r\nstreamed-to-eof")
     check r.body == "streamed-to-eof"

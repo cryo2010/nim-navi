@@ -35,6 +35,15 @@ suite "incremental decoder across chunk boundaries":
     check newStreamDecoder("identity") == nil
     check newStreamDecoder("") == nil
 
+  test "the incremental decoder should decode a multi-member gzip body (#244)":
+    # RFC 1952 permits several concatenated gzip members; each must be decoded, not
+    # just the first. Fed one byte at a time so a member boundary lands with no
+    # input buffered (the streaming edge case that used to latch `done` early).
+    let member = hexToBytes("1f8b0800000000000003ab56cacf56b22a292a4dad0500905fd4a70b000000")
+    check feedSliced("gzip", member & member, 1) == """{"ok":true}{"ok":true}"""
+    check feedSliced("gzip", member & member & member, 7) ==
+      """{"ok":true}{"ok":true}{"ok":true}"""
+
 suite "stream() decompresses the response body":
   test "stream should deliver a gzip body to the sink decoded":
     const port = 9230
@@ -86,4 +95,21 @@ suite "stacked content-encoding":
     check res.status == 200
     check res.body == """{"ok":true}"""         # both gzip layers undone, in reverse
     check not res.headers.contains("content-encoding")
+    joinThread(th)
+
+suite "multi-member gzip (RFC 1952)":
+  test "a buffered get should decode all concatenated gzip members (#244)":
+    const port = 9233
+    # Two independent gzip members of {"ok":true} concatenated: a valid gzip body
+    # that curl/Go decode whole. The buffered path used to stop after the first.
+    let member = hexToBytes("1f8b0800000000000003ab56cacf56b22a292a4dad0500905fd4a70b000000")
+    let body = member & member
+    let payload = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n" &
+                  "Content-Length: " & $body.len & "\r\nConnection: close\r\n\r\n" & body
+    var th: Thread[ServerCtx]
+    startRaw(th, port, payload)
+
+    let res = newNavi().get("http://127.0.0.1:" & $port & "/")
+    check res.status == 200
+    check res.body == """{"ok":true}{"ok":true}"""
     joinThread(th)

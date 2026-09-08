@@ -150,6 +150,27 @@ proc encodeGoAway*(lastStreamId: uint32, errorCode: uint32): string =
 proc encodeData*(streamId: uint32, data: string, endStream: bool): string =
   encodeFrame(ftData, if endStream: flagEndStream else: 0, streamId, data)
 
+proc encodeDataInto*(outbuf: var string, streamId: uint32, src: string,
+                     off, n: int, endStream: bool) =
+  ## Append a DATA frame for `src[off ..< off + n]` straight into `outbuf`: the
+  ## 9-byte header, then the payload copied once. Avoids the slice + encodeFrame
+  ## concat + `outbuf.add` triple-copy of the payload on the streamed-upload path.
+  let flags = if endStream: flagEndStream else: 0'u8
+  let base = outbuf.len
+  outbuf.setLen(base + 9 + n)
+  outbuf[base]     = char((n shr 16) and 0xff)      # length: u24
+  outbuf[base + 1] = char((n shr 8) and 0xff)
+  outbuf[base + 2] = char(n and 0xff)
+  outbuf[base + 3] = char(uint8(ftData))            # type
+  outbuf[base + 4] = char(flags)                     # flags
+  let sid = streamId and 0x7fffffff'u32              # stream id: u31
+  outbuf[base + 5] = char((sid shr 24) and 0xff)
+  outbuf[base + 6] = char((sid shr 16) and 0xff)
+  outbuf[base + 7] = char((sid shr 8) and 0xff)
+  outbuf[base + 8] = char(sid and 0xff)
+  if n > 0:
+    copyMem(addr outbuf[base + 9], unsafeAddr src[off], n)
+
 proc encodeHeaders*(streamId: uint32, headerBlock: string,
                     endStream, endHeaders: bool): string =
   var flags = 0'u8

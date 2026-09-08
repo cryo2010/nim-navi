@@ -48,7 +48,12 @@ template sendRequest(conn, req: typed) =
       await sendAll(conn, encodeChunk(req.body))
     await sendAll(conn, finalChunk(req))
   else:
-    await sendAll(conn, serializeRequest(req))
+    # Send the head and body separately rather than `serializeHead(req) & req.body`,
+    # which would allocate a whole (head + body)-sized buffer and copy the entire
+    # upload just to prepend a ~200-byte head (repeated on every retry/redirect).
+    await sendAll(conn, serializeHead(req))
+    if req.body.len > 0:
+      await sendAll(conn, req.body)
 
 template h1SendAndReadHeaders*(transport, req, streaming: typed): H1Parser =
   ## Send an HTTP/1.1 request and read up to the end of the response headers,

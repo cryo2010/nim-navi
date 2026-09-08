@@ -158,8 +158,7 @@ proc flushSend(c: H2Conn, streamId: uint32, s: Stream, outbuf: var string) =
     let n = min(min(avail, c.maxFrameSize), s.sendBuf.len - s.sendOff)
     # END_STREAM rides the last DATA frame only when no trailers follow.
     let last = s.sendClosed and s.sendOff + n >= s.sendBuf.len and s.trailers.len == 0
-    outbuf.add encodeData(streamId, s.sendBuf[s.sendOff ..< s.sendOff + n],
-                          endStream = last)
+    encodeDataInto(outbuf, streamId, s.sendBuf, s.sendOff, n, endStream = last)
     s.sendOff += n
     s.sendWindow -= n
     c.connSendWindow -= n

@@ -356,7 +356,7 @@ proc sendAll*(c: Conn, data: string): Future[void] {.async.} =
   await c.writer.write(data)
 
 proc plaintextRead(c: Conn): Future[string] {.async.} =
-  var buf = newString(naviReadBufSize)
+  var buf = newStringUninit(naviReadBufSize)   # overwritten by readOnce then setLen(n): no zero-fill
   var n = 0
   try:
     n = await c.reader.readOnce(addr buf[0], buf.len)
