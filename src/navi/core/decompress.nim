@@ -359,6 +359,38 @@ proc newStreamDecoder*(encoding: string): StreamDecoder =
   else:
     nil
 
+type CappedDecoder* = object
+  ## The decode-and-size-cap dance the engine repeats at every streamed-body read:
+  ## pick the decoder once the content-encoding is known, decode each raw chunk,
+  ## and abort when the decoded total passes the cap. Collapsing it into one type
+  ## keeps the several body-read sites from drifting.
+  dec: StreamDecoder
+  ready: bool            ## the decoder has been chosen (once the headers are in)
+  seen: int             ## decoded bytes so far, for the cap
+  cap: int              ## max decoded bytes; 0 disables
+  decompress: bool      ## whether to build a decoder at all
+
+proc initCappedDecoder*(decompress: bool, cap: int): CappedDecoder =
+  CappedDecoder(decompress: decompress, cap: cap)
+
+proc feed*(cd: var CappedDecoder, raw: string, encoding: string): string =
+  ## Decode one raw body chunk. On the first non-empty chunk the decoder is built
+  ## from `encoding` (read only then). Returns the decoded bytes, or "" when the
+  ## input was empty or the decoder buffered it without output yet. Raises
+  ## ResponseTooLargeError once the decoded total passes the cap.
+  if raw.len == 0: return ""
+  if not cd.ready:
+    cd.dec = if cd.decompress: newStreamDecoder(encoding) else: nil
+    cd.ready = true
+  let decoded =
+    if cd.dec != nil: cd.dec.update(raw.toOpenArrayByte(0, raw.high)) else: raw
+  if decoded.len == 0: return ""
+  cd.seen += decoded.len
+  if cd.cap > 0 and cd.seen > cd.cap:
+    raise newException(ResponseTooLargeError,
+      "navi: response exceeded maxResponseBytes")
+  decoded
+
 proc decodeBody*(resp: var Response, opts: NaviConfigBase) =
   ## Decompress the body in place per Content-Encoding, then drop the headers that
   ## described the encoded form. Handles a stacked encoding (e.g. `gzip, br`) by
