@@ -215,6 +215,11 @@ proc step(p: var H1Parser): bool =
     true
   of stChunkData:
     if p.buf.len < p.remaining + 2: return false # need data + trailing CRLF
+    # RFC 9112 7.1: chunk-data is terminated by CRLF. Verify it instead of blindly
+    # consuming two bytes -- a missing CRLF is a framing desync that would otherwise
+    # deliver a corrupted body and could leave the pooled connection poisoned.
+    if p.buf[p.remaining] != '\r' or p.buf[p.remaining + 1] != '\n':
+      raise newException(ValueError, "h1: chunk data not terminated by CRLF")
     p.emitBody(p.buf[0 ..< p.remaining])
     p.buf.delete(0 ..< p.remaining + 2)
     p.state = stChunkSize

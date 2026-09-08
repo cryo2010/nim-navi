@@ -526,6 +526,17 @@ suite "websocket frame validation (RFC 6455)":
     let o = a.offer(Frame(fin: true, opcode: opClose, payload: closePayload(closeNormal)))
     check o.ready and o.message.closeCode == closeNormal
 
+  test "an empty close frame surfaces as 1005, not 1000 (#244)":
+    # RFC 6455 7.1.5: an absent status code must be reported as 1005 ("no status
+    # received") so an application can distinguish it from an explicit normal
+    # closure (1000). 1005 is never sent on the wire, only surfaced here.
+    var a: WsAssembler
+    let o = a.offer(Frame(fin: true, opcode: opClose, payload: ""))
+    check o.ready
+    check o.message.kind == wmClose
+    check o.message.closeCode == closeNoStatus
+    check o.message.closeCode != closeNormal
+
   test "maxMessageBytes should not carry one message's size into the next":
     var a: WsAssembler                    # regression: a.buf was not cleared between messages
     check a.offer(Frame(fin: true, opcode: opText, payload: "aaaaaa"),

@@ -112,6 +112,22 @@ suite "sse parser":
     p.feed("\xEF\xBB\xBFdata: x\n\n")
     check p.drain()[0].data == "x"
 
+  test "a UTF-8 BOM split across small first feeds is still stripped (#244)":
+    # The BOM (3 bytes) can arrive one or two bytes at a time. The parser must not
+    # clear its start state until enough bytes are present to decide, or the BOM
+    # bytes leak into the first field name and it fails to match.
+    var p = initSseParser()
+    p.feed("\xEF")            # 1 byte: cannot decide yet
+    p.feed("\xBB")            # 2 bytes: still cannot decide
+    p.feed("\xBFdata: x\n\n") # BOM now complete, then the event
+    check p.drain()[0].data == "x"
+
+  test "a two-then-rest BOM split is stripped":
+    var p = initSseParser()
+    p.feed("\xEF\xBB")
+    p.feed("\xBFdata: y\n\n")
+    check p.drain()[0].data == "y"
+
   test "a data field with no value should contribute an empty line":
     var p = initSseParser()
     p.feed("data\ndata: y\n\n")       # "data" alone -> empty string in the buffer

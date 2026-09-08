@@ -128,6 +128,18 @@ suite "h1 parse":
     except ValueError as e: msg = e.msg
     check "chunk size" in msg
 
+  test "the h1 parser should reject chunk data not terminated by CRLF (#244)":
+    # The two bytes after chunk-data must be CRLF (RFC 9112 7.1). A missing CRLF is
+    # a framing desync: without the check it is silently consumed, a corrupted body
+    # is delivered, and the pooled connection can be left poisoned.
+    var p = initH1Parser()
+    var msg = ""
+    try:
+      # "abc" declared as a 3-byte chunk, but followed by "XX" instead of CRLF.
+      p.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcXX0\r\n\r\n")
+    except ValueError as e: msg = e.msg
+    check "CRLF" in msg
+
 suite "url port parsing":
   test "an explicit port and the scheme defaults parse":
     check parseUrl("http://h:8080/").port == 8080

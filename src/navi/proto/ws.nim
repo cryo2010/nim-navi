@@ -61,6 +61,9 @@ const
   closeGoingAway* = 1001'u16
   closeProtocolError* = 1002'u16
   closeMessageTooBig* = 1009'u16   ## RFC 6455 7.4.1: a message exceeded a size limit
+  closeNoStatus* = 1005'u16
+    ## RFC 6455 7.1.5: surfaced (never sent on the wire) when a close frame carries
+    ## no status code, so an application can distinguish it from an explicit 1000.
   maxFramePayload* = 64 * 1024 * 1024
     ## Reject a single incoming frame larger than this (64 MiB). A 64-bit length
     ## with its high bit set (RFC 6455 5.2 forbids it) would otherwise become a
@@ -335,7 +338,10 @@ proc offer*(a: var WsAssembler, f: Frame, maxMessageBytes = 0,
   of opClose:
     if f.payload.len == 1:          # RFC 6455 5.5.1: a close body is empty or >= 2 bytes
       raise newException(ValueError, "navi: WebSocket close frame with a 1-byte payload")
-    var code = closeNormal
+    # RFC 6455 7.1.5: an absent status code surfaces as 1005 ("no status
+    # received"), not 1000, so a codeless close is distinguishable from an
+    # explicit normal closure.
+    var code = closeNoStatus
     if f.payload.len >= 2:
       code = uint16((ord(f.payload[0]) shl 8) or ord(f.payload[1]))
       if not validCloseCode(code):
