@@ -14,6 +14,7 @@ on:
       - 'src/navi/backend/quic_common.nim'
       - 'src/navi/private/asyncdispatch_impl.nim'
       - 'src/navi/private/chronos_impl.nim'
+      - 'src/navi/private/impl_common.nim'
       - 'src/navi/core/altsvc.nim'
       - 'src/navi.nim'
       - 'tests/interop/http3/**'
