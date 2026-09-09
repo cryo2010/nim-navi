@@ -709,6 +709,8 @@ type
     parser: SseParser
     started: bool
     closed: bool
+    yieldCtr: int         ## events since the last cooperative yield (see `next`)
+    collectCtr: int       ## yield batches since the last flood cycle-collect (see `next`)
   SseStream* = ref SseStreamObj
 
 proc openConn(s: SseStream): Future[void] {.async.} =
@@ -796,6 +798,29 @@ proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
     if ev.isSome:
       if s.parser.retryMs() >= 0:
         s.baseRetryMs = min(s.parser.retryMs(), s.maxRetryMs)
+      # A server that floods events lets the read complete synchronously every time,
+      # so this loop can run the whole soak without the underlying read ever parking.
+      # Two things then go wrong -- both only under such a flood; a normally-paced
+      # stream parks in the read below long before 128 events and trips neither:
+      #   1. On asyncdispatch the loop never re-enters `poll()`, starving its timers
+      #      (e.g. a caller's reporter) and other tasks -- so yield cooperatively.
+      #   2. The per-read future/closure chain is cyclic, and asyncdispatch relies on
+      #      ORC's cycle collector (whose trigger scales with the live heap) to
+      #      reclaim it, so a flooded stream floats into the GiBs before auto-
+      #      collection fires. Force a collection on a spaced cadence (~1M events):
+      #      spacing is what makes it cheap -- a collect only frees futures that have
+      #      already died, so a sparse one reclaims a whole batch and amortizes to
+      #      well under 1% of runtime, where a frequent one frees little yet still
+      #      pays the O(heap) cost. chronos reclaims by refcount and needs neither.
+      inc s.yieldCtr
+      if s.yieldCtr >= 128:
+        s.yieldCtr = 0
+        await sleepAsync(msOf(0))
+        when not defined(useChronos) and not defined(js):
+          inc s.collectCtr
+          if s.collectCtr >= 8192:
+            s.collectCtr = 0
+            GC_fullCollect()
       return ev
     if s.handle == nil:
       if not s.reconnect: return none(SseEvent)
