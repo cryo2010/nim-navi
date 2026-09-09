@@ -57,6 +57,7 @@ type
     when defined(naviHttp3):
       altSvc: AltSvcCache                       ## per-origin h3 discovery cache
       h3conns: TableRef[string, QuicConnAsync]  ## live multiplexed h3 connections
+      pendingH3: TableRef[string, Future[QuicConnAsync]] ## in-flight h3 connects
 
 proc initNaviConfig*(): NaviConfig =
   ## The only way to build a config (`NaviConfig` requires every field). Sets the
@@ -92,6 +93,7 @@ proc newNavi*(config = initNaviConfig()): Navi =
   when defined(naviHttp3):
     result.altSvc = newAltSvcCache()
     result.h3conns = newTable[string, QuicConnAsync]()
+    result.pendingH3 = newTable[string, Future[QuicConnAsync]]()
 
 proc extend*(client: Navi, config: NaviConfig): Navi =
   var merged = mergeBase(client.config, config)
@@ -106,6 +108,7 @@ proc extend*(client: Navi, config: NaviConfig): Navi =
   when defined(naviHttp3):
     result.altSvc = newAltSvcCache()
     result.h3conns = newTable[string, QuicConnAsync]()
+    result.pendingH3 = newTable[string, Future[QuicConnAsync]]()
 
 proc close*(client: Navi): Future[void] {.async.} =
   ## Close all pooled connections and shared h2 connections, freeing their TLS
@@ -242,18 +245,34 @@ when defined(naviHttp3):
 
   proc getH3Conn(client: Navi, origin: string, ep: AltSvcEndpoint,
                  req: Request): Future[QuicConnAsync] {.async.} =
-    ## Reuse the origin's live h3 connection, or open one and cache it. A cold
-    ## race (two opens at once) closes the loser rather than leaking it.
-    if client.h3conns.hasKey(origin) and client.h3conns[origin].alive:
-      return client.h3conns[origin]
-    let qc = await openConnAsync(ep.host, ep.port, req.url.host,
-                                 client.config.tls.caFile,
-                                 client.config.tls.wantsVerify)
-    if client.h3conns.hasKey(origin) and client.h3conns[origin].alive:
-      await qc.closeConn()               # someone else won the race
-      return client.h3conns[origin]
-    client.h3conns[origin] = qc
-    return qc
+    ## Reuse the origin's live h3 connection, or open one and cache it. Concurrent
+    ## cold connects to the same origin are coalesced through a single in-flight
+    ## future (mirrors pendingMux for h2): without it, a burst of streams to a new
+    ## origin each opens -- and leaks -- its own QUIC connection, since the plain
+    ## open-then-recheck races (both see an empty cache and both cache a survivor).
+    while true:
+      if client.h3conns.hasKey(origin) and client.h3conns[origin].alive:
+        return client.h3conns[origin]
+      if client.pendingH3.hasKey(origin):
+        let qc = await client.pendingH3[origin]
+        if qc != nil and qc.alive: return qc
+        continue          # that connect resolved dead (rare race): re-check from top
+      # Register the in-flight connect synchronously (no await before this) so racing
+      # callers await it instead of opening a second connection.
+      let pending = newFuture[QuicConnAsync]("navi.pendingH3")
+      client.pendingH3[origin] = pending
+      try:
+        let qc = await openConnAsync(ep.host, ep.port, req.url.host,
+                                     client.config.tls.caFile,
+                                     client.config.tls.wantsVerify)
+        client.h3conns[origin] = qc
+        client.pendingH3.del(origin)
+        pending.complete(qc)
+        return qc
+      except CatchableError as e:
+        client.pendingH3.del(origin)
+        if not pending.finished: pending.fail(e)
+        raise
 
   proc h3TransportAsync(client: Navi, req: Request,
                         ep: AltSvcEndpoint): Future[Response] {.async.} =
@@ -299,8 +318,8 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
 proc doRequest(client: Navi, req: Request): Future[Response] {.async.} =
   result = performRequest(client, req)
 
-proc guard(client: Navi, fut: Future[Response],
-           cancel: CancelToken): Future[Response] {.async.} =
+proc guard[T](client: Navi, fut: Future[T],
+              cancel: CancelToken): Future[T] {.async.} =
   ## Bound the whole request (all attempts) by `timeout` and `cancel`. On expiry
   ## or cancellation the abandoned future runs to completion in the background
   ## (asyncdispatch has no true cancellation); its socket is later reclaimed.
@@ -951,8 +970,8 @@ proc toWsUrl(url: string): Url =
   elif s.startsWith("wss://"): s = "https://" & s["wss://".len .. ^1]
   parseUrl(s)
 
-proc websocketH1(client: Navi, u: Url, headers: Headers,
-                 maxMessageBytes, keepAlive: int): Future[WebSocket] {.async.} =
+proc doWebsocketH1(client: Navi, u: Url, headers: Headers,
+                   maxMessageBytes, keepAlive: int): Future[WebSocket] {.async.} =
   ## WebSocket over an HTTP/1.1 Upgrade (RFC 6455): the universal transport.
   let conn = await connect(u.host, u.port, u.isTls, client.config.tls,
                            resolveProxy(client.config, u), @[],
@@ -980,8 +999,8 @@ proc websocketH1(client: Navi, u: Url, headers: Headers,
     await conn.close()
     raise
 
-proc websocketH2(client: Navi, u: Url, headers: Headers,
-                 maxMessageBytes, keepAlive: int): Future[WebSocket] {.async.} =
+proc doWebsocketH2(client: Navi, u: Url, headers: Headers,
+                   maxMessageBytes, keepAlive: int): Future[WebSocket] {.async.} =
   ## WebSocket over HTTP/2 Extended CONNECT (RFC 8441). Dials a dedicated h2
   ## connection (ALPN "h2"), opens a CONNECT stream with `:protocol=websocket`,
   ## and tunnels frames as DATA. Sec-WebSocket-Key/Accept are not used over h2.
@@ -1011,8 +1030,8 @@ proc websocketH2(client: Navi, u: Url, headers: Headers,
     raise
 
 when defined(naviHttp3):
-  proc websocketH3(client: Navi, u: Url, headers: Headers,
-                   maxMessageBytes, keepAlive: int): Future[WebSocket] {.async.} =
+  proc doWebsocketH3(client: Navi, u: Url, headers: Headers,
+                     maxMessageBytes, keepAlive: int): Future[WebSocket] {.async.} =
     ## WebSocket over HTTP/3 Extended CONNECT (RFC 9220). Dials a dedicated h3
     ## (QUIC) connection to the origin and opens a CONNECT `:protocol=websocket`
     ## stream, tunnelling frames as DATA. Sec-WebSocket-Key/Accept are not used.
@@ -1030,6 +1049,26 @@ when defined(naviHttp3):
       await qc.closeConn()
       raise
 
+proc doWebsocket(client: Navi, url: string,
+                 headers = initHeaders(),
+                 maxMessageBytes = 0, keepAlive = 0): Future[WebSocket] {.async.} =
+  let u = toWsUrl(url)
+  let httpset = client.config.http
+  if httpset.card == 0 or H1 in httpset:             # h1 is the universal ws transport
+    return await client.doWebsocketH1(u, headers, maxMessageBytes, keepAlive)
+  elif H2 in httpset and u.isTls:                    # opt-in h2 (RFC 8441) by excluding H1
+    return await client.doWebsocketH2(u, headers, maxMessageBytes, keepAlive)
+  elif H3 in httpset and u.isTls:                    # opt-in h3 (RFC 9220): config.http = {H3}
+    when defined(naviHttp3):
+      return await client.doWebsocketH3(u, headers, maxMessageBytes, keepAlive)
+    else:
+      raise newException(ProtocolError,
+        "navi: WebSocket over h3 requires a -d:naviHttp3 build")
+  else:
+    raise newException(ProtocolError,
+      "navi: config.http " & $httpset & " permits no usable WebSocket transport " &
+      "(h2/h3 need TLS)")
+
 proc websocket*(client: Navi, url: string,
                 headers = initHeaders(),
                 maxMessageBytes = 0, keepAlive = 0): Future[WebSocket] {.async.} =
@@ -1037,7 +1076,8 @@ proc websocket*(client: Navi, url: string,
   ## `wss` uses TLS. The transport follows `config.http`: h1 Upgrade (RFC 6455) is
   ## used whenever H1 is allowed (the universal path); to tunnel over Extended
   ## CONNECT instead, exclude H1 -- `config.http = {H2}` for h2 (RFC 8441) or
-  ## `{H3}` for h3 (RFC 9220, needs `-d:naviHttp3`). Use `send`, `receive`, `close`.
+  ## `{H3}` for h3 (RFC 9220, needs `-d:naviHttp3`). The whole open is bounded by
+  ## `timeout`. Use `send`, `receive`, and `close`.
   ##
   ## `maxMessageBytes` (0 = unlimited) caps a reassembled message: past it `receive`
   ## closes with 1009 and raises `WsMessageTooLarge`. Set it for untrusted servers,
@@ -1047,22 +1087,8 @@ proc websocket*(client: Navi, url: string,
   ## `receive` is in progress*, and raises `TimeoutError` (closing the connection) if
   ## another interval passes with still nothing back -- so a dead peer is detected
   ## instead of awaiting forever.
-  let u = toWsUrl(url)
-  let httpset = client.config.http
-  if httpset.card == 0 or H1 in httpset:             # h1 is the universal ws transport
-    return await client.websocketH1(u, headers, maxMessageBytes, keepAlive)
-  elif H2 in httpset and u.isTls:                    # opt-in h2 (RFC 8441) by excluding H1
-    return await client.websocketH2(u, headers, maxMessageBytes, keepAlive)
-  elif H3 in httpset and u.isTls:                    # opt-in h3 (RFC 9220): config.http = {H3}
-    when defined(naviHttp3):
-      return await client.websocketH3(u, headers, maxMessageBytes, keepAlive)
-    else:
-      raise newException(ProtocolError,
-        "navi: WebSocket over h3 requires a -d:naviHttp3 build")
-  else:
-    raise newException(ProtocolError,
-      "navi: config.http " & $httpset & " permits no usable WebSocket transport " &
-      "(h2/h3 need TLS)")
+  result = await client.guard(
+    doWebsocket(client, url, headers, maxMessageBytes, keepAlive), nil)
 
 proc send*(ws: WebSocket, data: string, binary = false): Future[void] {.async.} =
   ## Send a text (default) or binary message. Client frames are masked.

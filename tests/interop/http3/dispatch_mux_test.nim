@@ -30,6 +30,25 @@ proc main() {.async.} =
     "concurrent requests should share ONE h3 conn, got " & $api.h3ConnCount
   echo N, " concurrent GETs multiplexed over ", api.h3ConnCount, " h3 connection"
 
+  # Cold-burst regression (#242): a FRESH client whose h3 cache is empty. All N
+  # first requests want h3 and race the connect at once; without the pendingH3
+  # coalescing each would open -- and leak -- its own QUIC connection. They must
+  # coalesce onto ONE. (The warm burst above cannot catch this: it reuses a conn.)
+  block:
+    let cold = newNavi(cfg)
+    discard await cold.get("https://localhost:4433/")          # h2 only: learn Alt-Svc
+    doAssert cold.h3ConnCount == 0, "h3 cache should be empty before the cold burst"
+    var burst: seq[Future[Response]]
+    for i in 0 ..< N:
+      burst.add cold.get("https://localhost:4433/big")         # all cold -> h3, at once
+    let cr = await all(burst)
+    for r in cr:
+      doAssert r.status == 200 and r.httpVersion == "HTTP/3", "bad cold-burst result"
+    doAssert cold.h3ConnCount == 1,
+      "cold burst must coalesce onto ONE h3 conn, got " & $cold.h3ConnCount
+    echo "cold burst of ", N, " coalesced onto ", cold.h3ConnCount, " h3 connection"
+    await cold.close()
+
   await api.close()
   echo "NAVI HTTP/3 MUX OK"
 

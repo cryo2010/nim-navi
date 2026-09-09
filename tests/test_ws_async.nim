@@ -83,6 +83,29 @@ suite "async websocket client end to end":
     waitFor run3()
     joinThread(th)
 
+  test "the WebSocket client should time out on open when the server never completes the handshake":
+    # The whole open is bounded by timeouts.total (parity with chronos): a server
+    # that accepts the TCP connection but never sends the 101 must not hang forever.
+    var th: Thread[WsSrv]
+    var stallPort: int
+    startWsStall(th, stallPort)
+
+    proc run(): Future[string] {.async.} =
+      var cfg = initNaviConfig()
+      cfg.timeouts.total = 600
+      let api = newNavi(cfg)
+      try:
+        discard await api.websocket("ws://127.0.0.1:" & $stallPort & "/")
+        return "opened"
+      except CatchableError as e:
+        # navi raises its own TimeoutError; match by name to avoid the
+        # std/net vs navi ambiguity on the bare type.
+        return (if $e.name == "TimeoutError": "timeout" else: "other:" & $e.name)
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == "timeout"
+
 suite "WebSocket transport selection (asyncdispatch)":
   test "websocket over {H2} on a non-TLS URL should raise ProtocolError":
     # {H2} excludes h1; h2 needs TLS, so a ws:// (plaintext) target has no usable
