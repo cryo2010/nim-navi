@@ -21,6 +21,48 @@ when defined(naviHttp3):
 claimEntry("navi/chronos")
 export public, chronos
 
+# --- per-backend prelude (provides what the shared body below relies on) ---
+
+{.pragma: naviMwClosure, closure, gcsafe.}
+
+when defined(naviHttp3):
+  type QuicConn = QuicConnChronos
+  template openQuicConn(host, port, sni, ca, verify: untyped): untyped =
+    openConnChronos(host, port, sni, ca, verify)
+
+template msOf(ms: int): untyped = ms.milliseconds
+
+proc guard[T](totalMs: int; fut: Future[T];
+              cancel: CancelToken): Future[T] {.async.} =
+  ## Bound the whole operation by `timeout` and `cancel`. On either, the in-flight
+  ## request is cancelled via chronos structured cancellation (its cleanup closes
+  ## the socket) and TimeoutError / RequestCancelledError is raised.
+  let ms = totalMs
+  if ms <= 0 and cancel == nil:
+    return await fut
+  var cancelFut = newFuture[void]("navi.cancel")
+  if cancel != nil:
+    cancel.armHook(proc() {.gcsafe, raises: [].} =
+      if not cancelFut.finished: cancelFut.complete())
+  var timer: Future[void] = nil
+  if ms > 0: timer = sleepAsync(ms.milliseconds)
+  try:
+    var cands = @[FutureBase(fut), FutureBase(cancelFut)]
+    if timer != nil: cands.add(FutureBase(timer))
+    discard await race(cands)
+    if fut.finished:
+      return await fut
+    await fut.cancelAndWait()
+    if cancel != nil and cancel.cancelled:
+      raise newException(RequestCancelledError, "navi: request cancelled")
+    raise newException(TimeoutError, "navi: request timed out after " & $ms & " ms")
+  finally:
+    if cancel != nil: cancel.disarmHook()
+    if not cancelFut.finished: cancelFut.complete()
+    if timer != nil and not timer.finished: timer.cancelSoon()
+
+# >>> impl_common candidate - must stay byte-identical to the twin (hoisted in PR 4)
+
 type
   NaviContext* = ref object
     ## Carried through the middleware chain. A middleware reads and mutates it,
@@ -29,13 +71,14 @@ type
     res*: Response           ## the response; set by `next`, adjust it after
     clientv: Navi            ## the owning client (see `client`)
     idx: int                 ## index of the next middleware to run
-  NaviMiddleware* = proc(ctx: NaviContext): Future[void] {.closure, gcsafe.}
+  NaviMiddleware* = proc(ctx: NaviContext): Future[void] {.naviMwClosure.}
     ## A middleware step; may be async. A closure, so it can capture: read/modify
     ## `ctx.req`, `await ctx.next()` to proceed -- or skip it to short-circuit --
     ## then read/modify `ctx.res`. Write it as a plain `{.async.}` proc (identical
     ## spelling on every backend); a factory `proc bearer(token): NaviMiddleware`
-    ## closes over config. chronos's strict-raises obligation is discharged
-    ## internally by `next` (see the cast there), not in this public type.
+    ## closes over config. The `gcsafe` chronos requires is carried by the
+    ## `naviMwClosure` pragma, not this public type; chronos's strict-raises
+    ## obligation is discharged in `next` (see the cast there).
 
   NaviConfig* {.requiresInit.} = object of NaviConfigBase
     ## `requiresInit`: build it with `initNaviConfig()`, not a bare `NaviConfig(...)`.
@@ -55,8 +98,8 @@ type
     pendingMux: TableRef[string, Future[H2Mux]] ## in-flight connects (coalescing)
     when defined(naviHttp3):
       altSvc: AltSvcCache                       ## per-origin h3 discovery cache
-      h3conns: TableRef[string, QuicConnChronos] ## live multiplexed h3 connections
-      pendingH3: TableRef[string, Future[QuicConnChronos]] ## in-flight h3 connects
+      h3conns: TableRef[string, QuicConn]  ## live multiplexed h3 connections
+      pendingH3: TableRef[string, Future[QuicConn]] ## in-flight h3 connects
 
 proc initNaviConfig*(): NaviConfig =
   ## The only way to build a config (`NaviConfig` requires every field). Sets the
@@ -91,8 +134,8 @@ proc newNavi*(config = initNaviConfig()): Navi =
        pendingMux: newTable[string, Future[H2Mux]]())
   when defined(naviHttp3):
     result.altSvc = newAltSvcCache()
-    result.h3conns = newTable[string, QuicConnChronos]()
-    result.pendingH3 = newTable[string, Future[QuicConnChronos]]()
+    result.h3conns = newTable[string, QuicConn]()
+    result.pendingH3 = newTable[string, Future[QuicConn]]()
 
 proc extend*(client: Navi, config: NaviConfig): Navi =
   var merged = mergeBase(client.config, config)
@@ -106,8 +149,8 @@ proc extend*(client: Navi, config: NaviConfig): Navi =
        pendingMux: newTable[string, Future[H2Mux]]())
   when defined(naviHttp3):
     result.altSvc = newAltSvcCache()
-    result.h3conns = newTable[string, QuicConnChronos]()
-    result.pendingH3 = newTable[string, Future[QuicConnChronos]]()
+    result.h3conns = newTable[string, QuicConn]()
+    result.pendingH3 = newTable[string, Future[QuicConn]]()
 
 proc close*(client: Navi): Future[void] {.async.} =
   ## Close all pooled connections and shared h2 connections, freeing their TLS
@@ -129,12 +172,6 @@ when defined(naviHttp3):
   proc h3ConnCount*(client: Navi): int = client.h3conns.len
     ## Live multiplexed HTTP/3 connections; for tests/introspection.
 
-  proc recordAltSvc(client: Navi, req: Request, resp: Response) =
-    ## Cache an h3 endpoint the origin advertised, so later requests can upgrade.
-    let alt = resp.headers.get("alt-svc")
-    if alt.len > 0:
-      client.altSvc.record("https", req.url.host, req.url.port, alt)
-
 proc muxRequest(client: Navi, mux: H2Mux, req: Request,
                 sink: BodySink): Future[Response] {.async.} =
   # The mux delivers a streaming request's body to `sink` incrementally (decoding
@@ -151,67 +188,6 @@ proc h1OnConn(client: Navi, conn: Conn, origin: string, req: Request,
   let pc = PooledConn[Conn](transport: conn)
   if not (keep and pushIdle(client.pool, origin, pc)):
     await close(conn)
-
-when defined(naviHttp3):
-  # Fields that must not cross to HTTP/3 (RFC 9114 connection-specific + the
-  # pseudo-header sources). accept-encoding IS forwarded so decodeBody decodes.
-  const h3SkipHeaders = ["host", "connection", "keep-alive", "proxy-connection",
-                         "transfer-encoding", "upgrade", "content-length"]
-
-  proc getH3Conn(client: Navi, origin: string, ep: AltSvcEndpoint,
-                 req: Request): Future[QuicConnChronos] {.async.} =
-    ## Reuse the origin's live h3 connection, or open one and cache it. Concurrent
-    ## cold connects to the same origin are coalesced through a single in-flight
-    ## future (mirrors pendingMux for h2): without it, a burst of streams to a new
-    ## origin each opens -- and leaks -- its own QUIC connection, since the plain
-    ## open-then-recheck races (both see an empty cache and both cache a survivor).
-    while true:
-      if client.h3conns.hasKey(origin) and client.h3conns[origin].alive:
-        return client.h3conns[origin]
-      if client.pendingH3.hasKey(origin):
-        let qc = await client.pendingH3[origin]
-        if qc != nil and qc.alive: return qc
-        continue          # that connect resolved dead (rare race): re-check from top
-      # Register the in-flight connect synchronously (no await before this) so racing
-      # callers await it instead of opening a second connection.
-      let pending = newFuture[QuicConnChronos]("navi.pendingH3")
-      client.pendingH3[origin] = pending
-      try:
-        let qc = await openConnChronos(ep.host, ep.port, req.url.host,
-                                       client.config.tls.caFile,
-                                       client.config.tls.wantsVerify)
-        client.h3conns[origin] = qc
-        client.pendingH3.del(origin)
-        pending.complete(qc)
-        return qc
-      except CatchableError as e:
-        client.pendingH3.del(origin)
-        if not pending.finished: pending.fail(e)
-        raise
-
-  proc h3TransportChronos(client: Navi, req: Request,
-                          ep: AltSvcEndpoint): Future[Response] {.async.} =
-    ## Send a buffered-body request over a shared HTTP/3 connection. Raises QuicError.
-    var fwd: seq[(string, string)]
-    for k, v in req.headers:
-      let lk = k.toLowerAscii
-      if lk notin h3SkipHeaders: fwd.add((lk, v))
-    var fwdTrl: seq[(string, string)]
-    for k, v in req.trailers:
-      let lk = k.toLowerAscii
-      if lk.len > 0 and lk[0] != ':' and lk notin h3SkipHeaders and lk notin ["te", "trailer"]:
-        fwdTrl.add((lk, v))
-    let origin = originKey(req.url)
-    let qc = await client.getH3Conn(origin, ep, req)
-    try:
-      let r = await qc.requestOnConn($req.verb, req.url.requestTarget, fwd, req.body,
-                                     req.bodyStream, fwdTrl)
-      result = initResponse(r.status, "", "HTTP/3", initHeaders(r.headers), r.body)
-      result.trailers = initHeaders(r.trailers)
-    except QuicError:
-      if client.h3conns.getOrDefault(origin, nil) == qc:
-        client.h3conns.del(origin)
-      raise
 
 proc transportInner(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
   ## Multiplex over a shared h2 connection when available/negotiable; otherwise
@@ -250,6 +226,9 @@ proc transportInner(client: Navi, req: Request, sink: BodySink): Future[Response
       return
     except CatchableError as e:
       await close(pc.transport)  # stale
+      # Safe to replay on a fresh connection when the request was not processed (a
+      # reused connection dropped before any response) or the method is idempotent /
+      # provably unprocessed; never replay a non-rewindable streamed body.
       let replayable = req.bodyStream == nil
       if not (replayable and
               (not gotResponse or isIdempotent(req.verb) or (e of UnprocessedError))):
@@ -283,9 +262,9 @@ proc transportInner(client: Navi, req: Request, sink: BodySink): Future[Response
         return await client.h1OnConn(conn, origin, rq, sink)
     except CatchableError as e:
       client.pendingMux.del(origin)
-      # In TLS 1.3 a post-handshake failure (e.g. a rejected client cert) can raise
-      # after the http/1.1 branch already completed `pending` with nil, so only fail
-      # it when it is still pending -- otherwise we'd complete the future twice.
+      # A failure after the branch already completed `pending` (h1 fallback via
+      # `complete(nil)`, or a post-handshake error like a rejected client cert while
+      # reading the response) must not complete the future twice (mirrors chronos).
       if not pending.finished: pending.fail(e)
       raise
 
@@ -293,6 +272,70 @@ proc transportInner(client: Navi, req: Request, sink: BodySink): Future[Response
                            client.config.tls, proxyTarget, alpn,
                            client.config.connectMs, client.config.readMs)
   result = await client.h1OnConn(conn, origin, rq, sink)
+
+when defined(naviHttp3):
+  proc recordAltSvc(client: Navi, req: Request, resp: Response) =
+    ## Cache an h3 endpoint the origin advertised, so later requests can upgrade.
+    let alt = resp.headers.get("alt-svc")
+    if alt.len > 0:
+      client.altSvc.record("https", req.url.host, req.url.port, alt)
+
+  proc getH3Conn(client: Navi, origin: string, ep: AltSvcEndpoint,
+                 req: Request): Future[QuicConn] {.async.} =
+    ## Reuse the origin's live h3 connection, or open one and cache it. Concurrent
+    ## cold connects to the same origin are coalesced through a single in-flight
+    ## future (mirrors pendingMux for h2): without it, a burst of streams to a new
+    ## origin each opens -- and leaks -- its own QUIC connection, since the plain
+    ## open-then-recheck races (both see an empty cache and both cache a survivor).
+    while true:
+      if client.h3conns.hasKey(origin) and client.h3conns[origin].alive:
+        return client.h3conns[origin]
+      if client.pendingH3.hasKey(origin):
+        let qc = await client.pendingH3[origin]
+        if qc != nil and qc.alive: return qc
+        continue          # that connect resolved dead (rare race): re-check from top
+      # Register the in-flight connect synchronously (no await before this) so racing
+      # callers await it instead of opening a second connection.
+      let pending = newFuture[QuicConn]("navi.pendingH3")
+      client.pendingH3[origin] = pending
+      try:
+        let qc = await openQuicConn(ep.host, ep.port, req.url.host,
+                                     client.config.tls.caFile,
+                                     client.config.tls.wantsVerify)
+        client.h3conns[origin] = qc
+        client.pendingH3.del(origin)
+        pending.complete(qc)
+        return qc
+      except CatchableError as e:
+        client.pendingH3.del(origin)
+        if not pending.finished: pending.fail(e)
+        raise
+
+  proc h3Transport(client: Navi, req: Request,
+                        ep: AltSvcEndpoint): Future[Response] {.async.} =
+    ## Send `req` (any verb with a buffered body) over a shared HTTP/3 connection
+    ## (multiplexed with concurrent requests), building a navi Response so the
+    ## policy layer is reused unchanged. Raises `QuicError`.
+    var fwd: seq[(string, string)]
+    for k, v in req.headers:
+      let lk = k.toLowerAscii
+      if lk notin h3SkipHeaders: fwd.add((lk, v))
+    var fwdTrl: seq[(string, string)]
+    for k, v in req.trailers:
+      let lk = k.toLowerAscii
+      if lk.len > 0 and lk[0] != ':' and lk notin h3SkipHeaders and lk notin ["te", "trailer"]:
+        fwdTrl.add((lk, v))
+    let origin = originKey(req.url)
+    let qc = await client.getH3Conn(origin, ep, req)
+    try:
+      let r = await qc.requestOnConn($req.verb, req.url.requestTarget, fwd, req.body,
+                                     req.bodyStream, fwdTrl)
+      result = initResponse(r.status, "", "HTTP/3", initHeaders(r.headers), r.body)
+      result.trailers = initHeaders(r.trailers)
+    except QuicError:
+      if client.h3conns.getOrDefault(origin, nil) == qc:
+        client.h3conns.del(origin)       # drop a dead connection
+      raise
 
 proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
   ## The wire transport `run` calls. In a `-d:naviHttp3` build, a buffered-body
@@ -303,7 +346,7 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
     if client.config.wantsH3 and req.url.isTls:   # buffered or streamed (bodyStream) body
       let ep = client.altSvc.h3Endpoint("https", req.url.host, req.url.port)
       if ep.isSome:
-        try: return await h3TransportChronos(client, req, ep.get)
+        try: return await h3Transport(client, req, ep.get)
         except QuicError: discard   # fall back to h2/h1 below
   result = await transportInner(client, req, sink)
   when defined(naviHttp3):
@@ -311,34 +354,6 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
 
 proc doRequest(client: Navi, req: Request): Future[Response] {.async.} =
   result = performRequest(client, req)
-
-proc guard[T](client: Navi, fut: Future[T], cancel: CancelToken): Future[T] {.async.} =
-  ## Bound the whole operation by `timeout` and `cancel`. On either, the in-flight
-  ## request is cancelled via chronos structured cancellation (its cleanup closes
-  ## the socket) and TimeoutError / RequestCancelledError is raised.
-  let ms = client.config.totalMs
-  if ms <= 0 and cancel == nil:
-    return await fut
-  var cancelFut = newFuture[void]("navi.cancel")
-  if cancel != nil:
-    cancel.armHook(proc() {.gcsafe, raises: [].} =
-      if not cancelFut.finished: cancelFut.complete())
-  var timer: Future[void] = nil
-  if ms > 0: timer = sleepAsync(ms.milliseconds)
-  try:
-    var cands = @[FutureBase(fut), FutureBase(cancelFut)]
-    if timer != nil: cands.add(FutureBase(timer))
-    discard await race(cands)
-    if fut.finished:
-      return await fut
-    await fut.cancelAndWait()
-    if cancel != nil and cancel.cancelled:
-      raise newException(RequestCancelledError, "navi: request cancelled")
-    raise newException(TimeoutError, "navi: request timed out after " & $ms & " ms")
-  finally:
-    if cancel != nil: cancel.disarmHook()
-    if not cancelFut.finished: cancelFut.complete()
-    if timer != nil and not timer.finished: timer.cancelSoon()
 
 proc client*(ctx: NaviContext): Navi = ctx.clientv
   ## The client handling this request (e.g. to read `ctx.client.config`).
@@ -370,15 +385,15 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
               params: seq[(string, string)] = @[],
               cancel: CancelToken = nil,
               trailers = initHeaders()): Future[Response] {.async.} =
-  ## `params` are appended to the URL query; `cancel` aborts the in-flight request.
-  ## `trailers` are sent after the body (chunked on h1, a trailing HEADERS block on
-  ## h2/h3).
+  ## Perform a request; configured middleware wraps the whole call. `params` are
+  ## appended to the URL query; `cancel` aborts the in-flight request. `trailers`
+  ## are sent after the body (chunked on h1, a trailing HEADERS block on h2/h3).
   let req = buildRequest(client.config, verb, target, headers, body, json,
                          form, multipart, bodyStream, params, trailers)
   if client.config.middleware.len == 0:
-    return await client.guard(doRequest(client, req), cancel)
+    return await guard(client.config.totalMs, doRequest(client, req), cancel)
   let ctx = NaviContext(req: req, clientv: client)
-  return await client.guard(runChain(ctx), cancel)
+  return await guard(client.config.totalMs, runChain(ctx), cancel)
 
 # --- Streaming downloads (pull-based handle) ---
 
@@ -411,7 +426,7 @@ type
       sid: uint32              ## our stream on it
     of skH3:
       when defined(naviHttp3):
-        qc: QuicConnChronos    ## the shared h3 connection (stays live for reuse)
+        qc: QuicConn      ## the shared h3 connection (stays live for reuse)
         h3sid: int64           ## our QUIC stream on it
       else: discard
   StreamResponse* = ref StreamResponseObj
@@ -449,8 +464,10 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
   let cap = client.config.maxResponseBytes
 
   when defined(naviHttp3):
-    # Stream over HTTP/3 when the origin advertised h3 (Alt-Svc); any QUIC failure
-    # falls through to h2/h1. Mirrors the buffered h3TransportChronos path.
+    # Stream over HTTP/3 when the origin has advertised h3 (Alt-Svc). Mirrors the
+    # buffered h3Transport path: submit on the shared connection, read headers,
+    # return a handle whose readChunk pulls the body incrementally. Any QUIC failure
+    # falls through to h2/h1.
     if client.config.wantsH3 and req.url.isTls and req.bodyStream == nil:
       let ep = client.altSvc.h3Endpoint("https", req.url.host, req.url.port)
       if ep.isSome:
@@ -473,7 +490,7 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
         except QuicError:
           if client.h3conns.getOrDefault(origin, nil) != nil and
              not client.h3conns[origin].alive:
-            client.h3conns.del(origin)
+            client.h3conns.del(origin)     # drop a dead connection; fall back below
 
   if wantH2:
     if client.muxes.hasKey(origin) and client.muxes[origin].canReuse:
@@ -531,9 +548,9 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
           decompress: decompress, cap: cap)
     except CatchableError as e:
       client.pendingMux.del(origin)
-      # In TLS 1.3 a post-handshake failure (e.g. a rejected client cert) can raise
-      # after the http/1.1 branch already completed `pending` with nil, so only fail
-      # it when it is still pending -- otherwise we'd complete the future twice.
+      # A failure after the branch already completed `pending` (h1 fallback via
+      # `complete(nil)`, or a post-handshake error like a rejected client cert while
+      # reading the response) must not complete the future twice (mirrors chronos).
       if not pending.finished: pending.fail(e)
       raise
 
@@ -564,8 +581,8 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
     applyCookies(client.jar, rreq)
     let handle = await openStreamConn(client, rreq)
     handle.cancel = cancel
-    when defined(naviHttp3): client.recordAltSvc(rreq, handle.resp)  # learn h3 from a
-                                                                     # streamed response too
+    when defined(naviHttp3):                       # learn h3 from a streamed response
+      client.recordAltSvc(rreq, handle.resp)        # too, so SSE/stream can upgrade
     # Arm the leak-guard for the synchronous fallback teardown if the handle is
     # dropped without drain/close. Captures only the connection essentials (never
     # `handle`, which would cycle): the h1 transport, or the mux + stream id.
@@ -652,7 +669,7 @@ proc readChunk*(sr: StreamResponse): Future[string] {.async.} =
   of skH3:
     when defined(naviHttp3):
       # h3 body arrives raw; apply the same streamed decode + size-cap as h1, then
-      # free the stream at EOF (a reset surfaces as an error). The connection stays up.
+      # free the stream at EOF (a reset surfaces as an error). The mux stays live.
       try:
         while true:
           let raw = await sr.qc.readStreamBody(sr.h3sid)
@@ -693,14 +710,14 @@ proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
   if sr.drained or sr.closed:
     raise newException(IOError, "navi: stream already drained or closed")
   throwIfCancelled(sr.cancel)
-  disarm(sr.guard)                         # from here `drain` owns the teardown
+  disarm(sr.guard)                      # from here `drain` owns the teardown
   case sr.kind
   of skH2:
     try:
       await sr.mux.drainDownload(sr.sid, sink)
-      sr.drained = true                    # drainDownload freed the stream
+      sr.drained = true                 # drainDownload freed the stream
     except CatchableError:
-      sr.drained = true                    # ...on error too, so the guard won't double-free
+      sr.drained = true                 # ...on error too, so the guard won't double-free
       raise
   of skH1:
     try:
@@ -710,7 +727,7 @@ proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
       if not (keep and pushIdle(sr.client.pool, sr.key, PooledConn[Conn](transport: sr.transport))):
         await close(sr.transport)
     except CatchableError:
-      if not sr.drained: sr.drained = true   # mark consumed for the "call once" guard
+      if not sr.drained: sr.drained = true
       await close(sr.transport)
       raise
   of skH3:
@@ -736,7 +753,7 @@ template each*(sr: StreamResponse; chunk, body: untyped): untyped =
   ##
   ## `body` runs as a proc, so `break`/`continue`/`return` cannot escape the loop
   ## from inside it. To stop early, don't call `each` and `close` the handle, or
-  ## raise from `body` (which closes the connection and propagates).
+  ## raise from `body` (which closes/resets the connection and propagates).
   await sr.drain(proc(chunk: string): Future[void] {.async.} = body)
 
 # --- Server-Sent Events (text/event-stream) ---
@@ -787,16 +804,20 @@ proc sse*(client: Navi, target: string, verb = GET,
           retryMs = 3000, maxRetryMs = 30_000, idleTimeoutMs = 45_000,
           cancel: CancelToken = nil): Future[SseStream] {.async.} =
   ## Open a Server-Sent Events stream. The initial response is validated up front (a
-  ## non-200 or non `text/event-stream` response raises). Consume with `next` (none
-  ## at end) or `each` (a real loop, so break/return work). Reconnects transparently
-  ## on a drop, resending Last-Event-ID and honoring the server's retry: (backoff to
-  ## `maxRetryMs`), unless `reconnect` is false. The underlying stream runs with the
+  ## non-200 or non `text/event-stream` response raises). Consume events with `next`
+  ## (none at end) or `each` (a real loop, so break/return work). Reconnects
+  ## transparently on a drop -- resending Last-Event-ID and honoring the server's
+  ## retry: with backoff to `maxRetryMs` -- unless `reconnect` is false. `verb`/
+  ## `body`/headers allow POST-SSE and auth. The underlying stream runs with the
   ## size cap and read/total timeouts off and shares the client's cookie jar.
   ##
   ## `idleTimeoutMs` bounds how long a single read or (re)open may block before the
   ## stream is treated as wedged and reconnected (resending Last-Event-ID), so a
-  ## parked read cannot hang forever. Any byte -- including a keep-alive `:` comment
-  ## -- resets it, so a live-but-quiet stream is not disturbed; set 0 to disable.
+  ## parked read cannot hang forever -- the failure mode when all timeouts are off
+  ## and reconnect only runs after a read returns (over a stalled HTTP/2 mux). Any
+  ## byte -- including a keep-alive `:` comment -- resets it, so a live-but-quiet
+  ## stream is not disturbed; set 0 to disable (only for a server known to go silent
+  ## for long stretches without sending keep-alives).
   var cfg = client.config
   cfg.maxResponseBytes = 0
   cfg.timeouts.read = 0
@@ -808,9 +829,9 @@ proc sse*(client: Navi, target: string, verb = GET,
     client: newNavi(cfg), verb: verb, target: target, headers: h, params: params,
     cancel: cancel, reconnect: reconnect, baseRetryMs: retryMs, retryMs: retryMs,
     maxRetryMs: maxRetryMs, idleTimeoutMs: idleTimeoutMs, parser: initSseParser(lastEventId))
-  s.client.jar = client.jar
+  s.client.jar = client.jar          # share cookies with the caller
   let openFut = s.openConn()
-  if idleTimeoutMs > 0 and not await withTimeout(openFut, idleTimeoutMs.milliseconds):
+  if idleTimeoutMs > 0 and not await withTimeout(openFut, msOf(idleTimeoutMs)):
     raise newException(IOError, "navi: SSE connect timed out after " & $idleTimeoutMs & " ms")
   await openFut                      # complete (or surface openConn's own error)
   s.started = true
@@ -818,7 +839,8 @@ proc sse*(client: Navi, target: string, verb = GET,
 
 proc close*(s: SseStream): Future[void] {.async.} =
   ## Stop consuming and dispose the connection, including the dedicated internal
-  ## client (its pool). Idempotent. Call it when done with the stream.
+  ## client (its pool and h2 mux, whose reader is joined). Idempotent. Call it when
+  ## done with the stream so the mux does not linger.
   if s.closed: return
   s.closed = true
   if s.handle != nil:
@@ -845,11 +867,11 @@ proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
       return ev
     if s.handle == nil:
       if not s.reconnect: return none(SseEvent)
-      await sleepAsync(min(s.retryMs, s.maxRetryMs).milliseconds)
+      await sleepAsync(msOf(min(s.retryMs, s.maxRetryMs)))
       if s.closed: return none(SseEvent)    # closed during the backoff: do not reconnect
       try:
         let openFut = s.openConn()
-        if s.idleTimeoutMs > 0 and not await withTimeout(openFut, s.idleTimeoutMs.milliseconds):
+        if s.idleTimeoutMs > 0 and not await withTimeout(openFut, msOf(s.idleTimeoutMs)):
           raise newException(IOError, "navi: SSE reconnect timed out")
         await openFut
         s.retryMs = s.baseRetryMs
@@ -864,7 +886,7 @@ proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
       # is caught here and driven back through reconnect+backoff, instead of hanging
       # forever. Any byte, incl. a keep-alive comment, completes readFut and resets
       # the bound, so a live-but-quiet stream is untouched.
-      if s.idleTimeoutMs > 0 and not await withTimeout(readFut, s.idleTimeoutMs.milliseconds):
+      if s.idleTimeoutMs > 0 and not await withTimeout(readFut, msOf(s.idleTimeoutMs)):
         s.handle = nil
         if not s.reconnect: return none(SseEvent)
         continue
@@ -881,7 +903,9 @@ proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
 
 template each*(s: SseStream; ev, body: untyped): untyped =
   ## Consume events until the stream ends, binding `ev` to each `SseEvent`. A real
-  ## loop (over the awaited `next`), so break/continue/return work.
+  ## loop (over the awaited `next`), so break/continue/return work:
+  ##   let s = await api.sse(url)
+  ##   s.each(ev): await handle(ev)
   while true:
     let evOpt = await s.next()
     if evOpt.isNone: break
@@ -909,7 +933,7 @@ type
       sid: uint32
     of wkH3:
       when defined(naviHttp3):     # the h3 (QUIC) transport type is opt-in
-        qc: QuicConnChronos
+        qc: QuicConn
         h3sid: int64
   WebSocket* = ref object
     tr: WsTransport
@@ -923,6 +947,10 @@ type
     pingOutstanding: bool      ## a keepalive ping is awaiting any inbound byte
     pendingRecv: Future[string]  ## the one in-flight read, kept across keepalive
                                  ## timeouts so a timed-out read is not orphaned
+
+# kaRecv is defined per backend after the shared body (the fireSend pattern):
+# withTimeout on asyncdispatch; race + a cancellable timer on chronos.
+proc kaRecv(ws: WebSocket): Future[string] {.async.}
 
 proc sendRaw(ws: WebSocket, data: string): Future[void] =
   ## Write raw bytes to the underlying transport (an encoded WS frame).
@@ -973,8 +1001,7 @@ proc doWebsocketH1(client: Navi, u: Url, headers: Headers,
                            client.config.connectMs, client.config.readMs)
   let key = genKey()
   # Close the connection on any handshake failure (its close is async, so this
-  # uses try/except rather than defer). A timeout cancels this future, raising
-  # CancelledError here (a CatchableError), so the connection is closed too.
+  # uses try/except rather than defer).
   try:
     await conn.sendAll(upgradeRequest(u, key, headers))
     var buf = ""
@@ -1031,8 +1058,8 @@ when defined(naviHttp3):
     ## WebSocket over HTTP/3 Extended CONNECT (RFC 9220). Dials a dedicated h3
     ## (QUIC) connection to the origin and opens a CONNECT `:protocol=websocket`
     ## stream, tunnelling frames as DATA. Sec-WebSocket-Key/Accept are not used.
-    let qc = await openConnChronos(u.host, u.port, u.host, client.config.tls.caFile,
-                                   client.config.tls.verify)
+    let qc = await openQuicConn(u.host, u.port, u.host, client.config.tls.caFile,
+                                 client.config.tls.verify)
     try:
       let (sid, status) = await qc.openConnect(u.requestTarget,
                                                wsExtraFields(headers), "websocket")
@@ -1070,9 +1097,10 @@ proc websocket*(client: Navi, url: string,
                 maxMessageBytes = 0, keepAlive = 0): Future[WebSocket] {.async.} =
   ## Open a WebSocket connection. Accepts `ws://` / `wss://` (or http/https);
   ## `wss` uses TLS. The transport follows `config.http`: h1 Upgrade (RFC 6455) is
-  ## used whenever H1 is allowed (the universal path); to tunnel over HTTP/2 Extended
-  ## CONNECT (RFC 8441) instead, exclude H1 (e.g. `config.http = {H2}`). The whole
-  ## open is bounded by `timeout`. Use `send`, `receive`, and `close`.
+  ## used whenever H1 is allowed (the universal path); to tunnel over Extended
+  ## CONNECT instead, exclude H1 -- `config.http = {H2}` for h2 (RFC 8441) or
+  ## `{H3}` for h3 (RFC 9220, needs `-d:naviHttp3`). The whole open is bounded by
+  ## `timeout`. Use `send`, `receive`, and `close`.
   ##
   ## `maxMessageBytes` (0 = unlimited) caps a reassembled message: past it `receive`
   ## closes with 1009 and raises `WsMessageTooLarge`. Set it for untrusted servers,
@@ -1082,7 +1110,7 @@ proc websocket*(client: Navi, url: string,
   ## `receive` is in progress*, and raises `TimeoutError` (closing the connection) if
   ## another interval passes with still nothing back -- so a dead peer is detected
   ## instead of awaiting forever.
-  result = await client.guard(
+  result = await guard(client.config.totalMs,
     doWebsocket(client, url, headers, maxMessageBytes, keepAlive), nil)
 
 proc send*(ws: WebSocket, data: string, binary = false): Future[void] {.async.} =
@@ -1091,29 +1119,6 @@ proc send*(ws: WebSocket, data: string, binary = false): Future[void] {.async.} 
 
 proc ping*(ws: WebSocket, data = ""): Future[void] {.async.} =
   await ws.sendRaw(encodeFrame(opPing, data))
-
-proc kaRecv(ws: WebSocket): Future[string] {.async.} =
-  ## One read chunk. With keepalive off, a plain read. With it on, a single
-  ## outstanding read is kept in `pendingRecv` (raced against a timer, so a timed-out
-  ## read is never cancelled and cannot lose bytes): on an idle interval send a ping,
-  ## and on a second idle interval with a ping still unanswered, declare the peer dead.
-  if ws.keepAlive <= 0: return await ws.recvRaw()
-  while true:
-    if ws.pendingRecv == nil: ws.pendingRecv = ws.recvRaw()
-    let timer = sleepAsync(ws.keepAlive.milliseconds)
-    discard await race(ws.pendingRecv, timer)
-    if ws.pendingRecv.finished:
-      await timer.cancelAndWait()
-      let chunk = ws.pendingRecv.read()     # completed (re-raises a read error)
-      ws.pendingRecv = nil
-      ws.pingOutstanding = false            # any inbound byte proves liveness
-      return chunk
-    if ws.pingOutstanding:                   # pinged last interval, still nothing back
-      ws.open = false
-      try: await ws.closeRaw() except CatchableError: discard
-      raise newException(TimeoutError, "navi: websocket keepalive timed out")
-    await ws.sendRaw(encodeFrame(opPing, ""))
-    ws.pingOutstanding = true
 
 proc receive*(ws: WebSocket): Future[WsMessage] {.async.} =
   ## Await a full message, answering pings and reassembling fragments. A close
@@ -1299,3 +1304,30 @@ template stream*(ws: WebSocket; writer, body: untyped): untyped =
 template streamBinary*(ws: WebSocket; writer, body: untyped): untyped =
   ## Like `stream(writer)`, but the message is binary.
   streamOut(ws, writer, true, body)
+# <<< impl_common candidate
+
+# kaRecv: per-backend (forward-declared in the shared body). chronos can't cancel a
+# read without losing its buffered bytes, so the in-flight read is raced against a
+# timer (cancelled on the read's completion) rather than withTimeout'd.
+proc kaRecv(ws: WebSocket): Future[string] {.async.} =
+  ## One read chunk. With keepalive off, a plain read. With it on, a single
+  ## outstanding read is kept in `pendingRecv` (raced against a timer, so a timed-out
+  ## read is never cancelled and cannot lose bytes): on an idle interval send a ping,
+  ## and on a second idle interval with a ping still unanswered, declare the peer dead.
+  if ws.keepAlive <= 0: return await ws.recvRaw()
+  while true:
+    if ws.pendingRecv == nil: ws.pendingRecv = ws.recvRaw()
+    let timer = sleepAsync(ws.keepAlive.milliseconds)
+    discard await race(ws.pendingRecv, timer)
+    if ws.pendingRecv.finished:
+      await timer.cancelAndWait()
+      let chunk = ws.pendingRecv.read()     # completed (re-raises a read error)
+      ws.pendingRecv = nil
+      ws.pingOutstanding = false            # any inbound byte proves liveness
+      return chunk
+    if ws.pingOutstanding:                   # pinged last interval, still nothing back
+      ws.open = false
+      try: await ws.closeRaw() except CatchableError: discard
+      raise newException(TimeoutError, "navi: websocket keepalive timed out")
+    await ws.sendRaw(encodeFrame(opPing, ""))
+    ws.pingOutstanding = true
