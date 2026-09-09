@@ -357,9 +357,8 @@ type
     closed: bool               ## disposed without draining
     guard: StreamGuard         ## closes/resets if the handle is dropped before
                                ## drain/close (see navi/private/streamguard)
-    dec: StreamDecoder         ## h1 decode + size-cap state carried across readChunk
-    decReady: bool             ## calls (h2 keeps its decoder in the mux)
-    seen: int
+    capped: CappedDecoder      ## h1/h3 decode + size-cap state carried across
+                               ## readChunk calls (h2 keeps its decoder in the mux)
     case kind: StreamKind
     of skH1:
       transport: Conn          ## the checked-out http/1.1 connection
@@ -426,7 +425,7 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
               let (status, hdrs) = await qc.awaitHeaders(sid)
               return StreamResponse(kind: skH3, qc: qc, h3sid: sid,
                 resp: initResponse(status, "", "HTTP/3", initHeaders(hdrs), ""),
-                client: client, key: origin, decompress: decompress, cap: cap)
+                client: client, key: origin, decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
             except CatchableError:                 # header wait failed or was cancelled
               qc.freeStream(sid)                   # (e.g. timeout): free the submitted
               raise                                # stream so it isn't left on the wire
@@ -441,14 +440,14 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
       let sid = await mux.sendAndReadHeaders(h2HeaderList(req), req.body, req.bodyStream, h2TrailerList(req))
       return StreamResponse(kind: skH2, mux: mux, sid: sid,
         resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
-        decompress: decompress, cap: cap)
+        decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
     if client.pendingMux.hasKey(origin):
       let mux = await client.pendingMux[origin]
       if mux != nil and mux.canReuse:
         let sid = await mux.sendAndReadHeaders(h2HeaderList(req), req.body, req.bodyStream, h2TrailerList(req))
         return StreamResponse(kind: skH2, mux: mux, sid: sid,
           resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
-          decompress: decompress, cap: cap)
+          decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
 
   var (found, pc) = popIdle(client.pool, origin)
   if found:
@@ -456,7 +455,7 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
       let parser = h1SendAndReadHeaders(pc.transport, req, true)
       return StreamResponse(kind: skH1, transport: pc.transport, parser: parser,
         resp: parser.toResponse(), client: client, key: origin,
-        decompress: decompress, cap: cap)
+        decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
     except CatchableError:
       await close(pc.transport)     # pooled connection was stale; open a fresh one
 
@@ -481,14 +480,14 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
         let sid = await mux.sendAndReadHeaders(h2HeaderList(rq), rq.body, rq.bodyStream, h2TrailerList(rq))
         return StreamResponse(kind: skH2, mux: mux, sid: sid,
           resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
-          decompress: decompress, cap: cap)
+          decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
       else:
         client.pendingMux.del(origin)
         pending.complete(nil)
         let parser = h1SendAndReadHeaders(conn, rq, true)
         return StreamResponse(kind: skH1, transport: conn, parser: parser,
           resp: parser.toResponse(), client: client, key: origin,
-          decompress: decompress, cap: cap)
+          decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
     except CatchableError as e:
       client.pendingMux.del(origin)
       # A failure after the branch already completed `pending` (h1 fallback via
@@ -503,7 +502,7 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
   let parser = h1SendAndReadHeaders(conn, rq, true)
   return StreamResponse(kind: skH1, transport: conn, parser: parser,
     resp: parser.toResponse(), client: client, key: origin,
-    decompress: decompress, cap: cap)
+    decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
 
 proc stream*(client: Navi, verb: HttpVerb, target: string,
              headers = initHeaders(), params: seq[(string, string)] = @[],
@@ -596,8 +595,7 @@ proc readChunk*(sr: StreamResponse): Future[string] {.async.} =
       raise
   of skH1:
     try:
-      result = h1ReadChunk(sr.transport, sr.parser,
-                           sr.dec, sr.decReady, sr.seen, sr.decompress, sr.cap)
+      result = h1ReadChunk(sr.transport, sr.parser, sr.capped)
       if result.len == 0:                 # end of body: we own the teardown now
         sr.drained = true
         disarm(sr.guard)
@@ -625,17 +623,8 @@ proc readChunk*(sr: StreamResponse): Future[string] {.async.} =
             if wasReset: raise newException(IOError, "navi: http/3 stream reset")
             if lengthBad: raise newException(IOError, h3BodyLengthErr)
             return ""
-          if not sr.decReady:
-            sr.dec = if sr.decompress:
-                newStreamDecoder(sr.resp.headers.get("content-encoding")) else: nil
-            sr.decReady = true
-          let decoded = if sr.dec != nil:
-              sr.dec.update(raw.toOpenArrayByte(0, raw.high)) else: raw
+          let decoded = sr.capped.feed(raw, sr.resp.headers.get("content-encoding"))
           if decoded.len == 0: continue   # decoder buffered input; pull more
-          sr.seen += decoded.len
-          if sr.cap > 0 and sr.seen > sr.cap:
-            raise newException(ResponseTooLargeError,
-              "navi: response exceeded maxResponseBytes")
           return decoded
       except CatchableError:
         if not sr.drained: sr.drained = true

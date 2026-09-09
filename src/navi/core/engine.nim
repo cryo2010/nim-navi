@@ -120,13 +120,14 @@ template h1DrainBody*(transport, parser, sink, keep, decompress, cap: typed) =
         break
     keep = parser.keepAliveAfter()
 
-template h1ReadChunk*(transport, parser, dec, decReady, seen, decompress, cap: typed): string =
+template h1ReadChunk*(transport, parser, capped: typed): string =
   ## Pull the next decoded body chunk over `transport`, or "" at end of body.
-  ## `dec`/`decReady`/`seen` hold the caller's persistent decode + size-cap state
-  ## across calls (fields on the streaming handle). "" is returned only at true end
-  ## of body; a decoder that buffers input without producing output loops for more.
-  ## The caller does the terminal pool/close once "" comes back (`keepAliveAfter`
-  ## is valid then). This is the single read/decode/cap path `drain` loops over.
+  ## `capped` (a `var CappedDecoder` field on the streaming handle) holds the
+  ## persistent decode + size-cap state across calls. "" is returned only at true
+  ## end of body; a decoder that buffers input without producing output loops for
+  ## more. The caller does the terminal pool/close once "" comes back
+  ## (`keepAliveAfter` is valid then). The single read/decode/cap path `drain` loops
+  ## over.
   mixin await, recvSome
   block:
     var res = ""
@@ -144,43 +145,26 @@ template h1ReadChunk*(transport, parser, dec, decReady, seen, decompress, cap: t
             raise newException(IOError, h1TruncatedErr)
         else: parser.feed(chunk)
         continue
-      if not decReady:
-        dec = if decompress: newStreamDecoder(parser.contentEncoding()) else: nil
-        decReady = true
-      let decoded =
-        if dec != nil: dec.update(raw.toOpenArrayByte(0, raw.high)) else: raw
+      let decoded = capped.feed(raw, parser.contentEncoding())
       if decoded.len == 0: continue          # decoder buffered input; read more
-      seen += decoded.len
-      if cap > 0 and seen > cap:
-        raise newException(ResponseTooLargeError,
-          "navi: response exceeded maxResponseBytes")
       res = decoded
       break
     res
 
-template h2ReadChunk*(transport, h2, sid, dec, decReady, seen, decompress, cap: typed): string =
+template h2ReadChunk*(transport, h2, sid, capped: typed): string =
   ## Pull the next decoded body chunk of an h2 stream over `transport` (the sync
   ## single-connection h2 path), or "" at end of stream, having dropped the stream.
   ## Sends any control frames the feed produces. Raises on reset / oversized /
   ## unprocessed / connection error, like the old drain loop. Persistent decode +
-  ## cap state lives in `dec`/`decReady`/`seen`.
+  ## cap state lives in `capped` (a `var CappedDecoder` field on the handle).
   mixin await, sendAll, recvSome
   block:
     var res = ""
     while true:
       let raw = h2.takeBody(sid)
       if raw.len > 0:
-        if not decReady:
-          dec = if decompress: newStreamDecoder(h2.respHeader(sid, "content-encoding"))
-                else: nil
-          decReady = true
-        let decoded =
-          if dec != nil: dec.update(raw.toOpenArrayByte(0, raw.high)) else: raw
+        let decoded = capped.feed(raw, h2.respHeader(sid, "content-encoding"))
         if decoded.len == 0: continue
-        seen += decoded.len
-        if cap > 0 and seen > cap:
-          raise newException(ResponseTooLargeError,
-            "navi: response exceeded maxResponseBytes")
         res = decoded
         break
       if h2.streamDone(sid):                  # no more body: terminal, drop the stream

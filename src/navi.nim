@@ -246,9 +246,8 @@ type
     closed: bool               ## connection disposed without draining
     guard: StreamGuard         ## closes the connection if the handle is dropped
                                ## before drain/close (see navi/private/streamguard)
-    dec: StreamDecoder         ## decode + size-cap state carried across readChunk
-    decReady: bool             ## calls (chosen once the response headers are in)
-    seen: int
+    capped: CappedDecoder      ## decode + size-cap state carried across readChunk
+                               ## calls (the decoder is chosen on the first chunk)
     when defined(naviHttp3):
       qc: QuicConn             ## h3 connection (non-nil marks an h3 stream; pc unused)
       h3sid: int64             ## its h3 stream id
@@ -307,7 +306,7 @@ proc openStream(client: Navi, req0: Request): StreamResponse =
               let (status, hdrs) = conn.awaitHeaders(sid)
               return StreamResponse(resp: initResponse(status, "", "HTTP/3",
                 initHeaders(hdrs), ""), client: client, key: key, qc: conn,
-                h3sid: sid, decompress: decompress, cap: cap)
+                h3sid: sid, decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
             except CatchableError:
               conn.freeStream(sid); conn.close(); raise
         except QuicError: discard   # fall back to the h2/h1 transport below
@@ -320,11 +319,11 @@ proc openStream(client: Navi, req0: Request): StreamResponse =
       if pc.h2 != nil:
         let sid = h2SendAndReadHeaders(pc.transport, pc.h2, rq)
         return StreamResponse(resp: toResponse(pc.h2.respSnapshot(sid)), client: client,
-                              key: key, pc: pc, sid: sid, decompress: decompress, cap: cap)
+                              key: key, pc: pc, sid: sid, decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
       else:
         let parser = h1SendAndReadHeaders(pc.transport, rq, true)
         return StreamResponse(resp: parser.toResponse(), client: client, key: key,
-                              pc: pc, parser: parser, decompress: decompress, cap: cap)
+                              pc: pc, parser: parser, decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
     except CatchableError:
       try: pc.transport.close()          # pooled connection was stale; open a fresh one
       except CatchableError: discard
@@ -338,11 +337,11 @@ proc openStream(client: Navi, req0: Request): StreamResponse =
     transport.sendAll(npc.h2.preamble())
     let sid = h2SendAndReadHeaders(transport, npc.h2, rq)
     result = StreamResponse(resp: toResponse(npc.h2.respSnapshot(sid)), client: client,
-                            key: key, pc: npc, sid: sid, decompress: decompress, cap: cap)
+                            key: key, pc: npc, sid: sid, decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
   else:
     let parser = h1SendAndReadHeaders(transport, rq, true)
     result = StreamResponse(resp: parser.toResponse(), client: client, key: key,
-                            pc: npc, parser: parser, decompress: decompress, cap: cap)
+                            pc: npc, parser: parser, decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
 
 proc stream*(client: Navi, verb: HttpVerb, target: string,
              headers = initHeaders(), params: seq[(string, string)] = @[],
@@ -438,17 +437,8 @@ proc readChunk*(sr: StreamResponse): string =
             if wasReset: raise newException(IOError, "navi: http/3 stream reset")
             if lengthBad: raise newException(IOError, h3BodyLengthErr)
             return ""
-          if not sr.decReady:
-            sr.dec = if sr.decompress:
-                newStreamDecoder(sr.resp.headers.get("content-encoding")) else: nil
-            sr.decReady = true
-          let decoded = if sr.dec != nil:
-              sr.dec.update(raw.toOpenArrayByte(0, raw.high)) else: raw
+          let decoded = sr.capped.feed(raw, sr.resp.headers.get("content-encoding"))
           if decoded.len == 0: continue          # decoder buffered input; pull more
-          sr.seen += decoded.len
-          if sr.cap > 0 and sr.seen > sr.cap:
-            raise newException(ResponseTooLargeError,
-              "navi: response exceeded maxResponseBytes")
           return decoded
       except CatchableError:
         if not sr.drained: sr.drained = true
@@ -456,15 +446,13 @@ proc readChunk*(sr: StreamResponse): string =
         raise
   try:
     if sr.pc.h2 != nil:
-      result = h2ReadChunk(sr.pc.transport, sr.pc.h2, sr.sid,
-                           sr.dec, sr.decReady, sr.seen, sr.decompress, sr.cap)
+      result = h2ReadChunk(sr.pc.transport, sr.pc.h2, sr.sid, sr.capped)
       if result.len == 0:                       # end of stream
         sr.drained = true
         if sr.pc.h2.canReuse and pushIdle(sr.client.pool, sr.key, sr.pc): disarm(sr.guard)
         else: closeNow(sr.guard)
     else:
-      result = h1ReadChunk(sr.pc.transport, sr.parser,
-                           sr.dec, sr.decReady, sr.seen, sr.decompress, sr.cap)
+      result = h1ReadChunk(sr.pc.transport, sr.parser, sr.capped)
       if result.len == 0:                       # end of body
         sr.drained = true
         if sr.parser.keepAliveAfter() and pushIdle(sr.client.pool, sr.key, sr.pc):
