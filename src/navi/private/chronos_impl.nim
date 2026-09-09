@@ -126,6 +126,9 @@ proc close*(client: Navi): Future[void] {.async.} =
   closeTlsCtxStore(client.config.tls.contextStore)
 
 when defined(naviHttp3):
+  proc h3ConnCount*(client: Navi): int = client.h3conns.len
+    ## Live multiplexed HTTP/3 connections; for tests/introspection.
+
   proc recordAltSvc(client: Navi, req: Request, resp: Response) =
     ## Cache an h3 endpoint the origin advertised, so later requests can upgrade.
     let alt = resp.headers.get("alt-svc")
@@ -139,14 +142,12 @@ proc muxRequest(client: Navi, mux: H2Mux, req: Request,
   # A non-streaming request (sink == nil) still buffers into r.body as before.
   result = toResponse(await mux.request(h2HeaderList(req), req.body, req.bodyStream,
                                         sink, h2TrailerList(req)))
-  when defined(naviHttp3): client.recordAltSvc(req, result)
 
 proc h1OnConn(client: Navi, conn: Conn, origin: string, req: Request,
               sink: BodySink): Future[Response] {.async.} =
   var keep = false
   result = h1Exchange(conn, req, sink, keep,
                       client.config.wantsDecompress, client.config.maxResponseBytes)
-  when defined(naviHttp3): client.recordAltSvc(req, result)
   let pc = PooledConn[Conn](transport: conn)
   if not (keep and pushIdle(client.pool, origin, pc)):
     await close(conn)
@@ -212,20 +213,12 @@ when defined(naviHttp3):
         client.h3conns.del(origin)
       raise
 
-proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
+proc transportInner(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
   ## Multiplex over a shared h2 connection when available/negotiable; otherwise
   ## pool http/1.1. Concurrent connects to the same new origin are coalesced so a
-  ## cold burst still ends up on one h2 connection. In a -d:naviHttp3 build, a
-  ## buffered request to an h3-advertised origin (Alt-Svc) goes over HTTP/3.
+  ## cold burst still ends up on one h2 connection.
   let origin = originKey(req.url)
   let wantH2 = client.config.wantsH2 and req.url.isTls
-
-  when defined(naviHttp3):
-    if client.config.wantsH3 and req.url.isTls:   # buffered or streamed (bodyStream) body
-      let ep = client.altSvc.h3Endpoint("https", req.url.host, req.url.port)
-      if ep.isSome:
-        try: return await h3TransportChronos(client, req, ep.get)
-        except QuicError: discard   # fall back to h2/h1 below
 
   if wantH2:
     # 1. A live shared connection, or one currently being established.
@@ -300,6 +293,21 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
                            client.config.tls, proxyTarget, alpn,
                            client.config.connectMs, client.config.readMs)
   result = await client.h1OnConn(conn, origin, rq, sink)
+
+proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
+  ## The wire transport `run` calls. In a `-d:naviHttp3` build, a buffered-body
+  ## request to an origin that has advertised h3 (Alt-Svc) goes over HTTP/3, with
+  ## any QUIC failure falling back to h2/h1; `alt-svc` on h2/h1 responses is
+  ## captured for later upgrades.
+  when defined(naviHttp3):
+    if client.config.wantsH3 and req.url.isTls:   # buffered or streamed (bodyStream) body
+      let ep = client.altSvc.h3Endpoint("https", req.url.host, req.url.port)
+      if ep.isSome:
+        try: return await h3TransportChronos(client, req, ep.get)
+        except QuicError: discard   # fall back to h2/h1 below
+  result = await transportInner(client, req, sink)
+  when defined(naviHttp3):
+    client.recordAltSvc(req, result)
 
 proc doRequest(client: Navi, req: Request): Future[Response] {.async.} =
   result = performRequest(client, req)
@@ -828,8 +836,8 @@ proc lastEventId*(s: SseStream): string = s.parser.lastEventId()
 proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
   ## The next event, or none once the stream ends. Reconnects transparently on a
   ## drop when enabled, resending Last-Event-ID.
-  if s.closed: return none(SseEvent)
   while true:
+    if s.closed: return none(SseEvent)   # also catches a close during a parked read
     let ev = s.parser.next()
     if ev.isSome:
       if s.parser.retryMs() >= 0:
@@ -838,6 +846,7 @@ proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
     if s.handle == nil:
       if not s.reconnect: return none(SseEvent)
       await sleepAsync(min(s.retryMs, s.maxRetryMs).milliseconds)
+      if s.closed: return none(SseEvent)    # closed during the backoff: do not reconnect
       try:
         let openFut = s.openConn()
         if s.idleTimeoutMs > 0 and not await withTimeout(openFut, s.idleTimeoutMs.milliseconds):
