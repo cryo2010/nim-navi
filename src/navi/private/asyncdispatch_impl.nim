@@ -2,25 +2,65 @@
 # on non-js targets. Kept separate so the entry can fall back to navi/js under
 # `nim js` without pulling in std/asyncdispatch (which has no JS backend).
 
-import std/[tables, options]
+import std/[options, tables]
 import navi/private/[entryguard, streamguard]
 import navi/proto/sse
-from std/strutils import toLowerAscii, startsWith, contains
-export sse.SseEvent
 import navi/core/public
+export sse.SseEvent
 import navi/core/[engine, pool, session, proxy, h2glue]
 import navi/core/[redirect, cookies, digest, cancel, retry, response]
-import navi/core/decompress   # StreamDecoder, for the h1 readChunk decode state
+import navi/core/decompress   # StreamDecoder, for the readChunk decode state
 import navi/proto/h1
 import navi/proto/ws
 import navi/backend/[asyncdispatch, h2mux]
-from std/strutils import startsWith, find, splitLines, contains
+from std/strutils import startsWith, find, splitLines, contains, toLowerAscii
 when defined(naviHttp3):
   import navi/core/altsvc
   import navi/backend/quic_async
 
 claimEntry("navi/asyncdispatch")
 export public, asyncdispatch
+
+# --- per-backend prelude (provides what the shared body below relies on) ---
+
+{.pragma: naviMwClosure, closure.}
+
+when defined(naviHttp3):
+  type QuicConn = QuicConnAsync
+  template openQuicConn(host, port, sni, ca, verify: untyped): untyped =
+    openConnAsync(host, port, sni, ca, verify)
+
+template msOf(ms: int): int = ms
+
+proc guard[T](totalMs: int; fut: Future[T];
+              cancel: CancelToken): Future[T] {.async.} =
+  ## Bound the whole request (all attempts) by `timeout` and `cancel`. On expiry
+  ## or cancellation the abandoned future runs to completion in the background
+  ## (asyncdispatch has no true cancellation); its socket is later reclaimed.
+  let ms = totalMs
+  if ms <= 0 and cancel == nil:
+    return await fut
+  var cancelFut = newFuture[void]("navi.cancel")
+  if cancel != nil:
+    cancel.armHook(proc() {.gcsafe, raises: [].} =
+      # complete() only raises if already finished, which the guard rules out.
+      {.cast(raises: []).}:
+        if not cancelFut.finished: cancelFut.complete())
+  try:
+    if ms > 0:
+      await fut or cancelFut or sleepAsync(ms)
+    else:
+      await fut or cancelFut
+    if fut.finished:
+      return fut.read
+    if cancel != nil and cancel.cancelled:
+      raise newException(RequestCancelledError, "navi: request cancelled")
+    raise newException(TimeoutError, "navi: request timed out after " & $ms & " ms")
+  finally:
+    if cancel != nil: cancel.disarmHook()
+    if not cancelFut.finished: cancelFut.complete()
+
+# >>> impl_common candidate - must stay byte-identical to the twin (hoisted in PR 4)
 
 type
   NaviContext* = ref object
@@ -30,13 +70,14 @@ type
     res*: Response           ## the response; set by `next`, adjust it after
     clientv: Navi            ## the owning client (see `client`)
     idx: int                 ## index of the next middleware to run
-  NaviMiddleware* = proc(ctx: NaviContext): Future[void] {.closure.}
+  NaviMiddleware* = proc(ctx: NaviContext): Future[void] {.naviMwClosure.}
     ## A middleware step; may be async. A closure, so it can capture: read/modify
     ## `ctx.req`, `await ctx.next()` to proceed -- or skip it to short-circuit --
     ## then read/modify `ctx.res`. Write it as a plain `{.async.}` proc (identical
     ## spelling on every backend); a factory `proc bearer(token): NaviMiddleware`
-    ## closes over per-instance config. (No `gcsafe`: asyncdispatch does not
-    ## require it -- only chronos does, at its call site.)
+    ## closes over config. The `gcsafe` chronos requires is carried by the
+    ## `naviMwClosure` pragma, not this public type; chronos's strict-raises
+    ## obligation is discharged in `next` (see the cast there).
 
   NaviConfig* {.requiresInit.} = object of NaviConfigBase
     ## `requiresInit`: build it with `initNaviConfig()`, not a bare `NaviConfig(...)`.
@@ -56,8 +97,8 @@ type
     pendingMux: TableRef[string, Future[H2Mux]] ## in-flight connects (coalescing)
     when defined(naviHttp3):
       altSvc: AltSvcCache                       ## per-origin h3 discovery cache
-      h3conns: TableRef[string, QuicConnAsync]  ## live multiplexed h3 connections
-      pendingH3: TableRef[string, Future[QuicConnAsync]] ## in-flight h3 connects
+      h3conns: TableRef[string, QuicConn]  ## live multiplexed h3 connections
+      pendingH3: TableRef[string, Future[QuicConn]] ## in-flight h3 connects
 
 proc initNaviConfig*(): NaviConfig =
   ## The only way to build a config (`NaviConfig` requires every field). Sets the
@@ -92,8 +133,8 @@ proc newNavi*(config = initNaviConfig()): Navi =
        pendingMux: newTable[string, Future[H2Mux]]())
   when defined(naviHttp3):
     result.altSvc = newAltSvcCache()
-    result.h3conns = newTable[string, QuicConnAsync]()
-    result.pendingH3 = newTable[string, Future[QuicConnAsync]]()
+    result.h3conns = newTable[string, QuicConn]()
+    result.pendingH3 = newTable[string, Future[QuicConn]]()
 
 proc extend*(client: Navi, config: NaviConfig): Navi =
   var merged = mergeBase(client.config, config)
@@ -107,8 +148,8 @@ proc extend*(client: Navi, config: NaviConfig): Navi =
        pendingMux: newTable[string, Future[H2Mux]]())
   when defined(naviHttp3):
     result.altSvc = newAltSvcCache()
-    result.h3conns = newTable[string, QuicConnAsync]()
-    result.pendingH3 = newTable[string, Future[QuicConnAsync]]()
+    result.h3conns = newTable[string, QuicConn]()
+    result.pendingH3 = newTable[string, Future[QuicConn]]()
 
 proc close*(client: Navi): Future[void] {.async.} =
   ## Close all pooled connections and shared h2 connections, freeing their TLS
@@ -232,11 +273,6 @@ proc transportInner(client: Navi, req: Request, sink: BodySink): Future[Response
   result = await client.h1OnConn(conn, origin, rq, sink)
 
 when defined(naviHttp3):
-  # Fields that must not cross to HTTP/3 (RFC 9114 connection-specific + the
-  # pseudo-header sources). accept-encoding IS forwarded so decodeBody decodes.
-  const h3SkipHeaders = ["host", "connection", "keep-alive", "proxy-connection",
-                         "transfer-encoding", "upgrade", "content-length"]
-
   proc recordAltSvc(client: Navi, req: Request, resp: Response) =
     ## Cache an h3 endpoint the origin advertised, so later requests can upgrade.
     let alt = resp.headers.get("alt-svc")
@@ -244,7 +280,7 @@ when defined(naviHttp3):
       client.altSvc.record("https", req.url.host, req.url.port, alt)
 
   proc getH3Conn(client: Navi, origin: string, ep: AltSvcEndpoint,
-                 req: Request): Future[QuicConnAsync] {.async.} =
+                 req: Request): Future[QuicConn] {.async.} =
     ## Reuse the origin's live h3 connection, or open one and cache it. Concurrent
     ## cold connects to the same origin are coalesced through a single in-flight
     ## future (mirrors pendingMux for h2): without it, a burst of streams to a new
@@ -259,10 +295,10 @@ when defined(naviHttp3):
         continue          # that connect resolved dead (rare race): re-check from top
       # Register the in-flight connect synchronously (no await before this) so racing
       # callers await it instead of opening a second connection.
-      let pending = newFuture[QuicConnAsync]("navi.pendingH3")
+      let pending = newFuture[QuicConn]("navi.pendingH3")
       client.pendingH3[origin] = pending
       try:
-        let qc = await openConnAsync(ep.host, ep.port, req.url.host,
+        let qc = await openQuicConn(ep.host, ep.port, req.url.host,
                                      client.config.tls.caFile,
                                      client.config.tls.wantsVerify)
         client.h3conns[origin] = qc
@@ -274,7 +310,7 @@ when defined(naviHttp3):
         if not pending.finished: pending.fail(e)
         raise
 
-  proc h3TransportAsync(client: Navi, req: Request,
+  proc h3Transport(client: Navi, req: Request,
                         ep: AltSvcEndpoint): Future[Response] {.async.} =
     ## Send `req` (any verb with a buffered body) over a shared HTTP/3 connection
     ## (multiplexed with concurrent requests), building a navi Response so the
@@ -309,7 +345,7 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
     if client.config.wantsH3 and req.url.isTls:   # buffered or streamed (bodyStream) body
       let ep = client.altSvc.h3Endpoint("https", req.url.host, req.url.port)
       if ep.isSome:
-        try: return await h3TransportAsync(client, req, ep.get)
+        try: return await h3Transport(client, req, ep.get)
         except QuicError: discard   # fall back to h2/h1 below
   result = await transportInner(client, req, sink)
   when defined(naviHttp3):
@@ -317,34 +353,6 @@ proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.a
 
 proc doRequest(client: Navi, req: Request): Future[Response] {.async.} =
   result = performRequest(client, req)
-
-proc guard[T](client: Navi, fut: Future[T],
-              cancel: CancelToken): Future[T] {.async.} =
-  ## Bound the whole request (all attempts) by `timeout` and `cancel`. On expiry
-  ## or cancellation the abandoned future runs to completion in the background
-  ## (asyncdispatch has no true cancellation); its socket is later reclaimed.
-  let ms = client.config.totalMs
-  if ms <= 0 and cancel == nil:
-    return await fut
-  var cancelFut = newFuture[void]("navi.cancel")
-  if cancel != nil:
-    cancel.armHook(proc() {.gcsafe, raises: [].} =
-      # complete() only raises if already finished, which the guard rules out.
-      {.cast(raises: []).}:
-        if not cancelFut.finished: cancelFut.complete())
-  try:
-    if ms > 0:
-      await fut or cancelFut or sleepAsync(ms)
-    else:
-      await fut or cancelFut
-    if fut.finished:
-      return fut.read
-    if cancel != nil and cancel.cancelled:
-      raise newException(RequestCancelledError, "navi: request cancelled")
-    raise newException(TimeoutError, "navi: request timed out after " & $ms & " ms")
-  finally:
-    if cancel != nil: cancel.disarmHook()
-    if not cancelFut.finished: cancelFut.complete()
 
 proc client*(ctx: NaviContext): Navi = ctx.clientv
   ## The client handling this request (e.g. to read `ctx.client.config`).
@@ -358,7 +366,12 @@ proc next*(ctx: NaviContext): Future[void] {.async.} =
   else:
     let m = mws[ctx.idx]
     inc ctx.idx
-    await m(ctx)
+    # The public NaviMiddleware type is a plain closure (portable to js), so it
+    # carries no chronos raises annotation. Middleware raise at most CatchableError
+    # (navi's error contract; CancelledError is one, so cancellation still flows),
+    # which we assert here to satisfy chronos's strict effect tracking.
+    {.cast(raises: [CatchableError]).}:
+      await m(ctx)
 
 proc runChain(ctx: NaviContext): Future[Response] {.async.} =
   await ctx.next()
@@ -377,9 +390,9 @@ proc request*(client: Navi, verb: HttpVerb, target: string,
   let req = buildRequest(client.config, verb, target, headers, body, json,
                          form, multipart, bodyStream, params, trailers)
   if client.config.middleware.len == 0:
-    return await client.guard(doRequest(client, req), cancel)
+    return await guard(client.config.totalMs, doRequest(client, req), cancel)
   let ctx = NaviContext(req: req, clientv: client)
-  return await client.guard(runChain(ctx), cancel)
+  return await guard(client.config.totalMs, runChain(ctx), cancel)
 
 # --- Streaming downloads (pull-based handle) ---
 
@@ -412,7 +425,7 @@ type
       sid: uint32              ## our stream on it
     of skH3:
       when defined(naviHttp3):
-        qc: QuicConnAsync      ## the shared h3 connection (stays live for reuse)
+        qc: QuicConn      ## the shared h3 connection (stays live for reuse)
         h3sid: int64           ## our QUIC stream on it
       else: discard
   StreamResponse* = ref StreamResponseObj
@@ -451,7 +464,7 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
 
   when defined(naviHttp3):
     # Stream over HTTP/3 when the origin has advertised h3 (Alt-Svc). Mirrors the
-    # buffered h3TransportAsync path: submit on the shared connection, read headers,
+    # buffered h3Transport path: submit on the shared connection, read headers,
     # return a handle whose readChunk pulls the body incrementally. Any QUIC failure
     # falls through to h2/h1.
     if client.config.wantsH3 and req.url.isTls and req.bodyStream == nil:
@@ -718,11 +731,16 @@ proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
       raise
   of skH3:
     when defined(naviHttp3):
-      # Reuse readChunk's decode/cap/free per chunk; it sets `drained` at EOF.
+      # Reuse readChunk's decode/cap/free per chunk; it sets `drained` at EOF. The
+      # sink is a bare closure (no chronos raises annotation); navi's contract is it
+      # raises at most CatchableError -- discharge chronos's strict effects here, as
+      # drainDownload does.
       while true:
         let chunk = await sr.readChunk()
         if chunk.len == 0: break
-        await sink(chunk)
+        {.cast(gcsafe).}:
+          {.cast(raises: [CatchableError]).}:
+            await sink(chunk)
     else: discard
 
 template each*(sr: StreamResponse; chunk, body: untyped): untyped =
@@ -812,7 +830,7 @@ proc sse*(client: Navi, target: string, verb = GET,
     maxRetryMs: maxRetryMs, idleTimeoutMs: idleTimeoutMs, parser: initSseParser(lastEventId))
   s.client.jar = client.jar          # share cookies with the caller
   let openFut = s.openConn()
-  if idleTimeoutMs > 0 and not await withTimeout(openFut, idleTimeoutMs):
+  if idleTimeoutMs > 0 and not await withTimeout(openFut, msOf(idleTimeoutMs)):
     raise newException(IOError, "navi: SSE connect timed out after " & $idleTimeoutMs & " ms")
   await openFut                      # complete (or surface openConn's own error)
   s.started = true
@@ -848,11 +866,11 @@ proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
       return ev
     if s.handle == nil:
       if not s.reconnect: return none(SseEvent)
-      await sleepAsync(min(s.retryMs, s.maxRetryMs))
+      await sleepAsync(msOf(min(s.retryMs, s.maxRetryMs)))
       if s.closed: return none(SseEvent)    # closed during the backoff: do not reconnect
       try:
         let openFut = s.openConn()
-        if s.idleTimeoutMs > 0 and not await withTimeout(openFut, s.idleTimeoutMs):
+        if s.idleTimeoutMs > 0 and not await withTimeout(openFut, msOf(s.idleTimeoutMs)):
           raise newException(IOError, "navi: SSE reconnect timed out")
         await openFut
         s.retryMs = s.baseRetryMs
@@ -867,7 +885,7 @@ proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
       # is caught here and driven back through reconnect+backoff, instead of hanging
       # forever. Any byte, incl. a keep-alive comment, completes readFut and resets
       # the bound, so a live-but-quiet stream is untouched.
-      if s.idleTimeoutMs > 0 and not await withTimeout(readFut, s.idleTimeoutMs):
+      if s.idleTimeoutMs > 0 and not await withTimeout(readFut, msOf(s.idleTimeoutMs)):
         s.handle = nil
         if not s.reconnect: return none(SseEvent)
         continue
@@ -914,7 +932,7 @@ type
       sid: uint32
     of wkH3:
       when defined(naviHttp3):     # the h3 (QUIC) transport type is opt-in
-        qc: QuicConnAsync
+        qc: QuicConn
         h3sid: int64
   WebSocket* = ref object
     tr: WsTransport
@@ -928,6 +946,10 @@ type
     pingOutstanding: bool      ## a keepalive ping is awaiting any inbound byte
     pendingRecv: Future[string]  ## the one in-flight read, kept across keepalive
                                  ## timeouts so a timed-out read is not orphaned
+
+# kaRecv is defined per backend after the shared body (the fireSend pattern):
+# withTimeout on asyncdispatch; race + a cancellable timer on chronos.
+proc kaRecv(ws: WebSocket): Future[string] {.async.}
 
 proc sendRaw(ws: WebSocket, data: string): Future[void] =
   ## Write raw bytes to the underlying transport (an encoded WS frame).
@@ -1035,7 +1057,7 @@ when defined(naviHttp3):
     ## WebSocket over HTTP/3 Extended CONNECT (RFC 9220). Dials a dedicated h3
     ## (QUIC) connection to the origin and opens a CONNECT `:protocol=websocket`
     ## stream, tunnelling frames as DATA. Sec-WebSocket-Key/Accept are not used.
-    let qc = await openConnAsync(u.host, u.port, u.host, client.config.tls.caFile,
+    let qc = await openQuicConn(u.host, u.port, u.host, client.config.tls.caFile,
                                  client.config.tls.verify)
     try:
       let (sid, status) = await qc.openConnect(u.requestTarget,
@@ -1087,7 +1109,7 @@ proc websocket*(client: Navi, url: string,
   ## `receive` is in progress*, and raises `TimeoutError` (closing the connection) if
   ## another interval passes with still nothing back -- so a dead peer is detected
   ## instead of awaiting forever.
-  result = await client.guard(
+  result = await guard(client.config.totalMs,
     doWebsocket(client, url, headers, maxMessageBytes, keepAlive), nil)
 
 proc send*(ws: WebSocket, data: string, binary = false): Future[void] {.async.} =
@@ -1096,26 +1118,6 @@ proc send*(ws: WebSocket, data: string, binary = false): Future[void] {.async.} 
 
 proc ping*(ws: WebSocket, data = ""): Future[void] {.async.} =
   await ws.sendRaw(encodeFrame(opPing, data))
-
-proc kaRecv(ws: WebSocket): Future[string] {.async.} =
-  ## One read chunk. With keepalive off, a plain read. With it on, a single
-  ## outstanding read is kept in `pendingRecv` (so a timed-out read is never
-  ## orphaned to steal the next bytes): on an idle interval send a ping, and on a
-  ## second idle interval with a ping still unanswered, declare the peer dead.
-  if ws.keepAlive <= 0: return await ws.recvRaw()
-  while true:
-    if ws.pendingRecv == nil: ws.pendingRecv = ws.recvRaw()
-    if await withTimeout(ws.pendingRecv, ws.keepAlive):
-      let chunk = ws.pendingRecv.read()     # completed (re-raises a read error)
-      ws.pendingRecv = nil
-      ws.pingOutstanding = false            # any inbound byte proves liveness
-      return chunk
-    if ws.pingOutstanding:                   # pinged last interval, still nothing back
-      ws.open = false
-      try: await ws.closeRaw() except CatchableError: discard
-      raise newException(TimeoutError, "navi: websocket keepalive timed out")
-    await ws.sendRaw(encodeFrame(opPing, ""))
-    ws.pingOutstanding = true
 
 proc receive*(ws: WebSocket): Future[WsMessage] {.async.} =
   ## Await a full message, answering pings and reassembling fragments. A close
@@ -1242,7 +1244,11 @@ proc drain*(r: WsReader, sink: BodySink): Future[void] {.async.} =
     while true:
       let chunk = await r.readChunk()
       if chunk.len == 0: break
-      await sink(chunk)
+      # the sink type carries no raises annotation; discharge chronos's strict
+      # effects here (it raises at most CatchableError), as the HTTP drain does.
+      {.cast(gcsafe).}:
+        {.cast(raises: [CatchableError]).}:
+          await sink(chunk)
   except CatchableError:
     r.ws.open = false
     try: await r.ws.closeRaw()
@@ -1297,3 +1303,27 @@ template stream*(ws: WebSocket; writer, body: untyped): untyped =
 template streamBinary*(ws: WebSocket; writer, body: untyped): untyped =
   ## Like `stream(writer)`, but the message is binary.
   streamOut(ws, writer, true, body)
+# <<< impl_common candidate
+
+# kaRecv: per-backend (forward-declared in the shared body). asyncdispatch has no
+# cancellation, so a single in-flight read is parked in `pendingRecv` and raced
+# against a timeout via withTimeout, kept across timeouts so it is never orphaned.
+proc kaRecv(ws: WebSocket): Future[string] {.async.} =
+  ## One read chunk. With keepalive off, a plain read. With it on, a single
+  ## outstanding read is kept in `pendingRecv` (so a timed-out read is never
+  ## orphaned to steal the next bytes): on an idle interval send a ping, and on a
+  ## second idle interval with a ping still unanswered, declare the peer dead.
+  if ws.keepAlive <= 0: return await ws.recvRaw()
+  while true:
+    if ws.pendingRecv == nil: ws.pendingRecv = ws.recvRaw()
+    if await withTimeout(ws.pendingRecv, ws.keepAlive):
+      let chunk = ws.pendingRecv.read()     # completed (re-raises a read error)
+      ws.pendingRecv = nil
+      ws.pingOutstanding = false            # any inbound byte proves liveness
+      return chunk
+    if ws.pingOutstanding:                   # pinged last interval, still nothing back
+      ws.open = false
+      try: await ws.closeRaw() except CatchableError: discard
+      raise newException(TimeoutError, "navi: websocket keepalive timed out")
+    await ws.sendRaw(encodeFrame(opPing, ""))
+    ws.pingOutstanding = true

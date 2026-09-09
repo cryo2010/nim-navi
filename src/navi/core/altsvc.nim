@@ -123,3 +123,11 @@ proc h3Endpoint*(c: AltSvcCache, scheme, host: string, port: int): Option[AltSvc
 proc clear*(c: AltSvcCache) =
   ## Drop all cached advertisements (e.g. on client close).
   if c != nil: c.entries.clear()
+
+const h3SkipHeaders* = ["host", "connection", "keep-alive", "proxy-connection",
+                        "transfer-encoding", "upgrade", "content-length"]
+  ## Request fields that must not cross to HTTP/3: pseudo-header sources and
+  ## connection-specific fields (RFC 9114). accept-encoding IS forwarded, so the
+  ## response is compressed on the wire; the policy layer's decodeBody decompresses
+  ## it (keyed on the content-encoding header the h3 response carries), exactly as
+  ## for h1/h2.
