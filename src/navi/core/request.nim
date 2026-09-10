@@ -244,6 +244,12 @@ proc validateRequest*(req: Request) =
   if hasCtl(req.url.host):
     raise newException(ValueError,
       "navi: invalid request host (contains CR, LF, or NUL)")
+  # The path/query are written raw onto the HTTP/1.1 request line (h1.serializeHead),
+  # so a CR/LF there splits the request line and injects headers just like a header
+  # value does. std/uri passes these through verbatim, so guard them here too (#274).
+  if hasCtl(req.url.requestTarget):
+    raise newException(ValueError,
+      "navi: invalid request target (path or query contains CR, LF, or NUL)")
   for (k, v) in req.headers.pairs:
     if hasCtl(k) or hasCtl(v):
       raise newException(ValueError,

@@ -30,6 +30,24 @@ suite "h1 serialize":
     req.headers["transfer-encoding"] = "chunked"
     expect ValueError: discard serializeRequest(req)
 
+  test "the request serializer should send Content-Length: 0 for an empty POST (#274)":
+    var req = Request(verb: POST, url: parseUrl("http://h/"))
+    check "Content-Length: 0\r\n" in serializeRequest(req)
+
+  test "the request serializer should not add Content-Length: 0 to an empty GET (#274)":
+    var req = Request(verb: GET, url: parseUrl("http://h/"))
+    check "Content-Length" notin serializeRequest(req)
+
+  test "encodeChunk should return empty for empty data rather than a premature terminator (#274)":
+    check encodeChunk("") == ""
+    check encodeChunk("ab") == "2\r\nab\r\n"
+
+  test "validateRequest should reject CR/LF in the request path (#274)":
+    var req = Request(verb: GET, url: parseUrl("http://h/a"))
+    req.url = parseUrl("http://h/a")
+    req.url.raw.path = "/a\r\nX-Injected: 1"
+    expect ValueError: validateRequest(req)
+
   test "the request serializer should bracket an IPv6 host literal in the Host header (#270)":
     var req = Request(verb: GET, url: parseUrl("http://[2001:db8::1]:8080/x"))
     check "Host: [2001:db8::1]:8080\r\n" in serializeRequest(req)

@@ -41,8 +41,14 @@ proc serializeHead*(req: Request, chunked = false): string =
       var names: seq[string]
       for (k, _) in req.trailers.pairs: names.add(k)
       result.add("Trailer: " & names.join(", ") & "\r\n")
-  elif req.body.len > 0 and not req.headers.contains("content-length"):
-    result.add("Content-Length: " & $req.body.len & "\r\n")
+  elif not req.headers.contains("content-length"):
+    if req.body.len > 0:
+      result.add("Content-Length: " & $req.body.len & "\r\n")
+    elif req.verb in {POST, PUT, PATCH}:
+      # An empty body for a method that normally carries one: send an explicit
+      # Content-Length: 0 so servers/WAFs that require a length don't stall or 411 on
+      # a bodyless POST/PUT/PATCH (#274). GET/HEAD/etc. carry no length by default.
+      result.add("Content-Length: 0\r\n")
   result.add("\r\n")
 
 proc serializeRequest*(req: Request): string =
@@ -56,6 +62,8 @@ proc encodeChunk*(data: string): string =
   ## non-empty. Built into a single preallocated buffer (the payload is copied once)
   ## rather than chained `&` temporaries, since this runs per chunk of a streamed
   ## upload.
+  if data.len == 0: return ""   # an empty chunk would encode as "0\r\n\r\n", a premature
+                                # body terminator; never emit one mid-stream (#274)
   let hex = fmt"{data.len:X}"
   result = newStringOfCap(hex.len + data.len + 4)
   result.add hex
@@ -258,8 +266,11 @@ proc step(p: var H1Parser): bool =
     p.remaining = parseHexInt(hex)
     # parseHexInt wraps on overflow; a negative or absurd size would slice out
     # of bounds (RangeDefect) or overflow `remaining + 2`. Reject it as a
-    # catchable error (fuzz-found). 1 shl 40 is far above any real chunk.
-    if p.remaining < 0 or p.remaining > (1 shl 40):
+    # catchable error (fuzz-found). The bound is far above any real chunk; use an
+    # int64 literal so it is valid on a 32-bit `int` build too (`1 shl 40` overflows
+    # a 32-bit int) (#274).
+    const maxChunkSize = 1'i64 shl 40
+    if p.remaining < 0 or p.remaining.int64 > maxChunkSize:
       raise newException(ValueError, "h1: invalid chunk size")
     p.state = if p.remaining == 0: stTrailers else: stChunkData
     true
@@ -314,6 +325,9 @@ proc keepAliveAfter*(p: H1Parser): bool =
   ## that did not ask to close.
   if p.state != stDone: return false
   if p.bodyMode == bmUntilClose: return false
+  # Only pool an HTTP/1.1 peer. HTTP/1.0 keep-alive (via `Connection: keep-alive`) is
+  # spec-permitted (RFC 9112 6.3) but notoriously ambiguous through proxies, so we
+  # deliberately decline to reuse a 1.0 connection rather than risk a desync (#274).
   if p.version != "HTTP/1.1": return false
   # RFC 9110 5.3: a field may be split across multiple lines with the same semantics
   # as one comma-joined value. `get` returns only the first, so a peer that sends
@@ -328,5 +342,9 @@ proc trailers*(p: H1Parser): Headers =
   p.trailers
 
 proc toResponse*(p: H1Parser): Response =
+  # Trailers are surfaced separately (`result.trailers`), never merged into the header
+  # set: RFC 9110 6.5.1 forbids blindly merging trailing fields, and keeping them apart
+  # is what makes the parser's lack of trailer-name filtering safe -- a trailer cannot
+  # override a real header (e.g. a smuggled Content-Length in a trailer is inert) (#274).
   result = initResponse(p.status, p.reason, p.version, p.headers, p.body)
   result.trailers = p.trailers
