@@ -18,6 +18,7 @@ when not defined(naviHttp3):
 
 import std/[strutils, atomics, os, times]
 import ../core/altsvc
+import ../core/response   # ResponseTooLargeError, raised when a body exceeds maxResponseBytes
 export altsvc.AltSvcEndpoint
 
 # Link the h3 stack via pkg-config so the build follows wherever the libraries
@@ -65,21 +66,16 @@ proc nghttp3_version(least: cint): ptr Nghttp3Info
   {.importc, cdecl, header: "nghttp3/nghttp3.h".}
 
 # From h3client.c. navi_h3_open completes the handshake (verifying the peer cert
-# unless verify=0; caFile "" uses the system store) and returns an opaque
-# connection, or nil on failure. navi_h3_request runs one GET on it (0 ok, filling
-# status and up to outCap body bytes). navi_h3_close frees it.
+# unless verify=0; caFile "" uses the system store) and returns an opaque connection,
+# or nil on failure. `maxBody` caps a single response body the driver will buffer
+# (0 = unlimited). navi_h3_close frees it. Requests are issued with navi_h3_submit +
+# the size-safe navi_h3_take_response / streaming read primitives below.
 type H3BodyPull* = proc(env: pointer, outPtr: ptr cstring): int {.cdecl.}
   ## C-callable pull for a streamed request body: returns the next chunk's length
   ## and sets `outPtr[]` to its bytes (valid only for the call); 0 = end, < 0 = error.
 
-proc navi_h3_open(host, port, sni, caFile: cstring, verify: cint): pointer
-  {.importc, cdecl.}
-proc navi_h3_request(c: pointer, verb, path, reqHeaders: cstring, body: ptr char,
-                     bodyLen: csize_t, pull: H3BodyPull, pullEnv: pointer,
-                     reqTrailers: cstring, outStatus: ptr clong, outBody: ptr char,
-                     outCap: csize_t, outLen: ptr csize_t, outHeaders: ptr char,
-                     hdrCap: csize_t, hdrLen: ptr csize_t, outTrailers: ptr char,
-                     trlCap: csize_t, trlLen: ptr csize_t): cint {.importc, cdecl.}
+proc navi_h3_open(host, port, sni, caFile: cstring, verify: cint,
+                  maxBody: culonglong): pointer {.importc, cdecl.}
 proc navi_h3_close*(c: pointer) {.importc, cdecl.}
 
 # --- streamed request body (navi bodyStream) over h3 -------------------------
@@ -106,8 +102,8 @@ proc h3PullThunk*(env: pointer, outPtr: ptr cstring): int {.cdecl.} =
 # Non-blocking step functions (exported for the asyncdispatch driver in
 # quic_async.nim): create without driving the handshake, then pump send/recv/timer
 # from the caller's event loop until handshake / request completion.
-proc navi_h3_new*(host, port, sni, caFile: cstring, verify: cint): pointer
-  {.importc, cdecl.}
+proc navi_h3_new*(host, port, sni, caFile: cstring, verify: cint,
+                  maxBody: culonglong): pointer {.importc, cdecl.}
 proc navi_h3_fd*(c: pointer): cint {.importc, cdecl.}
 proc navi_h3_send*(c: pointer, buf: pointer, buflen: csize_t): int {.importc, cdecl.}
 proc navi_h3_recv*(c: pointer, pkt: pointer, len: csize_t): cint {.importc, cdecl.}
@@ -119,12 +115,16 @@ proc navi_h3_pump*(c: pointer): cint {.importc, cdecl.}
   ## One blocking send/recv/timer cycle (for the sync buffered + streaming drivers).
 proc navi_h3_submit*(c: pointer, verb, path, reqHeaders: cstring, body: ptr char,
                      bodyLen: csize_t, pull: H3BodyPull, pullEnv: pointer,
-                     reqTrailers: cstring): int64 {.importc, cdecl.}   ## stream id, or -1
+                     reqTrailers: cstring, capBody: cint): int64 {.importc, cdecl.}
+  ## Returns the stream id, or -1. `capBody` = 1 enforces the connection's maxBody cap
+  ## on this stream's buffered body (0 for a streaming read, which caps navi-side).
 proc navi_h3_stream_done*(c: pointer, sid: int64): cint {.importc, cdecl.}
 proc navi_h3_stream_reset*(c: pointer, sid: int64): cint {.importc, cdecl.}
   ## 1 if the stream ended by reset/abort rather than a normal response.
 proc navi_h3_stream_length_mismatch*(c: pointer, sid: int64): cint {.importc, cdecl.}
   ## 1 if the stream ended cleanly but its body length disagreed with Content-Length.
+proc navi_h3_stream_too_large*(c: pointer, sid: int64): cint {.importc, cdecl.}
+  ## 1 if the response body exceeded maxResponseBytes (the driver stopped buffering).
 
 const h3BodyLengthErr* =
   "navi: response body length does not match the declared Content-Length"
@@ -165,14 +165,15 @@ proc ngtcp2VersionStr*(): string = $ngtcp2_version(0).version_str
 proc nghttp3VersionStr*(): string = $nghttp3_version(0).version_str
 
 proc h3Open*(host: string, port: int, sni = "", caFile = "",
-             verify = true): QuicConn =
+             verify = true, maxBody: uint64 = 0): QuicConn =
   ## Open a persistent HTTP/3 connection and complete the handshake. `sni`
   ## defaults to `host`; the server certificate and hostname are verified by
   ## default (`caFile` adds a custom CA, `verify=false` disables checking).
+  ## `maxBody` caps a buffered response body (0 = unlimited, navi maxResponseBytes).
   ## Raises `QuicError` on connect or verification failure.
   let name = if sni.len > 0: sni else: host
   let h = navi_h3_open(host.cstring, ($port).cstring, name.cstring,
-                       caFile.cstring, cint(verify))
+                       caFile.cstring, cint(verify), culonglong(maxBody))
   if h == nil:
     raise newException(QuicError,
       "navi HTTP/3 connect to " & host & ":" & $port & " failed")
@@ -209,27 +210,49 @@ proc request*(c: QuicConn, verb: string, path = "/",
     raise newException(QuicError, "navi HTTP/3: connection is closed")
   let reqHdr = encodeH3Fields(headers)
   let reqTrl = encodeH3Fields(trailers)
+  var b = body
+  let streamed = producer != nil
+  let pe = if streamed: H3PullEnv(producer: producer) else: nil  # lives on this frame,
+  let pull = if streamed: h3PullThunk else: nil                  # borrowed by the drive
+  let bp = if not streamed and b.len > 0: cast[ptr char](addr b[0]) else: nil
+  let sid = navi_h3_submit(c.handle, verb.cstring, path.cstring, reqHdr.cstring, bp,
+                           csize_t(if streamed: 0 else: b.len), pull, cast[pointer](pe),
+                           reqTrl.cstring, 1)   # buffered: enforce maxResponseBytes
+  if sid < 0:
+    raise newException(QuicError, "navi HTTP/3 submit failed")
+  while navi_h3_stream_done(c.handle, sid) == 0:   # drive until this stream completes
+    if navi_h3_pump(c.handle) != 0:
+      navi_h3_stream_free(c.handle, sid)
+      raise newException(QuicError, "navi HTTP/3 pump failed")
+  if navi_h3_stream_reset(c.handle, sid) != 0:
+    navi_h3_stream_free(c.handle, sid)
+    raise newException(QuicError, "navi HTTP/3 " & verb & " " & path & " was reset")
+  if navi_h3_stream_too_large(c.handle, sid) != 0:
+    navi_h3_stream_free(c.handle, sid)
+    raise newException(ResponseTooLargeError, "navi: response exceeded maxResponseBytes")
+  if navi_h3_stream_length_mismatch(c.handle, sid) != 0:
+    navi_h3_stream_free(c.handle, sid)
+    raise newException(IOError, h3BodyLengthErr)
   var status: clong
   var blen, hlen, tlen: csize_t
   var rbody = newString(64 * 1024)
   var hbuf = newString(16 * 1024)
   var tbuf = newString(16 * 1024)
-  var b = body
-  let streamed = producer != nil
-  let pe = if streamed: H3PullEnv(producer: producer) else: nil
-  let pull = if streamed: h3PullThunk else: nil
-  let bp = if not streamed and b.len > 0: cast[ptr char](addr b[0]) else: nil
-  let rv = navi_h3_request(c.handle, verb.cstring, path.cstring, reqHdr.cstring,
-                           bp, csize_t(if streamed: 0 else: b.len), pull,
-                           cast[pointer](pe), reqTrl.cstring, addr status,
-                           cast[ptr char](addr rbody[0]), csize_t(rbody.len),
-                           addr blen, cast[ptr char](addr hbuf[0]),
-                           csize_t(hbuf.len), addr hlen,
-                           cast[ptr char](addr tbuf[0]), csize_t(tbuf.len), addr tlen)
-  if rv == -2:   # body length disagreed with Content-Length: a real (received) response,
-    raise newException(IOError, h3BodyLengthErr)   # so raise instead of QuicError (no h2 fallback)
-  if rv != 0:
-    raise newException(QuicError, "navi HTTP/3 " & verb & " " & path & " failed")
+  # take_response reports the true sizes; grow and retry if our fixed buffers were too
+  # small (it only consumes the stream once everything fits), so a large buffered
+  # response is never silently truncated (#275, #276).
+  while true:
+    if navi_h3_take_response(c.handle, sid, addr status,
+        cast[ptr char](addr rbody[0]), csize_t(rbody.len), addr blen,
+        cast[ptr char](addr hbuf[0]), csize_t(hbuf.len), addr hlen,
+        cast[ptr char](addr tbuf[0]), csize_t(tbuf.len), addr tlen) != 0:
+      navi_h3_stream_free(c.handle, sid)
+      raise newException(QuicError, "navi HTTP/3 take_response failed")
+    if int(blen) <= rbody.len and int(hlen) <= hbuf.len and int(tlen) <= tbuf.len:
+      break
+    if int(blen) > rbody.len: rbody = newString(int(blen))
+    if int(hlen) > hbuf.len: hbuf = newString(int(hlen))
+    if int(tlen) > tbuf.len: tbuf = newString(int(tlen))
   rbody.setLen(int(blen))
   hbuf.setLen(int(hlen))
   tbuf.setLen(int(tlen))
@@ -260,7 +283,7 @@ proc submitStream*(c: QuicConn, verb, path: string,
   let reqHdr = encodeH3Fields(headers)
   let reqTrl = encodeH3Fields(trailers)
   navi_h3_submit(c.handle, verb.cstring, path.cstring, reqHdr.cstring, nil,
-                 csize_t(0), nil, nil, reqTrl.cstring)
+                 csize_t(0), nil, nil, reqTrl.cstring, 0)   # streaming read: capped navi-side
 
 proc awaitHeaders*(c: QuicConn, sid: int64):
     tuple[status: int, headers: seq[(string, string)]] =
@@ -401,7 +424,8 @@ proc openWsH3*(host: string, port: int, sni, caFile: string, verify: bool,
   ## cannot hang the caller forever.
   let name = if sni.len > 0: sni else: host
   let h = navi_h3_open(host.cstring, ($port).cstring, name.cstring,
-                       caFile.cstring, (if verify: 1.cint else: 0.cint))
+                       caFile.cstring, (if verify: 1.cint else: 0.cint),
+                       culonglong(0))   # WebSocket frames stream via read_body: no buffered cap
   if h == nil: raise newException(QuicError, "navi: HTTP/3 connect failed")
   let reqHdr = encodeH3Fields(headers)
   let sid = navi_h3_open_connect(h, path.cstring, reqHdr.cstring, "websocket".cstring)

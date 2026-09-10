@@ -17,6 +17,7 @@ when not defined(naviHttp3):
 
 import std/[strutils, tables]
 import pkg/chronos
+import ../core/response   # ResponseTooLargeError, used by the shared quic_common fragment
 import ./quic
 export quic
 
@@ -112,12 +113,13 @@ proc waitProgress(qc: QuicConn, sid: int64) {.async.} =
   await f
 
 proc openConnChronos*(host: string, port: int, sni, caFile: string,
-                      verify: bool): Future[QuicConnChronos] {.async.} =
+                      verify: bool, maxBody: uint64 = 0): Future[QuicConnChronos] {.async.} =
   ## Open a QUIC connection, complete the handshake, bind the h3 session, and start
-  ## the background reader. Raises `QuicError` on failure.
+  ## the background reader. `maxBody` caps a buffered response body (0 = unlimited,
+  ## navi maxResponseBytes). Raises `QuicError` on failure.
   let name = if sni.len > 0: sni else: host
   let c = navi_h3_new(host.cstring, ($port).cstring, name.cstring, caFile.cstring,
-                      cint(verify))
+                      cint(verify), culonglong(maxBody))
   if c == nil:
     raise newException(QuicError,
       "navi HTTP/3 connect to " & host & ":" & $port & " failed")

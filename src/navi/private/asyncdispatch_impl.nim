@@ -27,8 +27,8 @@ export public, asyncdispatch
 
 when defined(naviHttp3):
   type QuicConn = QuicConnAsync
-  template openQuicConn(host, port, sni, ca, verify: untyped): untyped =
-    openConnAsync(host, port, sni, ca, verify)
+  template openQuicConn(host, port, sni, ca, verify, maxBody: untyped): untyped =
+    openConnAsync(host, port, sni, ca, verify, maxBody)
 
 template msOf(ms: int): int = ms
 

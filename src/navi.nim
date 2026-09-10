@@ -160,7 +160,8 @@ when defined(naviHttp3):
         fwdTrl.add((lk, v))
     let conn = h3Open(ep.host, ep.port, sni = req.url.host,
                       caFile = client.config.tls.caFile,
-                      verify = client.config.tls.wantsVerify)
+                      verify = client.config.tls.wantsVerify,
+                      maxBody = uint64(max(0, client.config.maxResponseBytes)))
     try:
       let r = conn.request($req.verb, req.url.requestTarget, fwd, req.body,
                            req.bodyStream, fwdTrl)
@@ -293,7 +294,8 @@ proc openStream(client: Navi, req0: Request): StreamResponse =
         try:
           let conn = h3Open(ep.get.host, ep.get.port, sni = rq.url.host,
                             caFile = client.config.tls.caFile,
-                            verify = client.config.tls.wantsVerify)
+                            verify = client.config.tls.wantsVerify,
+                            maxBody = uint64(max(0, client.config.maxResponseBytes)))
           var fwd: seq[(string, string)]
           for k, v in rq.headers:
             let lk = k.toLowerAscii

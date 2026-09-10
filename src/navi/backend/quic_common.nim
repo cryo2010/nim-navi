@@ -35,7 +35,7 @@ proc requestOnConn*(qc: QuicConn, verb, path: string,
   if pe != nil: GC_ref(pe)
   let sid = navi_h3_submit(qc.c, verb.cstring, path.cstring, reqHdr.cstring, bp,
                            csize_t(if streamed: 0 else: b.len), pull, cast[pointer](pe),
-                           reqTrl.cstring)
+                           reqTrl.cstring, 1)   # buffered: enforce maxResponseBytes
   if sid < 0:
     if pe != nil: GC_unref(pe)
     raise newException(QuicError, "navi HTTP/3 submit failed")
@@ -54,6 +54,10 @@ proc requestOnConn*(qc: QuicConn, verb, path: string,
     # The stream was reset/aborted, not answered. The defer frees its C-side entry;
     # raise so the engine falls back to h2/h1 instead of a bogus empty response.
     raise newException(QuicError, "navi HTTP/3 stream was reset")
+  if navi_h3_stream_too_large(qc.c, sid) != 0:
+    # Body exceeded maxResponseBytes: the driver stopped buffering. A real (received)
+    # response, so raise the same error the h1/h2 paths do rather than fall back.
+    raise newException(ResponseTooLargeError, "navi: response exceeded maxResponseBytes")
   if navi_h3_stream_length_mismatch(qc.c, sid) != 0:
     # Cleanly ended but body != Content-Length: a real (received) response, so raise a
     # non-QuicError (IOError) that propagates rather than triggering the h2/h1 fallback.
@@ -64,12 +68,21 @@ proc requestOnConn*(qc: QuicConn, verb, path: string,
   var rbody = newString(64 * 1024)
   var hbuf = newString(16 * 1024)
   var tbuf = newString(16 * 1024)
-  if navi_h3_take_response(qc.c, sid, addr status, cast[ptr char](addr rbody[0]),
-                           csize_t(rbody.len), addr blen,
-                           cast[ptr char](addr hbuf[0]), csize_t(hbuf.len), addr hlen,
-                           cast[ptr char](addr tbuf[0]), csize_t(tbuf.len),
-                           addr tlen) != 0:
-    raise newException(QuicError, "navi HTTP/3 take_response failed")
+  # take_response reports the true sizes; grow and retry if the fixed buffers were too
+  # small (it only consumes the stream once everything fits), so a large buffered
+  # response is never silently truncated (#275, #276).
+  while true:
+    if navi_h3_take_response(qc.c, sid, addr status, cast[ptr char](addr rbody[0]),
+                             csize_t(rbody.len), addr blen,
+                             cast[ptr char](addr hbuf[0]), csize_t(hbuf.len), addr hlen,
+                             cast[ptr char](addr tbuf[0]), csize_t(tbuf.len),
+                             addr tlen) != 0:
+      raise newException(QuicError, "navi HTTP/3 take_response failed")
+    if int(blen) <= rbody.len and int(hlen) <= hbuf.len and int(tlen) <= tbuf.len:
+      break
+    if int(blen) > rbody.len: rbody = newString(int(blen))
+    if int(hlen) > hbuf.len: hbuf = newString(int(hlen))
+    if int(tlen) > tbuf.len: tbuf = newString(int(tlen))
   consumed = true                          # take_response erased the C stream on success
   rbody.setLen(int(blen))
   hbuf.setLen(int(hlen))
@@ -98,7 +111,7 @@ proc submitStream*(qc: QuicConn, verb, path: string,
   let bp = if pull == nil and b.len > 0: cast[ptr char](addr b[0]) else: nil
   result = navi_h3_submit(qc.c, verb.cstring, path.cstring, reqHdr.cstring, bp,
                           csize_t(if pull != nil: 0 else: b.len), pull, pullEnv,
-                          reqTrl.cstring)
+                          reqTrl.cstring, 0)   # streaming read: capped navi-side, not here
   wake(qc)
 
 proc awaitHeaders*(qc: QuicConn, sid: int64):

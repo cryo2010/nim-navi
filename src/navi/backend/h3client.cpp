@@ -103,6 +103,11 @@ struct Stream {
   long long content_length = -1;  // declared Content-Length, or -1 if absent
   unsigned long long body_total = 0;  // total DATA bytes received
   bool length_mismatch = false;   // set at end_stream when body_total != content_length
+  bool cap_body = false;          // enforce the connection's max_body cap on this stream
+                                  // (buffered requests only; a streaming read drains the
+                                  // body incrementally and caps it navi-side instead)
+  bool too_large = false;         // body exceeded the connection's max_body cap; the
+                                  // driver stops buffering and navi raises TooLarge
   // Streaming request body (navi bodyStream): chunks pulled from Nim on demand and
   // kept until acked. `pull` null => this stream has no streamed body.
   std::deque<BodyChunk> out;
@@ -141,6 +146,8 @@ struct H3Conn {
   bool handshake_done = false;
   bool want_verify = false; // verify the peer certificate after the handshake (see below)
   bool has_abort = false;   // some stream's producer failed; reset it in send_step
+  unsigned long long max_body = 0;  // navi maxResponseBytes: cap on a single response
+                                    // body the driver will buffer (0 = unlimited)
   std::unordered_map<int64_t, Stream> streams;   // live streams by id
   // Self-pipe (RAII: closed with the connection) so another thread can interrupt the
   // pump's poll() to flush an outbound frame promptly -- the sync WebSocket's pump
@@ -322,9 +329,17 @@ int on_recv_data(nghttp3_conn *, std::int64_t stream_id, const std::uint8_t *dat
   auto it = c->streams.find(stream_id);
   if (it == c->streams.end()) return 0;
   try {
-    it->second.headers_done = true;  // nghttp3 delivers all headers before any body
-    it->second.body.append(reinterpret_cast<const char *>(data), datalen);
-    it->second.body_total += datalen;   // total received (body is drained on streaming)
+    auto &s = it->second;
+    s.headers_done = true;  // nghttp3 delivers all headers before any body
+    s.body_total += datalen;   // total received (body is drained on streaming)
+    // Enforce navi's maxResponseBytes at the source: once the cap is exceeded, stop
+    // buffering (so a hostile/huge body cannot grow C memory without bound, matching
+    // the h1/h2 cap) and flag it -- navi raises ResponseTooLargeError and frees the
+    // stream. Flow control is still credited below so the peer is not stalled meanwhile.
+    if (s.cap_body && c->max_body > 0 && s.body_total > c->max_body)
+      s.too_large = true;
+    else
+      s.body.append(reinterpret_cast<const char *>(data), datalen);
   } catch (...) {
     return NGHTTP3_ERR_CALLBACK_FAILURE;
   }
@@ -742,7 +757,7 @@ int navi_h3_bind(H3Conn *c) {
 // Create a connection and set up ngtcp2/nghttp3 + TLS, but do NOT drive the
 // handshake (no I/O, non-blocking).
 H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
-                    const char *ca_file, int verify) {
+                    const char *ca_file, int verify, unsigned long long max_body) {
   static bool crypto_inited = false;
   if (!crypto_inited) {
     if (ngtcp2_crypto_ossl_init() != 0) {
@@ -755,6 +770,7 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
     // Owned locally so any early return / thrown exception frees it and the C
     // handles it has acquired; ownership is handed to the caller via release().
     auto c = std::make_unique<H3Conn>();
+    c->max_body = max_body;
     c->authority = std::string(sni) + ":" + port;
     c->fd = udp_connect(host, port, c.get());
     // Self-pipe for navi_h3_wake (nonblocking, close-on-exec). Best-effort: if it
@@ -906,8 +922,8 @@ void navi_h3_close(H3Conn *c) { delete c; }
 // Sync convenience: create, drive the handshake to completion with a blocking
 // poll loop, and bind the h3 session. Returns nullptr on failure.
 H3Conn *navi_h3_open(const char *host, const char *port, const char *sni,
-                     const char *ca_file, int verify) {
-  H3Conn *c = navi_h3_new(host, port, sni, ca_file, verify);
+                     const char *ca_file, int verify, unsigned long long max_body) {
+  H3Conn *c = navi_h3_new(host, port, sni, ca_file, verify, max_body);
   if (!c) return nullptr;
   if (drive_until(c, &c->handshake_done) != 0 || navi_h3_bind(c) != 0) {
     navi_h3_close(c);
@@ -941,12 +957,14 @@ void append_header_blob(const char *blob, std::vector<nghttp3_nv> &nva) {
 std::int64_t navi_h3_submit(H3Conn *c, const char *method, const char *path_,
                             const char *req_headers, const char *body,
                             std::size_t body_len, NaviBodyPull pull, void *pull_env,
-                            const char *req_trailers) {
+                            const char *req_trailers, int cap_body) {
   try {
     std::int64_t sid;
     if (ngtcp2_conn_open_bidi_stream(c->conn, &sid, nullptr) != 0) return -1;
     Stream &s = c->streams[sid];
     s.is_head = std::strcmp(method, "HEAD") == 0;   // its Content-Length has no body
+    s.cap_body = (cap_body != 0);   // buffered request: enforce max_body on the body
+
     if (pull) { s.pull = pull; s.pull_env = pull_env; }     // streamed body
     else if (body && body_len) s.req_body.assign(body, body_len);  // owned copy
     if (req_trailers && req_trailers[0]) s.req_trailers.assign(req_trailers);
@@ -1055,6 +1073,13 @@ int navi_h3_stream_length_mismatch(H3Conn *c, std::int64_t sid) {
   return (it != c->streams.end() && it->second.length_mismatch) ? 1 : 0;
 }
 
+// 1 if stream `sid`'s response body exceeded the connection's max_body cap (navi
+// maxResponseBytes). The driver stopped buffering; navi raises ResponseTooLargeError.
+int navi_h3_stream_too_large(H3Conn *c, std::int64_t sid) {
+  auto it = c->streams.find(sid);
+  return (it != c->streams.end() && it->second.too_large) ? 1 : 0;
+}
+
 // Copy stream `sid`'s completed response into the caller's buffers and drop it.
 // out_trailers receives the trailing fields ("name\nvalue\n"), empty if none.
 int navi_h3_take_response(H3Conn *c, std::int64_t sid, long *out_status, char *out_body,
@@ -1066,15 +1091,19 @@ int navi_h3_take_response(H3Conn *c, std::int64_t sid, long *out_status, char *o
     if (it == c->streams.end()) return -1;
     Stream &s = it->second;
     *out_status = s.status;
-    std::size_t k = std::min(s.body.size(), out_cap);
-    std::memcpy(out_body, s.body.data(), k);
-    *out_len = k;
-    std::size_t hk = std::min(s.resp_headers.size(), hdr_cap);
-    std::memcpy(out_headers, s.resp_headers.data(), hk);
-    *hdr_len = hk;
-    std::size_t tk = std::min(s.resp_trailers.size(), trl_cap);
-    std::memcpy(out_trailers, s.resp_trailers.data(), tk);
-    *trl_len = tk;
+    // Report the TRUE sizes so a caller whose fixed buffers are too small can grow and
+    // retry -- never silently truncate a response (#275, #276). If ANY buffer is too
+    // small, copy nothing and keep the stream alive for the retry; only erase (consume)
+    // once everything fits.
+    *out_len = s.body.size();
+    *hdr_len = s.resp_headers.size();
+    *trl_len = s.resp_trailers.size();
+    if (s.body.size() > out_cap || s.resp_headers.size() > hdr_cap ||
+        s.resp_trailers.size() > trl_cap)
+      return 0;
+    std::memcpy(out_body, s.body.data(), s.body.size());
+    std::memcpy(out_headers, s.resp_headers.data(), s.resp_headers.size());
+    std::memcpy(out_trailers, s.resp_trailers.data(), s.resp_trailers.size());
     c->streams.erase(it);
     return 0;
   } catch (...) {
@@ -1160,37 +1189,9 @@ void navi_h3_stream_free(H3Conn *c, std::int64_t sid) {
   c->streams.erase(sid);
 }
 
-// Sync convenience: submit, drive to completion with a blocking poll loop, and
-// take the response.
-int navi_h3_request(H3Conn *c, const char *method, const char *path_,
-                    const char *req_headers, const char *body, std::size_t body_len,
-                    NaviBodyPull pull, void *pull_env, const char *req_trailers,
-                    long *out_status, char *out_body,
-                    std::size_t out_cap, std::size_t *out_len, char *out_headers,
-                    std::size_t hdr_cap, std::size_t *hdr_len,
-                    char *out_trailers, std::size_t trl_cap, std::size_t *trl_len) {
-  std::int64_t sid = navi_h3_submit(c, method, path_, req_headers, body, body_len, pull,
-                                    pull_env, req_trailers);
-  if (sid < 0) return -1;
-  // Look the stream up with find(), not at(): this is an extern "C" boundary with no
-  // try/catch, so an at() miss would throw std::out_of_range into Nim-generated C.
-  // (References into an unordered_map stay valid across inserts, so &done survives the
-  // drive_until pump loop -- only erasing the element would invalidate it.)
-  auto it = c->streams.find(sid);
-  if (it == c->streams.end()) return -1;
-  if (drive_until(c, &it->second.done) != 0) return -1;
-  if (navi_h3_stream_reset(c, sid)) {   // reset/abort, not a real response
-    c->streams.erase(sid);
-    return -1;
-  }
-  if (navi_h3_stream_length_mismatch(c, sid)) {   // body != declared Content-Length
-    c->streams.erase(sid);
-    return -2;                                    // distinct: caller raises, no fallback
-  }
-  return navi_h3_take_response(c, sid, out_status, out_body, out_cap, out_len,
-                               out_headers, hdr_cap, hdr_len,
-                               out_trailers, trl_cap, trl_len);
-}
+// (The old all-in-one navi_h3_request was removed: the sync driver now submits, drives
+// with a pump loop, and reads via the size-safe navi_h3_take_response grow/retry path,
+// matching the async backend -- so a large buffered response is never truncated.)
 
 }  // extern "C"
 
