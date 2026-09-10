@@ -167,9 +167,13 @@ proc send(mux: H2Mux, data: string) {.async.} =
   let prev = mux.sendTail
   let mine = newFuture[void]("h2mux.send")
   mux.sendTail = mine
-  if prev != nil and not prev.finished:
-    await prev
+  # `await prev` must be INSIDE the try: on chronos a cancellation (guard timeout,
+  # CancelToken, SSE withTimeout) can land while we are parked here, and `mine` is
+  # already installed as `sendTail`. If it were not completed on that path, every
+  # later send on the connection would chain behind it forever (issue #258).
   try:
+    if prev != nil and not prev.finished:
+      await prev
     await be.sendAll(mux.transport, data)
   finally:
     mine.complete()
