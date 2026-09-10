@@ -300,6 +300,9 @@ proc awaitHeaders*(c: QuicConn, sid: int64):
                                addr hlen, addr ready) != 0:
       raise newException(QuicError, "navi HTTP/3 stream gone")
     if ready != 0:
+      if int(hlen) > hbuf.len:          # header block did not fit: grow and re-read (#276)
+        hbuf = newString(int(hlen))
+        continue
       hbuf.setLen(int(hlen))
       var hs: seq[(string, string)]
       let parts = hbuf.split('\n')
@@ -332,9 +335,12 @@ proc streamTrailers*(c: QuicConn, sid: int64): seq[(string, string)] =
   if c.handle == nil: return
   var tbuf = newString(16 * 1024)
   var tlen: csize_t
-  if navi_h3_response_trailers(c.handle, sid, cast[ptr char](addr tbuf[0]),
-                               csize_t(tbuf.len), addr tlen) != 0:
-    return
+  while true:                          # grow and re-read if the block did not fit (#276)
+    if navi_h3_response_trailers(c.handle, sid, cast[ptr char](addr tbuf[0]),
+                                 csize_t(tbuf.len), addr tlen) != 0:
+      return
+    if int(tlen) <= tbuf.len: break
+    tbuf = newString(int(tlen))
   tbuf.setLen(int(tlen))
   parseH3Fields(tbuf)
 

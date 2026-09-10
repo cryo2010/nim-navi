@@ -1118,9 +1118,12 @@ int navi_h3_response_trailers(H3Conn *c, std::int64_t sid, char *out_trailers,
   try {
     auto it = c->streams.find(sid);
     if (it == c->streams.end()) return -1;
-    std::size_t tk = std::min(it->second.resp_trailers.size(), trl_cap);
-    std::memcpy(out_trailers, it->second.resp_trailers.data(), tk);
-    *trl_len = tk;
+    // Report the true size; if the buffer is too small, copy nothing so the caller can
+    // grow and retry rather than get a truncated, parser-desyncing field block (#276).
+    *trl_len = it->second.resp_trailers.size();
+    if (it->second.resp_trailers.size() > trl_cap) return 0;
+    std::memcpy(out_trailers, it->second.resp_trailers.data(),
+                it->second.resp_trailers.size());
     return 0;
   } catch (...) {
     return -1;
@@ -1145,10 +1148,12 @@ int navi_h3_response_headers(H3Conn *c, std::int64_t sid, long *out_status,
     Stream &s = it->second;
     if (!s.headers_done) { *out_ready = 0; return 0; }
     *out_status = s.status;
-    std::size_t hk = std::min(s.resp_headers.size(), hdr_cap);
-    std::memcpy(out_headers, s.resp_headers.data(), hk);
-    *hdr_len = hk;
     *out_ready = 1;
+    // Report the true size; if the buffer is too small, copy nothing so the caller can
+    // grow and retry rather than get a truncated, parser-desyncing header block (#276).
+    *hdr_len = s.resp_headers.size();
+    if (s.resp_headers.size() > hdr_cap) return 0;
+    std::memcpy(out_headers, s.resp_headers.data(), s.resp_headers.size());
     return 0;
   } catch (...) {
     return -1;
