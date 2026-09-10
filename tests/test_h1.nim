@@ -38,6 +38,14 @@ proc parseAll(chunks: varargs[string]): Response =
   check p.finished
   p.toResponse()
 
+proc parseKA(chunks: varargs[string]): bool =
+  ## Parse to completion and report whether the connection may be pooled.
+  var p = initH1Parser()
+  for c in chunks:
+    p.feed(c)
+  if not p.finished: p.eof()
+  p.keepAliveAfter()
+
 suite "h1 parse":
   test "the h1 parser should read a Content-Length body":
     let r = parseAll("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
@@ -199,11 +207,18 @@ suite "h1 parse":
     # 6.3 says read until close, so the whole remainder is the body, not a chunk size.
     let r = parseAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: not-chunked\r\n\r\n5\r\nhello")
     check r.body == "5\r\nhello"
-    check not r.keepAliveAfter()
+    check not parseKA("HTTP/1.1 200 OK\r\nTransfer-Encoding: not-chunked\r\n\r\n5\r\nhello")
 
   test "the h1 parser should read until close when chunked is not the final coding (#271)":
     let r = parseAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\nrawbytes")
     check r.body == "rawbytes"
+
+  test "keepAliveAfter should see a second Connection: close line (#272)":
+    check not parseKA("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n" &
+                      "Connection: keep-alive\r\nConnection: close\r\n\r\n")
+
+  test "keepAliveAfter should reuse a plain keep-alive response (#272)":
+    check parseKA("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
 
 suite "url port parsing":
   test "an explicit port and the scheme defaults parse":

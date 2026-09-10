@@ -306,7 +306,13 @@ proc keepAliveAfter*(p: H1Parser): bool =
   if p.state != stDone: return false
   if p.bodyMode == bmUntilClose: return false
   if p.version != "HTTP/1.1": return false
-  "close" notin p.headers.get("connection").toLowerAscii
+  # RFC 9110 5.3: a field may be split across multiple lines with the same semantics
+  # as one comma-joined value. `get` returns only the first, so a peer that sends
+  # `Connection: keep-alive` then `Connection: close` would look reusable. Inspect
+  # every value.
+  for v in p.headers.getAll("connection"):
+    if "close" in v.toLowerAscii: return false
+  true
 
 proc trailers*(p: H1Parser): Headers =
   ## Trailing header fields received after a chunked body (empty if none).
