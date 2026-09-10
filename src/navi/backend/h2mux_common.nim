@@ -60,7 +60,7 @@ proc fireSend(mux: H2Mux, data: string) {.gcsafe, raises: [].}
   ## Defined per backend after the include: `asyncCheck` on asyncdispatch,
   ## `asyncSpawn mux.trySend` on chronos.
 
-proc reapStream(mux: H2Mux, sid: uint32)
+proc reapStream(mux: H2Mux, sid: uint32) {.gcsafe, raises: [].}
   ## Forward-declared (defined after the teardown helpers it uses). Tears a half-open
   ## stream off a still-healthy connection -- RST it, drop bookkeeping, release the
   ## slot -- when a request's send/produce phase raises (issue #261) or dispatch finds
@@ -94,7 +94,15 @@ proc dispatch(mux: H2Mux) =
   for sid in mux.waiters.keys: done.add sid
   for sid in done:
     let fut = mux.waiters[sid]
-    if fut.finished: continue
+    if fut.finished:
+      # On chronos a guard timeout / CancelToken can cancel the waiter while
+      # `request` is parked at `await fut`, marking it finished(cancelled). Skipping
+      # it would leak its stream + slot on every pass; after maxConcurrentStreams
+      # cancellations every new request to the origin parks forever. Reap it: RST the
+      # stream and release the slot (issue #262). asyncdispatch never cancels, so a
+      # finished waiter here is always a cancellation.
+      mux.reapStream(sid)
+      continue
     if mux.h2.streamReset(sid):
       let tooLarge = mux.h2.streamTooLarge(sid)
       let unprocessed = mux.h2.streamUnprocessed(sid)
@@ -161,25 +169,31 @@ proc waitSendable(mux: H2Mux, sid: uint32) {.async.} =
   mux.sendReady[sid].add ready
   await ready
 
-proc reapStream(mux: H2Mux, sid: uint32) =
+proc reapStream(mux: H2Mux, sid: uint32) {.gcsafe, raises: [].} =
   ## RST the live stream (so the peer frees its side), drop all per-stream
   ## bookkeeping, wake anything parked on it, and release its concurrency slot.
   ## Handles both a buffered waiter and a sink stream (the absent-key ops are no-ops),
   ## so it serves the send-phase failure (#261) and the cancelled-waiter reap (#262).
-  mux.waiters.del(sid)
-  mux.sinkStreams.excl sid
-  mux.recvq.del(sid)
-  mux.clearSendReady(sid)
-  let r = mux.recvReady.getOrDefault(sid, nil)
-  if r != nil and not r.finished: r.complete()   # wake a parked reader; it re-checks
-  mux.recvReady.del(sid)
-  mux.decoders.del(sid)
-  if mux.alive:
-    let rst = mux.h2.resetStream(sid)
-    if rst.len > 0: mux.fireSend(rst)
-  else:
-    discard mux.h2.takeResponse(sid)
-  mux.releaseSlot()
+  ## Best-effort teardown: fully non-raising so it can run from the reader's dispatch
+  ## (chronos, strict raises) and the async request paths alike -- completing a future
+  ## can raise on asyncdispatch, and there is nothing useful to do with that here.
+  try:
+    mux.waiters.del(sid)
+    mux.sinkStreams.excl sid
+    mux.recvq.del(sid)
+    mux.clearSendReady(sid)
+    let r = mux.recvReady.getOrDefault(sid, nil)
+    if r != nil and not r.finished: r.complete()   # wake a parked reader; it re-checks
+    mux.recvReady.del(sid)
+    mux.decoders.del(sid)
+    if mux.alive:
+      let rst = mux.h2.resetStream(sid)
+      if rst.len > 0: mux.fireSend(rst)
+    else:
+      discard mux.h2.takeResponse(sid)
+    mux.releaseSlot()
+  except Exception:
+    discard
 
 proc queueBodies(mux: H2Mux) =
   ## Move each sink stream's newly-arrived body out of the connection into its
