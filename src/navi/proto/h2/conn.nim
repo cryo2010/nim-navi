@@ -664,6 +664,13 @@ proc resetStream*(c: H2Conn, streamId: uint32): string =
   ## stream locally, so the peer stops sending DATA and the stream state is freed.
   if c.streams.hasKey(streamId):
     result = encodeRstStream(streamId, errCancel)
+    if c.contHeaderStream == streamId:
+      # A peer header block is still open on this stream (HEADERS seen, END_HEADERS
+      # not). Deleting the stream drops its buffered prefix (`hdrBuf`); the remaining
+      # CONTINUATION frames would then take the s==nil path and decode only the tail,
+      # desyncing HPACK or spuriously failing the whole connection (issue #266). Move
+      # the prefix into `discardHdr` so the full block still feeds the decoder.
+      c.discardHdr.add c.streams[streamId].hdrBuf
     c.streams.del(streamId)
 
 proc canReuse*(c: H2Conn): bool = not c.goneAway and c.fatal.len == 0
