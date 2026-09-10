@@ -35,8 +35,12 @@ proc keepAlive(mux: H2Mux) {.async.} =
       if mux.sawFrameSinceTick:
         mux.sawFrameSinceTick = false
         mux.pingOutstanding = false          # a frame arrived this interval: alive
-      elif mux.activeStreams == 0:
+      elif mux.activeStreams == 0 and mux.settingsSeen.finished:
         mux.pingOutstanding = false           # nothing to protect: idle without pinging
+        # ... but a connection still waiting for the peer's SETTINGS IS being waited on
+        # (openConnect parks on settingsSeen with zero active streams), so keep probing
+        # while settingsSeen is unfinished: a peer that completes ALPN=h2 then goes dark
+        # before its SETTINGS would otherwise never be torn down (issue #265).
       elif mux.pingOutstanding:               # pinged last interval, still silent: dead
         mux.alive = false
         be.shutdownConn(mux.transport)        # wake the reader; it fails streams + closes
