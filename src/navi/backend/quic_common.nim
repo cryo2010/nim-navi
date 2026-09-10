@@ -137,6 +137,12 @@ proc awaitHeaders*(qc: QuicConn, sid: int64):
       while i + 1 < parts.len:
         hs.add((parts[i], parts[i + 1])); i += 2
       return (int(status), hs)
+    # A stream that finished without headers_done was reset/aborted before its response
+    # headers. Without this check the pull parks forever (headers never become ready and
+    # the reader only fails on whole-connection death) -- the streaming/tunnel hang of
+    # #277. Mirror the sync awaitHeaders and raise; the caller frees the stream.
+    if navi_h3_stream_done(qc.c, sid) != 0:
+      raise newException(QuicError, "navi HTTP/3 stream ended before headers")
     await waitProgress(qc, sid)
 
 proc readStreamBody*(qc: QuicConn, sid: int64): Future[string] {.async.} =
@@ -195,8 +201,12 @@ proc openConnect*(qc: QuicConn, path: string, headers: seq[(string, string)],
   let sid = navi_h3_open_connect(qc.c, path.cstring, reqHdr.cstring, protocol.cstring)
   if sid < 0: raise newException(QuicError, "navi: HTTP/3 Extended CONNECT failed to open")
   wake(qc)
-  let (status, _) = await qc.awaitHeaders(sid)
-  return (sid, status)
+  try:
+    let (status, _) = await qc.awaitHeaders(sid)
+    return (sid, status)
+  except CatchableError:
+    qc.freeStream(sid)   # reset before headers (#277): free the C stream, don't leak it
+    raise
 
 proc tunnelSend*(qc: QuicConn, sid: int64, data: string): Future[void] {.async.} =
   ## Send `data` as tunnel DATA on `sid` (never END_STREAM); the reader flushes it.
