@@ -273,10 +273,18 @@ int on_recv_header(nghttp3_conn *, std::int64_t stream_id, std::int32_t,
   std::string_view val{reinterpret_cast<char *>(v.base), v.len};
   try {
     if (nm == ":status") {
-      it->second.status = std::strtol(std::string(val).c_str(), nullptr, 10);
+      // RFC 9110: :status is exactly three digits. Parse strictly rather than with
+      // strtol, which silently accepts a leading sign or trailing garbage (#279).
+      if (val.size() != 3 || val[0] < '0' || val[0] > '9' || val[1] < '0' ||
+          val[1] > '9' || val[2] < '0' || val[2] > '9')
+        return NGHTTP3_ERR_CALLBACK_FAILURE;
+      it->second.status = (val[0] - '0') * 100 + (val[1] - '0') * 10 + (val[2] - '0');
     } else if (!nm.empty() && nm.front() != ':') {  // a regular response field
       it->second.resp_headers.append(nm).append("\n").append(val).append("\n");
-      if (nm == "content-length") {   // remember it for the end-of-stream length check
+      // Only trust a Content-Length from the final (>= 200) header section: recording
+      // one from a 1xx interim section could flag a false length mismatch on the final
+      // response (which may legitimately omit it) (#279).
+      if (nm == "content-length" && it->second.status >= 200) {
         std::string vs(val);
         char *end = nullptr;
         long long cl = std::strtoll(vs.c_str(), &end, 10);

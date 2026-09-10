@@ -184,7 +184,10 @@ proc h3Open*(host: string, port: int, sni = "", caFile = "",
 
 proc encodeH3Fields*(fields: openArray[(string, string)]): string =
   ## Serialize name/value pairs to the "name\nvalue\n..." wire form the C driver reads
-  ## (request headers and request trailers). "" when there are none.
+  ## (request headers and request trailers). "" when there are none. `\n` is the field
+  ## delimiter, so a name/value must not contain one; the engine's `validateRequest`
+  ## (engine.nim) rejects CR/LF/NUL in every header/trailer before this runs, which is
+  ## what keeps this format unambiguous. Do not weaken that invariant (#279).
   for (k, v) in fields:
     result.add k; result.add '\n'; result.add v; result.add '\n'
 
