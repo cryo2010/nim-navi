@@ -60,6 +60,12 @@ proc fireSend(mux: H2Mux, data: string) {.gcsafe, raises: [].}
   ## Defined per backend after the include: `asyncCheck` on asyncdispatch,
   ## `asyncSpawn mux.trySend` on chronos.
 
+proc reapStream(mux: H2Mux, sid: uint32)
+  ## Forward-declared (defined after the teardown helpers it uses). Tears a half-open
+  ## stream off a still-healthy connection -- RST it, drop bookkeeping, release the
+  ## slot -- when a request's send/produce phase raises (issue #261) or dispatch finds
+  ## its waiter cancelled (issue #262), so a failure never strands a concurrency slot.
+
 const goAwayGraceMs = 30_000
   ## After a GOAWAY the peer promises (via last-stream-id) to finish the covered
   ## streams, so the reader keeps waiting for their responses. Bound that wait with
@@ -154,6 +160,26 @@ proc waitSendable(mux: H2Mux, sid: uint32) {.async.} =
   if not mux.sendReady.hasKey(sid): mux.sendReady[sid] = @[]
   mux.sendReady[sid].add ready
   await ready
+
+proc reapStream(mux: H2Mux, sid: uint32) =
+  ## RST the live stream (so the peer frees its side), drop all per-stream
+  ## bookkeeping, wake anything parked on it, and release its concurrency slot.
+  ## Handles both a buffered waiter and a sink stream (the absent-key ops are no-ops),
+  ## so it serves the send-phase failure (#261) and the cancelled-waiter reap (#262).
+  mux.waiters.del(sid)
+  mux.sinkStreams.excl sid
+  mux.recvq.del(sid)
+  mux.clearSendReady(sid)
+  let r = mux.recvReady.getOrDefault(sid, nil)
+  if r != nil and not r.finished: r.complete()   # wake a parked reader; it re-checks
+  mux.recvReady.del(sid)
+  mux.decoders.del(sid)
+  if mux.alive:
+    let rst = mux.h2.resetStream(sid)
+    if rst.len > 0: mux.fireSend(rst)
+  else:
+    discard mux.h2.takeResponse(sid)
+  mux.releaseSlot()
 
 proc queueBodies(mux: H2Mux) =
   ## Move each sink stream's newly-arrived body out of the connection into its
@@ -354,13 +380,17 @@ proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: strin
   let sid = mux.h2.openStream()
   mux.h2.setSinkMode(sid)                 # gate the receive window; drainDownload acks it
   mux.sinkStreams.incl sid
-  if connectTunnel:
-    await mux.send(mux.h2.encodeRequestHead(sid, headers))   # no END_STREAM: send side open
-  elif bodyStream != nil:
-    await mux.send(mux.h2.encodeRequestHead(sid, headers))
-    await mux.streamBody(sid, bodyStream, trailers)
-  else:
-    await mux.send(mux.h2.encodeRequest(sid, headers, body, trailers))
+  try:
+    if connectTunnel:
+      await mux.send(mux.h2.encodeRequestHead(sid, headers))   # no END_STREAM: send side open
+    elif bodyStream != nil:
+      await mux.send(mux.h2.encodeRequestHead(sid, headers))
+      await mux.streamBody(sid, bodyStream, trailers)
+    else:
+      await mux.send(mux.h2.encodeRequest(sid, headers, body, trailers))
+  except CatchableError:
+    mux.reapStream(sid)                   # send/producer raised: RST + free the slot (#261)
+    raise
   # Wait for the response headers. As in drainDownload, there is no yield between the
   # state checks and registering `recvReady`, so the reader (which runs only while we
   # await) cannot slip a wake in between: no lost wakeup.
@@ -497,9 +527,17 @@ proc request*(mux: H2Mux, headers: seq[(string, string)], body: string,
   let sid = mux.h2.openStream()
   let fut = newFuture[H2Response]("h2mux.stream")
   mux.waiters[sid] = fut
-  if bodyStream != nil:
-    await mux.send(mux.h2.encodeRequestHead(sid, headers))
-    await mux.streamBody(sid, bodyStream, trailers)
-  else:
-    await mux.send(mux.h2.encodeRequest(sid, headers, body, trailers))
+  try:
+    if bodyStream != nil:
+      await mux.send(mux.h2.encodeRequestHead(sid, headers))
+      await mux.streamBody(sid, bodyStream, trailers)
+    else:
+      await mux.send(mux.h2.encodeRequest(sid, headers, body, trailers))
+  except CatchableError:
+    # The send or the user's BodyProducer raised (a file read error, etc.): the
+    # waiter is registered, no END_STREAM/RST is on the wire, and the slot is held.
+    # Left alone the mux stays pooled and reusable, so repeated producer failures
+    # exhaust MAX_CONCURRENT_STREAMS. RST the stream and release the slot (issue #261).
+    mux.reapStream(sid)
+    raise
   result = await fut
