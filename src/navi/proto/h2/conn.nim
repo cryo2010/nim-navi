@@ -483,7 +483,12 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
     if f.payload.len != 4:                        # RFC 9113 6.4: exactly 4 octets
       c.connFail(errFrameSizeError, "RST_STREAM length not 4", outbuf); return
     let s = c.streams.getOrDefault(f.streamId)
-    if s != nil:
+    if s != nil and not s.ended:
+      # RFC 9113 8.1: a server may send END_STREAM and then RST_STREAM(NO_ERROR) to
+      # abort the request body after answering early (e.g. 413). A client MUST NOT
+      # discard the already-complete response because of that trailing RST. So once
+      # the stream has ended, ignore a subsequent RST for delivery (issue #259);
+      # only a RST that arrives before END_STREAM aborts the response.
       if readU32(f.payload, 0) == errRefusedStream:
         s.refused = true                       # not processed -> safe to retry
       s.reset = true
