@@ -24,6 +24,12 @@ suite "h1 serialize":
     var req = Request(verb: GET, url: parseUrl("http://h:8080/"))
     check "Host: h:8080\r\n" in serializeRequest(req)
 
+  test "the request serializer should bracket an IPv6 host literal in the Host header (#270)":
+    var req = Request(verb: GET, url: parseUrl("http://[2001:db8::1]:8080/x"))
+    check "Host: [2001:db8::1]:8080\r\n" in serializeRequest(req)
+    var reqDef = Request(verb: GET, url: parseUrl("http://[2001:db8::1]/x"))
+    check "Host: [2001:db8::1]\r\n" in serializeRequest(reqDef)   # default port, still bracketed
+
 proc parseAll(chunks: varargs[string]): Response =
   var p = initH1Parser()
   for c in chunks:

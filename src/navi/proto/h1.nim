@@ -16,7 +16,7 @@ proc serializeHead*(req: Request, chunked = false): string =
   let target = if req.absoluteForm: req.url.absoluteTarget else: req.url.requestTarget
   result = $req.verb & " " & target & " HTTP/1.1\r\n"
   if not req.headers.contains("host"):
-    var hostLine = req.url.host
+    var hostLine = req.url.hostLiteral   # IPv6 literals stay bracketed
     let p = req.url.port
     if not ((req.url.isTls and p == 443) or (not req.url.isTls and p == 80)):
       hostLine.add(":" & $p)
