@@ -13,10 +13,19 @@ proc serializeHead*(req: Request, chunked = false): string =
   ## when missing, and either Transfer-Encoding: chunked (streaming upload) or
   ## Content-Length. HTTP/1.1 keeps connections alive by default, which pooling
   ## relies on.
+  # navi owns transfer framing: a streamed body (`bodyStream`) or trailers select the
+  # chunked path (`chunked = true`, which frames the body and adds the header). A caller
+  # must not set Transfer-Encoding by hand -- on the buffered path (`chunked = false`)
+  # the header loop below would advertise it while the body is written unframed, a
+  # connection-desyncing / request-smuggling footgun (#273). Reject rather than emit it.
+  if not chunked and req.headers.contains("transfer-encoding"):
+    raise newException(ValueError,
+      "navi: use a streaming body (bodyStream) for chunked transfer; " &
+      "do not set a Transfer-Encoding request header manually")
   let target = if req.absoluteForm: req.url.absoluteTarget else: req.url.requestTarget
   result = $req.verb & " " & target & " HTTP/1.1\r\n"
   if not req.headers.contains("host"):
-    var hostLine = req.url.host
+    var hostLine = req.url.hostLiteral   # IPv6 literals stay bracketed
     let p = req.url.port
     if not ((req.url.isTls and p == 443) or (not req.url.isTls and p == 80)):
       hostLine.add(":" & $p)
@@ -32,8 +41,14 @@ proc serializeHead*(req: Request, chunked = false): string =
       var names: seq[string]
       for (k, _) in req.trailers.pairs: names.add(k)
       result.add("Trailer: " & names.join(", ") & "\r\n")
-  elif req.body.len > 0 and not req.headers.contains("content-length"):
-    result.add("Content-Length: " & $req.body.len & "\r\n")
+  elif not req.headers.contains("content-length"):
+    if req.body.len > 0:
+      result.add("Content-Length: " & $req.body.len & "\r\n")
+    elif req.verb in {POST, PUT, PATCH}:
+      # An empty body for a method that normally carries one: send an explicit
+      # Content-Length: 0 so servers/WAFs that require a length don't stall or 411 on
+      # a bodyless POST/PUT/PATCH (#274). GET/HEAD/etc. carry no length by default.
+      result.add("Content-Length: 0\r\n")
   result.add("\r\n")
 
 proc serializeRequest*(req: Request): string =
@@ -47,6 +62,8 @@ proc encodeChunk*(data: string): string =
   ## non-empty. Built into a single preallocated buffer (the payload is copied once)
   ## rather than chained `&` temporaries, since this runs per chunk of a streamed
   ## upload.
+  if data.len == 0: return ""   # an empty chunk would encode as "0\r\n\r\n", a premature
+                                # body terminator; never emit one mid-stream (#274)
   let hex = fmt"{data.len:X}"
   result = newStringOfCap(hex.len + data.len + 4)
   result.add hex
@@ -163,17 +180,44 @@ proc finishHeaders(p: var H1Parser) =
     p.state = stDone
     return
   let te = p.headers.get("transfer-encoding")
-  if te.len > 0 and "chunked" in te.toLowerAscii:
-    p.bodyMode = bmChunked
-    p.state = stChunkSize
-  elif p.headers.contains("content-length"):
+  let hasCl = p.headers.contains("content-length")
+  if te.len > 0:
+    # RFC 9112 6.1: chunked must be the *final* transfer coding. A value that merely
+    # contains "chunked" as a substring, or where chunked is not last, is not chunk-
+    # framed -- treating it as chunked (the old substring test) would misframe the
+    # body. Tokenize and only trust chunked when it is the final coding.
+    var codings: seq[string]
+    for tok in te.toLowerAscii.split(','): codings.add tok.strip()
+    if codings.len > 0 and codings[^1] == "chunked":
+      # RFC 9112 6.1/6.3: chunked framing together with a Content-Length is the
+      # classic request-smuggling ambiguity. Reject rather than silently prefer one
+      # and pool a possibly-poisoned connection.
+      if hasCl:
+        raise newException(ValueError, "h1: both Transfer-Encoding: chunked and Content-Length")
+      p.bodyMode = bmChunked
+      p.state = stChunkSize
+    else:
+      # Transfer-Encoding present but chunked is not final: RFC 9112 6.3 says the body
+      # runs until the connection closes (Transfer-Encoding overrides Content-Length),
+      # and such a connection is not reusable (keepAliveAfter rejects bmUntilClose).
+      p.bodyMode = bmUntilClose
+      p.state = stBody
+  elif hasCl:
+    # RFC 9112 6.3: multiple Content-Length values must agree (a conflict is a framing
+    # error / smuggling vector); collapse duplicates, reject a conflict.
+    var clVal = ""
+    for v in p.headers.getAll("content-length"):
+      let s = v.strip()
+      if clVal.len == 0: clVal = s
+      elif s != clVal:
+        raise newException(ValueError, "h1: conflicting Content-Length values")
+    # RFC 9112 6.3: Content-Length is 1*DIGIT. parseInt would accept a leading '+' (a
+    # smuggling differential) and the old negative guard only caught '-'. Require pure
+    # digits; parseInt still raises (caught upstream) on an overflowing value.
+    if clVal.len == 0 or not clVal.allCharsInSet({'0' .. '9'}):
+      raise newException(ValueError, "h1: invalid Content-Length")
+    p.remaining = parseInt(clVal)
     p.bodyMode = bmLength
-    p.remaining = parseInt(p.headers.get("content-length").strip())
-    # A peer controls this; a negative length would slice out of bounds (a
-    # RangeDefect crash). Reject it as a catchable error instead (found by
-    # tests/fuzz). parseInt already rejects non-numeric and overflowing values.
-    if p.remaining < 0:
-      raise newException(ValueError, "h1: negative Content-Length")
     p.state = if p.remaining == 0: stDone else: stBody
   else:
     p.bodyMode = bmUntilClose
@@ -222,8 +266,11 @@ proc step(p: var H1Parser): bool =
     p.remaining = parseHexInt(hex)
     # parseHexInt wraps on overflow; a negative or absurd size would slice out
     # of bounds (RangeDefect) or overflow `remaining + 2`. Reject it as a
-    # catchable error (fuzz-found). 1 shl 40 is far above any real chunk.
-    if p.remaining < 0 or p.remaining > (1 shl 40):
+    # catchable error (fuzz-found). The bound is far above any real chunk; use an
+    # int64 literal so it is valid on a 32-bit `int` build too (`1 shl 40` overflows
+    # a 32-bit int) (#274).
+    const maxChunkSize = 1'i64 shl 40
+    if p.remaining < 0 or p.remaining.int64 > maxChunkSize:
       raise newException(ValueError, "h1: invalid chunk size")
     p.state = if p.remaining == 0: stTrailers else: stChunkData
     true
@@ -278,13 +325,26 @@ proc keepAliveAfter*(p: H1Parser): bool =
   ## that did not ask to close.
   if p.state != stDone: return false
   if p.bodyMode == bmUntilClose: return false
+  # Only pool an HTTP/1.1 peer. HTTP/1.0 keep-alive (via `Connection: keep-alive`) is
+  # spec-permitted (RFC 9112 6.3) but notoriously ambiguous through proxies, so we
+  # deliberately decline to reuse a 1.0 connection rather than risk a desync (#274).
   if p.version != "HTTP/1.1": return false
-  "close" notin p.headers.get("connection").toLowerAscii
+  # RFC 9110 5.3: a field may be split across multiple lines with the same semantics
+  # as one comma-joined value. `get` returns only the first, so a peer that sends
+  # `Connection: keep-alive` then `Connection: close` would look reusable. Inspect
+  # every value.
+  for v in p.headers.getAll("connection"):
+    if "close" in v.toLowerAscii: return false
+  true
 
 proc trailers*(p: H1Parser): Headers =
   ## Trailing header fields received after a chunked body (empty if none).
   p.trailers
 
 proc toResponse*(p: H1Parser): Response =
+  # Trailers are surfaced separately (`result.trailers`), never merged into the header
+  # set: RFC 9110 6.5.1 forbids blindly merging trailing fields, and keeping them apart
+  # is what makes the parser's lack of trailer-name filtering safe -- a trailer cannot
+  # override a real header (e.g. a smuggled Content-Length in a trailer is inert) (#274).
   result = initResponse(p.status, p.reason, p.version, p.headers, p.body)
   result.trailers = p.trailers

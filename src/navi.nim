@@ -160,7 +160,8 @@ when defined(naviHttp3):
         fwdTrl.add((lk, v))
     let conn = h3Open(ep.host, ep.port, sni = req.url.host,
                       caFile = client.config.tls.caFile,
-                      verify = client.config.tls.wantsVerify)
+                      verify = client.config.tls.wantsVerify,
+                      maxBody = uint64(max(0, client.config.maxResponseBytes)))
     try:
       let r = conn.request($req.verb, req.url.requestTarget, fwd, req.body,
                            req.bodyStream, fwdTrl)
@@ -293,7 +294,8 @@ proc openStream(client: Navi, req0: Request): StreamResponse =
         try:
           let conn = h3Open(ep.get.host, ep.get.port, sni = rq.url.host,
                             caFile = client.config.tls.caFile,
-                            verify = client.config.tls.wantsVerify)
+                            verify = client.config.tls.wantsVerify,
+                            maxBody = uint64(max(0, client.config.maxResponseBytes)))
           var fwd: seq[(string, string)]
           for k, v in rq.headers:
             let lk = k.toLowerAscii
@@ -730,7 +732,12 @@ proc transportGroup(client: Navi, items: seq[BatchItem],
       while not parser.finished:
         let chunk = transport.recvSome()
         if chunk.len == 0:
-          parser.eof()
+          parser.eof()                       # completes a read-until-close body
+          # A length- or chunked-delimited body that isn't `finished` at EOF was cut
+          # short by a premature close. Raise rather than return the partial body as a
+          # complete response (silent truncation), mirroring h1DrainBody in engine.nim.
+          if not parser.finished:
+            raise newException(IOError, h1TruncatedErr)
           break
         parser.feed(chunk)
       result[k] = parser.toResponse()

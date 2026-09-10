@@ -12,6 +12,7 @@ when not defined(naviHttp3):
   {.error: "navi/backend/quic_async is a -d:naviHttp3-only module.".}
 
 import std/[asyncdispatch, strutils, tables]
+import ../core/response   # ResponseTooLargeError, used by the shared quic_common fragment
 import ./quic
 export quic
 
@@ -71,9 +72,13 @@ proc step(qc: QuicConn) {.async.} =
   while true:                                   # drain incoming datagrams
     let r = sockRecv(rawFd(qc.fd), addr buf[0], csize_t(buf.len), 0)
     if r <= 0: break
-    if navi_h3_recv(qc.c, addr buf[0], csize_t(r)) != 0:
+    let rc = navi_h3_recv(qc.c, addr buf[0], csize_t(r))
+    if rc < 0:
       raise newException(QuicError, "navi HTTP/3: read_pkt failed")
-  if navi_h3_timeout_ms(qc.c) == 0:
+    if rc > 0:                    # peer closed gracefully: stop reading and let the reader
+      qc.alive = false            # deliver completed streams, then tear down cleanly (#278)
+      break
+  if qc.alive and navi_h3_timeout_ms(qc.c) == 0:   # skip once a graceful close ended it (#278)
     if navi_h3_handle_timeout(qc.c) != 0:
       raise newException(QuicError, "navi HTTP/3: handle_timeout failed")
 
@@ -118,12 +123,13 @@ proc waitProgress(qc: QuicConn, sid: int64) {.async.} =
   await f
 
 proc openConnAsync*(host: string, port: int, sni, caFile: string,
-                    verify: bool): Future[QuicConnAsync] {.async.} =
+                    verify: bool, maxBody: uint64 = 0): Future[QuicConnAsync] {.async.} =
   ## Open a QUIC connection, complete the handshake, bind the h3 session, and
-  ## start the background reader. Raises `QuicError` on failure.
+  ## start the background reader. `maxBody` caps a buffered response body
+  ## (0 = unlimited, navi maxResponseBytes). Raises `QuicError` on failure.
   let name = if sni.len > 0: sni else: host
   let c = navi_h3_new(host.cstring, ($port).cstring, name.cstring, caFile.cstring,
-                      cint(verify))
+                      cint(verify), culonglong(maxBody))
   if c == nil:
     raise newException(QuicError,
       "navi HTTP/3 connect to " & host & ":" & $port & " failed")

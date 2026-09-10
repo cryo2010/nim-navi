@@ -15,6 +15,14 @@ proc scheme*(u: Url): string = u.raw.scheme
 proc host*(u: Url): string = u.raw.hostname
 proc isTls*(u: Url): bool = cmpIgnoreCase(u.raw.scheme, "https") == 0
 
+proc hostLiteral*(u: Url): string =
+  ## The host as it must appear in a Host header or request authority. std/uri
+  ## strips the brackets from an IPv6 literal (`[2001:db8::1]` -> `2001:db8::1`),
+  ## but an address with colons is ambiguous unbracketed (RFC 3986 3.2.2), so
+  ## re-wrap it. A regular hostname or IPv4 literal passes through unchanged.
+  let h = u.host
+  if ':' in h and not h.startsWith("["): "[" & h & "]" else: h
+
 proc port*(u: Url): int =
   ## Explicit port, or the scheme default (443 for https, else 80). A malformed or
   ## out-of-range port (e.g. from a crafted redirect Location) raises a clear
@@ -47,7 +55,7 @@ proc requestTarget*(u: Url): string =
 proc absoluteTarget*(u: Url): string =
   ## The absolute-form target sent to an HTTP proxy: scheme://host[:port]/path.
   let scheme = if u.isTls: "https" else: "http"
-  var authority = u.host
+  var authority = u.hostLiteral
   let p = u.port
   if not ((u.isTls and p == 443) or (not u.isTls and p == 80)):
     authority.add(":" & $p)

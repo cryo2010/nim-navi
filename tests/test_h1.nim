@@ -24,6 +24,36 @@ suite "h1 serialize":
     var req = Request(verb: GET, url: parseUrl("http://h:8080/"))
     check "Host: h:8080\r\n" in serializeRequest(req)
 
+  test "the request serializer should reject a manually-set Transfer-Encoding on a buffered body (#273)":
+    var req = Request(verb: POST, url: parseUrl("http://h/"), body: "hello")
+    req.headers = initHeaders()
+    req.headers["transfer-encoding"] = "chunked"
+    expect ValueError: discard serializeRequest(req)
+
+  test "the request serializer should send Content-Length: 0 for an empty POST (#274)":
+    var req = Request(verb: POST, url: parseUrl("http://h/"))
+    check "Content-Length: 0\r\n" in serializeRequest(req)
+
+  test "the request serializer should not add Content-Length: 0 to an empty GET (#274)":
+    var req = Request(verb: GET, url: parseUrl("http://h/"))
+    check "Content-Length" notin serializeRequest(req)
+
+  test "encodeChunk should return empty for empty data rather than a premature terminator (#274)":
+    check encodeChunk("") == ""
+    check encodeChunk("ab") == "2\r\nab\r\n"
+
+  test "validateRequest should reject CR/LF in the request path (#274)":
+    var req = Request(verb: GET, url: parseUrl("http://h/a"))
+    req.url = parseUrl("http://h/a")
+    req.url.raw.path = "/a\r\nX-Injected: 1"
+    expect ValueError: validateRequest(req)
+
+  test "the request serializer should bracket an IPv6 host literal in the Host header (#270)":
+    var req = Request(verb: GET, url: parseUrl("http://[2001:db8::1]:8080/x"))
+    check "Host: [2001:db8::1]:8080\r\n" in serializeRequest(req)
+    var reqDef = Request(verb: GET, url: parseUrl("http://[2001:db8::1]/x"))
+    check "Host: [2001:db8::1]\r\n" in serializeRequest(reqDef)   # default port, still bracketed
+
 proc parseAll(chunks: varargs[string]): Response =
   var p = initH1Parser()
   for c in chunks:
@@ -31,6 +61,14 @@ proc parseAll(chunks: varargs[string]): Response =
   if not p.finished: p.eof()
   check p.finished
   p.toResponse()
+
+proc parseKA(chunks: varargs[string]): bool =
+  ## Parse to completion and report whether the connection may be pooled.
+  var p = initH1Parser()
+  for c in chunks:
+    p.feed(c)
+  if not p.finished: p.eof()
+  p.keepAliveAfter()
 
 suite "h1 parse":
   test "the h1 parser should read a Content-Length body":
@@ -159,6 +197,52 @@ suite "h1 parse":
       p.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcXX0\r\n\r\n")
     except ValueError as e: msg = e.msg
     check "CRLF" in msg
+
+  test "the h1 parser should reject Transfer-Encoding: chunked together with Content-Length (#271)":
+    var p = initH1Parser()
+    var msg = ""
+    try:
+      p.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n")
+    except ValueError as e: msg = e.msg
+    check "Transfer-Encoding" in msg
+
+  test "the h1 parser should reject conflicting Content-Length values (#271)":
+    var p = initH1Parser()
+    var msg = ""
+    try:
+      p.feed("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 5\r\n\r\n")
+    except ValueError as e: msg = e.msg
+    check "Content-Length" in msg
+
+  test "the h1 parser should collapse duplicate agreeing Content-Length values (#271)":
+    let r = parseAll("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc")
+    check r.body == "abc"
+
+  test "the h1 parser should reject a signed Content-Length (#271)":
+    var p = initH1Parser()
+    var msg = ""
+    try:
+      p.feed("HTTP/1.1 200 OK\r\nContent-Length: +5\r\n\r\n")
+    except ValueError as e: msg = e.msg
+    check "Content-Length" in msg
+
+  test "the h1 parser should not treat a substring 'chunked' as chunked framing (#271)":
+    # "not-chunked" is a single (unknown) coding, not the chunked framing: RFC 9112
+    # 6.3 says read until close, so the whole remainder is the body, not a chunk size.
+    let r = parseAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: not-chunked\r\n\r\n5\r\nhello")
+    check r.body == "5\r\nhello"
+    check not parseKA("HTTP/1.1 200 OK\r\nTransfer-Encoding: not-chunked\r\n\r\n5\r\nhello")
+
+  test "the h1 parser should read until close when chunked is not the final coding (#271)":
+    let r = parseAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\nrawbytes")
+    check r.body == "rawbytes"
+
+  test "keepAliveAfter should see a second Connection: close line (#272)":
+    check not parseKA("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n" &
+                      "Connection: keep-alive\r\nConnection: close\r\n\r\n")
+
+  test "keepAliveAfter should reuse a plain keep-alive response (#272)":
+    check parseKA("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
 
 suite "url port parsing":
   test "an explicit port and the scheme defaults parse":

@@ -27,8 +27,8 @@ export public, chronos
 
 when defined(naviHttp3):
   type QuicConn = QuicConnChronos
-  template openQuicConn(host, port, sni, ca, verify: untyped): untyped =
-    openConnChronos(host, port, sni, ca, verify)
+  template openQuicConn(host, port, sni, ca, verify, maxBody: untyped): untyped =
+    openConnChronos(host, port, sni, ca, verify, maxBody)
 
 template msOf(ms: int): untyped = ms.milliseconds
 

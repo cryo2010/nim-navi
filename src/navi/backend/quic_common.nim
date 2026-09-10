@@ -35,7 +35,7 @@ proc requestOnConn*(qc: QuicConn, verb, path: string,
   if pe != nil: GC_ref(pe)
   let sid = navi_h3_submit(qc.c, verb.cstring, path.cstring, reqHdr.cstring, bp,
                            csize_t(if streamed: 0 else: b.len), pull, cast[pointer](pe),
-                           reqTrl.cstring)
+                           reqTrl.cstring, 1)   # buffered: enforce maxResponseBytes
   if sid < 0:
     if pe != nil: GC_unref(pe)
     raise newException(QuicError, "navi HTTP/3 submit failed")
@@ -54,6 +54,10 @@ proc requestOnConn*(qc: QuicConn, verb, path: string,
     # The stream was reset/aborted, not answered. The defer frees its C-side entry;
     # raise so the engine falls back to h2/h1 instead of a bogus empty response.
     raise newException(QuicError, "navi HTTP/3 stream was reset")
+  if navi_h3_stream_too_large(qc.c, sid) != 0:
+    # Body exceeded maxResponseBytes: the driver stopped buffering. A real (received)
+    # response, so raise the same error the h1/h2 paths do rather than fall back.
+    raise newException(ResponseTooLargeError, "navi: response exceeded maxResponseBytes")
   if navi_h3_stream_length_mismatch(qc.c, sid) != 0:
     # Cleanly ended but body != Content-Length: a real (received) response, so raise a
     # non-QuicError (IOError) that propagates rather than triggering the h2/h1 fallback.
@@ -64,12 +68,21 @@ proc requestOnConn*(qc: QuicConn, verb, path: string,
   var rbody = newString(64 * 1024)
   var hbuf = newString(16 * 1024)
   var tbuf = newString(16 * 1024)
-  if navi_h3_take_response(qc.c, sid, addr status, cast[ptr char](addr rbody[0]),
-                           csize_t(rbody.len), addr blen,
-                           cast[ptr char](addr hbuf[0]), csize_t(hbuf.len), addr hlen,
-                           cast[ptr char](addr tbuf[0]), csize_t(tbuf.len),
-                           addr tlen) != 0:
-    raise newException(QuicError, "navi HTTP/3 take_response failed")
+  # take_response reports the true sizes; grow and retry if the fixed buffers were too
+  # small (it only consumes the stream once everything fits), so a large buffered
+  # response is never silently truncated (#275, #276).
+  while true:
+    if navi_h3_take_response(qc.c, sid, addr status, cast[ptr char](addr rbody[0]),
+                             csize_t(rbody.len), addr blen,
+                             cast[ptr char](addr hbuf[0]), csize_t(hbuf.len), addr hlen,
+                             cast[ptr char](addr tbuf[0]), csize_t(tbuf.len),
+                             addr tlen) != 0:
+      raise newException(QuicError, "navi HTTP/3 take_response failed")
+    if int(blen) <= rbody.len and int(hlen) <= hbuf.len and int(tlen) <= tbuf.len:
+      break
+    if int(blen) > rbody.len: rbody = newString(int(blen))
+    if int(hlen) > hbuf.len: hbuf = newString(int(hlen))
+    if int(tlen) > tbuf.len: tbuf = newString(int(tlen))
   consumed = true                          # take_response erased the C stream on success
   rbody.setLen(int(blen))
   hbuf.setLen(int(hlen))
@@ -98,7 +111,7 @@ proc submitStream*(qc: QuicConn, verb, path: string,
   let bp = if pull == nil and b.len > 0: cast[ptr char](addr b[0]) else: nil
   result = navi_h3_submit(qc.c, verb.cstring, path.cstring, reqHdr.cstring, bp,
                           csize_t(if pull != nil: 0 else: b.len), pull, pullEnv,
-                          reqTrl.cstring)
+                          reqTrl.cstring, 0)   # streaming read: capped navi-side, not here
   wake(qc)
 
 proc awaitHeaders*(qc: QuicConn, sid: int64):
@@ -114,6 +127,9 @@ proc awaitHeaders*(qc: QuicConn, sid: int64):
                                 csize_t(hbuf.len), addr hlen, addr ready) != 0:
       raise newException(QuicError, "navi HTTP/3 stream gone")
     if ready != 0:
+      if int(hlen) > hbuf.len:          # header block did not fit: grow and re-read
+        hbuf = newString(int(hlen))      # (never truncate a header block, #276)
+        continue
       hbuf.setLen(int(hlen))
       var hs: seq[(string, string)]
       let parts = hbuf.split('\n')
@@ -121,6 +137,12 @@ proc awaitHeaders*(qc: QuicConn, sid: int64):
       while i + 1 < parts.len:
         hs.add((parts[i], parts[i + 1])); i += 2
       return (int(status), hs)
+    # A stream that finished without headers_done was reset/aborted before its response
+    # headers. Without this check the pull parks forever (headers never become ready and
+    # the reader only fails on whole-connection death) -- the streaming/tunnel hang of
+    # #277. Mirror the sync awaitHeaders and raise; the caller frees the stream.
+    if navi_h3_stream_done(qc.c, sid) != 0:
+      raise newException(QuicError, "navi HTTP/3 stream ended before headers")
     await waitProgress(qc, sid)
 
 proc readStreamBody*(qc: QuicConn, sid: int64): Future[string] {.async.} =
@@ -143,9 +165,12 @@ proc streamTrailers*(qc: QuicConn, sid: int64): seq[(string, string)] =
   if qc.c == nil: return
   var tbuf = newString(16 * 1024)
   var tlen: csize_t
-  if navi_h3_response_trailers(qc.c, sid, cast[ptr char](addr tbuf[0]),
-                               csize_t(tbuf.len), addr tlen) != 0:
-    return
+  while true:                          # grow and re-read if the block did not fit (#276)
+    if navi_h3_response_trailers(qc.c, sid, cast[ptr char](addr tbuf[0]),
+                                 csize_t(tbuf.len), addr tlen) != 0:
+      return
+    if int(tlen) <= tbuf.len: break
+    tbuf = newString(int(tlen))
   tbuf.setLen(int(tlen))
   parseH3Fields(tbuf)
 
@@ -176,8 +201,12 @@ proc openConnect*(qc: QuicConn, path: string, headers: seq[(string, string)],
   let sid = navi_h3_open_connect(qc.c, path.cstring, reqHdr.cstring, protocol.cstring)
   if sid < 0: raise newException(QuicError, "navi: HTTP/3 Extended CONNECT failed to open")
   wake(qc)
-  let (status, _) = await qc.awaitHeaders(sid)
-  return (sid, status)
+  try:
+    let (status, _) = await qc.awaitHeaders(sid)
+    return (sid, status)
+  except CatchableError:
+    qc.freeStream(sid)   # reset before headers (#277): free the C stream, don't leak it
+    raise
 
 proc tunnelSend*(qc: QuicConn, sid: int64, data: string): Future[void] {.async.} =
   ## Send `data` as tunnel DATA on `sid` (never END_STREAM); the reader flushes it.
