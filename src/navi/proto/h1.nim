@@ -163,17 +163,44 @@ proc finishHeaders(p: var H1Parser) =
     p.state = stDone
     return
   let te = p.headers.get("transfer-encoding")
-  if te.len > 0 and "chunked" in te.toLowerAscii:
-    p.bodyMode = bmChunked
-    p.state = stChunkSize
-  elif p.headers.contains("content-length"):
+  let hasCl = p.headers.contains("content-length")
+  if te.len > 0:
+    # RFC 9112 6.1: chunked must be the *final* transfer coding. A value that merely
+    # contains "chunked" as a substring, or where chunked is not last, is not chunk-
+    # framed -- treating it as chunked (the old substring test) would misframe the
+    # body. Tokenize and only trust chunked when it is the final coding.
+    var codings: seq[string]
+    for tok in te.toLowerAscii.split(','): codings.add tok.strip()
+    if codings.len > 0 and codings[^1] == "chunked":
+      # RFC 9112 6.1/6.3: chunked framing together with a Content-Length is the
+      # classic request-smuggling ambiguity. Reject rather than silently prefer one
+      # and pool a possibly-poisoned connection.
+      if hasCl:
+        raise newException(ValueError, "h1: both Transfer-Encoding: chunked and Content-Length")
+      p.bodyMode = bmChunked
+      p.state = stChunkSize
+    else:
+      # Transfer-Encoding present but chunked is not final: RFC 9112 6.3 says the body
+      # runs until the connection closes (Transfer-Encoding overrides Content-Length),
+      # and such a connection is not reusable (keepAliveAfter rejects bmUntilClose).
+      p.bodyMode = bmUntilClose
+      p.state = stBody
+  elif hasCl:
+    # RFC 9112 6.3: multiple Content-Length values must agree (a conflict is a framing
+    # error / smuggling vector); collapse duplicates, reject a conflict.
+    var clVal = ""
+    for v in p.headers.getAll("content-length"):
+      let s = v.strip()
+      if clVal.len == 0: clVal = s
+      elif s != clVal:
+        raise newException(ValueError, "h1: conflicting Content-Length values")
+    # RFC 9112 6.3: Content-Length is 1*DIGIT. parseInt would accept a leading '+' (a
+    # smuggling differential) and the old negative guard only caught '-'. Require pure
+    # digits; parseInt still raises (caught upstream) on an overflowing value.
+    if clVal.len == 0 or not clVal.allCharsInSet({'0' .. '9'}):
+      raise newException(ValueError, "h1: invalid Content-Length")
+    p.remaining = parseInt(clVal)
     p.bodyMode = bmLength
-    p.remaining = parseInt(p.headers.get("content-length").strip())
-    # A peer controls this; a negative length would slice out of bounds (a
-    # RangeDefect crash). Reject it as a catchable error instead (found by
-    # tests/fuzz). parseInt already rejects non-numeric and overflowing values.
-    if p.remaining < 0:
-      raise newException(ValueError, "h1: negative Content-Length")
     p.state = if p.remaining == 0: stDone else: stBody
   else:
     p.bodyMode = bmUntilClose

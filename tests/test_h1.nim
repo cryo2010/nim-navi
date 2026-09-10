@@ -166,6 +166,45 @@ suite "h1 parse":
     except ValueError as e: msg = e.msg
     check "CRLF" in msg
 
+  test "the h1 parser should reject Transfer-Encoding: chunked together with Content-Length (#271)":
+    var p = initH1Parser()
+    var msg = ""
+    try:
+      p.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n")
+    except ValueError as e: msg = e.msg
+    check "Transfer-Encoding" in msg
+
+  test "the h1 parser should reject conflicting Content-Length values (#271)":
+    var p = initH1Parser()
+    var msg = ""
+    try:
+      p.feed("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 5\r\n\r\n")
+    except ValueError as e: msg = e.msg
+    check "Content-Length" in msg
+
+  test "the h1 parser should collapse duplicate agreeing Content-Length values (#271)":
+    let r = parseAll("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc")
+    check r.body == "abc"
+
+  test "the h1 parser should reject a signed Content-Length (#271)":
+    var p = initH1Parser()
+    var msg = ""
+    try:
+      p.feed("HTTP/1.1 200 OK\r\nContent-Length: +5\r\n\r\n")
+    except ValueError as e: msg = e.msg
+    check "Content-Length" in msg
+
+  test "the h1 parser should not treat a substring 'chunked' as chunked framing (#271)":
+    # "not-chunked" is a single (unknown) coding, not the chunked framing: RFC 9112
+    # 6.3 says read until close, so the whole remainder is the body, not a chunk size.
+    let r = parseAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: not-chunked\r\n\r\n5\r\nhello")
+    check r.body == "5\r\nhello"
+    check not r.keepAliveAfter()
+
+  test "the h1 parser should read until close when chunked is not the final coding (#271)":
+    let r = parseAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\nrawbytes")
+    check r.body == "rawbytes"
+
 suite "url port parsing":
   test "an explicit port and the scheme defaults parse":
     check parseUrl("http://h:8080/").port == 8080
