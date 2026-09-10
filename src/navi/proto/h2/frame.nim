@@ -53,6 +53,7 @@ const
   errNoError* = 0x0'u32
   errProtocolError* = 0x1'u32
   errFlowControlError* = 0x3'u32
+  errStreamClosed* = 0x5'u32
   errFrameSizeError* = 0x6'u32
   errRefusedStream* = 0x7'u32
   errCancel* = 0x8'u32

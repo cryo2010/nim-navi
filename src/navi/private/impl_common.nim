@@ -844,6 +844,15 @@ proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
       # forever. Any byte, incl. a keep-alive comment, completes readFut and resets
       # the bound, so a live-but-quiet stream is untouched.
       if s.idleTimeoutMs > 0 and not await withTimeout(readFut, msOf(s.idleTimeoutMs)):
+        # Idle bound elapsed with the read still parked. Dispose the handle so its h2
+        # stream is RST and its concurrency slot freed -- abandoning it with just
+        # `s.handle = nil` left the sid in the mux's sinkStreams, the orphaned read
+        # acking to nobody, and a stream window + slot leaking per reconnect (#267).
+        # Closing wakes the parked read; drain it so the future does not dangle.
+        try: await s.handle.close()
+        except CatchableError: discard
+        try: discard await readFut
+        except CatchableError: discard
         s.handle = nil
         if not s.reconnect: return none(SseEvent)
         continue

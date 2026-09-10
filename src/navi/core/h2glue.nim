@@ -4,9 +4,30 @@ import std/strutils
 import ./headers, ./url, ./request, ./response
 import ../proto/h2/[conn, hpack]
 
+proc appendMappedHeaders(result: var seq[HeaderPair], headers: Headers) =
+  ## Append user headers lowercased, dropping everything that must not cross to h2
+  ## (RFC 9113 8.2.2): the connection-specific fields, any field a `Connection` header
+  ## nominates, a user pseudo-header (name starting ':', which would land after the
+  ## regular fields and be malformed), and a `TE` that is not exactly "trailers".
+  var nominated: seq[string]
+  for (name, value) in headers.pairs:
+    if name.toLowerAscii == "connection":
+      for tok in value.split(','):
+        let t = tok.strip.toLowerAscii
+        if t.len > 0: nominated.add t
+  for (name, value) in headers.pairs:
+    let lower = name.toLowerAscii
+    if lower.len == 0 or lower[0] == ':': continue
+    if lower in ["host", "connection", "keep-alive", "proxy-connection",
+                 "transfer-encoding", "upgrade"]:
+      continue
+    if lower in nominated: continue
+    if lower == "te" and value.strip.toLowerAscii != "trailers": continue
+    result.add((lower, value))
+
 proc h2HeaderList*(req: Request): seq[HeaderPair] =
-  ## Pseudo-headers first, then regular headers (lowercased, connection-specific
-  ## fields dropped, Host replaced by :authority).
+  ## Pseudo-headers first, then regular headers (lowercased, connection-specific and
+  ## connection-nominated fields dropped, Host replaced by :authority).
   result.add((":method", $req.verb))
   result.add((":scheme", if req.url.isTls: "https" else: "http"))
   result.add((":path", req.url.requestTarget))
@@ -15,12 +36,7 @@ proc h2HeaderList*(req: Request): seq[HeaderPair] =
   if not ((req.url.isTls and p == 443) or (not req.url.isTls and p == 80)):
     authority.add(":" & $p)
   result.add((":authority", authority))
-  for (name, value) in req.headers.pairs:
-    let lower = name.toLowerAscii
-    if lower in ["host", "connection", "keep-alive", "proxy-connection",
-                 "transfer-encoding", "upgrade"]:
-      continue
-    result.add((lower, value))
+  result.appendMappedHeaders(req.headers)
 
 proc h2ConnectHeaderList*(url: Url, protocol: string, extra: Headers): seq[HeaderPair] =
   ## Pseudo-headers for an Extended CONNECT (RFC 8441): `:method` is CONNECT with a
@@ -37,12 +53,7 @@ proc h2ConnectHeaderList*(url: Url, protocol: string, extra: Headers): seq[Heade
   if not ((url.isTls and p == 443) or (not url.isTls and p == 80)):
     authority.add(":" & $p)
   result.add((":authority", authority))
-  for (name, value) in extra.pairs:
-    let lower = name.toLowerAscii
-    if lower in ["host", "connection", "keep-alive", "proxy-connection",
-                 "transfer-encoding", "upgrade"]:
-      continue
-    result.add((lower, value))
+  result.appendMappedHeaders(extra)
 
 proc h2TrailerList*(req: Request): seq[HeaderPair] =
   ## Request trailer fields as HPACK pairs (lowercased names). Pseudo-headers and

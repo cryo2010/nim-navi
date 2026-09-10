@@ -41,14 +41,24 @@ proc keepAlive(mux: H2Mux) {.async.} =
       if mux.sawFrameSinceTick:
         mux.sawFrameSinceTick = false
         mux.pingOutstanding = false          # a frame arrived this interval: alive
-      elif mux.activeStreams == 0:
+      elif mux.activeStreams == 0 and mux.settingsSeen.finished:
         mux.pingOutstanding = false           # nothing to protect: idle without pinging
+        # ... but a connection still waiting for the peer's SETTINGS IS being waited on
+        # (openConnect parks on settingsSeen with zero active streams), so keep probing
+        # while settingsSeen is unfinished: a peer that completes ALPN=h2 then goes dark
+        # before its SETTINGS would otherwise never be torn down (issue #265).
       elif mux.pingOutstanding:               # pinged last interval, still silent: dead
         mux.alive = false
         be.shutdownConn(mux.transport)        # wake the reader; it fails streams + closes
         break
       else:
-        await mux.send(encodePing(h2KeepAlivePayload))
+        # Fire-and-forget: do NOT join the (possibly blocked) send chain. On a network
+        # partition with a request body in flight the kernel send buffer fills and
+        # `sendAll` never completes; awaiting the PING here would chain behind that
+        # blocked tail and park the timer loop forever, so the "pinged last interval,
+        # still silent: dead" branch could never fire (issue #264). Letting the loop
+        # keep ticking is what detects the dead peer, whether or not the PING gets out.
+        mux.fireSend(encodePing(h2KeepAlivePayload))
         mux.pingOutstanding = true
   except CatchableError:
     discard   # a failed send/transport tears down via the reader; nothing to do here
@@ -93,7 +103,7 @@ proc newH2Mux*(transport: be.Conn, maxBody = 0, decompress = false,
                   readerDone: newFuture[void]("h2mux.readerDone"),
                   settingsSeen: newFuture[void]("h2mux.settingsSeen"),
                   waiters: initTable[uint32, Future[H2Response]](),
-                  sendReady: initTable[uint32, Future[void]](),
+                  sendReady: initTable[uint32, seq[Future[void]]](),
                   sinkStreams: initHashSet[uint32](),
                   recvq: initTable[uint32, Deque[string]](),
                   recvReady: initTable[uint32, Future[void]](),
