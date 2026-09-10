@@ -169,6 +169,7 @@ proc decodeLiteral(dec: var HpackDecoder, data: string, i: var int,
 proc decode*(dec: var HpackDecoder, headerBlock: string): seq[HeaderPair] =
   var i = 0
   var listSize = 0
+  var seenField = false
   while i < headerBlock.len:
     let b = uint8(headerBlock[i])
     var pair: HeaderPair
@@ -179,11 +180,18 @@ proc decode*(dec: var HpackDecoder, headerBlock: string): seq[HeaderPair] =
       pair = dec.decodeLiteral(headerBlock, i, 6)
       dec.dyn.add(pair[0], pair[1])
     elif (b and 0x20) != 0:                    # dynamic table size update
+      # RFC 7541 4.2: a size update MUST occur at the beginning of a header block,
+      # before any header field. A mid-block update is a decoding error (reference
+      # decoders treat it as COMPRESSION_ERROR).
+      if seenField:
+        raise newException(ValueError,
+          "hpack: dynamic table size update after a header field")
       dec.dyn.resize(decodeInteger(headerBlock, i, 5))
       emit = false
     else:                                       # literal, without/never indexed
       pair = dec.decodeLiteral(headerBlock, i, 4)
     if emit:
+      seenField = true
       # Bound the decoded list before appending, so an indexed-reference bomb
       # raises at ~maxList octets instead of expanding without limit.
       listSize += pair[0].len + pair[1].len + entryOverhead
@@ -212,7 +220,14 @@ proc encode*(enc: HpackEncoder, headers: openArray[HeaderPair]): string =
       b[0] = char(uint8(b[0]) or 0x80)         # indexed header field
       result.add b
     else:
-      # literal without indexing (0x00 prefix), name indexed if known
-      result.add encodeInteger(idx, 4)          # top 4 bits already 0
+      # Literal, name indexed if known. Sensitive fields use the never-indexed
+      # representation (0x10 prefix) so a re-encoding intermediary is told not to add
+      # them to its dynamic table (RFC 7541 6.2.3/7.1.3); others use literal-without-
+      # indexing (0x00 prefix).
+      let sensitive = lower in ["authorization", "cookie", "set-cookie",
+                                "proxy-authorization"]
+      var b = encodeInteger(idx, 4)             # top 4 bits already 0
+      if sensitive: b[0] = char(uint8(b[0]) or 0x10)   # never-indexed literal
+      result.add b
       if idx == 0: result.add encodeString(lower)
       result.add encodeString(value)

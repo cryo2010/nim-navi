@@ -253,30 +253,69 @@ proc replenishRecv(c: H2Conn, sid: uint32, s: Stream, n: int, outbuf: var string
   c.replenishStream(sid, s, n, outbuf)
   c.replenishConn(n, outbuf)
 
-proc applyHeaders(c: H2Conn, s: Stream) =
+proc malformedResponse(s: Stream, sid: uint32, outbuf: var string) =
+  ## RFC 9113 8.1.1: a malformed response is a STREAM error (RST_STREAM), not a
+  ## connection error -- the header block was already HPACK-decoded, so the shared
+  ## dynamic table stays in sync and the connection survives. The driver surfaces the
+  ## reset as a failed request.
+  outbuf.add encodeRstStream(sid, errProtocolError)
+  s.reset = true
+  s.ended = true
+
+proc applyHeaders(c: H2Conn, s: Stream, sid: uint32, outbuf: var string) =
   # HPACK is stateful, so every block must be decoded even when its fields are
-  # dropped -- otherwise the dynamic table desyncs and later blocks corrupt.
+  # dropped -- otherwise the dynamic table desyncs and later blocks corrupt. Decoded
+  # fields are then validated (RFC 9113 8.2.1/8.2.2/8.3): a violation is a stream
+  # error, kept separate from a COMPRESSION_ERROR (which the caller raises).
   var status = 0
+  var statusSeen = false
   var headers: seq[(string, string)]
+  var sawRegular = false
+  var malformed = false
   for (name, value) in c.dec.decode(s.hdrBuf):
-    if name == ":status":
-      try: status = parseInt(value)
-      except ValueError: discard
-    elif not name.startsWith(":"):
-      headers.add((name, value))
+    if malformed: continue                     # keep draining to finish HPACK cleanly
+    if name.len == 0:
+      malformed = true; continue               # empty field name (8.2.1)
+    if name[0] == ':':
+      if s.sawFinal: malformed = true; continue          # pseudo-header in trailers (8.1)
+      if sawRegular: malformed = true; continue          # pseudo after a regular field (8.3)
+      if name == ":status":
+        statusSeen = true
+        try: status = parseInt(value)
+        except ValueError: malformed = true               # unparseable :status
+      else:
+        malformed = true                                  # unknown response pseudo-header
+      continue
+    sawRegular = true
+    for ch in name:
+      if ch in {'A'..'Z'}: malformed = true; break        # names must be lowercase (8.2.1)
+    if malformed: continue
+    if name in ["connection", "keep-alive", "proxy-connection", "transfer-encoding",
+                "upgrade"]:
+      malformed = true; continue                          # connection-specific field (8.2.2)
+    if name == "te" and value.strip.toLowerAscii != "trailers":
+      malformed = true; continue                          # TE may only be "trailers" (8.2.2)
+    headers.add((name, value))
   s.hdrBuf.setLen(0)
+  if malformed:
+    malformedResponse(s, sid, outbuf); return
   if s.sawFinal:
-    # A header block after the final response is trailers (RFC 9113 8.1). They
-    # were HPACK-decoded above (required to keep the dynamic table in sync); keep
-    # the non-pseudo fields so the caller can read them off the response.
+    # A header block after the final response is trailers (RFC 9113 8.1). Keep the
+    # non-pseudo fields so the caller can read them off the response. Trailers MUST
+    # carry END_STREAM; without it the response can never complete -- malformed.
     for h in headers: s.resp.trailers.add(h)
     if s.hdrEndStream: s.ended = true
+    else: malformedResponse(s, sid, outbuf)
     return
   if status in 100 .. 199:
     # Interim response (100 Continue, 103 Early Hints, ...): its headers do not
-    # belong to the final response, and it never carries END_STREAM. Discard it;
-    # the final response follows in a later HEADERS block.
+    # belong to the final response, and it MUST NOT carry END_STREAM (8.1). A 1xx with
+    # END_STREAM is malformed (it would otherwise hang the request, `ended` unset);
+    # otherwise discard it and wait for the final response in a later HEADERS block.
+    if s.hdrEndStream: malformedResponse(s, sid, outbuf)
     return
+  if not statusSeen or status < 100 or status > 599:
+    malformedResponse(s, sid, outbuf); return             # missing/invalid :status
   s.sawFinal = true
   s.resp.status = status
   for h in headers: s.resp.headers.add(h)
@@ -294,8 +333,8 @@ proc unpad(c: H2Conn, f: Frame, frag: var string, outbuf: var string): bool =
   ## pad length, and that many trailing bytes are the padding. Sets `frag` to the
   ## content in between. A pad length that meets or exceeds the payload is a
   ## PROTOCOL_ERROR (GOAWAY sent, returns false).
-  if f.payload.len < 1:
-    c.connFail(errProtocolError, "padded frame with no pad length", outbuf)
+  if f.payload.len < 1:                        # too short to hold the pad-length octet:
+    c.connFail(errFrameSizeError, "padded frame with no pad length", outbuf)  # RFC 9113 4.2
     return false
   let padLen = int(uint8(f.payload[0]))
   if padLen > f.payload.len - 1:
@@ -305,6 +344,11 @@ proc unpad(c: H2Conn, f: Frame, frag: var string, outbuf: var string): bool =
   true
 
 proc handle(c: H2Conn, f: Frame, outbuf: var string) =
+  if c.fatal.len > 0: return
+    # A fatal connection error already sent GOAWAY. RFC 9113 5.4.1: stop processing --
+    # do not ACK/apply later frames in the same feed batch, and in particular do not
+    # decode further header blocks against a known-corrupt HPACK table after a
+    # COMPRESSION_ERROR. The driver observes `connError` and unwinds.
   if not c.sawFirstFrame:                     # RFC 9113 3.4: server preface is SETTINGS
     c.sawFirstFrame = true
     if f.typ != uint8(ftSettings):
@@ -353,10 +397,16 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
             c.connFail(errFlowControlError, "SETTINGS_INITIAL_WINDOW_SIZE too large", outbuf)
             return
           # Adjust every open stream's send window by the delta (RFC 9113 6.9.2),
-          # then release any body the new room allows.
+          # then release any body the new room allows. A delta that pushes any stream
+          # window past 2^31-1 is a FLOW_CONTROL_ERROR (RFC 9113 6.9.2 MUST) -- the
+          # WINDOW_UPDATE path bounds this too, but the delta path did not.
           let delta = int(value) - c.peerInitialWindow
           c.peerInitialWindow = int(value)
           for sid, s in c.streams:
+            if s.sendWindow.int64 + delta.int64 > 0x7fffffff'i64:
+              c.connFail(errFlowControlError,
+                "SETTINGS_INITIAL_WINDOW_SIZE delta overflows a stream send window", outbuf)
+              return
             s.sendWindow += delta
             c.flushSend(sid, s, outbuf)
       outbuf.add encodeSettingsAck()
@@ -401,8 +451,8 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
       # reset/unknown one) so the fragment fed to HPACK is correct.
       if (f.flags and flagPadded) != 0 and not c.unpad(f, frag, outbuf): return
       if (f.flags and flagPriority) != 0:
-        if frag.len < 5:
-          c.connFail(errProtocolError, "HEADERS priority block truncated", outbuf)
+        if frag.len < 5:                       # missing the 5-byte priority block:
+          c.connFail(errFrameSizeError, "HEADERS priority block truncated", outbuf)  # RFC 9113 4.2
           return
         frag = frag[5 ..< frag.len]
     if s != nil and not s.reset:
@@ -420,7 +470,7 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
           # Any HPACK decoding failure (truncated block, integer overflow, a
           # table-size update over the advertised max, or a header list past
           # SETTINGS_MAX_HEADER_LIST_SIZE) is a connection-level COMPRESSION_ERROR.
-          try: c.applyHeaders(s)
+          try: c.applyHeaders(s, f.streamId, outbuf)
           except ValueError as e:
             c.connFail(errCompressionError, e.msg, outbuf)
             return
@@ -450,7 +500,14 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
     # have reset or never opened. Skipping that leaks the window and eventually
     # stalls a long-lived pooled/mux connection.
     let s = c.streams.getOrDefault(f.streamId)
-    if s != nil and not s.reset:
+    if s != nil and s.ended and not s.reset:
+      # DATA after END_STREAM: STREAM_CLOSED (RFC 9113 5.1). The response already
+      # completed, so drop the stray bytes -- appending would grow memory without
+      # bound when maxBodyBytes==0, or corrupt the delivered body when the extra DATA
+      # rides the same feed batch -- and RST the stream; keep the conn window in sync.
+      outbuf.add encodeRstStream(f.streamId, errStreamClosed)
+      if f.payload.len > 0: c.replenishConn(f.payload.len, outbuf)
+    elif s != nil and not s.reset:
       var data = f.payload
       if (f.flags and flagPadded) != 0 and not c.unpad(f, data, outbuf): return
       s.resp.body.add data
@@ -502,9 +559,15 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
       if f.streamId == 0:                        # connection error, or a stream error (RST)
         c.connFail(errProtocolError, "WINDOW_UPDATE increment 0 on the connection", outbuf)
       else:
-        outbuf.add encodeRstStream(f.streamId, errProtocolError)
         let s = c.streams.getOrDefault(f.streamId)
-        if s != nil: s.reset = true; s.ended = true
+        if s != nil:
+          outbuf.add encodeRstStream(f.streamId, errProtocolError)   # live stream: RST it
+          s.reset = true; s.ended = true
+        elif f.streamId mod 2 == 0'u32 or f.streamId >= c.nextId:
+          # Idle stream: RFC 9113 5.1/6.4 forbid RST_STREAM on an idle stream, so a bad
+          # WINDOW_UPDATE here is a connection PROTOCOL_ERROR, not a stream RST.
+          c.connFail(errProtocolError, "WINDOW_UPDATE(0) on an idle stream", outbuf)
+        # else a closed stream we have already forgotten: ignore
       return
     if f.streamId == 0:                        # connection-level: release all streams
       # A window that would exceed 2^31-1 is a FLOW_CONTROL_ERROR (RFC 9113 6.9.1);
@@ -673,4 +736,10 @@ proc resetStream*(c: H2Conn, streamId: uint32): string =
       c.discardHdr.add c.streams[streamId].hdrBuf
     c.streams.del(streamId)
 
-proc canReuse*(c: H2Conn): bool = not c.goneAway and c.fatal.len == 0
+proc nextStreamExhausted*(c: H2Conn): bool = c.nextId >= 0x7fffffff'u32
+  ## Client stream ids are odd and bounded by 2^31-1 (RFC 9113 5.1.1). Once `nextId`
+  ## reaches the limit, opening another stream would let the frame encoder's u31 mask
+  ## silently alias an old id, so the connection must be retired instead.
+
+proc canReuse*(c: H2Conn): bool =
+  not c.goneAway and c.fatal.len == 0 and not c.nextStreamExhausted

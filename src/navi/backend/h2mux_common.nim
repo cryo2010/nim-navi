@@ -158,6 +158,15 @@ proc clearSendReady(mux: H2Mux, sid: uint32) =
   for r in futs:
     if not r.finished: r.complete()
 
+proc wakeRecver(mux: H2Mux, sid: uint32) =
+  ## Complete and drop `sid`'s parked reader (a `readChunk`), so a teardown racing an
+  ## in-flight read does not strand it: `wakeRecvers` only iterates `sinkStreams`, so
+  ## once the stream is pulled from that set the parked future is otherwise unreachable
+  ## by every wakeup (issue #267). The woken `readChunk` re-checks state and exits.
+  let r = mux.recvReady.getOrDefault(sid, nil)
+  if r != nil and not r.finished: r.complete()
+  mux.recvReady.del(sid)
+
 proc waitSendable(mux: H2Mux, sid: uint32) {.async.} =
   ## Park until `sid`'s queued send drains onto the wire (or the stream/connection
   ## is gone). Multiple senders may park on one stream, so waiters are a per-stream
@@ -182,9 +191,7 @@ proc reapStream(mux: H2Mux, sid: uint32) {.gcsafe, raises: [].} =
     mux.sinkStreams.excl sid
     mux.recvq.del(sid)
     mux.clearSendReady(sid)
-    let r = mux.recvReady.getOrDefault(sid, nil)
-    if r != nil and not r.finished: r.complete()   # wake a parked reader; it re-checks
-    mux.recvReady.del(sid)
+    mux.wakeRecver(sid)                              # wake a parked reader; it re-checks
     mux.decoders.del(sid)
     if mux.alive:
       let rst = mux.h2.resetStream(sid)
@@ -301,6 +308,11 @@ proc readChunk*(mux: H2Mux, sid: uint32): Future[string] {.async.} =
     while true:
       if not mux.alive:
         raise newException(IOError, "navi: http/2 connection closed")
+      if sid notin mux.sinkStreams:
+        # A concurrent abandon/dropStream/close pulled this stream out of sinkStreams
+        # while we were parked (it wakes us via wakeRecver). Detect the removal and
+        # exit instead of re-parking on a future no wakeup can reach (issue #267).
+        raise newException(IOError, "navi: http/2 stream closed")
       if mux.h2.streamReset(sid):
         if mux.h2.streamTooLarge(sid):
           raise newException(ResponseTooLargeError,
@@ -391,6 +403,9 @@ proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: strin
   if mux.h2.goneAway:       # a GOAWAY landed while we waited: opening a new stream now
     raise newException(UnprocessedError,   # would break RFC 9113 6.8 (peer PROTOCOL_ERRORs
       "navi: http/2 request not processed") # and drops the conn). Retry on a fresh conn.
+  if mux.h2.nextStreamExhausted:   # 2^31 stream ids used (RFC 9113 5.1.1): opening one
+    raise newException(UnprocessedError,   # more would alias an old id. Retry on a fresh
+      "navi: http/2 request not processed") # connection; canReuse already retires this one.
   let sid = mux.h2.openStream()
   mux.h2.setSinkMode(sid)                 # gate the receive window; drainDownload acks it
   mux.sinkStreams.incl sid
@@ -487,7 +502,7 @@ proc dropStream*(mux: H2Mux, sid: uint32) =
   if sid notin mux.sinkStreams: return
   mux.sinkStreams.excl sid
   mux.recvq.del(sid)
-  mux.recvReady.del(sid)
+  mux.wakeRecver(sid)                          # wake a parked readChunk racing us
   mux.clearSendReady(sid)                     # a tunnel may have a parked send
   mux.decoders.del(sid)
   mux.releaseSlot()
@@ -504,7 +519,7 @@ proc abandon*(mux: H2Mux, sid: uint32): Future[void] {.async.} =
   if sid notin mux.sinkStreams: return
   mux.sinkStreams.excl sid
   mux.recvq.del(sid)
-  mux.recvReady.del(sid)
+  mux.wakeRecver(sid)                          # wake a parked readChunk racing us
   mux.clearSendReady(sid)                     # a tunnel may have a parked send
   mux.decoders.del(sid)
   mux.releaseSlot()
@@ -535,6 +550,9 @@ proc request*(mux: H2Mux, headers: seq[(string, string)], body: string,
   if mux.h2.goneAway:       # a GOAWAY landed while we waited: opening a new stream now
     raise newException(UnprocessedError,   # would break RFC 9113 6.8 (peer PROTOCOL_ERRORs
       "navi: http/2 request not processed") # and drops the conn). Retry on a fresh conn.
+  if mux.h2.nextStreamExhausted:   # 2^31 stream ids used (RFC 9113 5.1.1): opening one
+    raise newException(UnprocessedError,   # more would alias an old id. Retry on a fresh
+      "navi: http/2 request not processed") # connection; canReuse already retires this one.
   # Streaming responses go through sendAndReadHeaders + readChunk/drainDownload on
   # the handle, not here, so this path is buffered: it waits for the whole response.
   # (`bodyStream` still streams the request body up.)

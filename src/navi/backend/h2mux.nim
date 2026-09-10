@@ -62,7 +62,16 @@ proc reader(mux: H2Mux) {.async.} =
     while mux.alive:
       let recvFut = be.recvSome(mux.transport)
       if mux.h2.goneAway and mux.activeStreams > 0:
-        if not await withTimeout(recvFut, goAwayGraceMs): break  # peer went silent
+        if not await withTimeout(recvFut, goAwayGraceMs):        # peer went silent
+          # asyncdispatch withTimeout does not cancel `recvFut`, so it is still parked
+          # on the fd. Closing the transport under it (the teardown below) crashes --
+          # the exact pattern this module's `close` doc warns of. EOF the read via
+          # shutdownConn and drain it first, so the fd is closed with no read pending
+          # (issue #267; the chronos twin cancels via withTimeout instead).
+          be.shutdownConn(mux.transport)
+          try: discard await recvFut
+          except CatchableError: discard
+          break
       let chunk = await recvFut
       if chunk.len == 0: break                 # peer closed
       mux.sawFrameSinceTick = true             # inbound bytes: liveness for the keepalive
