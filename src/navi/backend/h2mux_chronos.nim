@@ -48,7 +48,13 @@ proc keepAlive(mux: H2Mux) {.async.} =
         be.shutdownConn(mux.transport)        # wake the reader; it fails streams + closes
         break
       else:
-        await mux.send(encodePing(h2KeepAlivePayload))
+        # Fire-and-forget: do NOT join the (possibly blocked) send chain. On a network
+        # partition with a request body in flight the kernel send buffer fills and
+        # `sendAll` never completes; awaiting the PING here would chain behind that
+        # blocked tail and park the timer loop forever, so the "pinged last interval,
+        # still silent: dead" branch could never fire (issue #264). Letting the loop
+        # keep ticking is what detects the dead peer, whether or not the PING gets out.
+        mux.fireSend(encodePing(h2KeepAlivePayload))
         mux.pingOutstanding = true
   except CatchableError:
     discard   # a failed send/transport tears down via the reader; nothing to do here
