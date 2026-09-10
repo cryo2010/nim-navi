@@ -730,7 +730,12 @@ proc transportGroup(client: Navi, items: seq[BatchItem],
       while not parser.finished:
         let chunk = transport.recvSome()
         if chunk.len == 0:
-          parser.eof()
+          parser.eof()                       # completes a read-until-close body
+          # A length- or chunked-delimited body that isn't `finished` at EOF was cut
+          # short by a premature close. Raise rather than return the partial body as a
+          # complete response (silent truncation), mirroring h1DrainBody in engine.nim.
+          if not parser.finished:
+            raise newException(IOError, h1TruncatedErr)
           break
         parser.feed(chunk)
       result[k] = parser.toResponse()
