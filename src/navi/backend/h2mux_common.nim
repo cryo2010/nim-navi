@@ -55,7 +55,7 @@ type
                                 ## keepalive tick (any frame proves liveness)
     pingOutstanding: bool       ## a keepalive PING is awaiting any inbound frame
 
-proc fireSend(mux: H2Mux, data: string)
+proc fireSend(mux: H2Mux, data: string) {.gcsafe, raises: [].}
   ## Fire-and-forget a control-frame send (RST_STREAM from the destructor path).
   ## Defined per backend after the include: `asyncCheck` on asyncdispatch,
   ## `asyncSpawn mux.trySend` on chronos.
@@ -237,7 +237,17 @@ proc endStream(mux: H2Mux, sid: uint32) =
   mux.recvq.del(sid)
   mux.sinkStreams.excl sid
   mux.decoders.del(sid)
-  discard mux.h2.takeResponse(sid)
+  if wasActive and mux.alive and not mux.h2.streamEnded(sid) and
+     not mux.h2.streamReset(sid):
+    # Error unwind (the sink raised, or the content decoder failed on corrupt input)
+    # before the stream finished: the server still thinks the stream is live and can
+    # send up to a full stream window of discarded DATA, then stalls forever, leaking
+    # a server-side zombie stream per abort on a pooled connection (issue #260). RST
+    # it (also drops the stream locally) instead of a silent takeResponse.
+    let rst = mux.h2.resetStream(sid)
+    if rst.len > 0: mux.fireSend(rst)
+  else:
+    discard mux.h2.takeResponse(sid)
   if wasActive: mux.releaseSlot()
 
 proc readChunk*(mux: H2Mux, sid: uint32): Future[string] {.async.} =

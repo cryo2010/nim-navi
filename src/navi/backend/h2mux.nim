@@ -13,11 +13,13 @@ import ./asyncdispatch as be     # for Conn / BodySink
 
 include ./h2mux_common
 
-proc fireSend(mux: H2Mux, data: string) =
+proc fireSend(mux: H2Mux, data: string) {.gcsafe, raises: [].} =
   ## asyncdispatch has no untracked spawn, so `asyncCheck` the serialized send and
   ## drop the returned future; `send` already swallows nothing, so guard the call.
+  ## Fully non-raising (catches Exception): the stream-teardown paths that fire a
+  ## best-effort RST cannot handle a scheduler failure here.
   try: asyncCheck mux.send(data)
-  except CatchableError: discard
+  except Exception: discard
 
 proc keepAlive(mux: H2Mux) {.async.} =
   ## Once per interval (not per chunk): if a connection with active streams has gone a
