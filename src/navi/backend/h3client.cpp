@@ -146,6 +146,8 @@ struct H3Conn {
   bool handshake_done = false;
   bool want_verify = false; // verify the peer certificate after the handshake (see below)
   bool has_abort = false;   // some stream's producer failed; reset it in send_step
+  bool draining = false;    // peer closed the connection gracefully (CONNECTION_CLOSE /
+                            // draining): a clean end, not a transport error
   unsigned long long max_body = 0;  // navi maxResponseBytes: cap on a single response
                                     // body the driver will buffer (0 = unlimited)
   std::unordered_map<int64_t, Stream> streams;   // live streams by id
@@ -637,12 +639,28 @@ ngtcp2_ssize navi_h3_send(H3Conn *c, std::uint8_t *buf, std::size_t buflen) {
   return send_step(c, {buf, buflen});
 }
 
+// Returns 0 on success, 1 if the peer closed the connection gracefully (a clean end,
+// not an error), or -1 on a real transport error. Distinguishing the graceful case
+// (#278) lets the reader deliver already-completed streams and fail only in-flight ones,
+// instead of treating a normal server shutdown as an abnormal transport failure.
 int navi_h3_recv(H3Conn *c, const std::uint8_t *pkt, std::size_t len) {
   ngtcp2_pkt_info pi{};
   int rv = ngtcp2_conn_read_pkt(c->conn, &c->path, &pi, pkt, len, now_ns());
-  if (rv != 0) std::fprintf(stderr, "read_pkt: %s\n", ngtcp2_strerror(rv));
-  return rv;
+  if (rv == 0) return 0;
+  // A received CONNECTION_CLOSE (closing/draining) or a drop-connection signal is the
+  // peer ending the connection, not an I/O failure. Flag it and report it distinctly;
+  // do not log it as an error.
+  if (rv == NGTCP2_ERR_DRAINING || rv == NGTCP2_ERR_CLOSING ||
+      rv == NGTCP2_ERR_DROP_CONN) {
+    c->draining = true;
+    return 1;
+  }
+  std::fprintf(stderr, "read_pkt: %s\n", ngtcp2_strerror(rv));
+  return -1;
 }
+
+// 1 once the peer has gracefully closed the connection (see navi_h3_recv).
+int navi_h3_draining(H3Conn *c) { return c->draining ? 1 : 0; }
 
 std::uint64_t navi_h3_timeout_ms(H3Conn *c) {
   ngtcp2_tstamp e = ngtcp2_conn_get_expiry(c->conn);
@@ -685,8 +703,9 @@ int navi_h3_pump(H3Conn *c) {
       for (;;) {   // drain EVERY queued datagram this cycle, not just one: a streamed
         ssize_t r = recv(c->fd, buf.data(), buf.size(), 0);   // upload otherwise advances
         if (r <= 0) break;                                    // one MAX_STREAM_DATA per
-        if (navi_h3_recv(c, buf.data(), static_cast<std::size_t>(r)) != 0)  // cycle -> crawls
-          return -1;
+        int rc = navi_h3_recv(c, buf.data(), static_cast<std::size_t>(r));  // cycle -> crawls
+        if (rc < 0) return -1;
+        if (rc > 0) break;   // peer closed gracefully; drive loops observe navi_h3_draining
       }
   }
   if (navi_h3_timeout_ms(c) == 0 && navi_h3_handle_timeout(c) != 0) return -1;

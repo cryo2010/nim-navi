@@ -72,9 +72,13 @@ proc step(qc: QuicConn) {.async.} =
   while true:                                   # drain incoming datagrams
     let r = sockRecv(rawFd(qc.fd), addr buf[0], csize_t(buf.len), 0)
     if r <= 0: break
-    if navi_h3_recv(qc.c, addr buf[0], csize_t(r)) != 0:
+    let rc = navi_h3_recv(qc.c, addr buf[0], csize_t(r))
+    if rc < 0:
       raise newException(QuicError, "navi HTTP/3: read_pkt failed")
-  if navi_h3_timeout_ms(qc.c) == 0:
+    if rc > 0:                    # peer closed gracefully: stop reading and let the reader
+      qc.alive = false            # deliver completed streams, then tear down cleanly (#278)
+      break
+  if qc.alive and navi_h3_timeout_ms(qc.c) == 0:   # skip once a graceful close ended it (#278)
     if navi_h3_handle_timeout(qc.c) != 0:
       raise newException(QuicError, "navi HTTP/3: handle_timeout failed")
 

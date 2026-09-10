@@ -107,6 +107,9 @@ proc navi_h3_new*(host, port, sni, caFile: cstring, verify: cint,
 proc navi_h3_fd*(c: pointer): cint {.importc, cdecl.}
 proc navi_h3_send*(c: pointer, buf: pointer, buflen: csize_t): int {.importc, cdecl.}
 proc navi_h3_recv*(c: pointer, pkt: pointer, len: csize_t): cint {.importc, cdecl.}
+  ## 0 ok, 1 the peer closed the connection gracefully, -1 a transport error.
+proc navi_h3_draining*(c: pointer): cint {.importc, cdecl.}
+  ## 1 once the peer has gracefully closed the connection (CONNECTION_CLOSE / draining).
 proc navi_h3_timeout_ms*(c: pointer): uint64 {.importc, cdecl.}
 proc navi_h3_handle_timeout*(c: pointer): cint {.importc, cdecl.}
 proc navi_h3_handshake_done*(c: pointer): cint {.importc, cdecl.}
@@ -221,9 +224,13 @@ proc request*(c: QuicConn, verb: string, path = "/",
   if sid < 0:
     raise newException(QuicError, "navi HTTP/3 submit failed")
   while navi_h3_stream_done(c.handle, sid) == 0:   # drive until this stream completes
+    if navi_h3_draining(c.handle) != 0: break      # peer closed gracefully (#278)
     if navi_h3_pump(c.handle) != 0:
       navi_h3_stream_free(c.handle, sid)
       raise newException(QuicError, "navi HTTP/3 pump failed")
+  if navi_h3_stream_done(c.handle, sid) == 0:      # connection drained before the response
+    navi_h3_stream_free(c.handle, sid)
+    raise newException(QuicError, "navi HTTP/3 connection closed before response")
   if navi_h3_stream_reset(c.handle, sid) != 0:
     navi_h3_stream_free(c.handle, sid)
     raise newException(QuicError, "navi HTTP/3 " & verb & " " & path & " was reset")
@@ -311,6 +318,8 @@ proc awaitHeaders*(c: QuicConn, sid: int64):
       return (int(status), hs)
     if navi_h3_stream_done(c.handle, sid) != 0:   # ended before any headers => reset
       raise newException(QuicError, "navi HTTP/3 stream ended before headers")
+    if navi_h3_draining(c.handle) != 0:           # peer closed gracefully (#278)
+      raise newException(QuicError, "navi HTTP/3 connection closed before headers")
     if navi_h3_pump(c.handle) != 0:
       raise newException(QuicError, "navi HTTP/3 pump failed")
 
@@ -326,6 +335,8 @@ proc readStreamBody*(c: QuicConn, sid: int64): string =
     if n < 0: raise newException(QuicError, "navi HTTP/3 stream gone")
     if n > 0: buf.setLen(int(n)); return buf
     if eof != 0: return ""
+    if navi_h3_draining(c.handle) != 0:           # peer closed gracefully mid-stream (#278)
+      raise newException(QuicError, "navi HTTP/3 connection closed mid-stream")
     if navi_h3_pump(c.handle) != 0:
       raise newException(QuicError, "navi HTTP/3 pump failed")
 
@@ -405,6 +416,7 @@ proc wsPumpLoop(p: ptr WsH3PumpObj) {.thread.} =
   while not p.stop.load():
     if not p.drainOutbound(): break              # send-side error: stop pumping
     if navi_h3_pump(p.conn) != 0: break          # one cycle; blocks on timer or a wake
+    if navi_h3_draining(p.conn) != 0: break      # peer closed the connection (#278)
     while p.toApp.peek() < wsInboundHighWater:    # drain only while the app keeps up
       let n = navi_h3_read_body(p.conn, p.sid, cast[ptr char](addr buf[0]),
                                 csize_t(buf.len), addr eof)
