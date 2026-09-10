@@ -22,8 +22,11 @@ type
     h2: H2Conn
     waiters: Table[uint32, Future[H2Response]]
     pendingSlots: Deque[Future[void]]  ## requests waiting for a concurrency slot
-    sendReady: Table[uint32, Future[void]]  ## streaming uploads waiting for the send
-                                            ## window to drain their queued chunk
+    sendReady: Table[uint32, seq[Future[void]]]  ## senders parked until the send
+                                            ## window drains their queued chunk. A LIST
+                                            ## per stream: a tunnel can have two in flight
+                                            ## (a user send + the WS keepalive ping), and
+                                            ## a single slot would strand one (issue #263)
     sinkStreams: HashSet[uint32]       ## streams owned by a drainDownload coroutine
                                        ## (their body goes to a sink, not `waiters`)
     recvq: Table[uint32, Deque[string]]  ## raw body chunks the reader drained per feed,
@@ -116,17 +119,41 @@ proc dispatch(mux: H2Mux) =
       fut.fail(newException(UnprocessedError, "navi: http/2 request not processed"))
 
 proc wakeSenders(mux: H2Mux) =
-  ## Wake streaming uploads whose queued chunk has drained onto the wire (the
-  ## reader just released a window-blocked tail on WINDOW_UPDATE), or whose stream
-  ## is finished/gone, so they pull the next chunk or stop.
+  ## Wake streaming uploads / tunnel sends whose queued chunk has drained onto the
+  ## wire (the reader released a window-blocked tail on WINDOW_UPDATE), or whose
+  ## stream is finished/gone, so they pull the next chunk or stop. Each stream's
+  ## waiters are a list -- a tunnel can have two parked at once (issue #263) -- and
+  ## all are woken; each re-checks its own condition on resume.
   var wake: seq[uint32]
-  for sid, ready in mux.sendReady:
-    if not ready.finished and (not mux.alive or mux.h2.goneAway or
-        mux.h2.sendDrained(sid) or mux.h2.streamEnded(sid)):
+  for sid, futs in mux.sendReady:
+    if not mux.alive or mux.h2.goneAway or mux.h2.sendDrained(sid) or
+        mux.h2.streamEnded(sid):
       wake.add sid
   for sid in wake:
-    let r = mux.sendReady[sid]
+    let futs = mux.sendReady[sid]
+    mux.sendReady.del(sid)
+    for r in futs:
+      if not r.finished: r.complete()
+
+proc clearSendReady(mux: H2Mux, sid: uint32) =
+  ## Complete and drop every sender parked on `sid` (they re-check state and exit),
+  ## for the stream-teardown paths. Never strand a parked send future.
+  if not mux.sendReady.hasKey(sid): return
+  let futs = mux.sendReady[sid]
+  mux.sendReady.del(sid)
+  for r in futs:
     if not r.finished: r.complete()
+
+proc waitSendable(mux: H2Mux, sid: uint32) {.async.} =
+  ## Park until `sid`'s queued send drains onto the wire (or the stream/connection
+  ## is gone). Multiple senders may park on one stream, so waiters are a per-stream
+  ## list (issue #263). There is no yield between the state check and registering, so
+  ## the reader (which runs only while we await) cannot slip a wake in: no lost wake.
+  if mux.h2.sendDrained(sid) or mux.h2.streamDone(sid) or not mux.alive: return
+  let ready = newFuture[void]("h2mux.sendready")
+  if not mux.sendReady.hasKey(sid): mux.sendReady[sid] = @[]
+  mux.sendReady[sid].add ready
+  await ready
 
 proc queueBodies(mux: H2Mux) =
   ## Move each sink stream's newly-arrived body out of the connection into its
@@ -197,13 +224,7 @@ proc streamBody(mux: H2Mux, sid: uint32, bodyStream: BodyProducer,
         break
       await mux.send(mux.h2.queueSend(sid, chunk))
     else:
-      let ready = newFuture[void]("h2mux.drain")
-      mux.sendReady[sid] = ready
-      if mux.h2.sendDrained(sid) or mux.h2.streamDone(sid) or not mux.alive:
-        mux.sendReady.del(sid)                     # drained between check and register
-      else:
-        await ready
-        mux.sendReady.del(sid)
+      await mux.waitSendable(sid)
 
 proc endStream(mux: H2Mux, sid: uint32) =
   ## Free a sink stream's per-stream state once it is done (or errored), and release
@@ -391,13 +412,7 @@ proc tunnelSend*(mux: H2Mux, sid: uint32, data: string) {.async.} =
   if not mux.alive: raise newException(IOError, "navi: http/2 connection closed")
   await mux.send(mux.h2.queueSend(sid, data))
   while mux.alive and not mux.h2.sendDrained(sid) and not mux.h2.streamDone(sid):
-    let ready = newFuture[void]("h2mux.tunnelsend")
-    mux.sendReady[sid] = ready
-    if mux.h2.sendDrained(sid) or mux.h2.streamDone(sid) or not mux.alive:
-      mux.sendReady.del(sid)
-    else:
-      await ready
-      mux.sendReady.del(sid)
+    await mux.waitSendable(sid)
 
 proc tunnelRecv*(mux: H2Mux, sid: uint32): Future[string] =
   ## One inbound tunnel chunk, or "" once the peer half-closes (drops the stream).
@@ -419,6 +434,7 @@ proc dropStream*(mux: H2Mux, sid: uint32) =
   mux.sinkStreams.excl sid
   mux.recvq.del(sid)
   mux.recvReady.del(sid)
+  mux.clearSendReady(sid)                     # a tunnel may have a parked send
   mux.decoders.del(sid)
   mux.releaseSlot()
   if mux.alive:
@@ -435,6 +451,7 @@ proc abandon*(mux: H2Mux, sid: uint32): Future[void] {.async.} =
   mux.sinkStreams.excl sid
   mux.recvq.del(sid)
   mux.recvReady.del(sid)
+  mux.clearSendReady(sid)                     # a tunnel may have a parked send
   mux.decoders.del(sid)
   mux.releaseSlot()
   if mux.alive:
