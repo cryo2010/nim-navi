@@ -24,6 +24,12 @@ suite "h1 serialize":
     var req = Request(verb: GET, url: parseUrl("http://h:8080/"))
     check "Host: h:8080\r\n" in serializeRequest(req)
 
+  test "the request serializer should reject a manually-set Transfer-Encoding on a buffered body (#273)":
+    var req = Request(verb: POST, url: parseUrl("http://h/"), body: "hello")
+    req.headers = initHeaders()
+    req.headers["transfer-encoding"] = "chunked"
+    expect ValueError: discard serializeRequest(req)
+
   test "the request serializer should bracket an IPv6 host literal in the Host header (#270)":
     var req = Request(verb: GET, url: parseUrl("http://[2001:db8::1]:8080/x"))
     check "Host: [2001:db8::1]:8080\r\n" in serializeRequest(req)

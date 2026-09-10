@@ -13,6 +13,15 @@ proc serializeHead*(req: Request, chunked = false): string =
   ## when missing, and either Transfer-Encoding: chunked (streaming upload) or
   ## Content-Length. HTTP/1.1 keeps connections alive by default, which pooling
   ## relies on.
+  # navi owns transfer framing: a streamed body (`bodyStream`) or trailers select the
+  # chunked path (`chunked = true`, which frames the body and adds the header). A caller
+  # must not set Transfer-Encoding by hand -- on the buffered path (`chunked = false`)
+  # the header loop below would advertise it while the body is written unframed, a
+  # connection-desyncing / request-smuggling footgun (#273). Reject rather than emit it.
+  if not chunked and req.headers.contains("transfer-encoding"):
+    raise newException(ValueError,
+      "navi: use a streaming body (bodyStream) for chunked transfer; " &
+      "do not set a Transfer-Encoding request header manually")
   let target = if req.absoluteForm: req.url.absoluteTarget else: req.url.requestTarget
   result = $req.verb & " " & target & " HTTP/1.1\r\n"
   if not req.headers.contains("host"):
