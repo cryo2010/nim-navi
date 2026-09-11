@@ -373,6 +373,11 @@ type CappedDecoder* = object
 proc initCappedDecoder*(decompress: bool, cap: int): CappedDecoder =
   CappedDecoder(decompress: decompress, cap: cap)
 
+proc encodingResolved*(cd: CappedDecoder): bool = cd.ready
+  ## Whether the decoder has already been chosen (on the first non-empty chunk).
+  ## Once true the content-encoding has been read, so callers can skip the per-chunk
+  ## header lookup they would otherwise pass to `feed` for the whole download.
+
 proc feed*(cd: var CappedDecoder, raw: string, encoding: string): string =
   ## Decode one raw body chunk. On the first non-empty chunk the decoder is built
   ## from `encoding` (read only then). Returns the decoded bytes, or "" when the

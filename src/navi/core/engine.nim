@@ -93,7 +93,8 @@ template h1DrainBody*(transport, parser, sink, keep, decompress, cap: typed) =
     var cd = initCappedDecoder(decompress, cap)   # lazy decoder + running size cap
     template deliver() =
       if streaming:
-        let decoded = cd.feed(parser.takeBody(), parser.contentEncoding())
+        let decoded = cd.feed(parser.takeBody(),
+                              if cd.encodingResolved: "" else: parser.contentEncoding())
         if decoded.len > 0:
           # single-threaded client; the sink need not be gcsafe (see sendRequest).
           # `decoded` is navi's native body type (`string`), which the sink also
@@ -145,7 +146,8 @@ template h1ReadChunk*(transport, parser, capped: typed): string =
             raise newException(IOError, h1TruncatedErr)
         else: parser.feed(chunk)
         continue
-      let decoded = capped.feed(raw, parser.contentEncoding())
+      let decoded = capped.feed(raw,
+                                if capped.encodingResolved: "" else: parser.contentEncoding())
       if decoded.len == 0: continue          # decoder buffered input; read more
       res = decoded
       break
@@ -163,7 +165,8 @@ template h2ReadChunk*(transport, h2, sid, capped: typed): string =
     while true:
       let raw = h2.takeBody(sid)
       if raw.len > 0:
-        let decoded = capped.feed(raw, h2.respHeader(sid, "content-encoding"))
+        let decoded = capped.feed(raw,
+          if capped.encodingResolved: "" else: h2.respHeader(sid, "content-encoding"))
         if decoded.len == 0: continue
         res = decoded
         break
@@ -246,7 +249,8 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
       let toSend = h2.feed(chunk)
       if toSend.len > 0: await sendAll(transport, toSend)
       if not sink.isNil:
-        let decoded = cd.feed(h2.takeBody(sid), h2.respHeader(sid, "content-encoding"))
+        let decoded = cd.feed(h2.takeBody(sid),
+        if cd.encodingResolved: "" else: h2.respHeader(sid, "content-encoding"))
         if decoded.len > 0:
           {.cast(gcsafe).}:
             {.cast(raises: [CatchableError]).}:
@@ -327,7 +331,8 @@ template h2DrainBody*(transport, h2, sid, sink, decompress, cap: typed) =
   block:
     var cd = initCappedDecoder(decompress, cap)
     template deliver() =
-      let decoded = cd.feed(h2.takeBody(sid), h2.respHeader(sid, "content-encoding"))
+      let decoded = cd.feed(h2.takeBody(sid),
+        if cd.encodingResolved: "" else: h2.respHeader(sid, "content-encoding"))
       if decoded.len > 0:
         {.cast(gcsafe).}:
           {.cast(raises: [CatchableError]).}:

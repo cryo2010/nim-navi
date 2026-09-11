@@ -439,7 +439,8 @@ proc readChunk*(sr: StreamResponse): string =
             if wasReset: raise newException(IOError, "navi: http/3 stream reset")
             if lengthBad: raise newException(IOError, h3BodyLengthErr)
             return ""
-          let decoded = sr.capped.feed(raw, sr.resp.headers.get("content-encoding"))
+          let decoded = sr.capped.feed(raw,
+            if sr.capped.encodingResolved: "" else: sr.resp.headers.get("content-encoding"))
           if decoded.len == 0: continue          # decoder buffered input; pull more
           return decoded
       except CatchableError:
