@@ -508,10 +508,20 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
       outbuf.add encodeRstStream(f.streamId, errStreamClosed)
       if f.payload.len > 0: c.replenishConn(f.payload.len, outbuf)
     elif s != nil and not s.reset:
-      var data = f.payload
-      if (f.flags and flagPadded) != 0 and not c.unpad(f, data, outbuf): return
-      s.resp.body.add data
-      s.bodyTotal += data.len
+      # Unpadded is the common case: append the frame payload straight into the body
+      # with no intermediate copy. Only a padded frame needs a stripped buffer (via
+      # `unpad`, which slices the content out).
+      let padded = (f.flags and flagPadded) != 0
+      var contentLen: int
+      if padded:
+        var data = f.payload
+        if not c.unpad(f, data, outbuf): return
+        contentLen = data.len
+        s.resp.body.add data
+      else:
+        contentLen = f.payload.len
+        s.resp.body.add f.payload
+      s.bodyTotal += contentLen
       if c.maxBodyBytes > 0 and s.bodyTotal > c.maxBodyBytes:  # over the size cap: RST
         outbuf.add encodeRstStream(f.streamId, errCancel)
         s.reset = true; s.ended = true; s.tooLarge = true
@@ -526,7 +536,7 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
             # is never delivered to the sink, so ackRecv would never return it --
             # return it to the stream window now, or the window leaks (1 + padLen)
             # per padded frame and the download eventually stalls at window 0.
-            let padOverhead = f.payload.len - data.len
+            let padOverhead = f.payload.len - contentLen
             if padOverhead > 0: c.replenishStream(f.streamId, s, padOverhead, outbuf)
             c.replenishConn(f.payload.len, outbuf)
           else:
