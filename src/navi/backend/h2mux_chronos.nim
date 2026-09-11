@@ -89,8 +89,10 @@ proc reader(mux: H2Mux) {.async.} =
   # race it. Only self-exit (peer close / GOAWAY / error) runs the teardown here.
   if not mux.closing:
     mux.failAll("navi: http/2 connection closed")
-    try: await be.close(mux.transport)   # the reader owns the transport close
-    except CatchableError: discard
+    if not mux.transportClosed:            # `close` may race us mid-teardown: whoever
+      mux.transportClosed = true           # flips this first owns the be.close, so the
+      try: await be.close(mux.transport)   # transport (and its unshared SSL_CTX) is never
+      except CatchableError: discard       # freed twice (issue #314)
     if not mux.settingsSeen.finished: mux.settingsSeen.complete()  # unblock a pending
     if not mux.readerDone.finished: mux.readerDone.complete()      # openConnect (dead conn)
 
@@ -133,8 +135,10 @@ proc close*(mux: H2Mux) {.async.} =
   mux.closing = true
   mux.alive = false
   mux.failAll("navi: client closed")
-  try: await be.close(mux.transport)   # EOFs the reader's parked read (no cancel)
-  except CatchableError: discard
+  if not mux.transportClosed:            # the reader's self-exit teardown may already own
+    mux.transportClosed = true           # the close; don't double-close it (issue #314).
+    try: await be.close(mux.transport)   # EOFs the reader's parked read (no cancel)
+    except CatchableError: discard
   if mux.readerFut != nil and not mux.readerFut.finished:
     try: await mux.readerFut           # it observes EOF and returns; no cancellation
     except CatchableError: discard
