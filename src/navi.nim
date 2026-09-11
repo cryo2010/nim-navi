@@ -434,12 +434,19 @@ proc readChunk*(sr: StreamResponse): string =
           if raw.len == 0:                       # EOF
             sr.drained = true
             let wasReset = sr.qc.streamWasReset(sr.h3sid)
+            let tooLarge = sr.qc.streamTooLarge(sr.h3sid)         # before the guard frees it
             let lengthBad = sr.qc.streamLengthMismatch(sr.h3sid)  # before the guard frees it
             closeNow(sr.guard)
+            if tooLarge:
+              raise newException(ResponseTooLargeError,
+                "navi: response exceeded maxResponseBytes")
             if wasReset: raise newException(IOError, "navi: http/3 stream reset")
             if lengthBad: raise newException(IOError, h3BodyLengthErr)
+            if not sr.capped.streamComplete:       # compressed stream cut short mid-decode
+              raise newException(IOError, truncatedBodyErr)
             return ""
-          let decoded = sr.capped.feed(raw, sr.resp.headers.get("content-encoding"))
+          let decoded = sr.capped.feed(raw,
+            if sr.capped.encodingResolved: "" else: sr.resp.headers.get("content-encoding"))
           if decoded.len == 0: continue          # decoder buffered input; pull more
           return decoded
       except CatchableError:

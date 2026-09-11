@@ -99,7 +99,7 @@ proc newH2Mux*(transport: be.Conn, maxBody = 0, decompress = false,
   ## Take ownership of a freshly connected h2 transport, send the preface, and
   ## start the background reader.
   let mux = H2Mux(transport: transport, h2: initH2Conn(maxBody), alive: true,
-                  decompress: decompress, keepAliveMs: keepAliveMs,
+                  decompress: decompress, cap: maxBody, keepAliveMs: keepAliveMs,
                   readerDone: newFuture[void]("h2mux.readerDone"),
                   settingsSeen: newFuture[void]("h2mux.settingsSeen"),
                   waiters: initTable[uint32, Future[H2Response]](),
@@ -107,7 +107,7 @@ proc newH2Mux*(transport: be.Conn, maxBody = 0, decompress = false,
                   sinkStreams: initHashSet[uint32](),
                   recvq: initTable[uint32, Deque[string]](),
                   recvReady: initTable[uint32, Future[void]](),
-                  decoders: initTable[uint32, StreamDecoder](),
+                  decoders: initTable[uint32, CappedDecoder](),
                   pendingSlots: initDeque[Future[void]]())
   await be.sendAll(transport, mux.h2.preamble())
   mux.readerFut = reader(mux)   # held (not asyncSpawn'd) so close can join it

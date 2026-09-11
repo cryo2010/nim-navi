@@ -258,6 +258,15 @@ type
   StreamDecoderObj = object
     done: bool
     scratch: string          ## reused decode-output buffer (grown once, not per chunk)
+    lastOut: int             ## size of the previous decode output, to pre-reserve the
+                             ## next one and avoid growing it from empty every chunk
+    everFed: bool            ## at least one non-empty input chunk was decoded
+    atEnd: bool              ## the last update ended exactly at a clean stream boundary
+                             ## (Z_STREAM_END / brotli success / a completed zstd frame);
+                             ## false means the decoder is mid-member (truncated at EOF)
+    allowRawRetry: bool      ## a `deflate` decoder may fall back to raw (headerless)
+                             ## deflate if the auto-detecting decoder fails on chunk 1
+    triedRaw: bool           ## already switched to raw window bits (retry only once)
     case kind: DecoderKind
     of dkZlib: zs: ZStream
     of dkBrotli: brs: BrotliState
@@ -275,24 +284,43 @@ proc `=destroy`(d: var StreamDecoderObj) =
   of dkBrotli: (if d.brs != nil: brotliDestroy(d.brs))
   of dkZstd: (if d.zds != nil: discard zstdFree(d.zds))
 
-proc newZlibDecoder(windowBits: cint): StreamDecoder =
-  result = StreamDecoder(kind: dkZlib, scratch: newString(decodeScratchSize))
+proc newZlibDecoder(windowBits: cint, allowRawRetry = false): StreamDecoder =
+  result = StreamDecoder(kind: dkZlib, scratch: newString(decodeScratchSize),
+                         allowRawRetry: allowRawRetry)
   if inflateInit2(addr result.zs, windowBits, "1", cint(sizeof(ZStream))) != zOk:
     raise newException(ValueError, "navi: zlib inflateInit failed")
 
-proc updateZlib(d: StreamDecoder, input: openArray[byte]): string =
+proc updateZlib(d: StreamDecoder, input: openArray[byte], capRemaining: int): string =
   if d.done or input.len == 0: return ""
   # `input` is a contiguous, GC-owned buffer that is stable for this synchronous
   # call, so point the FFI straight at it -- no throwaway copy.
+  let isFirst = not d.everFed
   d.zs.nextIn = cast[ptr uint8](unsafeAddr input[0])
   d.zs.availIn = cuint(input.len)
+  d.everFed = true
+  d.atEnd = false
+  result = newStringOfCap(max(decodeScratchSize, d.lastOut))
   while true:
     d.zs.nextOut = cast[ptr uint8](addr d.scratch[0])
     d.zs.availOut = cuint(d.scratch.len)
     let ret = inflate(addr d.zs, zNoFlush)
     if ret != zOk and ret != zStreamEnd:
+      if d.allowRawRetry and isFirst and not d.triedRaw and result.len == 0:
+        # A raw (headerless) deflate body fails under the header-detecting decoder.
+        # Reinit for raw deflate and retry this (first) chunk once. Matches the
+        # buffered path's wbAuto -> wbRaw fallback (see decodeBody).
+        d.triedRaw = true
+        discard inflateEnd(addr d.zs)
+        d.zs = ZStream()
+        if inflateInit2(addr d.zs, wbRaw, "1", cint(sizeof(ZStream))) != zOk:
+          raise newException(ValueError, "navi: zlib inflateInit failed")
+        d.zs.nextIn = cast[ptr uint8](unsafeAddr input[0])
+        d.zs.availIn = cuint(input.len)
+        continue
       raise newException(ValueError, "navi: malformed compressed body")
     result.addBytes(d.scratch, d.scratch.len - int(d.zs.availOut))
+    if capRemaining >= 0 and result.len > capRemaining:  # bound peak output per chunk
+      raise newException(ResponseTooLargeError, "navi: response exceeded maxResponseBytes")
     if ret == zStreamEnd:
       # Multi-member gzip (RFC 1952): reset and decode any following member rather
       # than latching `done`. A member can end exactly on a chunk boundary
@@ -300,28 +328,40 @@ proc updateZlib(d: StreamDecoder, input: openArray[byte]): string =
       # the reset state decodes it, instead of being silently truncated.
       if inflateReset(addr d.zs) != zOk:
         raise newException(ValueError, "navi: zlib inflateReset failed")
-      if d.zs.availIn == 0: break
+      if d.zs.availIn == 0:
+        d.atEnd = true                         # ended exactly at a member boundary
+        break
       continue
-    if d.zs.availIn == 0: break                # all of this chunk consumed
+    if d.zs.availIn == 0: break                # mid-member: more input expected (atEnd stays false)
+  d.lastOut = result.len
 
-proc updateBrotli(d: StreamDecoder, input: openArray[byte]): string =
+proc updateBrotli(d: StreamDecoder, input: openArray[byte], capRemaining: int): string =
   if d.done or input.len == 0: return ""
   var availIn = csize_t(input.len)
   var nextIn = cast[ptr uint8](unsafeAddr input[0])
+  d.everFed = true
+  d.atEnd = false
+  result = newStringOfCap(max(decodeScratchSize, d.lastOut))
   while true:
     var availOut = csize_t(d.scratch.len)
     var nextOut = cast[ptr uint8](addr d.scratch[0])
     let r = brotliStream(d.brs, availIn, nextIn, availOut, nextOut, nil)
     result.addBytes(d.scratch, d.scratch.len - int(availOut))
-    if r == brSuccess: d.done = true; break
+    if capRemaining >= 0 and result.len > capRemaining:  # bound peak output per chunk
+      raise newException(ResponseTooLargeError, "navi: response exceeded maxResponseBytes")
+    if r == brSuccess: d.done = true; d.atEnd = true; break
     if r == brNeedOutput: continue             # output full, keep draining
     if r < brSuccess: raise newException(ValueError, "navi: malformed brotli body")
     break                                       # needs more input: wait for the next chunk
+  d.lastOut = result.len
 
-proc updateZstd(d: StreamDecoder, input: openArray[byte]): string =
+proc updateZstd(d: StreamDecoder, input: openArray[byte], capRemaining: int): string =
   if d.done or input.len == 0: return ""
   var inb = ZstdBuffer(buf: cast[typeof(ZstdBuffer().buf)](unsafeAddr input[0]),
                        size: csize_t(input.len), pos: 0)
+  d.everFed = true
+  d.atEnd = false
+  result = newStringOfCap(max(decodeScratchSize, d.lastOut))
   while inb.pos < inb.size:
     var outb = ZstdBuffer(buf: cast[typeof(ZstdBuffer().buf)](addr d.scratch[0]),
                           size: csize_t(d.scratch.len), pos: 0)
@@ -329,23 +369,32 @@ proc updateZstd(d: StreamDecoder, input: openArray[byte]): string =
     if zstdIsError(r) != 0:
       raise newException(ValueError, "navi: malformed zstd body")
     result.addBytes(d.scratch, int(outb.pos))
-    if r == 0: d.done = true; break            # a full frame completed
+    if capRemaining >= 0 and result.len > capRemaining:  # bound peak output per chunk
+      raise newException(ResponseTooLargeError, "navi: response exceeded maxResponseBytes")
+    if r == 0: d.done = true; d.atEnd = true; break   # a full frame completed
     if outb.pos == 0: break                     # no progress: needs more input
+  d.lastOut = result.len
 
-proc update*(d: StreamDecoder, input: openArray[byte]): string =
+proc update*(d: StreamDecoder, input: openArray[byte], capRemaining = -1): string =
   ## Decode a chunk of compressed input into as much plaintext as it yields now.
+  ## `capRemaining` (-1 = unlimited) bounds how many additional decoded bytes this
+  ## call may produce; exceeding it raises ResponseTooLargeError before the whole
+  ## chunk is materialized, so one highly-compressible chunk cannot blow the cap.
   case d.kind
-  of dkZlib: updateZlib(d, input)
-  of dkBrotli: updateBrotli(d, input)
-  of dkZstd: updateZstd(d, input)
+  of dkZlib: updateZlib(d, input, capRemaining)
+  of dkBrotli: updateBrotli(d, input, capRemaining)
+  of dkZstd: updateZstd(d, input, capRemaining)
 
 proc newStreamDecoder*(encoding: string): StreamDecoder =
   ## A decoder for `encoding`, or nil for identity/unknown (pass bytes through).
   case encoding.strip.toLowerAscii
-  of "gzip", "x-gzip", "deflate":
-    # wbAuto detects gzip or zlib-wrapped deflate. Raw (headerless) deflate is
-    # not auto-detectable mid-stream; that rare form is left to the buffered path.
-    newZlibDecoder(wbAuto)
+  of "gzip", "x-gzip":
+    newZlibDecoder(wbAuto)             # wbAuto detects gzip or zlib-wrapped deflate
+  of "deflate":
+    # Officially zlib-wrapped, but some servers send raw (headerless) deflate, which
+    # wbAuto cannot detect. Allow a one-shot raw fallback on the first chunk so a
+    # streamed raw-deflate body decodes like the buffered path (decodeBody) does.
+    newZlibDecoder(wbAuto, allowRawRetry = true)
   of "br":
     loadBrotli()                       # resolve the lazily-bound symbols first
     let s = brotliCreate(nil, nil, nil)
@@ -373,23 +422,44 @@ type CappedDecoder* = object
 proc initCappedDecoder*(decompress: bool, cap: int): CappedDecoder =
   CappedDecoder(decompress: decompress, cap: cap)
 
-proc feed*(cd: var CappedDecoder, raw: string, encoding: string): string =
+proc encodingResolved*(cd: CappedDecoder): bool = cd.ready
+  ## Whether the decoder has already been chosen (on the first non-empty chunk).
+  ## Once true the content-encoding has been read, so callers can skip the per-chunk
+  ## header lookup they would otherwise pass to `feed` for the whole download.
+
+proc feed*(cd: var CappedDecoder, raw: sink string, encoding: string): string =
   ## Decode one raw body chunk. On the first non-empty chunk the decoder is built
   ## from `encoding` (read only then). Returns the decoded bytes, or "" when the
   ## input was empty or the decoder buffered it without output yet. Raises
-  ## ResponseTooLargeError once the decoded total passes the cap.
+  ## ResponseTooLargeError once the decoded total passes the cap. `raw` is a sink so
+  ## the identity (no-decoder) path moves it straight out with no copy.
   if raw.len == 0: return ""
   if not cd.ready:
     cd.dec = if cd.decompress: newStreamDecoder(encoding) else: nil
     cd.ready = true
   let decoded =
-    if cd.dec != nil: cd.dec.update(raw.toOpenArrayByte(0, raw.high)) else: raw
+    if cd.dec != nil:
+      # Pass the remaining budget so the decoder aborts mid-inflate rather than
+      # materializing an unbounded chunk before the post-check below.
+      cd.dec.update(raw.toOpenArrayByte(0, raw.high),
+                    if cd.cap > 0: cd.cap - cd.seen else: -1)
+    else: raw
   if decoded.len == 0: return ""
   cd.seen += decoded.len
-  if cd.cap > 0 and cd.seen > cd.cap:
+  if cd.cap > 0 and cd.seen > cd.cap:            # identity (no decoder) is capped here
     raise newException(ResponseTooLargeError,
       "navi: response exceeded maxResponseBytes")
   decoded
+
+const truncatedBodyErr* =
+  "navi: compressed response body truncated (stream ended mid-decode)"
+
+proc streamComplete*(cd: CappedDecoder): bool =
+  ## Whether the body ended at a clean decode boundary. False means a compressed
+  ## stream was cut short mid-member, so the caller should raise `truncatedBodyErr`
+  ## rather than deliver a partial body as complete. An identity body, or one whose
+  ## decoder was never fed, is complete.
+  cd.dec == nil or not cd.dec.everFed or cd.dec.atEnd
 
 proc decodeBody*(resp: var Response, opts: NaviConfigBase) =
   ## Decompress the body in place per Content-Encoding, then drop the headers that

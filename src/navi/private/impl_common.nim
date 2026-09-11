@@ -619,12 +619,19 @@ proc readChunk*(sr: StreamResponse): Future[string] {.async.} =
             sr.drained = true
             disarm(sr.guard)
             let wasReset = sr.qc.streamWasReset(sr.h3sid)
+            let tooLarge = sr.qc.streamTooLarge(sr.h3sid)          # before freeStream
             let lengthBad = sr.qc.streamLengthMismatch(sr.h3sid)  # before freeStream
             sr.qc.freeStream(sr.h3sid)
+            if tooLarge:
+              raise newException(ResponseTooLargeError,
+                "navi: response exceeded maxResponseBytes")
             if wasReset: raise newException(IOError, "navi: http/3 stream reset")
             if lengthBad: raise newException(IOError, h3BodyLengthErr)
+            if not sr.capped.streamComplete:   # compressed stream cut short mid-decode
+              raise newException(IOError, truncatedBodyErr)
             return ""
-          let decoded = sr.capped.feed(raw, sr.resp.headers.get("content-encoding"))
+          let decoded = sr.capped.feed(raw,
+            if sr.capped.encodingResolved: "" else: sr.resp.headers.get("content-encoding"))
           if decoded.len == 0: continue   # decoder buffered input; pull more
           return decoded
       except CatchableError:
@@ -668,13 +675,21 @@ proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
       # Reuse readChunk's decode/cap/free per chunk; it sets `drained` at EOF. The
       # sink is a bare closure (no chronos raises annotation); navi's contract is it
       # raises at most CatchableError -- discharge chronos's strict effects here, as
-      # drainDownload does.
-      while true:
-        let chunk = await sr.readChunk()
-        if chunk.len == 0: break
-        {.cast(gcsafe).}:
-          {.cast(raises: [CatchableError]).}:
-            await sink(chunk)
+      # drainDownload does. `readChunk` frees the stream on its own error/EOF, but a
+      # SINK error escapes it while the guard is already disarmed (above), so free the
+      # stream here too or it leaks on the shared connection (mirrors skH1/skH2).
+      try:
+        while true:
+          let chunk = await sr.readChunk()
+          if chunk.len == 0: break
+          {.cast(gcsafe).}:
+            {.cast(raises: [CatchableError]).}:
+              await sink(chunk)
+      except CatchableError:
+        if not sr.drained:
+          sr.drained = true
+          sr.qc.freeStream(sr.h3sid)
+        raise
     else: discard
 
 template each*(sr: StreamResponse; chunk, body: untyped): untyped =

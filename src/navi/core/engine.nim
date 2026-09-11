@@ -93,7 +93,8 @@ template h1DrainBody*(transport, parser, sink, keep, decompress, cap: typed) =
     var cd = initCappedDecoder(decompress, cap)   # lazy decoder + running size cap
     template deliver() =
       if streaming:
-        let decoded = cd.feed(parser.takeBody(), parser.contentEncoding())
+        let decoded = cd.feed(parser.takeBody(),
+                              if cd.encodingResolved: "" else: parser.contentEncoding())
         if decoded.len > 0:
           # single-threaded client; the sink need not be gcsafe (see sendRequest).
           # `decoded` is navi's native body type (`string`), which the sink also
@@ -118,6 +119,8 @@ template h1DrainBody*(transport, parser, sink, keep, decompress, cap: typed) =
         if not parser.finished:
           raise newException(IOError, h1TruncatedErr)
         break
+    if streaming and not cd.streamComplete:   # compressed stream cut short mid-decode
+      raise newException(IOError, truncatedBodyErr)
     keep = parser.keepAliveAfter()
 
 template h1ReadChunk*(transport, parser, capped: typed): string =
@@ -134,7 +137,10 @@ template h1ReadChunk*(transport, parser, capped: typed): string =
     while true:
       let raw = parser.takeBody()
       if raw.len == 0:
-        if parser.finished: break            # end of body: res stays ""
+        if parser.finished:
+          if not capped.streamComplete:      # compressed stream cut short mid-decode
+            raise newException(IOError, truncatedBodyErr)
+          break                              # end of body: res stays ""
         let chunk = await recvSome(transport)
         if chunk.len == 0:
           parser.eof()                       # completes a read-until-close body
@@ -145,7 +151,8 @@ template h1ReadChunk*(transport, parser, capped: typed): string =
             raise newException(IOError, h1TruncatedErr)
         else: parser.feed(chunk)
         continue
-      let decoded = capped.feed(raw, parser.contentEncoding())
+      let decoded = capped.feed(raw,
+                                if capped.encodingResolved: "" else: parser.contentEncoding())
       if decoded.len == 0: continue          # decoder buffered input; read more
       res = decoded
       break
@@ -163,7 +170,8 @@ template h2ReadChunk*(transport, h2, sid, capped: typed): string =
     while true:
       let raw = h2.takeBody(sid)
       if raw.len > 0:
-        let decoded = capped.feed(raw, h2.respHeader(sid, "content-encoding"))
+        let decoded = capped.feed(raw,
+          if capped.encodingResolved: "" else: h2.respHeader(sid, "content-encoding"))
         if decoded.len == 0: continue
         res = decoded
         break
@@ -184,6 +192,8 @@ template h2ReadChunk*(transport, h2, sid, capped: typed): string =
           raise newException(IOError, "navi: http/2 request did not complete")
         if lengthBad:
           raise newException(IOError, bodyLengthErr)
+        if not capped.streamComplete:         # compressed stream cut short mid-decode
+          raise newException(IOError, truncatedBodyErr)
         break                                 # clean end: res ""
       let chunk = await recvSome(transport)
       if chunk.len == 0:                       # transport EOF before END_STREAM:
@@ -246,7 +256,8 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
       let toSend = h2.feed(chunk)
       if toSend.len > 0: await sendAll(transport, toSend)
       if not sink.isNil:
-        let decoded = cd.feed(h2.takeBody(sid), h2.respHeader(sid, "content-encoding"))
+        let decoded = cd.feed(h2.takeBody(sid),
+        if cd.encodingResolved: "" else: h2.respHeader(sid, "content-encoding"))
         if decoded.len > 0:
           {.cast(gcsafe).}:
             {.cast(raises: [CatchableError]).}:
@@ -271,6 +282,8 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
       raise newException(IOError, h2TruncatedErr)   # don't return a partial body
     if lengthBad:                  # cleanly ended, but body != declared Content-Length
       raise newException(IOError, bodyLengthErr)
+    if not sink.isNil and not cd.streamComplete:   # compressed stream cut short mid-decode
+      raise newException(IOError, truncatedBodyErr)
     if not sink.isNil: r.body = ""  # delivered incrementally above
     r
 
@@ -327,7 +340,8 @@ template h2DrainBody*(transport, h2, sid, sink, decompress, cap: typed) =
   block:
     var cd = initCappedDecoder(decompress, cap)
     template deliver() =
-      let decoded = cd.feed(h2.takeBody(sid), h2.respHeader(sid, "content-encoding"))
+      let decoded = cd.feed(h2.takeBody(sid),
+        if cd.encodingResolved: "" else: h2.respHeader(sid, "content-encoding"))
       if decoded.len > 0:
         {.cast(gcsafe).}:
           {.cast(raises: [CatchableError]).}:
@@ -358,6 +372,8 @@ template h2DrainBody*(transport, h2, sid, sink, decompress, cap: typed) =
       raise newException(IOError, h2TruncatedErr)
     if lengthBad:                      # cleanly ended, but body != declared Content-Length
       raise newException(IOError, bodyLengthErr)
+    if not cd.streamComplete:          # compressed stream cut short mid-decode
+      raise newException(IOError, truncatedBodyErr)
 
 template poolTransport*(client, req, sink: typed): Response =
   ## Pool-based transport: reuse a pooled connection (http/1.1 or a persistent

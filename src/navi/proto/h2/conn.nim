@@ -34,6 +34,10 @@ type
     hdrEndStream: bool
     sawFinal: bool        ## the final (non-1xx) response HEADERS block has arrived
     recvPending: int      ## received bytes not yet acked with a WINDOW_UPDATE
+    recvWindow: int       ## receive window still granted to the peer for this stream;
+                          ## debited by each DATA payload, credited by each WINDOW_UPDATE.
+                          ## Going negative means the peer overran the window (RFC 9113
+                          ## 6.9.1) -> RST_STREAM(FLOW_CONTROL_ERROR)
     bodyTotal: int        ## total body bytes received (for the size cap; `resp.body`
                           ## is drained incrementally by `takeBody`)
     sinkMode: bool        ## hold the stream receive window until `ackRecv`, so a
@@ -67,6 +71,10 @@ type
     goAwayErr: uint32            ## GOAWAY error code; NO_ERROR is a graceful shutdown
     connSendWindow: int          ## connection-level send window (shared by streams)
     connRecvPending: int         ## received bytes not yet acked at the connection level
+    connRecvWindow: int          ## connection receive window still granted to the peer;
+                                 ## debited by every DATA payload, credited by every
+                                 ## connection WINDOW_UPDATE. Negative = overrun -> GOAWAY
+                                 ## with FLOW_CONTROL_ERROR (RFC 9113 6.9.1)
     peerInitialWindow: int       ## peer's SETTINGS_INITIAL_WINDOW_SIZE
     maxConcurrent: int           ## peer's SETTINGS_MAX_CONCURRENT_STREAMS
     peerConnectProtocol: bool    ## peer sent SETTINGS_ENABLE_CONNECT_PROTOCOL=1 (RFC 8441)
@@ -85,11 +93,15 @@ const
   connReplenish = 4 * 1024 * 1024
     ## Batch flow-control replenishment: emit a WINDOW_UPDATE only when consumed-
     ## but-unacked bytes cross these thresholds, instead of one per DATA frame.
+  connWindowBump = 0x3fff0000'u32
+    ## Connection-level WINDOW_UPDATE sent in the preface so downloads are not
+    ## throttled to the 64 KiB default connection window.
 
 proc initH2Conn*(maxBody = 0): H2Conn =
   H2Conn(dec: initHpackDecoder(), nextId: 1, maxFrameSize: defaultMaxFrameSize,
          maxBodyBytes: maxBody, streams: initTable[uint32, Stream](),
          connSendWindow: defaultWindow, peerInitialWindow: defaultWindow,
+         connRecvWindow: defaultWindow + int(connWindowBump),  # matches `preamble`
          maxConcurrent: int.high)   # RFC 9113: unlimited until the peer says otherwise
 
 proc maxConcurrentStreams*(c: H2Conn): int = c.maxConcurrent
@@ -114,12 +126,12 @@ proc preamble*(c: H2Conn): string =
   result.add encodeSettings({settingsEnablePush: 0'u32,
                              settingsInitialWindowSize: uint32(recvWindowSize),
                              settingsMaxHeaderListSize: uint32(defaultMaxHeaderList)})
-  result.add encodeWindowUpdate(0, 0x3fff0000'u32)
+  result.add encodeWindowUpdate(0, connWindowBump)
 
 proc openStream*(c: H2Conn): uint32 =
   result = c.nextId
   c.nextId += 2
-  c.streams[result] = Stream(sendWindow: c.peerInitialWindow)
+  c.streams[result] = Stream(sendWindow: c.peerInitialWindow, recvWindow: recvWindowSize)
 
 proc encodeHeaderFrames(c: H2Conn, streamId: uint32, headers: openArray[HeaderPair],
                         endStream: bool): string =
@@ -234,6 +246,7 @@ proc replenishConn(c: H2Conn, n: int, outbuf: var string) =
   c.connRecvPending += n
   if c.connRecvPending >= connReplenish:
     outbuf.add encodeWindowUpdate(0, uint32(c.connRecvPending))
+    c.connRecvWindow += c.connRecvPending    # the peer regains this much connection window
     c.connRecvPending = 0
 
 proc replenishStream(c: H2Conn, sid: uint32, s: Stream, n: int, outbuf: var string) =
@@ -243,6 +256,7 @@ proc replenishStream(c: H2Conn, sid: uint32, s: Stream, n: int, outbuf: var stri
   s.recvPending += n
   if s.recvPending >= streamReplenish:
     outbuf.add encodeWindowUpdate(sid, uint32(s.recvPending))
+    s.recvWindow += s.recvPending            # the peer regains this much stream window
     s.recvPending = 0
 
 proc replenishRecv(c: H2Conn, sid: uint32, s: Stream, n: int, outbuf: var string) =
@@ -498,7 +512,12 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
     # Every DATA payload -- pad length byte and padding included (RFC 9113 6.9.1)
     # -- counts against the connection flow-control window, even on a stream we
     # have reset or never opened. Skipping that leaks the window and eventually
-    # stalls a long-lived pooled/mux connection.
+    # stalls a long-lived pooled/mux connection. Debit the window we granted and
+    # fail the connection if the peer overran it (a peer that ignores flow control).
+    c.connRecvWindow -= f.payload.len
+    if c.connRecvWindow < 0:
+      c.connFail(errFlowControlError, "connection flow-control window exceeded", outbuf)
+      return
     let s = c.streams.getOrDefault(f.streamId)
     if s != nil and s.ended and not s.reset:
       # DATA after END_STREAM: STREAM_CLOSED (RFC 9113 5.1). The response already
@@ -508,30 +527,48 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
       outbuf.add encodeRstStream(f.streamId, errStreamClosed)
       if f.payload.len > 0: c.replenishConn(f.payload.len, outbuf)
     elif s != nil and not s.reset:
-      var data = f.payload
-      if (f.flags and flagPadded) != 0 and not c.unpad(f, data, outbuf): return
-      s.resp.body.add data
-      s.bodyTotal += data.len
-      if c.maxBodyBytes > 0 and s.bodyTotal > c.maxBodyBytes:  # over the size cap: RST
-        outbuf.add encodeRstStream(f.streamId, errCancel)
-        s.reset = true; s.ended = true; s.tooLarge = true
-        c.replenishConn(f.payload.len, outbuf)   # still owe the connection window
+      s.recvWindow -= f.payload.len
+      if s.recvWindow < 0:
+        # Peer sent more than the per-stream receive window we advertised: a stream
+        # FLOW_CONTROL_ERROR (RFC 9113 6.9.1). RST it; the connection survives (its
+        # window was already debited and validated above).
+        outbuf.add encodeRstStream(f.streamId, errFlowControlError)
+        s.reset = true; s.ended = true
       else:
-        if f.payload.len > 0:
-          if s.sinkMode:
-            # Hold the stream window for the BODY bytes until the sink consumes
-            # them (via ackRecv); still replenish the shared connection window so
-            # other streams don't stall. The padding overhead (pad length byte +
-            # padding) is debited from the stream window too (RFC 9113 6.9.1) but
-            # is never delivered to the sink, so ackRecv would never return it --
-            # return it to the stream window now, or the window leaks (1 + padLen)
-            # per padded frame and the download eventually stalls at window 0.
-            let padOverhead = f.payload.len - data.len
-            if padOverhead > 0: c.replenishStream(f.streamId, s, padOverhead, outbuf)
-            c.replenishConn(f.payload.len, outbuf)
-          else:
-            c.replenishRecv(f.streamId, s, f.payload.len, outbuf)
-        if (f.flags and flagEndStream) != 0: s.ended = true
+        # Unpadded is the common case: append the frame payload straight into the body
+        # with no intermediate copy. Only a padded frame needs a stripped buffer (via
+        # `unpad`, which slices the content out).
+        let padded = (f.flags and flagPadded) != 0
+        var contentLen: int
+        if padded:
+          var data = f.payload
+          if not c.unpad(f, data, outbuf): return
+          contentLen = data.len
+          s.resp.body.add data
+        else:
+          contentLen = f.payload.len
+          s.resp.body.add f.payload
+        s.bodyTotal += contentLen
+        if c.maxBodyBytes > 0 and s.bodyTotal > c.maxBodyBytes:  # over the size cap: RST
+          outbuf.add encodeRstStream(f.streamId, errCancel)
+          s.reset = true; s.ended = true; s.tooLarge = true
+          c.replenishConn(f.payload.len, outbuf)   # still owe the connection window
+        else:
+          if f.payload.len > 0:
+            if s.sinkMode:
+              # Hold the stream window for the BODY bytes until the sink consumes
+              # them (via ackRecv); still replenish the shared connection window so
+              # other streams don't stall. The padding overhead (pad length byte +
+              # padding) is debited from the stream window too (RFC 9113 6.9.1) but
+              # is never delivered to the sink, so ackRecv would never return it --
+              # return it to the stream window now, or the window leaks (1 + padLen)
+              # per padded frame and the download eventually stalls at window 0.
+              let padOverhead = f.payload.len - contentLen
+              if padOverhead > 0: c.replenishStream(f.streamId, s, padOverhead, outbuf)
+              c.replenishConn(f.payload.len, outbuf)
+            else:
+              c.replenishRecv(f.streamId, s, f.payload.len, outbuf)
+          if (f.flags and flagEndStream) != 0: s.ended = true
     elif f.payload.len > 0:
       c.replenishConn(f.payload.len, outbuf)     # reset/unknown stream: keep the conn window in sync
   of uint8(ftRstStream):

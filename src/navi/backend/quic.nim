@@ -293,7 +293,7 @@ proc submitStream*(c: QuicConn, verb, path: string,
   let reqHdr = encodeH3Fields(headers)
   let reqTrl = encodeH3Fields(trailers)
   navi_h3_submit(c.handle, verb.cstring, path.cstring, reqHdr.cstring, nil,
-                 csize_t(0), nil, nil, reqTrl.cstring, 0)   # streaming read: capped navi-side
+                 csize_t(0), nil, nil, reqTrl.cstring, 1)   # cap_body: bound C-side buffer
 
 proc awaitHeaders*(c: QuicConn, sid: int64):
     tuple[status: int, headers: seq[(string, string)]] =
@@ -366,6 +366,11 @@ proc streamLengthMismatch*(c: QuicConn, sid: int64): bool =
   ## Whether `sid` ended cleanly but its body length disagreed with Content-Length
   ## (check at EOF, before freeStream).
   c.handle != nil and navi_h3_stream_length_mismatch(c.handle, sid) != 0
+
+proc streamTooLarge*(c: QuicConn, sid: int64): bool =
+  ## Whether `sid`'s body exceeded maxResponseBytes (the driver stopped buffering and
+  ## flagged it; read_body then reports EOF). Check at EOF, before freeStream.
+  c.handle != nil and navi_h3_stream_too_large(c.handle, sid) != 0
 
 proc freeStream*(c: QuicConn, sid: int64) =
   ## Drop `sid` (STOP_SENDING + RESET_STREAM), abandoning an undrained handle.
