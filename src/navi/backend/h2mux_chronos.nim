@@ -135,12 +135,22 @@ proc close*(mux: H2Mux) {.async.} =
   mux.closing = true
   mux.alive = false
   mux.failAll("navi: client closed")
+  # A guard timeout / CancelToken can cancel this close() while it is parked on an
+  # await below. Capture the cancellation rather than swallowing it, finish the
+  # bookkeeping so no waiter (a pending openConnect on settingsSeen, keepAlive on
+  # readerDone) is stranded, then re-raise so structured cancellation still
+  # propagates to the caller: a swallowed CancelledError would have this proc report
+  # a clean close on a cancelled one (issue #316).
+  var cancelled: ref CancelledError
   if not mux.transportClosed:            # the reader's self-exit teardown may already own
     mux.transportClosed = true           # the close; don't double-close it (issue #314).
     try: await be.close(mux.transport)   # EOFs the reader's parked read (no cancel)
+    except CancelledError as e: cancelled = e
     except CatchableError: discard
-  if mux.readerFut != nil and not mux.readerFut.finished:
+  if cancelled == nil and mux.readerFut != nil and not mux.readerFut.finished:
     try: await mux.readerFut           # it observes EOF and returns; no cancellation
+    except CancelledError as e: cancelled = e
     except CatchableError: discard
   if not mux.settingsSeen.finished: mux.settingsSeen.complete()  # unblock a pending openConnect
   if not mux.readerDone.finished: mux.readerDone.complete()
+  if cancelled != nil: raise cancelled
