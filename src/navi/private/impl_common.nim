@@ -101,10 +101,31 @@ proc close*(client: Navi): Future[void] {.async.} =
   ## Optional but recommended when done with the client.
   for pc in client.pool.drain():
     await close(pc.transport)
+  # Await any in-flight coalesced connects before closing the live tables: a connect
+  # that resolves after we clear `muxes` would otherwise cache its mux into the
+  # cleared table and never be closed, orphaning the connection and its reader
+  # (issue #315). Snapshot the futures first -- a resolving connect `del`s its own
+  # pending entry, so iterating the table directly would mutate it mid-iteration.
+  var pendingMuxes: seq[Future[H2Mux]]
+  for f in client.pendingMux.values: pendingMuxes.add f
+  for f in pendingMuxes:
+    try:
+      let mux = await f
+      if mux != nil: await mux.close()
+    except CatchableError: discard   # a failed connect has nothing to close
+  client.pendingMux.clear()
   for mux in client.muxes.values:
     await mux.close()
   client.muxes.clear()
   when defined(naviHttp3):
+    var pendingConns: seq[Future[QuicConn]]
+    for f in client.pendingH3.values: pendingConns.add f
+    for f in pendingConns:
+      try:
+        let qc = await f
+        if qc != nil: await qc.closeConn()
+      except CatchableError: discard
+    client.pendingH3.clear()
     for qc in client.h3conns.values:
       await qc.closeConn()
     client.h3conns.clear()
