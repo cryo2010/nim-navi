@@ -438,6 +438,8 @@ proc readChunk*(sr: StreamResponse): string =
             closeNow(sr.guard)
             if wasReset: raise newException(IOError, "navi: http/3 stream reset")
             if lengthBad: raise newException(IOError, h3BodyLengthErr)
+            if not sr.capped.streamComplete:       # compressed stream cut short mid-decode
+              raise newException(IOError, truncatedBodyErr)
             return ""
           let decoded = sr.capped.feed(raw,
             if sr.capped.encodingResolved: "" else: sr.resp.headers.get("content-encoding"))

@@ -119,6 +119,8 @@ template h1DrainBody*(transport, parser, sink, keep, decompress, cap: typed) =
         if not parser.finished:
           raise newException(IOError, h1TruncatedErr)
         break
+    if streaming and not cd.streamComplete:   # compressed stream cut short mid-decode
+      raise newException(IOError, truncatedBodyErr)
     keep = parser.keepAliveAfter()
 
 template h1ReadChunk*(transport, parser, capped: typed): string =
@@ -135,7 +137,10 @@ template h1ReadChunk*(transport, parser, capped: typed): string =
     while true:
       let raw = parser.takeBody()
       if raw.len == 0:
-        if parser.finished: break            # end of body: res stays ""
+        if parser.finished:
+          if not capped.streamComplete:      # compressed stream cut short mid-decode
+            raise newException(IOError, truncatedBodyErr)
+          break                              # end of body: res stays ""
         let chunk = await recvSome(transport)
         if chunk.len == 0:
           parser.eof()                       # completes a read-until-close body
@@ -187,6 +192,8 @@ template h2ReadChunk*(transport, h2, sid, capped: typed): string =
           raise newException(IOError, "navi: http/2 request did not complete")
         if lengthBad:
           raise newException(IOError, bodyLengthErr)
+        if not capped.streamComplete:         # compressed stream cut short mid-decode
+          raise newException(IOError, truncatedBodyErr)
         break                                 # clean end: res ""
       let chunk = await recvSome(transport)
       if chunk.len == 0:                       # transport EOF before END_STREAM:
@@ -275,6 +282,8 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
       raise newException(IOError, h2TruncatedErr)   # don't return a partial body
     if lengthBad:                  # cleanly ended, but body != declared Content-Length
       raise newException(IOError, bodyLengthErr)
+    if not sink.isNil and not cd.streamComplete:   # compressed stream cut short mid-decode
+      raise newException(IOError, truncatedBodyErr)
     if not sink.isNil: r.body = ""  # delivered incrementally above
     r
 
@@ -363,6 +372,8 @@ template h2DrainBody*(transport, h2, sid, sink, decompress, cap: typed) =
       raise newException(IOError, h2TruncatedErr)
     if lengthBad:                      # cleanly ended, but body != declared Content-Length
       raise newException(IOError, bodyLengthErr)
+    if not cd.streamComplete:          # compressed stream cut short mid-decode
+      raise newException(IOError, truncatedBodyErr)
 
 template poolTransport*(client, req, sink: typed): Response =
   ## Pool-based transport: reuse a pooled connection (http/1.1 or a persistent
