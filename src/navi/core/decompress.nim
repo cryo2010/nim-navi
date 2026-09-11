@@ -427,11 +427,12 @@ proc encodingResolved*(cd: CappedDecoder): bool = cd.ready
   ## Once true the content-encoding has been read, so callers can skip the per-chunk
   ## header lookup they would otherwise pass to `feed` for the whole download.
 
-proc feed*(cd: var CappedDecoder, raw: string, encoding: string): string =
+proc feed*(cd: var CappedDecoder, raw: sink string, encoding: string): string =
   ## Decode one raw body chunk. On the first non-empty chunk the decoder is built
   ## from `encoding` (read only then). Returns the decoded bytes, or "" when the
   ## input was empty or the decoder buffered it without output yet. Raises
-  ## ResponseTooLargeError once the decoded total passes the cap.
+  ## ResponseTooLargeError once the decoded total passes the cap. `raw` is a sink so
+  ## the identity (no-decoder) path moves it straight out with no copy.
   if raw.len == 0: return ""
   if not cd.ready:
     cd.dec = if cd.decompress: newStreamDecoder(encoding) else: nil

@@ -35,9 +35,10 @@ type
                                          ## receive window, whose ack is gated by the sink)
     recvReady: Table[uint32, Future[void]]  ## a sink stream's drain loop waiting for
                                             ## the reader to feed more DATA
-    decoders: Table[uint32, StreamDecoder]  ## per-sink-stream decoder, created lazily
-                                            ## once headers are in (presence = chosen)
+    decoders: Table[uint32, CappedDecoder]  ## per-sink-stream decode + size-cap state,
+                                            ## created lazily once headers are in
     decompress: bool                   ## decode content-encoding before the sink
+    cap: int                           ## max decoded response bytes (maxResponseBytes)
     sendTail: Future[void]   ## tail of the serialized send chain
     alive: bool
     readerDone: Future[void] ## completed once the reader has exited and the
@@ -325,17 +326,22 @@ proc readChunk*(mux: H2Mux, sid: uint32): Future[string] {.async.} =
         var raw = mux.recvq[sid].popFirst()
         let rawLen = raw.len   # window is acked by raw (wire) bytes, captured before the move
         if not mux.decoders.hasKey(sid):
-          mux.decoders[sid] = if mux.decompress:
-              newStreamDecoder(mux.h2.respHeader(sid, "content-encoding")) else: nil
-        let dec = mux.decoders[sid]
-        let decoded =
-          if dec != nil: dec.update(raw.toOpenArrayByte(0, raw.high)) else: move raw
+          mux.decoders[sid] = initCappedDecoder(mux.decompress, mux.cap)
+        var decoded: string
+        # CappedDecoder enforces the decoded-size cap (and truncation) here, matching
+        # the sync single-connection h2 path -- a bare StreamDecoder let a compression
+        # bomb bypass maxResponseBytes on this (default async/chronos) path.
+        mux.decoders.withValue(sid, cd):
+          decoded = cd[].feed(raw,
+            if cd[].encodingResolved: "" else: mux.h2.respHeader(sid, "content-encoding"))
         await mux.send(mux.h2.ackRecv(sid, rawLen))  # replenish window: gated by the puller
         if decoded.len > 0: return decoded
         continue                                     # decoder buffered input; pull more
       if mux.h2.streamEnded(sid):                    # ended and the queue is drained
         if mux.h2.streamLengthMismatch(sid):         # body != declared Content-Length
           raise newException(IOError, bodyLengthErr) # the except below drops the stream
+        if mux.decoders.hasKey(sid) and not mux.decoders[sid].streamComplete:
+          raise newException(IOError, truncatedBodyErr)  # compressed stream cut short
         mux.endStream(sid)
         return ""
       if mux.h2.goneAway and mux.h2.streamUnprocessed(sid):
