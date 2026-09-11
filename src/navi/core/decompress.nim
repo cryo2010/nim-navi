@@ -264,6 +264,9 @@ type
     atEnd: bool              ## the last update ended exactly at a clean stream boundary
                              ## (Z_STREAM_END / brotli success / a completed zstd frame);
                              ## false means the decoder is mid-member (truncated at EOF)
+    allowRawRetry: bool      ## a `deflate` decoder may fall back to raw (headerless)
+                             ## deflate if the auto-detecting decoder fails on chunk 1
+    triedRaw: bool           ## already switched to raw window bits (retry only once)
     case kind: DecoderKind
     of dkZlib: zs: ZStream
     of dkBrotli: brs: BrotliState
@@ -281,8 +284,9 @@ proc `=destroy`(d: var StreamDecoderObj) =
   of dkBrotli: (if d.brs != nil: brotliDestroy(d.brs))
   of dkZstd: (if d.zds != nil: discard zstdFree(d.zds))
 
-proc newZlibDecoder(windowBits: cint): StreamDecoder =
-  result = StreamDecoder(kind: dkZlib, scratch: newString(decodeScratchSize))
+proc newZlibDecoder(windowBits: cint, allowRawRetry = false): StreamDecoder =
+  result = StreamDecoder(kind: dkZlib, scratch: newString(decodeScratchSize),
+                         allowRawRetry: allowRawRetry)
   if inflateInit2(addr result.zs, windowBits, "1", cint(sizeof(ZStream))) != zOk:
     raise newException(ValueError, "navi: zlib inflateInit failed")
 
@@ -290,6 +294,7 @@ proc updateZlib(d: StreamDecoder, input: openArray[byte], capRemaining: int): st
   if d.done or input.len == 0: return ""
   # `input` is a contiguous, GC-owned buffer that is stable for this synchronous
   # call, so point the FFI straight at it -- no throwaway copy.
+  let isFirst = not d.everFed
   d.zs.nextIn = cast[ptr uint8](unsafeAddr input[0])
   d.zs.availIn = cuint(input.len)
   d.everFed = true
@@ -300,6 +305,18 @@ proc updateZlib(d: StreamDecoder, input: openArray[byte], capRemaining: int): st
     d.zs.availOut = cuint(d.scratch.len)
     let ret = inflate(addr d.zs, zNoFlush)
     if ret != zOk and ret != zStreamEnd:
+      if d.allowRawRetry and isFirst and not d.triedRaw and result.len == 0:
+        # A raw (headerless) deflate body fails under the header-detecting decoder.
+        # Reinit for raw deflate and retry this (first) chunk once. Matches the
+        # buffered path's wbAuto -> wbRaw fallback (see decodeBody).
+        d.triedRaw = true
+        discard inflateEnd(addr d.zs)
+        d.zs = ZStream()
+        if inflateInit2(addr d.zs, wbRaw, "1", cint(sizeof(ZStream))) != zOk:
+          raise newException(ValueError, "navi: zlib inflateInit failed")
+        d.zs.nextIn = cast[ptr uint8](unsafeAddr input[0])
+        d.zs.availIn = cuint(input.len)
+        continue
       raise newException(ValueError, "navi: malformed compressed body")
     result.addBytes(d.scratch, d.scratch.len - int(d.zs.availOut))
     if capRemaining >= 0 and result.len > capRemaining:  # bound peak output per chunk
@@ -371,10 +388,13 @@ proc update*(d: StreamDecoder, input: openArray[byte], capRemaining = -1): strin
 proc newStreamDecoder*(encoding: string): StreamDecoder =
   ## A decoder for `encoding`, or nil for identity/unknown (pass bytes through).
   case encoding.strip.toLowerAscii
-  of "gzip", "x-gzip", "deflate":
-    # wbAuto detects gzip or zlib-wrapped deflate. Raw (headerless) deflate is
-    # not auto-detectable mid-stream; that rare form is left to the buffered path.
-    newZlibDecoder(wbAuto)
+  of "gzip", "x-gzip":
+    newZlibDecoder(wbAuto)             # wbAuto detects gzip or zlib-wrapped deflate
+  of "deflate":
+    # Officially zlib-wrapped, but some servers send raw (headerless) deflate, which
+    # wbAuto cannot detect. Allow a one-shot raw fallback on the first chunk so a
+    # streamed raw-deflate body decodes like the buffered path (decodeBody) does.
+    newZlibDecoder(wbAuto, allowRawRetry = true)
   of "br":
     loadBrotli()                       # resolve the lazily-bound symbols first
     let s = brotliCreate(nil, nil, nil)
