@@ -354,11 +354,13 @@ int on_recv_data(nghttp3_conn *, std::int64_t stream_id, const std::uint8_t *dat
     return NGHTTP3_ERR_CALLBACK_FAILURE;
   }
   // nghttp3_conn_read_stream's return (extended in on_recv_stream_data) does NOT
-  // count the DATA payload delivered here, so credit these bytes back to QUIC flow
-  // control now that we have buffered them. Without this the connection-level
-  // receive window (initial_max_data) leaks ~body-size per stream and wedges after
-  // ~1 MiB cumulative across a long-lived connection's streams (e.g. SSE reconnects).
-  ngtcp2_conn_extend_max_stream_offset(c->conn, stream_id, datalen);
+  // count the DATA payload delivered here. Credit the CONNECTION window now (so other
+  // streams on the shared connection are never starved), but DEFER the per-stream
+  // credit until navi_h3_read_body drains the bytes to the app. That deferral is the
+  // backpressure: a fast peer fills the ~8 MiB per-stream window and then blocks until
+  // the app reads, instead of buffering the whole body in C memory (mirrors the h2
+  // sink-mode gated window). Without the connection credit the shared window
+  // (initial_max_data) would still leak ~body-size per stream.
   ngtcp2_conn_extend_max_offset(c->conn, datalen);
   return 0;
 }
@@ -1203,8 +1205,15 @@ ngtcp2_ssize navi_h3_read_body(H3Conn *c, std::int64_t sid, char *buf,
     if (k > 0) {
       std::memcpy(buf, s.body.data(), k);
       s.body.erase(0, k);
+      // Return the per-stream flow-control credit deferred in on_recv_data as the app
+      // consumes the bytes, so a slow reader backpressures the peer instead of letting
+      // it fill memory. The connection window was already credited on receipt.
+      if (c->conn) ngtcp2_conn_extend_max_stream_offset(c->conn, sid, k);
     }
-    *out_eof = (s.done && s.body.empty()) ? 1 : 0;
+    // A body that overran max_body (cap_body streams) is reported as end-of-body so the
+    // navi side raises ResponseTooLargeError immediately rather than waiting for the
+    // peer's END_STREAM (it checks navi_h3_stream_too_large at EOF).
+    *out_eof = ((s.done && s.body.empty()) || s.too_large) ? 1 : 0;
     return static_cast<ngtcp2_ssize>(k);
   } catch (...) {
     return -1;
