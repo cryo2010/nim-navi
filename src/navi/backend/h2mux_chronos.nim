@@ -109,7 +109,15 @@ proc newH2Mux*(transport: be.Conn, maxBody = 0, decompress = false,
                   recvReady: initTable[uint32, Future[void]](),
                   decoders: initTable[uint32, CappedDecoder](),
                   pendingSlots: initDeque[Future[void]]())
-  await be.sendAll(transport, mux.h2.preamble())
+  try:
+    await be.sendAll(transport, mux.h2.preamble())
+  except CatchableError:
+    # The reader (which owns closing the transport) has not started yet, so if the
+    # preface send fails nothing else closes the transport we just took ownership of.
+    # Close it here before re-raising, or the fd/TLS handle leaks -- the caller's
+    # `except` frees the pending-future, not this connection (issue #311).
+    await be.close(transport)
+    raise
   mux.readerFut = reader(mux)   # held (not asyncSpawn'd) so close can join it
   if keepAliveMs > 0: asyncSpawn keepAlive(mux)  # self-exits when readerDone completes
   result = mux
