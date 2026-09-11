@@ -258,6 +258,8 @@ type
   StreamDecoderObj = object
     done: bool
     scratch: string          ## reused decode-output buffer (grown once, not per chunk)
+    lastOut: int             ## size of the previous decode output, to pre-reserve the
+                             ## next one and avoid growing it from empty every chunk
     case kind: DecoderKind
     of dkZlib: zs: ZStream
     of dkBrotli: brs: BrotliState
@@ -286,6 +288,7 @@ proc updateZlib(d: StreamDecoder, input: openArray[byte]): string =
   # call, so point the FFI straight at it -- no throwaway copy.
   d.zs.nextIn = cast[ptr uint8](unsafeAddr input[0])
   d.zs.availIn = cuint(input.len)
+  result = newStringOfCap(max(decodeScratchSize, d.lastOut))
   while true:
     d.zs.nextOut = cast[ptr uint8](addr d.scratch[0])
     d.zs.availOut = cuint(d.scratch.len)
@@ -303,11 +306,13 @@ proc updateZlib(d: StreamDecoder, input: openArray[byte]): string =
       if d.zs.availIn == 0: break
       continue
     if d.zs.availIn == 0: break                # all of this chunk consumed
+  d.lastOut = result.len
 
 proc updateBrotli(d: StreamDecoder, input: openArray[byte]): string =
   if d.done or input.len == 0: return ""
   var availIn = csize_t(input.len)
   var nextIn = cast[ptr uint8](unsafeAddr input[0])
+  result = newStringOfCap(max(decodeScratchSize, d.lastOut))
   while true:
     var availOut = csize_t(d.scratch.len)
     var nextOut = cast[ptr uint8](addr d.scratch[0])
@@ -317,11 +322,13 @@ proc updateBrotli(d: StreamDecoder, input: openArray[byte]): string =
     if r == brNeedOutput: continue             # output full, keep draining
     if r < brSuccess: raise newException(ValueError, "navi: malformed brotli body")
     break                                       # needs more input: wait for the next chunk
+  d.lastOut = result.len
 
 proc updateZstd(d: StreamDecoder, input: openArray[byte]): string =
   if d.done or input.len == 0: return ""
   var inb = ZstdBuffer(buf: cast[typeof(ZstdBuffer().buf)](unsafeAddr input[0]),
                        size: csize_t(input.len), pos: 0)
+  result = newStringOfCap(max(decodeScratchSize, d.lastOut))
   while inb.pos < inb.size:
     var outb = ZstdBuffer(buf: cast[typeof(ZstdBuffer().buf)](addr d.scratch[0]),
                           size: csize_t(d.scratch.len), pos: 0)
@@ -331,6 +338,7 @@ proc updateZstd(d: StreamDecoder, input: openArray[byte]): string =
     result.addBytes(d.scratch, int(outb.pos))
     if r == 0: d.done = true; break            # a full frame completed
     if outb.pos == 0: break                     # no progress: needs more input
+  d.lastOut = result.len
 
 proc update*(d: StreamDecoder, input: openArray[byte]): string =
   ## Decode a chunk of compressed input into as much plaintext as it yields now.
