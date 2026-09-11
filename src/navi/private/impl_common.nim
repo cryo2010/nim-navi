@@ -466,6 +466,8 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
           resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
           decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
 
+  for dead in reapExpired(client.pool):    # close idle connections past idleConnTimeout
+    await close(dead.transport)            # (the buffered path reaps too; issue #313)
   var (found, pc) = popIdle(client.pool, origin)
   if found:
     try:
