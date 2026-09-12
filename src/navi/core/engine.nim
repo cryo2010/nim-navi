@@ -545,14 +545,12 @@ template performRequest*(client, req0: typed; cancel: CancelToken = nil): Respon
       except CatchableError as e:
         # A provably-unprocessed request (h2 REFUSED_STREAM / above GOAWAY) is
         # safe to retry even when non-idempotent.
-        let retryable = bodyReplayable and
-          (isRetryableVerb(req.verb, policy) or (e of UnprocessedError))
-        if not (attempt < policy.limit and retryable):
+        if not shouldRetryAfterError(attempt, bodyReplayable, e of UnprocessedError,
+                                     req.verb, policy):
           raise # not retryable: propagate the transport error
       if gotResp and
-         not (attempt < policy.limit and bodyReplayable and
-              isRetryableVerb(req.verb, policy) and
-              isRetryableStatus(resp.status, policy)):
+         not shouldRetryAfterResponse(attempt, resp.status, bodyReplayable,
+                                      req.verb, policy):
         break
       inc attempt
       await sleep(backoffMs(attempt, resp, policy))
