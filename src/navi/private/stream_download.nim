@@ -253,31 +253,25 @@ proc drain*(sr: StreamResponse, sink: BodySink) =
   ## then return the connection to the pool (or close it if it cannot be reused).
   ## Consumes the handle: call once. On error the connection is closed and the
   ## error re-raised. Prefer the `each` template for the common case.
+  ##
+  ## `readChunk` owns the per-transport decode, size-cap, EOF teardown (pool-return
+  ## or close), and error handling for h1/h2/h3 alike, so drain is one loop over it
+  ## for every transport (as the h3 arm always was) rather than a per-protocol ladder.
   if sr.phase != spOpen:
     raise newException(IOError, "navi: stream already drained or closed")
   throwIfCancelled(sr.cancel)
-  when defined(naviHttp3):
-    if sr.qc != nil:                          # h3: readChunk owns decode + teardown
-      while true:
-        let c = sr.readChunk()
-        if c.len == 0: break
-        sink(c)
-      return
   try:
-    if sr.pc.h2 != nil:
-      h2DrainBody(sr.pc.transport, sr.pc.h2, sr.sid, sink, sr.decompress, sr.cap)
-      sr.phase = spDrained
-      if sr.pc.h2.canReuse and pushIdle(sr.client.pool, sr.key, sr.pc): disarm(sr.guard)
-      else: closeNow(sr.guard)
-    else:
-      var keep = false
-      h1DrainBody(sr.pc.transport, sr.parser, sink, keep, sr.decompress, sr.cap)
-      sr.phase = spDrained
-      if keep and pushIdle(sr.client.pool, sr.key, sr.pc): disarm(sr.guard)
-      else: closeNow(sr.guard)
+    while true:
+      let c = sr.readChunk()
+      if c.len == 0: break
+      sink(c)
   except CatchableError:
-    if sr.phase == spOpen: sr.phase = spDrained  # mark consumed for the "call once" guard
-    closeNow(sr.guard)
+    # readChunk already tears down (phase -> spDrained + closeNow) on its own
+    # errors; a sink error escapes it with the connection still open (phase still
+    # spOpen), so close it here. Guarding on spOpen avoids a double closeNow.
+    if sr.phase == spOpen:
+      sr.phase = spDrained
+      closeNow(sr.guard)
     raise
 
 template each*(sr: StreamResponse; chunk, body: untyped): untyped =

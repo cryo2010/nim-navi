@@ -231,16 +231,18 @@ template h1Exchange*(transport, req, sink, keep, decompress, cap: typed): Respon
     h1DrainBody(transport, parser, sink, keep, decompress, cap)
     parser.toResponse()
 
-template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
-  ## One HTTP/2 request/response on a new stream of the shared connection `h2`.
+template h2SendRequest*(transport, h2, req: typed): uint32 =
+  ## Open a new h2 stream and send `req` on it, returning the stream id (response
+  ## still to be read). A buffered body goes in one shot; a streamed body
+  ## (`bodyStream`) is sent as DATA pulled from the producer, reading between frames
+  ## so the peer's WINDOW_UPDATE releases more of the body -- the producer is pulled
+  ## only once the queued bytes are on the wire, so buffered upload memory stays
+  ## ~one chunk. This is the h2 analog of h1's `sendRequest`; both h2Stream and
+  ## h2SendAndReadHeaders drive their read loop from the id it returns.
+  mixin await, sendAll, recvSome
   block:
-    mixin BodySink
     let sid = h2.openStream()
     if req.bodyStream != nil:
-      # Stream the request body: HEADERS now, then DATA frames pulled from the
-      # producer. When the send window closes, read so the peer's WINDOW_UPDATE
-      # releases more of the body; the producer is pulled only once the queued
-      # bytes are on the wire, so buffered upload memory stays ~one chunk.
       await sendAll(transport, h2.encodeRequestHead(sid, h2HeaderList(req)))
       var sending = true
       while sending and h2.connError.len == 0 and not h2.streamDone(sid):
@@ -260,6 +262,13 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
     else:
       await sendAll(transport,
         h2.encodeRequest(sid, h2HeaderList(req), req.body, h2TrailerList(req)))
+    sid
+
+template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
+  ## One HTTP/2 request/response on a new stream of the shared connection `h2`.
+  block:
+    mixin BodySink
+    let sid = h2SendRequest(transport, h2, req)
     # Deliver the body to the sink incrementally as DATA arrives (bounded memory),
     # or buffer it for a non-streaming request. The decoder is built once the
     # response headers are in (so content-encoding is known); the loop runs once
@@ -302,27 +311,7 @@ template h2SendAndReadHeaders*(transport, h2, req: typed): uint32 =
   ## retry/redirect loop can react), mirroring `h2Stream`'s terminal errors.
   mixin await, sendAll, recvSome
   block:
-    let sid = h2.openStream()
-    if req.bodyStream != nil:
-      await sendAll(transport, h2.encodeRequestHead(sid, h2HeaderList(req)))
-      var sending = true
-      while sending and h2.connError.len == 0 and not h2.streamDone(sid):
-        if h2.sendDrained(sid):
-          var chunk: string
-          {.cast(gcsafe).}: chunk = req.bodyStream()
-          if chunk.len == 0:
-            await sendAll(transport, h2.finishSend(sid, h2TrailerList(req)))
-            sending = false
-          else:
-            await sendAll(transport, h2.queueSend(sid, chunk))
-        else:
-          let inbound = await recvSome(transport)
-          if inbound.len == 0: break
-          let toSend = h2.feed(inbound)
-          if toSend.len > 0: await sendAll(transport, toSend)
-    else:
-      await sendAll(transport,
-        h2.encodeRequest(sid, h2HeaderList(req), req.body, h2TrailerList(req)))
+    let sid = h2SendRequest(transport, h2, req)
     while not h2.headersReady(sid) and not h2.streamDone(sid):
       let chunk = await recvSome(transport)
       if chunk.len == 0: break
