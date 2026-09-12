@@ -303,11 +303,14 @@ proc happyConnect*(ips: seq[string], port: int):
 
 proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
               proxy: ProxyTarget, alpn: seq[string] = @[],
-              connectMs = 0, readMs = 0): Future[Conn] {.async.} =
+              connectMs = 0, readMs = 0, totalMs = 0): Future[Conn] {.async.} =
   ## Dial `host:port` (or the proxy), upgrading to TLS for https with a CONNECT
   ## tunnel when proxied. The handshake completes here so the ALPN result (h2 vs
   ## http/1.1) is known before any request. `connectMs` bounds establishment (TCP
-  ## + TLS); `readMs` is stored for per-read timeouts. TLS requires `-d:ssl`.
+  ## + TLS); `readMs` is stored for per-read timeouts. `totalMs` is enforced by the
+  ## async entry's `guard`, so it is accepted for signature parity with the other
+  ## backends but unused here. TLS requires `-d:ssl`.
+  discard totalMs
   inc openedConnections
   var conn: Conn
   conn.fd = invalidFd
