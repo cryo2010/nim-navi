@@ -370,6 +370,40 @@ template h2DrainBody*(transport, h2, sid, sink, decompress, cap: typed) =
     raiseH2Terminal(connErr, tooLarge, unprocessed, wasReset, done, lengthBad,
                     cd.streamComplete)
 
+template serveOnce(client, pc, rq, sink, key, gotResponse: typed): Response =
+  ## Run one request/response over the pooled connection `pc` -- reused or freshly
+  ## opened -- then return `pc` to the idle pool if it may be kept, else close it.
+  ## `pc.h2` set means an established h2 connection; otherwise HTTP/1.1, unless the
+  ## transport just negotiated "h2" on a fresh connection (`pc.h2` still nil), in
+  ## which case the h2 connection is initialized and its client preamble sent first.
+  ## `gotResponse` is set false while an h1 request is in flight and true once the
+  ## response headers arrive, so a caller's stale-retry logic can tell a pre- from a
+  ## post-response failure (h2 signals its own unprocessed case via UnprocessedError,
+  ## so it leaves `gotResponse` true). The caller must guard the call so a raised
+  ## exchange closes the transport before re-raising; the pool/close below runs only
+  ## on success, so a pooled connection is never double-closed.
+  mixin sendAll, await, BodySink
+  block:
+    var r: Response
+    var keep = false
+    if pc.h2 != nil or pc.transport.protocol == "h2":
+      if pc.h2 == nil:
+        pc.h2 = initH2Conn(client.config.maxResponseBytes)
+        await sendAll(pc.transport, pc.h2.preamble())
+      r = h2Stream(pc.transport, pc.h2, rq, sink,
+                   client.config.wantsDecompress, client.config.maxResponseBytes)
+      keep = pc.h2.canReuse
+    else:
+      gotResponse = false
+      var parser = h1SendAndReadHeaders(pc.transport, rq, not sink.isNil)
+      gotResponse = true
+      h1DrainBody(pc.transport, parser, sink, keep,
+                  client.config.wantsDecompress, client.config.maxResponseBytes)
+      r = parser.toResponse()
+    if not (keep and pushIdle(client.pool, key, pc)):
+      await close(pc.transport)
+    r
+
 template poolTransport*(client, req, sink: typed): Response =
   ## Pool-based transport: reuse a pooled connection (http/1.1 or a persistent
   ## h2 connection) or open a fresh one, negotiating the protocol via ALPN.
@@ -396,21 +430,7 @@ template poolTransport*(client, req, sink: typed): Response =
       # case via UnprocessedError, so treat its failures as post-response.
       var gotResponse = true
       try:
-        if pc.h2 != nil:
-          resp = h2Stream(pc.transport, pc.h2, rq, sink,
-                          client.config.wantsDecompress, client.config.maxResponseBytes)
-          if not (pc.h2.canReuse and pushIdle(client.pool, key, pc)):
-            await close(pc.transport)
-        else:
-          var keep = false
-          gotResponse = false
-          var parser = h1SendAndReadHeaders(pc.transport, rq, not sink.isNil)
-          gotResponse = true
-          h1DrainBody(pc.transport, parser, sink, keep,
-                      client.config.wantsDecompress, client.config.maxResponseBytes)
-          resp = parser.toResponse()
-          if not (keep and pushIdle(client.pool, key, pc)):
-            await close(pc.transport)
+        resp = serveOnce(client, pc, rq, sink, key, gotResponse)
         served = true
       except CatchableError as e:
         await close(pc.transport)  # pooled connection was stale
@@ -433,28 +453,16 @@ template poolTransport*(client, req, sink: typed): Response =
                                     client.config.connectMs, client.config.readMs,
                                     client.config.totalMs)
       var npc = PooledConn[typeof(transport)](transport: transport)
-      var keep = false
-      # Guard the exchange so a failure (e.g. h1Exchange raising IOError on a
-      # truncated body, or the h2 preamble/stream raising) closes the just-opened
-      # transport before re-raising, instead of leaking the fd/TLS handle. Without
-      # this, each retry attempt would leak another connection. The pool/close
-      # decision runs once afterwards so a successfully pooled connection is not
-      # double-closed. Mirrors the pooled branch's cleanup.
+      var gotResponse = true   # unused on the fresh path (nothing to replay onto)
+      # Guard the exchange so a failure (h1/h2 send, the h2 preamble/stream, or a
+      # truncated body) closes the just-opened transport before re-raising, instead
+      # of leaking the fd/TLS handle. serveOnce's pool/close decision runs only on
+      # success, so a pooled connection is never double-closed.
       try:
-        if transport.protocol == "h2":
-          npc.h2 = initH2Conn(client.config.maxResponseBytes)
-          await sendAll(transport, npc.h2.preamble())
-          resp = h2Stream(transport, npc.h2, rq, sink,
-                          client.config.wantsDecompress, client.config.maxResponseBytes)
-          keep = npc.h2.canReuse
-        else:
-          resp = h1Exchange(transport, rq, sink, keep,
-                            client.config.wantsDecompress, client.config.maxResponseBytes)
+        resp = serveOnce(client, npc, rq, sink, key, gotResponse)
       except CatchableError:
         await close(transport)
         raise
-      if not (keep and pushIdle(client.pool, key, npc)):
-        await close(transport)
     resp
 
 template run(client, req, sink: typed): Response =
