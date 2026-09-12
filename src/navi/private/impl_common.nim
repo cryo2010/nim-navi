@@ -101,10 +101,31 @@ proc close*(client: Navi): Future[void] {.async.} =
   ## Optional but recommended when done with the client.
   for pc in client.pool.drain():
     await close(pc.transport)
+  # Await any in-flight coalesced connects before closing the live tables: a connect
+  # that resolves after we clear `muxes` would otherwise cache its mux into the
+  # cleared table and never be closed, orphaning the connection and its reader
+  # (issue #315). Snapshot the futures first -- a resolving connect `del`s its own
+  # pending entry, so iterating the table directly would mutate it mid-iteration.
+  var pendingMuxes: seq[Future[H2Mux]]
+  for f in client.pendingMux.values: pendingMuxes.add f
+  for f in pendingMuxes:
+    try:
+      let mux = await f
+      if mux != nil: await mux.close()
+    except CatchableError: discard   # a failed connect has nothing to close
+  client.pendingMux.clear()
   for mux in client.muxes.values:
     await mux.close()
   client.muxes.clear()
   when defined(naviHttp3):
+    var pendingConns: seq[Future[QuicConn]]
+    for f in client.pendingH3.values: pendingConns.add f
+    for f in pendingConns:
+      try:
+        let qc = await f
+        if qc != nil: await qc.closeConn()
+      except CatchableError: discard
+    client.pendingH3.clear()
     for qc in client.h3conns.values:
       await qc.closeConn()
     client.h3conns.clear()
@@ -132,12 +153,27 @@ proc h1OnConn(client: Navi, conn: Conn, origin: string, req: Request,
   if not (keep and pushIdle(client.pool, origin, pc)):
     await close(conn)
 
+proc pruneDeadMuxes(client: Navi) =
+  ## Drop shared h2 connections that can no longer be reused (reader exited / GOAWAY /
+  ## stream-id exhausted). A revisited origin overwrites its own entry, but an origin
+  ## that dies and is never contacted again would otherwise keep its dead `H2Mux` for
+  ## the client's lifetime, so a client fanning out across many h2 origins leaks one
+  ## entry per dead origin (the h3conns table is already pruned this way). The sweep
+  ## has no await, so it is atomic w.r.t. the event loop; an in-flight request holds
+  ## its own mux ref, so dropping the table entry never disturbs a request under way
+  ## (issue #312).
+  var dead: seq[string]
+  for origin, mux in client.muxes:
+    if not mux.canReuse: dead.add origin
+  for origin in dead: client.muxes.del(origin)
+
 proc transportInner(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
   ## Multiplex over a shared h2 connection when available/negotiable; otherwise
   ## pool http/1.1. Concurrent connects to the same new origin are coalesced so a
   ## cold burst still ends up on one h2 connection.
   let origin = originKey(req.url)
   let wantH2 = client.config.wantsH2 and req.url.isTls
+  client.pruneDeadMuxes()          # evict muxes that died since the last request (#312)
 
   if wantH2:
     # 1. A live shared connection, or one currently being established.
@@ -405,6 +441,7 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
   let wantH2 = client.config.wantsH2 and req.url.isTls
   let decompress = client.config.wantsDecompress
   let cap = client.config.maxResponseBytes
+  client.pruneDeadMuxes()          # evict muxes that died since the last request (#312)
 
   when defined(naviHttp3):
     # Stream over HTTP/3 when the origin has advertised h3 (Alt-Svc). Mirrors the
@@ -450,6 +487,8 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
           resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
           decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
 
+  for dead in reapExpired(client.pool):    # close idle connections past idleConnTimeout
+    await close(dead.transport)            # (the buffered path reaps too; issue #313)
   var (found, pc) = popIdle(client.pool, origin)
   if found:
     try:

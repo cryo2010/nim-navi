@@ -390,6 +390,9 @@ template poolTransport*(client, req, sink: typed): Response =
     var resp: Response
     var served = false
 
+    for dead in reapExpired(client.pool):   # close idle connections past idleConnTimeout;
+      await close(dead.transport)           # popIdle only defers expired entries, it does
+                                            # not close them, so sweep here too (issue #313)
     var (found, pc) = popIdle(client.pool, key)
     if found:
       # `gotResponse` splits a reused-connection failure into "before any response"

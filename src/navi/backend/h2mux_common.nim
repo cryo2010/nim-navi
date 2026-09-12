@@ -51,6 +51,12 @@ type
                              ## asyncdispatch backend, whose reader is `asyncCheck`ed.
     closing: bool            ## set by chronos `close`, so the reader defers the transport
                              ## teardown to it. Never set on asyncdispatch.
+    transportClosed: bool    ## chronos only: whoever (the reader's self-exit teardown or
+                             ## `close`) flips this first owns the single `be.close`. The
+                             ## `closing` flag alone can't prevent a double close -- the
+                             ## reader may already be parked mid-teardown when `close`
+                             ## arrives -- and a second `be.close` frees the transport's
+                             ## unshared SSL_CTX twice (issue #314). Unused on asyncdispatch.
     keepAliveMs: int            ## PING keepalive interval (0 = off); see `keepAlive`
     sawFrameSinceTick: bool     ## the reader saw an inbound frame since the last
                                 ## keepalive tick (any frame proves liveness)
