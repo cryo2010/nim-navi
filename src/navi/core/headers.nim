@@ -35,6 +35,18 @@ proc `[]=`*(h: var Headers, name, value: string) =
   if not written:
     h.fields.add((name, value))
 
+proc parseHeaderLine*(line: string): tuple[name, value: string, ok: bool] =
+  ## Split one HTTP/1.x field line ("Name: value") at the first colon, stripping
+  ## surrounding whitespace from both sides. `ok` is false when there is no colon
+  ## in a valid position (the colon must not be the first character, RFC 9112 5),
+  ## so the caller can skip a malformed line. Shared by the h1 parser (header and
+  ## trailer lines) and the WebSocket handshake validator.
+  let colon = line.find(':')
+  if colon > 0:
+    (line[0 ..< colon].strip(), line[colon + 1 .. ^1].strip(), true)
+  else:
+    ("", "", false)
+
 proc del*(h: var Headers, name: string) =
   ## Remove all fields matching `name` (case-insensitive).
   var i = 0

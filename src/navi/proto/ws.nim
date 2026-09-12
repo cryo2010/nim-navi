@@ -395,7 +395,7 @@ proc validate101*(responseHead, key: string): bool =
   let lines = responseHead.splitLines
   if lines.len == 0 or not lines[0].startsWith("HTTP/1.1 101"): return false
   for line in lines[1 .. ^1]:
-    let c = line.find(':')
-    if c > 0 and cmpIgnoreCase(line[0 ..< c].strip, "sec-websocket-accept") == 0:
-      return line[c + 1 .. ^1].strip == acceptFor(key)
+    let (name, value, ok) = parseHeaderLine(line)
+    if ok and cmpIgnoreCase(name, "sec-websocket-accept") == 0:
+      return value == acceptFor(key)
   false
