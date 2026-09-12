@@ -9,6 +9,10 @@
 import std/[strutils, base64]
 import ../core/socks
 
+const proxyConnectReplyBuf = 1024
+  ## One recv suffices for a proxy CONNECT status line + headers; a well-behaved
+  ## proxy replies with a short "HTTP/1.x 200 ..." head that fits comfortably.
+
 template proxyConnectDriver*(conn, host, port, user, pass: typed) =
   ## Establish a CONNECT tunnel to `host:port` through an already-connected HTTP
   ## proxy, sending Proxy-Authorization when credentials are supplied. `conn` is
@@ -21,7 +25,7 @@ template proxyConnectDriver*(conn, host, port, user, pass: typed) =
     req.add("Proxy-Authorization: Basic " & encode(user & ":" & pass) & "\r\n")
   req.add("\r\n")
   await sockWrite(conn, req)
-  let resp = await sockReadSome(conn, 1024)
+  let resp = await sockReadSome(conn, proxyConnectReplyBuf)
   if not (resp.startsWith("HTTP/1.1 200") or resp.startsWith("HTTP/1.0 200")):
     raise newException(ValueError, "navi: proxy CONNECT failed: " & resp.splitLines()[0])
 

@@ -49,6 +49,9 @@ when defined(ssl):
   # add_extra_chain_cert (via SSL_CTX_ctrl) transfers ownership, so we do not.
 
   const SSL_CTRL_EXTRA_CHAIN_CERT = 14
+  const X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT = 0x1.cuint
+    ## X509_VERIFY_PARAM flag: always compare the subject CN, not only when the
+    ## certificate carries no subjectAltName. Passed to X509_check_host below.
 
   proc SSL_CTX_use_certificate(ctx: SslCtx, x: PX509): cint
     {.cdecl, dynlib: DLLSSLName, importc.}
@@ -439,7 +442,6 @@ when defined(ssl):
     ## it for IP literals (as std/net does): X509_check_host matches DNS names.
     let cert = SSL_get_peer_certificate(ssl)
     if cert.isNil: fail("server presented no certificate")
-    const X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT = 0x1.cuint
     let match = X509_check_host(cert, host.cstring, host.len.cint,
                                 X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT, nil)
     X509_free(cert)
