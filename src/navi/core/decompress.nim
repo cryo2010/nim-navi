@@ -300,16 +300,44 @@ proc newZlibDecoder(windowBits: cint, allowRawRetry = false): StreamDecoder =
   if inflateInit2(addr result.zs, windowBits, "1", cint(sizeof(ZStream))) != zOk:
     raise newException(ValueError, "navi: zlib inflateInit failed")
 
+proc emitScratch(d: StreamDecoder, result: var string, produced, capRemaining: int) {.inline.} =
+  ## Shared per-iteration output step for every codec: append the `produced` bytes
+  ## the codec just wrote into `d.scratch`, then enforce the per-chunk output cap.
+  ## Raises ResponseTooLargeError before the whole chunk is materialized so one
+  ## highly-compressible chunk cannot blow past the budget.
+  result.addBytes(d.scratch, produced)
+  if capRemaining >= 0 and result.len > capRemaining:  # bound peak output per chunk
+    raise newException(ResponseTooLargeError, "navi: response exceeded maxResponseBytes")
+
+template decodeLoop(d: StreamDecoder, input: openArray[byte], capRemaining: int,
+                    step: untyped): string =
+  ## Template-method wrapper shared by every streaming codec updater. It supplies
+  ## the scaffolding common to all three -- the done/empty guard, the dsMidMember
+  ## transition, the `d.lastOut`-primed result buffer, the decode `while` loop, and
+  ## the final `d.lastOut` record -- and injects the codec-specific `step` as the
+  ## loop body. Inside `step`, `result`, `d`, `input` and `capRemaining` are in
+  ## scope; a step calls `emitScratch` to flush + cap its output and `break`s (or
+  ## sets `d.state`) at its own boundaries. The per-codec decode logic stays intact;
+  ## only the identical wrapper is unified.
+  block:
+    var res: string
+    if d.state != dsDone and input.len != 0:
+      d.state = dsMidMember
+      res = newStringOfCap(max(decodeScratchSize, d.lastOut))
+      template result: var string = res      # let `step` write via `result`
+      while true:
+        step
+      d.lastOut = res.len
+    res
+
 proc updateZlib(d: StreamDecoder, input: openArray[byte], capRemaining: int): string =
-  if d.state == dsDone or input.len == 0: return ""
   # `input` is a contiguous, GC-owned buffer that is stable for this synchronous
   # call, so point the FFI straight at it -- no throwaway copy.
   let isFirst = d.state == dsIdle
-  d.zs.nextIn = cast[ptr uint8](unsafeAddr input[0])
-  d.zs.availIn = cuint(input.len)
-  d.state = dsMidMember
-  result = newStringOfCap(max(decodeScratchSize, d.lastOut))
-  while true:
+  if d.state != dsDone and input.len != 0:
+    d.zs.nextIn = cast[ptr uint8](unsafeAddr input[0])
+    d.zs.availIn = cuint(input.len)
+  decodeLoop(d, input, capRemaining):
     d.zs.nextOut = cast[ptr uint8](addr d.scratch[0])
     d.zs.availOut = cuint(d.scratch.len)
     let ret = inflate(addr d.zs, zNoFlush)
@@ -327,9 +355,7 @@ proc updateZlib(d: StreamDecoder, input: openArray[byte], capRemaining: int): st
         d.zs.availIn = cuint(input.len)
         continue
       raise newException(ValueError, "navi: malformed compressed body")
-    result.addBytes(d.scratch, d.scratch.len - int(d.zs.availOut))
-    if capRemaining >= 0 and result.len > capRemaining:  # bound peak output per chunk
-      raise newException(ResponseTooLargeError, "navi: response exceeded maxResponseBytes")
+    emitScratch(d, result, d.scratch.len - int(d.zs.availOut), capRemaining)
     if ret == zStreamEnd:
       # Multi-member gzip (RFC 1952): reset and decode any following member rather
       # than latching `done`. A member can end exactly on a chunk boundary
@@ -342,45 +368,36 @@ proc updateZlib(d: StreamDecoder, input: openArray[byte], capRemaining: int): st
         break
       continue
     if d.zs.availIn == 0: break                # mid-member: more input expected (state stays dsMidMember)
-  d.lastOut = result.len
 
 proc updateBrotli(d: StreamDecoder, input: openArray[byte], capRemaining: int): string =
-  if d.state == dsDone or input.len == 0: return ""
   var availIn = csize_t(input.len)
-  var nextIn = cast[ptr uint8](unsafeAddr input[0])
-  d.state = dsMidMember
-  result = newStringOfCap(max(decodeScratchSize, d.lastOut))
-  while true:
+  var nextIn: ptr uint8
+  if input.len != 0: nextIn = cast[ptr uint8](unsafeAddr input[0])
+  decodeLoop(d, input, capRemaining):
     var availOut = csize_t(d.scratch.len)
     var nextOut = cast[ptr uint8](addr d.scratch[0])
     let r = brotliStream(d.brs, availIn, nextIn, availOut, nextOut, nil)
-    result.addBytes(d.scratch, d.scratch.len - int(availOut))
-    if capRemaining >= 0 and result.len > capRemaining:  # bound peak output per chunk
-      raise newException(ResponseTooLargeError, "navi: response exceeded maxResponseBytes")
+    emitScratch(d, result, d.scratch.len - int(availOut), capRemaining)
     if r == brSuccess: d.state = dsDone; break
     if r == brNeedOutput: continue             # output full, keep draining
     if r < brSuccess: raise newException(ValueError, "navi: malformed brotli body")
     break                                       # needs more input: wait for the next chunk
-  d.lastOut = result.len
 
 proc updateZstd(d: StreamDecoder, input: openArray[byte], capRemaining: int): string =
-  if d.state == dsDone or input.len == 0: return ""
-  var inb = ZstdBuffer(buf: cast[typeof(ZstdBuffer().buf)](unsafeAddr input[0]),
-                       size: csize_t(input.len), pos: 0)
-  d.state = dsMidMember
-  result = newStringOfCap(max(decodeScratchSize, d.lastOut))
-  while inb.pos < inb.size:
+  var inb: ZstdBuffer
+  if input.len != 0:
+    inb = ZstdBuffer(buf: cast[typeof(ZstdBuffer().buf)](unsafeAddr input[0]),
+                     size: csize_t(input.len), pos: 0)
+  decodeLoop(d, input, capRemaining):
+    if inb.pos >= inb.size: break              # input drained
     var outb = ZstdBuffer(buf: cast[typeof(ZstdBuffer().buf)](addr d.scratch[0]),
                           size: csize_t(d.scratch.len), pos: 0)
     let r = zstdStream(d.zds, outb, inb)
     if zstdIsError(r) != 0:
       raise newException(ValueError, "navi: malformed zstd body")
-    result.addBytes(d.scratch, int(outb.pos))
-    if capRemaining >= 0 and result.len > capRemaining:  # bound peak output per chunk
-      raise newException(ResponseTooLargeError, "navi: response exceeded maxResponseBytes")
+    emitScratch(d, result, int(outb.pos), capRemaining)
     if r == 0: d.state = dsDone; break   # a full frame completed
     if outb.pos == 0: break                     # no progress: needs more input
-  d.lastOut = result.len
 
 proc update*(d: StreamDecoder, input: openArray[byte], capRemaining = -1): string =
   ## Decode a chunk of compressed input into as much plaintext as it yields now.
