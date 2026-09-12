@@ -163,31 +163,42 @@ template h1ReadChunk*(transport, parser, capped: typed): string =
       break
     res
 
-template raiseH2Terminal*(connErr: string;
-                          tooLarge, unprocessed, wasReset, done, lengthBad,
-                          decoderComplete: bool) =
+type H2Terminal* = object
+  ## The terminal outcome of an h2 stream, captured by the caller before
+  ## `takeResponse` clears the per-stream flags. Not a variant: these conditions
+  ## are independent and checked in a fixed precedence order (a single
+  ## discriminant would misrepresent them); the object exists so the seven
+  ## captured signals travel as one named bundle instead of seven positional
+  ## bools that are easy to transpose.
+  connErr*: string          ## non-empty => connection-level error text
+  tooLarge*: bool           ## response exceeded maxResponseBytes
+  unprocessed*: bool        ## peer proved the request was not processed
+  wasReset*: bool           ## stream was reset / did not complete
+  done*: bool               ## END_STREAM seen (false => truncated mid-stream)
+  lengthBad*: bool          ## content-length / DATA length mismatch
+  decoderComplete*: bool    ## body decoder ended cleanly
+
+template raiseH2Terminal*(t: H2Terminal) =
   ## The canonical "h2 stream reached a terminal point" -> exception cascade,
-  ## shared by every h2 read path (`h2ReadChunk`, `h2Stream`, `h2DrainBody`). The
-  ## per-stream flags are cleared by `takeResponse`, so each caller captures them
-  ## first and passes them here. Order is load-bearing: a connection error and the
-  ## oversize/unprocessed/reset outcomes take precedence over the truncation
-  ## checks. `done` is whether END_STREAM was seen (false => the peer died
-  ## mid-stream, a truncation); `decoderComplete` is whether the body decoder ended
-  ## cleanly (a compressed body cut short is also a truncation). Falls through
-  ## silently on a clean end.
-  if connErr.len > 0: raise newException(IOError, "navi: http/2 " & connErr)
-  if tooLarge:
+  ## shared by every h2 read path (`h2ReadChunk`, `h2Stream`, `h2DrainBody`).
+  ## Order is load-bearing: a connection error and the oversize/unprocessed/reset
+  ## outcomes take precedence over the truncation checks. `done` is whether
+  ## END_STREAM was seen (false => the peer died mid-stream, a truncation);
+  ## `decoderComplete` is whether the body decoder ended cleanly (a compressed
+  ## body cut short is also a truncation). Falls through silently on a clean end.
+  if t.connErr.len > 0: raise newException(IOError, "navi: http/2 " & t.connErr)
+  if t.tooLarge:
     raise newException(ResponseTooLargeError,
       "navi: response exceeded maxResponseBytes")
-  if unprocessed:
+  if t.unprocessed:
     raise newException(UnprocessedError, "navi: http/2 request not processed")
-  if wasReset:
+  if t.wasReset:
     raise newException(IOError, "navi: http/2 request did not complete")
-  if not done:
+  if not t.done:
     raise newException(IOError, h2TruncatedErr)
-  if lengthBad:
+  if t.lengthBad:
     raise newException(IOError, bodyLengthErr)
-  if not decoderComplete:
+  if not t.decoderComplete:
     raise newException(IOError, truncatedBodyErr)
 
 template h2ReadChunk*(transport, h2, sid, capped: typed): string =
@@ -215,8 +226,9 @@ template h2ReadChunk*(transport, h2, sid, capped: typed): string =
         let lengthBad = h2.streamLengthMismatch(sid)  # capture before takeResponse
         discard h2.takeResponse(sid)
         # Reached only once streamDone is true, so END_STREAM was seen (done=true).
-        raiseH2Terminal(connErr, tooLarge, unprocessed, wasReset, true, lengthBad,
-                        capped.streamComplete)
+        raiseH2Terminal(H2Terminal(connErr: connErr, tooLarge: tooLarge,
+          unprocessed: unprocessed, wasReset: wasReset, done: true,
+          lengthBad: lengthBad, decoderComplete: capped.streamComplete))
         break                                 # clean end: res ""
       let chunk = await recvSome(transport)
       if chunk.len == 0:                       # transport EOF before END_STREAM:
@@ -298,8 +310,9 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
     var r = toResponse(h2.takeResponse(sid))
     # `r.status == 0` (gone away before a response) is treated as a reset here; on the
     # buffered path the decoder-complete check only applies when streaming to a sink.
-    raiseH2Terminal(connErr, tooLarge, unprocessed, wasReset or r.status == 0, done,
-                    lengthBad, sink.isNil or cd.streamComplete)
+    raiseH2Terminal(H2Terminal(connErr: connErr, tooLarge: tooLarge,
+      unprocessed: unprocessed, wasReset: wasReset or r.status == 0, done: done,
+      lengthBad: lengthBad, decoderComplete: sink.isNil or cd.streamComplete))
     if not sink.isNil: r.body = ""  # delivered incrementally above
     r
 
@@ -351,8 +364,9 @@ template h2DrainBody*(transport, h2, sid, sink, decompress, cap: typed) =
     let done = h2.streamDone(sid)      # END_STREAM seen (else the loop broke on EOF)
     let lengthBad = h2.streamLengthMismatch(sid)   # capture before takeResponse
     discard h2.takeResponse(sid)       # body delivered; drop the stream
-    raiseH2Terminal(connErr, tooLarge, unprocessed, wasReset, done, lengthBad,
-                    cd.streamComplete)
+    raiseH2Terminal(H2Terminal(connErr: connErr, tooLarge: tooLarge,
+      unprocessed: unprocessed, wasReset: wasReset, done: done,
+      lengthBad: lengthBad, decoderComplete: cd.streamComplete))
 
 template serveOnce(client, pc, rq, sink, key, gotResponse: typed): Response =
   ## Run one request/response over the pooled connection `pc` -- reused or freshly
