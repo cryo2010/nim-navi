@@ -3,6 +3,8 @@
 ## Encodes frames to bytes and decodes them incrementally from a byte stream,
 ## with no I/O. The connection layer drives this over any transport.
 
+import ../../core/bytewriter
+
 type
   FrameType* = enum
     ftData = 0x0
@@ -60,19 +62,6 @@ const
   errCompressionError* = 0x9'u32
   errEnhanceYourCalm* = 0xb'u32
 
-proc u24(n: int): string =
-  result = newString(3)
-  result[0] = char((n shr 16) and 0xff)
-  result[1] = char((n shr 8) and 0xff)
-  result[2] = char(n and 0xff)
-
-proc u32(n: uint32): string =
-  result = newString(4)
-  result[0] = char((n shr 24) and 0xff)
-  result[1] = char((n shr 16) and 0xff)
-  result[2] = char((n shr 8) and 0xff)
-  result[3] = char(n and 0xff)
-
 proc readU24(s: openArray[char], i: int): int =
   (int(uint8(s[i])) shl 16) or (int(uint8(s[i + 1])) shl 8) or int(uint8(s[i + 2]))
 
@@ -82,11 +71,13 @@ proc readU32*(s: openArray[char], i: int): uint32 =
 
 proc encodeFrame*(typ: uint8, flags: uint8, streamId: uint32, payload: string): string =
   ## Serialize one frame: 9-byte header (length, type, flags, stream id) + payload.
-  result = u24(payload.len)
-  result.add char(typ)
-  result.add char(flags)
-  result.add u32(streamId and 0x7fffffff'u32)
-  result.add payload
+  var w = initByteWriter(9 + payload.len)
+  w.addU24BE(payload.len)
+  w.addByte(typ)
+  w.addByte(flags)
+  w.addU32BE(streamId and 0x7fffffff'u32)
+  w.add(payload)
+  w.buf
 
 proc encodeFrame*(typ: FrameType, flags: uint8, streamId: uint32, payload = ""): string =
   encodeFrame(uint8(typ), flags, streamId, payload)
@@ -125,28 +116,27 @@ proc next*(d: var FrameDecoder, frame: var Frame): bool =
 # --- Payload builders for the frames a client sends ---
 
 proc encodeSettings*(params: openArray[(uint16, uint32)]): string =
-  var payload = ""
+  var w = initByteWriter(params.len * 6)
   for (id, value) in params:
-    payload.add char((id shr 8) and 0xff)
-    payload.add char(id and 0xff)
-    payload.add u32(value)
-  encodeFrame(ftSettings, 0, 0, payload)
+    w.addU16BE(id)
+    w.addU32BE(value)
+  encodeFrame(ftSettings, 0, 0, w.buf)
 
 proc encodeSettingsAck*(): string =
   encodeFrame(ftSettings, flagAck, 0)
 
 proc encodeWindowUpdate*(streamId: uint32, increment: uint32): string =
-  encodeFrame(ftWindowUpdate, 0, streamId, u32(increment and 0x7fffffff'u32))
+  encodeFrame(ftWindowUpdate, 0, streamId, u32BE(increment and 0x7fffffff'u32))
 
 proc encodePing*(data: string, ack = false): string =
   ## `data` must be 8 bytes of opaque payload.
   encodeFrame(ftPing, if ack: flagAck else: 0, 0, data)
 
 proc encodeRstStream*(streamId: uint32, errorCode: uint32): string =
-  encodeFrame(ftRstStream, 0, streamId, u32(errorCode))
+  encodeFrame(ftRstStream, 0, streamId, u32BE(errorCode))
 
 proc encodeGoAway*(lastStreamId: uint32, errorCode: uint32): string =
-  encodeFrame(ftGoAway, 0, 0, u32(lastStreamId and 0x7fffffff'u32) & u32(errorCode))
+  encodeFrame(ftGoAway, 0, 0, u32BE(lastStreamId and 0x7fffffff'u32) & u32BE(errorCode))
 
 proc encodeData*(streamId: uint32, data: string, endStream: bool): string =
   encodeFrame(ftData, if endStream: flagEndStream else: 0, streamId, data)

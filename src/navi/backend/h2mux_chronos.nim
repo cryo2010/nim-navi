@@ -87,12 +87,12 @@ proc reader(mux: H2Mux) {.async.} =
   # When `close` is tearing us down it has EOF'd the transport (no cancel) and owns
   # the transport close + readerDone itself, so running the teardown here too would
   # race it. Only self-exit (peer close / GOAWAY / error) runs the teardown here.
-  if not mux.closing:
+  if mux.state == msActive:                # `close` has not taken over (would be msClosing)
     mux.failAll("navi: http/2 connection closed")
-    if not mux.transportClosed:            # `close` may race us mid-teardown: whoever
-      mux.transportClosed = true           # flips this first owns the be.close, so the
-      try: await be.close(mux.transport)   # transport (and its unshared SSL_CTX) is never
-      except CatchableError: discard       # freed twice (issue #314)
+    if mux.state != msTransportClosed:     # `close` may race us mid-teardown: whoever
+      mux.state = msTransportClosed        # reaches this state first owns the be.close, so
+      try: await be.close(mux.transport)   # the transport (and its unshared SSL_CTX) is
+      except CatchableError: discard       # never freed twice (issue #314)
     if not mux.settingsSeen.finished: mux.settingsSeen.complete()  # unblock a pending
     if not mux.readerDone.finished: mux.readerDone.complete()      # openConnect (dead conn)
 
@@ -129,10 +129,13 @@ proc close*(mux: H2Mux) {.async.} =
   ## transport so the reader's parked read completes with EOF, then let the reader
   ## unwind on its own. We deliberately do NOT cancel the reader: cancelling a
   ## chronos StreamTransport read in flight leaks the read's future/buffers, so we
-  ## EOF it via `closeWait` instead. `closing` tells the reader to leave the
+  ## EOF it via `closeWait` instead. `msClosing` tells the reader to leave the
   ## transport teardown to us.
   if mux.readerDone.finished: return   # reader already exited (e.g. peer closed)
-  mux.closing = true
+  if mux.state == msActive: mux.state = msClosing   # don't regress past a reader that is
+                                       # already mid-teardown (it may have set
+                                       # msTransportClosed while parked at its own be.close);
+                                       # the msTransportClosed guard below then skips (#314)
   mux.alive = false
   mux.failAll("navi: client closed")
   # A guard timeout / CancelToken can cancel this close() while it is parked on an
@@ -142,8 +145,8 @@ proc close*(mux: H2Mux) {.async.} =
   # propagates to the caller: a swallowed CancelledError would have this proc report
   # a clean close on a cancelled one (issue #316).
   var cancelled: ref CancelledError
-  if not mux.transportClosed:            # the reader's self-exit teardown may already own
-    mux.transportClosed = true           # the close; don't double-close it (issue #314).
+  if mux.state != msTransportClosed:     # the reader's self-exit teardown may already own
+    mux.state = msTransportClosed        # the close; don't double-close it (issue #314).
     try: await be.close(mux.transport)   # EOFs the reader's parked read (no cancel)
     except CancelledError as e: cancelled = e
     except CatchableError: discard

@@ -3,7 +3,7 @@
 # `nim js` without pulling in std/asyncdispatch (which has no JS backend).
 
 import std/[options, tables]
-import navi/private/[entryguard, streamguard]
+import navi/private/[entryguard, streamguard, guard_common]
 import navi/proto/sse
 import navi/core/public
 export sse.SseEvent
@@ -37,25 +37,23 @@ proc guard[T](totalMs: int; fut: Future[T];
   ## Bound the whole request (all attempts) by `timeout` and `cancel`. On expiry
   ## or cancellation the abandoned future runs to completion in the background
   ## (asyncdispatch has no true cancellation); its socket is later reclaimed.
+  ## Shared scaffolding (hook arming + expiry error) lives in guard_common; the
+  ## await/timeout CORE below is asyncdispatch-specific and must not be unified.
   let ms = totalMs
   if ms <= 0 and cancel == nil:
     return await fut
   var cancelFut = newFuture[void]("navi.cancel")
-  if cancel != nil:
-    cancel.armHook(proc() {.gcsafe, raises: [].} =
-      # complete() only raises if already finished, which the guard rules out.
-      {.cast(raises: []).}:
-        if not cancelFut.finished: cancelFut.complete())
+  armCancelHook(cancel, cancelFut)
   try:
+    # CORE (asyncdispatch): race the future against cancel and a plain timer; on
+    # expiry `fut` is left to drain in the background (no cancellation).
     if ms > 0:
       await fut or cancelFut or sleepAsync(ms)
     else:
       await fut or cancelFut
     if fut.finished:
       return fut.read
-    if cancel != nil and cancel.cancelled:
-      raise newException(RequestCancelledError, "navi: request cancelled")
-    raise newException(TimeoutError, "navi: request timed out after " & $ms & " ms")
+    raiseGuardExpiry(ms, cancel)
   finally:
     if cancel != nil: cancel.disarmHook()
     if not cancelFut.finished: cancelFut.complete()

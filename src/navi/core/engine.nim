@@ -79,6 +79,22 @@ template h1SendAndReadHeaders*(transport, req, streaming: typed): H1Parser =
       raise newException(IOError, "navi: http/1.1 connection closed before response")
     parser
 
+template deliverChunk*(cd, sink, rawBody, encoding: typed) =
+  ## Feed one raw body slice through the capped decoder `cd` and `await` any
+  ## decoded output into `sink`. Shared by the h1/h2 drain loops. `encoding` is
+  ## only consulted until the decoder resolves the content-encoding. The decoded
+  ## buffer is navi's native body type (`string`), so its last use here moves it
+  ## straight into the sink (into the async env on the async backends) with no
+  ## copy; the raises cast discharges chronos's strict-raises obligation on the
+  ## portable (annotation-free) sink type, as the middleware path does.
+  mixin await
+  let decoded = cd.feed(rawBody, if cd.encodingResolved: "" else: encoding)
+  if decoded.len > 0:
+    # single-threaded client; the sink need not be gcsafe (see sendRequest).
+    {.cast(gcsafe).}:
+      {.cast(raises: [CatchableError]).}:
+        await sink(decoded)
+
 template h1DrainBody*(transport, parser, sink, keep, decompress, cap: typed) =
   ## Read and parse the response body over `transport`. When `sink` is set the body
   ## is drained per read, decoded (if `decompress`), size-capped at `cap` decoded
@@ -93,18 +109,7 @@ template h1DrainBody*(transport, parser, sink, keep, decompress, cap: typed) =
     var cd = initCappedDecoder(decompress, cap)   # lazy decoder + running size cap
     template deliver() =
       if streaming:
-        let decoded = cd.feed(parser.takeBody(),
-                              if cd.encodingResolved: "" else: parser.contentEncoding())
-        if decoded.len > 0:
-          # single-threaded client; the sink need not be gcsafe (see sendRequest).
-          # `decoded` is navi's native body type (`string`), which the sink also
-          # takes, so its last use here moves the buffer straight into the sink
-          # (into the async env on the async backends) with no copy. The raises
-          # cast discharges chronos's strict-raises obligation on the portable
-          # (annotation-free) sink type, as the middleware path does.
-          {.cast(gcsafe).}:
-            {.cast(raises: [CatchableError]).}:
-              await sink(decoded)
+        deliverChunk(cd, sink, parser.takeBody(), parser.contentEncoding())
     deliver()                               # body read alongside the headers
     while not parser.finished:
       let chunk = await recvSome(transport)
@@ -158,31 +163,42 @@ template h1ReadChunk*(transport, parser, capped: typed): string =
       break
     res
 
-template raiseH2Terminal*(connErr: string;
-                          tooLarge, unprocessed, wasReset, done, lengthBad,
-                          decoderComplete: bool) =
+type H2Terminal* = object
+  ## The terminal outcome of an h2 stream, captured by the caller before
+  ## `takeResponse` clears the per-stream flags. Not a variant: these conditions
+  ## are independent and checked in a fixed precedence order (a single
+  ## discriminant would misrepresent them); the object exists so the seven
+  ## captured signals travel as one named bundle instead of seven positional
+  ## bools that are easy to transpose.
+  connErr*: string          ## non-empty => connection-level error text
+  tooLarge*: bool           ## response exceeded maxResponseBytes
+  unprocessed*: bool        ## peer proved the request was not processed
+  wasReset*: bool           ## stream was reset / did not complete
+  done*: bool               ## END_STREAM seen (false => truncated mid-stream)
+  lengthBad*: bool          ## content-length / DATA length mismatch
+  decoderComplete*: bool    ## body decoder ended cleanly
+
+template raiseH2Terminal*(t: H2Terminal) =
   ## The canonical "h2 stream reached a terminal point" -> exception cascade,
-  ## shared by every h2 read path (`h2ReadChunk`, `h2Stream`, `h2DrainBody`). The
-  ## per-stream flags are cleared by `takeResponse`, so each caller captures them
-  ## first and passes them here. Order is load-bearing: a connection error and the
-  ## oversize/unprocessed/reset outcomes take precedence over the truncation
-  ## checks. `done` is whether END_STREAM was seen (false => the peer died
-  ## mid-stream, a truncation); `decoderComplete` is whether the body decoder ended
-  ## cleanly (a compressed body cut short is also a truncation). Falls through
-  ## silently on a clean end.
-  if connErr.len > 0: raise newException(IOError, "navi: http/2 " & connErr)
-  if tooLarge:
+  ## shared by every h2 read path (`h2ReadChunk`, `h2Stream`, `h2DrainBody`).
+  ## Order is load-bearing: a connection error and the oversize/unprocessed/reset
+  ## outcomes take precedence over the truncation checks. `done` is whether
+  ## END_STREAM was seen (false => the peer died mid-stream, a truncation);
+  ## `decoderComplete` is whether the body decoder ended cleanly (a compressed
+  ## body cut short is also a truncation). Falls through silently on a clean end.
+  if t.connErr.len > 0: raise newException(IOError, "navi: http/2 " & t.connErr)
+  if t.tooLarge:
     raise newException(ResponseTooLargeError,
       "navi: response exceeded maxResponseBytes")
-  if unprocessed:
+  if t.unprocessed:
     raise newException(UnprocessedError, "navi: http/2 request not processed")
-  if wasReset:
+  if t.wasReset:
     raise newException(IOError, "navi: http/2 request did not complete")
-  if not done:
+  if not t.done:
     raise newException(IOError, h2TruncatedErr)
-  if lengthBad:
+  if t.lengthBad:
     raise newException(IOError, bodyLengthErr)
-  if not decoderComplete:
+  if not t.decoderComplete:
     raise newException(IOError, truncatedBodyErr)
 
 template h2ReadChunk*(transport, h2, sid, capped: typed): string =
@@ -210,8 +226,9 @@ template h2ReadChunk*(transport, h2, sid, capped: typed): string =
         let lengthBad = h2.streamLengthMismatch(sid)  # capture before takeResponse
         discard h2.takeResponse(sid)
         # Reached only once streamDone is true, so END_STREAM was seen (done=true).
-        raiseH2Terminal(connErr, tooLarge, unprocessed, wasReset, true, lengthBad,
-                        capped.streamComplete)
+        raiseH2Terminal(H2Terminal(connErr: connErr, tooLarge: tooLarge,
+          unprocessed: unprocessed, wasReset: wasReset, done: true,
+          lengthBad: lengthBad, decoderComplete: capped.streamComplete))
         break                                 # clean end: res ""
       let chunk = await recvSome(transport)
       if chunk.len == 0:                       # transport EOF before END_STREAM:
@@ -283,12 +300,7 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
       let toSend = h2.feed(chunk)
       if toSend.len > 0: await sendAll(transport, toSend)
       if not sink.isNil:
-        let decoded = cd.feed(h2.takeBody(sid),
-        if cd.encodingResolved: "" else: h2.respHeader(sid, "content-encoding"))
-        if decoded.len > 0:
-          {.cast(gcsafe).}:
-            {.cast(raises: [CatchableError]).}:
-              await sink(decoded)     # native body type -> moved in, no copy
+        deliverChunk(cd, sink, h2.takeBody(sid), h2.respHeader(sid, "content-encoding"))
     let wasReset = h2.streamReset(sid)
     let tooLarge = h2.streamTooLarge(sid)
     let unprocessed = h2.streamUnprocessed(sid)
@@ -298,8 +310,9 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
     var r = toResponse(h2.takeResponse(sid))
     # `r.status == 0` (gone away before a response) is treated as a reset here; on the
     # buffered path the decoder-complete check only applies when streaming to a sink.
-    raiseH2Terminal(connErr, tooLarge, unprocessed, wasReset or r.status == 0, done,
-                    lengthBad, sink.isNil or cd.streamComplete)
+    raiseH2Terminal(H2Terminal(connErr: connErr, tooLarge: tooLarge,
+      unprocessed: unprocessed, wasReset: wasReset or r.status == 0, done: done,
+      lengthBad: lengthBad, decoderComplete: sink.isNil or cd.streamComplete))
     if not sink.isNil: r.body = ""  # delivered incrementally above
     r
 
@@ -336,12 +349,7 @@ template h2DrainBody*(transport, h2, sid, sink, decompress, cap: typed) =
   block:
     var cd = initCappedDecoder(decompress, cap)
     template deliver() =
-      let decoded = cd.feed(h2.takeBody(sid),
-        if cd.encodingResolved: "" else: h2.respHeader(sid, "content-encoding"))
-      if decoded.len > 0:
-        {.cast(gcsafe).}:
-          {.cast(raises: [CatchableError]).}:
-            await sink(decoded)     # native body type -> moved in, no copy
+      deliverChunk(cd, sink, h2.takeBody(sid), h2.respHeader(sid, "content-encoding"))
     deliver()                         # body read alongside the headers
     while not h2.streamDone(sid):
       let chunk = await recvSome(transport)
@@ -356,8 +364,9 @@ template h2DrainBody*(transport, h2, sid, sink, decompress, cap: typed) =
     let done = h2.streamDone(sid)      # END_STREAM seen (else the loop broke on EOF)
     let lengthBad = h2.streamLengthMismatch(sid)   # capture before takeResponse
     discard h2.takeResponse(sid)       # body delivered; drop the stream
-    raiseH2Terminal(connErr, tooLarge, unprocessed, wasReset, done, lengthBad,
-                    cd.streamComplete)
+    raiseH2Terminal(H2Terminal(connErr: connErr, tooLarge: tooLarge,
+      unprocessed: unprocessed, wasReset: wasReset, done: done,
+      lengthBad: lengthBad, decoderComplete: cd.streamComplete))
 
 template serveOnce(client, pc, rq, sink, key, gotResponse: typed): Response =
   ## Run one request/response over the pooled connection `pc` -- reused or freshly
@@ -506,7 +515,7 @@ template followRedirects(client, startReq, resp: typed) =
     maybeDigest(client, rreq, resp, digestOrigin)
     decodeBody(resp, client.config)
     let location = resp.headers.get("location")
-    if limit > 0 and hops < limit and isRedirect(resp.status) and location.len > 0:
+    if shouldFollowRedirect(resp.status, hops, limit, location):
       # 307/308 preserve the method and body (redirect.nim). A streamed body
       # (`bodyStream`) can't be rewound after the first attempt pulled its
       # producer, so auto-following would send a truncated body. Return the
@@ -545,14 +554,12 @@ template performRequest*(client, req0: typed; cancel: CancelToken = nil): Respon
       except CatchableError as e:
         # A provably-unprocessed request (h2 REFUSED_STREAM / above GOAWAY) is
         # safe to retry even when non-idempotent.
-        let retryable = bodyReplayable and
-          (isRetryableVerb(req.verb, policy) or (e of UnprocessedError))
-        if not (attempt < policy.limit and retryable):
+        if not shouldRetryAfterError(attempt, bodyReplayable, e of UnprocessedError,
+                                     req.verb, policy):
           raise # not retryable: propagate the transport error
       if gotResp and
-         not (attempt < policy.limit and bodyReplayable and
-              isRetryableVerb(req.verb, policy) and
-              isRetryableStatus(resp.status, policy)):
+         not shouldRetryAfterResponse(attempt, resp.status, bodyReplayable,
+                                      req.verb, policy):
         break
       inc attempt
       await sleep(backoffMs(attempt, resp, policy))
