@@ -79,6 +79,22 @@ template h1SendAndReadHeaders*(transport, req, streaming: typed): H1Parser =
       raise newException(IOError, "navi: http/1.1 connection closed before response")
     parser
 
+template deliverChunk*(cd, sink, rawBody, encoding: typed) =
+  ## Feed one raw body slice through the capped decoder `cd` and `await` any
+  ## decoded output into `sink`. Shared by the h1/h2 drain loops. `encoding` is
+  ## only consulted until the decoder resolves the content-encoding. The decoded
+  ## buffer is navi's native body type (`string`), so its last use here moves it
+  ## straight into the sink (into the async env on the async backends) with no
+  ## copy; the raises cast discharges chronos's strict-raises obligation on the
+  ## portable (annotation-free) sink type, as the middleware path does.
+  mixin await
+  let decoded = cd.feed(rawBody, if cd.encodingResolved: "" else: encoding)
+  if decoded.len > 0:
+    # single-threaded client; the sink need not be gcsafe (see sendRequest).
+    {.cast(gcsafe).}:
+      {.cast(raises: [CatchableError]).}:
+        await sink(decoded)
+
 template h1DrainBody*(transport, parser, sink, keep, decompress, cap: typed) =
   ## Read and parse the response body over `transport`. When `sink` is set the body
   ## is drained per read, decoded (if `decompress`), size-capped at `cap` decoded
@@ -93,18 +109,7 @@ template h1DrainBody*(transport, parser, sink, keep, decompress, cap: typed) =
     var cd = initCappedDecoder(decompress, cap)   # lazy decoder + running size cap
     template deliver() =
       if streaming:
-        let decoded = cd.feed(parser.takeBody(),
-                              if cd.encodingResolved: "" else: parser.contentEncoding())
-        if decoded.len > 0:
-          # single-threaded client; the sink need not be gcsafe (see sendRequest).
-          # `decoded` is navi's native body type (`string`), which the sink also
-          # takes, so its last use here moves the buffer straight into the sink
-          # (into the async env on the async backends) with no copy. The raises
-          # cast discharges chronos's strict-raises obligation on the portable
-          # (annotation-free) sink type, as the middleware path does.
-          {.cast(gcsafe).}:
-            {.cast(raises: [CatchableError]).}:
-              await sink(decoded)
+        deliverChunk(cd, sink, parser.takeBody(), parser.contentEncoding())
     deliver()                               # body read alongside the headers
     while not parser.finished:
       let chunk = await recvSome(transport)
@@ -283,12 +288,7 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
       let toSend = h2.feed(chunk)
       if toSend.len > 0: await sendAll(transport, toSend)
       if not sink.isNil:
-        let decoded = cd.feed(h2.takeBody(sid),
-        if cd.encodingResolved: "" else: h2.respHeader(sid, "content-encoding"))
-        if decoded.len > 0:
-          {.cast(gcsafe).}:
-            {.cast(raises: [CatchableError]).}:
-              await sink(decoded)     # native body type -> moved in, no copy
+        deliverChunk(cd, sink, h2.takeBody(sid), h2.respHeader(sid, "content-encoding"))
     let wasReset = h2.streamReset(sid)
     let tooLarge = h2.streamTooLarge(sid)
     let unprocessed = h2.streamUnprocessed(sid)
@@ -336,12 +336,7 @@ template h2DrainBody*(transport, h2, sid, sink, decompress, cap: typed) =
   block:
     var cd = initCappedDecoder(decompress, cap)
     template deliver() =
-      let decoded = cd.feed(h2.takeBody(sid),
-        if cd.encodingResolved: "" else: h2.respHeader(sid, "content-encoding"))
-      if decoded.len > 0:
-        {.cast(gcsafe).}:
-          {.cast(raises: [CatchableError]).}:
-            await sink(decoded)     # native body type -> moved in, no copy
+      deliverChunk(cd, sink, h2.takeBody(sid), h2.respHeader(sid, "content-encoding"))
     deliver()                         # body read alongside the headers
     while not h2.streamDone(sid):
       let chunk = await recvSome(transport)
