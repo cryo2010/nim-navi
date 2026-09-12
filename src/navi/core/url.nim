@@ -38,9 +38,16 @@ proc port*(u: Url): int =
     return p
   if u.isTls: 443 else: 80
 
+proc originKey*(scheme, host: string, port: int): string =
+  ## Canonical origin key `scheme://host:port`. Scheme and host are lowercased
+  ## (both are case-insensitive per RFC 3986 3.2.2), so differently-cased URLs for
+  ## the same origin share one connection pool and one Alt-Svc cache entry. Single
+  ## source of truth for pool keys and the Alt-Svc cache.
+  scheme.toLowerAscii & "://" & host.toLowerAscii & ":" & $port
+
 proc originKey*(u: Url): string =
   ## Pool key identifying a reusable connection: scheme, host, and port.
-  (if u.isTls: "https" else: "http") & "://" & u.host & ":" & $u.port
+  originKey((if u.isTls: "https" else: "http"), u.host, u.port)
 
 proc path*(u: Url): string =
   if u.raw.path.len == 0: "/" else: u.raw.path

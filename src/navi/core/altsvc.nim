@@ -8,6 +8,7 @@
 ## compile in every build (the transport that consumes it is `-d:naviHttp3`-only).
 
 import std/[tables, options, strutils, monotimes, times]
+import ./url
 
 const defaultMaxAge = 86_400   ## RFC 7838: `ma` defaults to 24h when absent.
 
@@ -87,10 +88,6 @@ proc parseAltSvc*(value: string): AltSvc =
 
 proc newAltSvcCache*(): AltSvcCache =
   AltSvcCache(entries: initTable[string, CacheEntry]())
-
-proc originKey*(scheme, host: string, port: int): string =
-  ## Canonical origin key: `scheme://host:port` (scheme/host lowercased).
-  scheme.toLowerAscii & "://" & host.toLowerAscii & ":" & $port
 
 proc record*(c: AltSvcCache, scheme, host: string, port: int, header: string) =
   ## Update the cache for an origin from its `Alt-Svc` response header. An `h3=`
