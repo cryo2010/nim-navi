@@ -427,7 +427,7 @@ template poolTransport*(client, req, sink: typed): Response =
         # process it, so only an idempotent method (or a proven-unprocessed peer
         # signal: h2 REFUSED_STREAM / above GOAWAY) may be replayed. A non-replayable
         # streamed body (`bodyStream`) is never retried (its producer cannot rewind).
-        let replayable = req.bodyStream == nil
+        let replayable = isReplayable(req)
         if not (replayable and
                 (not gotResponse or isIdempotent(req.verb) or (e of UnprocessedError))):
           raise
@@ -489,7 +489,7 @@ template maybeDigest(client, rreq, resp, digestOrigin: typed) =
   # truncated (empty) body. Return the 401 to the caller instead (mirrors the
   # retry layer's guard and the 307/308 guard in followRedirects).
   if resp.status == 401 and client.config.auth.kind == akDigest and
-     rreq.bodyStream == nil and
+     isReplayable(rreq) and
      not rreq.headers.contains("authorization") and
      originKey(rreq.url) == digestOrigin:
     let chal = bestChallenge(resp.headers.getAll("www-authenticate"))
@@ -543,7 +543,7 @@ template performRequest*(client, req0: typed; cancel: CancelToken = nil): Respon
     # advanced, so replaying it would send a truncated body. Such a request is never
     # retried -- not even a provably-unprocessed one, since the producer may already
     # have been pulled during the attempt.
-    let bodyReplayable = req.bodyStream == nil
+    let bodyReplayable = isReplayable(req)
     while true:
       throwIfCancelled(cancel)
       var gotResp = false

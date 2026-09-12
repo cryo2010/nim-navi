@@ -208,7 +208,7 @@ proc transportInner(client: Navi, req: Request, sink: BodySink): Future[Response
       # Safe to replay on a fresh connection when the request was not processed (a
       # reused connection dropped before any response) or the method is idempotent /
       # provably unprocessed; never replay a non-rewindable streamed body.
-      let replayable = req.bodyStream == nil
+      let replayable = isReplayable(req)
       if not (replayable and
               (not gotResponse or isIdempotent(req.verb) or (e of UnprocessedError))):
         raise
