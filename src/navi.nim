@@ -243,8 +243,8 @@ type
     decompress: bool
     cap: int
     cancel: CancelToken
-    drained: bool              ## body fully read; connection returned or closed
-    closed: bool               ## connection disposed without draining
+    phase: StreamPhase         ## spOpen -> spDrained (body fully read) or spClosed
+                               ## (disposed without draining); see StreamPhase
     guard: StreamGuard         ## closes the connection if the handle is dropped
                                ## before drain/close (see navi/private/streamguard)
     capped: CappedDecoder      ## decode + size-cap state carried across readChunk
@@ -258,8 +258,8 @@ proc close*(sr: StreamResponse) =
   ## Dispose a streaming handle whose body will not be fully drained: closes the
   ## underlying connection (a partially-read response cannot be safely pooled).
   ## Idempotent, and a no-op once the body has been drained.
-  if sr.drained or sr.closed: return
-  sr.closed = true
+  if sr.phase != spOpen: return
+  sr.phase = spClosed
   closeNow(sr.guard)
 
 proc status*(sr: StreamResponse): int = sr.resp.status
@@ -422,7 +422,7 @@ proc readChunk*(sr: StreamResponse): string =
   ## reraises. Call it until it returns "". This is the break-friendly pull form
   ## (a `while (let c = sr.readChunk(); c.len > 0)` loop) that the SSE reader builds
   ## on; `drain`/`each` remain the push form.
-  if sr.drained or sr.closed: return ""
+  if sr.phase != spOpen: return ""
   when defined(naviHttp3):
     if sr.qc != nil:
       # h3 body arrives raw; apply the same streamed decode + size-cap as h1, then
@@ -432,7 +432,7 @@ proc readChunk*(sr: StreamResponse): string =
         while true:
           let raw = sr.qc.readStreamBody(sr.h3sid)
           if raw.len == 0:                       # EOF
-            sr.drained = true
+            sr.phase = spDrained
             let wasReset = sr.qc.streamWasReset(sr.h3sid)
             let tooLarge = sr.qc.streamTooLarge(sr.h3sid)         # before the guard frees it
             let lengthBad = sr.qc.streamLengthMismatch(sr.h3sid)  # before the guard frees it
@@ -450,25 +450,25 @@ proc readChunk*(sr: StreamResponse): string =
           if decoded.len == 0: continue          # decoder buffered input; pull more
           return decoded
       except CatchableError:
-        if not sr.drained: sr.drained = true
+        if sr.phase == spOpen: sr.phase = spDrained
         closeNow(sr.guard)
         raise
   try:
     if sr.pc.h2 != nil:
       result = h2ReadChunk(sr.pc.transport, sr.pc.h2, sr.sid, sr.capped)
       if result.len == 0:                       # end of stream
-        sr.drained = true
+        sr.phase = spDrained
         if sr.pc.h2.canReuse and pushIdle(sr.client.pool, sr.key, sr.pc): disarm(sr.guard)
         else: closeNow(sr.guard)
     else:
       result = h1ReadChunk(sr.pc.transport, sr.parser, sr.capped)
       if result.len == 0:                       # end of body
-        sr.drained = true
+        sr.phase = spDrained
         if sr.parser.keepAliveAfter() and pushIdle(sr.client.pool, sr.key, sr.pc):
           disarm(sr.guard)
         else: closeNow(sr.guard)
   except CatchableError:
-    if not sr.drained: sr.drained = true        # consumed; the guard must not re-close
+    if sr.phase == spOpen: sr.phase = spDrained  # consumed; the guard must not re-close
     closeNow(sr.guard)
     raise
 
@@ -477,7 +477,7 @@ proc drain*(sr: StreamResponse, sink: BodySink) =
   ## then return the connection to the pool (or close it if it cannot be reused).
   ## Consumes the handle: call once. On error the connection is closed and the
   ## error re-raised. Prefer the `each` template for the common case.
-  if sr.drained or sr.closed:
+  if sr.phase != spOpen:
     raise newException(IOError, "navi: stream already drained or closed")
   throwIfCancelled(sr.cancel)
   when defined(naviHttp3):
@@ -490,17 +490,17 @@ proc drain*(sr: StreamResponse, sink: BodySink) =
   try:
     if sr.pc.h2 != nil:
       h2DrainBody(sr.pc.transport, sr.pc.h2, sr.sid, sink, sr.decompress, sr.cap)
-      sr.drained = true
+      sr.phase = spDrained
       if sr.pc.h2.canReuse and pushIdle(sr.client.pool, sr.key, sr.pc): disarm(sr.guard)
       else: closeNow(sr.guard)
     else:
       var keep = false
       h1DrainBody(sr.pc.transport, sr.parser, sink, keep, sr.decompress, sr.cap)
-      sr.drained = true
+      sr.phase = spDrained
       if keep and pushIdle(sr.client.pool, sr.key, sr.pc): disarm(sr.guard)
       else: closeNow(sr.guard)
   except CatchableError:
-    if not sr.drained: sr.drained = true   # mark consumed for the "call once" guard
+    if sr.phase == spOpen: sr.phase = spDrained  # mark consumed for the "call once" guard
     closeNow(sr.guard)
     raise
 

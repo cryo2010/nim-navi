@@ -390,8 +390,8 @@ type
     decompress: bool
     cap: int
     cancel: CancelToken
-    drained: bool              ## body fully read; connection returned/finished
-    closed: bool               ## disposed without draining
+    phase: StreamPhase         ## spOpen -> spDrained (body fully read) or spClosed
+                               ## (disposed without draining); see StreamPhase
     guard: StreamGuard         ## closes/resets if the handle is dropped before
                                ## drain/close (see navi/private/streamguard)
     capped: CappedDecoder      ## h1/h3 decode + size-cap state carried across
@@ -414,8 +414,8 @@ proc close*(sr: StreamResponse): Future[void] {.async.} =
   ## Dispose a streaming handle whose body will not be fully drained: closes the
   ## http/1.1 connection (a partially-read response cannot be pooled) or resets the
   ## h2 stream (the shared connection stays up). Idempotent; a no-op once drained.
-  if sr.drained or sr.closed: return
-  sr.closed = true
+  if sr.phase != spOpen: return
+  sr.phase = spClosed
   disarm(sr.guard)                    # we do the awaitable teardown ourselves
   case sr.kind
   of skH1: await close(sr.transport)
@@ -621,29 +621,29 @@ proc readChunk*(sr: StreamResponse): Future[string] {.async.} =
   ## on the shared connection, and the guard is disarmed; a cap breach or h2 reset
   ## closes/drops and reraises. The guard stays armed across the incremental reads,
   ## so a handle dropped before EOF is still cleaned up by it.
-  if sr.drained or sr.closed: return ""
+  if sr.phase != spOpen: return ""
   case sr.kind
   of skH2:
     try:
       result = await sr.mux.readChunk(sr.sid)
       if result.len == 0:                 # stream ended; readChunk dropped it
-        sr.drained = true
+        sr.phase = spDrained
         disarm(sr.guard)
     except CatchableError:
-      if not sr.drained: sr.drained = true
+      if sr.phase == spOpen: sr.phase = spDrained
       disarm(sr.guard)                    # readChunk dropped the stream; mux stays up
       raise
   of skH1:
     try:
       result = h1ReadChunk(sr.transport, sr.parser, sr.capped)
       if result.len == 0:                 # end of body: we own the teardown now
-        sr.drained = true
+        sr.phase = spDrained
         disarm(sr.guard)
         if not (sr.parser.keepAliveAfter() and
                 pushIdle(sr.client.pool, sr.key, PooledConn[Conn](transport: sr.transport))):
           await close(sr.transport)
     except CatchableError:
-      if not sr.drained: sr.drained = true
+      if sr.phase == spOpen: sr.phase = spDrained
       disarm(sr.guard)
       await close(sr.transport)
       raise
@@ -655,7 +655,7 @@ proc readChunk*(sr: StreamResponse): Future[string] {.async.} =
         while true:
           let raw = await sr.qc.readStreamBody(sr.h3sid)
           if raw.len == 0:                # EOF
-            sr.drained = true
+            sr.phase = spDrained
             disarm(sr.guard)
             let wasReset = sr.qc.streamWasReset(sr.h3sid)
             let tooLarge = sr.qc.streamTooLarge(sr.h3sid)          # before freeStream
@@ -674,7 +674,7 @@ proc readChunk*(sr: StreamResponse): Future[string] {.async.} =
           if decoded.len == 0: continue   # decoder buffered input; pull more
           return decoded
       except CatchableError:
-        if not sr.drained: sr.drained = true
+        if sr.phase == spOpen: sr.phase = spDrained
         disarm(sr.guard)
         sr.qc.freeStream(sr.h3sid)
         raise
@@ -686,7 +686,7 @@ proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
   ## http/1.1 connection to the pool (or close it if it cannot be reused); an h2
   ## stream just finishes on the shared connection. Consumes the handle: call once.
   ## On error the connection is closed/reset and the error re-raised. Prefer `each`.
-  if sr.drained or sr.closed:
+  if sr.phase != spOpen:
     raise newException(IOError, "navi: stream already drained or closed")
   throwIfCancelled(sr.cancel)
   disarm(sr.guard)                      # from here `drain` owns the teardown
@@ -694,19 +694,19 @@ proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
   of skH2:
     try:
       await sr.mux.drainDownload(sr.sid, sink)
-      sr.drained = true                 # drainDownload freed the stream
+      sr.phase = spDrained                 # drainDownload freed the stream
     except CatchableError:
-      sr.drained = true                 # ...on error too, so the guard won't double-free
+      sr.phase = spDrained                 # ...on error too, so the guard won't double-free
       raise
   of skH1:
     try:
       var keep = false
       h1DrainBody(sr.transport, sr.parser, sink, keep, sr.decompress, sr.cap)
-      sr.drained = true
+      sr.phase = spDrained
       if not (keep and pushIdle(sr.client.pool, sr.key, PooledConn[Conn](transport: sr.transport))):
         await close(sr.transport)
     except CatchableError:
-      if not sr.drained: sr.drained = true
+      if sr.phase == spOpen: sr.phase = spDrained
       await close(sr.transport)
       raise
   of skH3:
@@ -725,8 +725,8 @@ proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
             {.cast(raises: [CatchableError]).}:
               await sink(chunk)
       except CatchableError:
-        if not sr.drained:
-          sr.drained = true
+        if sr.phase == spOpen:
+          sr.phase = spDrained
           sr.qc.freeStream(sr.h3sid)
         raise
     else: discard
