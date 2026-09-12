@@ -125,52 +125,27 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
         resp: parser.toResponse(), client: client, key: origin,
         decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
     except CatchableError:
-      await close(pc.transport)     # pooled connection was stale; open a fresh one
+      await close(pc.transport)     # pooled connection was stale
+      # Only open a fresh connection when replay is safe (mirrors transportInner):
+      # the header read failed, so the request was not processed (the classic
+      # keep-alive race -- safe to replay any method), but a non-rewindable streamed
+      # body cannot be re-sent. Previously the streaming path replayed here
+      # unconditionally, unlike the buffered path.
+      if not isReplayable(req): raise
 
   var rq = req
-  let proxyTarget = resolveProxy(client.config, rq.url)
-  rq.absoluteForm = usesAbsoluteForm(proxyTarget, rq.url.isTls)
-  let alpn = if wantH2: @["h2", "http/1.1"] else: @[]
-
-  if wantH2:
-    let pending = newFuture[H2Mux]("navi.pendingMux")
-    client.pendingMux[origin] = pending
-    try:
-      let conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
-                               client.config.tls, proxyTarget, alpn,
-                               client.config.connectMs, client.config.readMs)
-      if conn.protocol == "h2":
-        let mux = await newH2Mux(conn, client.config.maxResponseBytes, decompress,
-                                 client.config.h2KeepAliveMs)
-        client.muxes[origin] = mux
-        client.pendingMux.del(origin)
-        pending.complete(mux)
-        let sid = await mux.sendAndReadHeaders(h2HeaderList(rq), rq.body, rq.bodyStream, h2TrailerList(rq))
-        return StreamResponse(kind: skH2, mux: mux, sid: sid,
-          resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
-          decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
-      else:
-        client.pendingMux.del(origin)
-        pending.complete(nil)
-        let parser = h1SendAndReadHeaders(conn, rq, true)
-        return StreamResponse(kind: skH1, transport: conn, parser: parser,
-          resp: parser.toResponse(), client: client, key: origin,
-          decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
-    except CatchableError as e:
-      client.pendingMux.del(origin)
-      # A failure after the branch already completed `pending` (h1 fallback via
-      # `complete(nil)`, or a post-handshake error like a rejected client cert while
-      # reading the response) must not complete the future twice (mirrors chronos).
-      if not pending.finished: pending.fail(e)
-      raise
-
-  let conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
-                           client.config.tls, proxyTarget, alpn,
-                           client.config.connectMs, client.config.readMs)
-  let parser = h1SendAndReadHeaders(conn, rq, true)
-  return StreamResponse(kind: skH1, transport: conn, parser: parser,
-    resp: parser.toResponse(), client: client, key: origin,
-    decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
+  rq.absoluteForm = usesAbsoluteForm(resolveProxy(client.config, rq.url), rq.url.isTls)
+  let (conn, mux) = await client.openFreshConn(rq, origin, wantH2)
+  if mux != nil:
+    let sid = await mux.sendAndReadHeaders(h2HeaderList(rq), rq.body, rq.bodyStream, h2TrailerList(rq))
+    return StreamResponse(kind: skH2, mux: mux, sid: sid,
+      resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
+      decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
+  else:
+    let parser = h1SendAndReadHeaders(conn, rq, true)
+    return StreamResponse(kind: skH1, transport: conn, parser: parser,
+      resp: parser.toResponse(), client: client, key: origin,
+      decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
 
 proc stream*(client: Navi, verb: HttpVerb, target: string,
              headers = initHeaders(), params: seq[(string, string)] = @[],

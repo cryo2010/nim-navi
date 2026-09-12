@@ -167,6 +167,49 @@ proc pruneDeadMuxes(client: Navi) =
     if not mux.canReuse: dead.add origin
   for origin in dead: client.muxes.del(origin)
 
+proc openFreshConn(client: Navi, rq: Request, origin: string,
+                   wantH2: bool): Future[tuple[conn: Conn, mux: H2Mux]] {.async.} =
+  ## Open a fresh connection to `rq`'s origin, coalescing concurrent cold connects
+  ## to the same new origin through one `pendingMux` future so a burst still lands on
+  ## a single h2 connection. Returns (conn, mux): a non-nil `mux` is a live, cached
+  ## shared h2 connection whose pending future has been completed (use `mux`); a nil
+  ## `mux` means the origin negotiated http/1.1 (use `conn`). Raises on connect/
+  ## handshake failure, failing the pending future so coalesced waiters observe it
+  ## too. `rq.absoluteForm` must already be set by the caller (it is what the caller
+  ## sends with). Shared by the buffered (transportInner) and streaming
+  ## (openStreamConn) routers so the coalescing dance lives in one place.
+  let proxyTarget = resolveProxy(client.config, rq.url)
+  let alpn = if wantH2: @["h2", "http/1.1"] else: @[]
+  if not wantH2:
+    let conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
+                             client.config.tls, proxyTarget, alpn,
+                             client.config.connectMs, client.config.readMs)
+    return (conn, H2Mux(nil))
+  let pending = newFuture[H2Mux]("navi.pendingMux")
+  client.pendingMux[origin] = pending
+  try:
+    let conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
+                             client.config.tls, proxyTarget, alpn,
+                             client.config.connectMs, client.config.readMs)
+    if conn.protocol == "h2":
+      let mux = await newH2Mux(conn, client.config.maxResponseBytes,
+                               client.config.wantsDecompress,
+                               client.config.h2KeepAliveMs)
+      client.muxes[origin] = mux
+      client.pendingMux.del(origin)
+      pending.complete(mux)
+      return (conn, mux)
+    else:
+      client.pendingMux.del(origin)
+      pending.complete(nil)          # this origin is http/1.1
+      return (conn, H2Mux(nil))
+  except CatchableError as e:
+    client.pendingMux.del(origin)
+    # A failure after the branch already completed `pending` (h1 fallback, or a
+    # post-handshake error) must not complete the future twice (mirrors chronos).
+    if not pending.finished: pending.fail(e)
+    raise
+
 proc transportInner(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
   ## Multiplex over a shared h2 connection when available/negotiable; otherwise
   ## pool http/1.1. Concurrent connects to the same new origin are coalesced so a
@@ -214,43 +257,14 @@ proc transportInner(client: Navi, req: Request, sink: BodySink): Future[Response
         raise
       # else fall through to a fresh connection below
 
-  # 3. Open a fresh connection.
+  # 3. Open a fresh connection (coalescing concurrent cold h2 connects).
   var rq = req
-  let proxyTarget = resolveProxy(client.config, rq.url)
-  rq.absoluteForm = usesAbsoluteForm(proxyTarget, rq.url.isTls)
-  let alpn = if wantH2: @["h2", "http/1.1"] else: @[]
-
-  if wantH2:
-    let pending = newFuture[H2Mux]("navi.pendingMux")
-    client.pendingMux[origin] = pending
-    try:
-      let conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
-                               client.config.tls, proxyTarget, alpn,
-                               client.config.connectMs, client.config.readMs)
-      if conn.protocol == "h2":
-        let mux = await newH2Mux(conn, client.config.maxResponseBytes,
-                                 client.config.wantsDecompress,
-                                 client.config.h2KeepAliveMs)
-        client.muxes[origin] = mux
-        client.pendingMux.del(origin)
-        pending.complete(mux)
-        return await client.muxRequest(mux, rq, sink)
-      else:
-        client.pendingMux.del(origin)
-        pending.complete(nil)  # this origin is http/1.1
-        return await client.h1OnConn(conn, origin, rq, sink)
-    except CatchableError as e:
-      client.pendingMux.del(origin)
-      # A failure after the branch already completed `pending` (h1 fallback via
-      # `complete(nil)`, or a post-handshake error like a rejected client cert while
-      # reading the response) must not complete the future twice (mirrors chronos).
-      if not pending.finished: pending.fail(e)
-      raise
-
-  let conn = await connect(rq.url.host, rq.url.port, rq.url.isTls,
-                           client.config.tls, proxyTarget, alpn,
-                           client.config.connectMs, client.config.readMs)
-  result = await client.h1OnConn(conn, origin, rq, sink)
+  rq.absoluteForm = usesAbsoluteForm(resolveProxy(client.config, rq.url), rq.url.isTls)
+  let (conn, mux) = await client.openFreshConn(rq, origin, wantH2)
+  if mux != nil:
+    result = await client.muxRequest(mux, rq, sink)
+  else:
+    result = await client.h1OnConn(conn, origin, rq, sink)
 
 when defined(naviHttp3):
   proc recordAltSvc(client: Navi, req: Request, resp: Response) =
