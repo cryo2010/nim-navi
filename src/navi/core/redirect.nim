@@ -5,6 +5,13 @@ import ./headers, ./url, ./request
 proc isRedirect*(status: int): bool =
   status in [301, 302, 303, 307, 308]
 
+proc dropBody(r: var Request) =
+  ## Clear the request body when a redirect rewrites the method to GET; the
+  ## trailers belong to the dropped body and go with it.
+  r.body = ""
+  r.bodyStream = nil
+  r.trailers = initHeaders()
+
 proc redirectRequest*(req: Request, status: int, location: string): Request =
   ## Build the follow-up request for a redirect response, applying the usual
   ## method rewrites and stripping Authorization when the origin changes.
@@ -22,15 +29,11 @@ proc redirectRequest*(req: Request, status: int, location: string): Request =
   of 303:
     # 303 See Other always continues with GET and no body.
     result.verb = GET
-    result.body = ""
-    result.bodyStream = nil
-    result.trailers = initHeaders()   # trailers belong to the dropped body
+    result.dropBody()
   of 301, 302:
     # A non-idempotent method degrades to GET (matching fetch/browsers).
     if req.verb notin {GET, HEAD}:
       result.verb = GET
-      result.body = ""
-      result.bodyStream = nil
-      result.trailers = initHeaders()
+      result.dropBody()
   else:
     discard # 307/308 preserve method and body
