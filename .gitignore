@@ -88,3 +88,7 @@ bench/clients/rust_client/Cargo.lock
 
 # checkmate test-runner cache (disposable)
 .checkmate/
+
+# Claude Code runtime lock (machine-local session state, not project config)
+.claude/scheduled_tasks.lock
+.claude/*.lock
