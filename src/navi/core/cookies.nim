@@ -86,9 +86,7 @@ proc parseSetCookie(line, host, reqPath: string, secureContext: bool): (Cookie, 
   var i = 0
   for part in line.split(';'):
     let p = part.strip
-    let eq = p.find('=')
-    let key = (if eq < 0: p else: p[0 ..< eq])
-    let val = (if eq < 0: "" else: p[eq + 1 .. ^1])
+    let (key, val, _) = splitParam(p)
     if i == 0:
       c.name = key.strip
       c.value = val.strip
