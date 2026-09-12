@@ -10,7 +10,7 @@
 ## async: the per-connection cost drops to roughly the sync backend's.
 
 import std/[asyncdispatch, nativesockets, strutils, monotimes, times, base64]
-import ./api, ./openssl_ctx, ./happyeyeballs
+import ./api, ./openssl_ctx, ./happyeyeballs, ./tls_store, ./tunnel
 import ../core/response  # for navi's TimeoutError
 import ../core/socks
 when defined(ssl):
@@ -20,7 +20,7 @@ when defined(posix):
   proc cConnect(fd: SocketHandle, sa: ptr SockAddr, sl: SockLen): cint
     {.importc: "connect", header: "<sys/socket.h>".}
 
-export api, asyncdispatch
+export api, asyncdispatch, tls_store
 
 type
   BodySink* = proc(data: string): Future[void] {.closure.}
@@ -84,13 +84,6 @@ proc waitWrite(fd: AsyncFD): owned(Future[void]) =
 # --- TLS over the owned fd (ssl only) ----------------------------------
 
 when defined(ssl):
-  proc resumeSlot(cfg: TlsConfig, origin: string): SessionSlot =
-    ## When resumption is on and the client has a session cache, return a slot keyed
-    ## by `origin`; otherwise nil. The context is armed once in `obtainContext`, so
-    ## this only mints the per-connection link.
-    if cfg.wantsResume and not cfg.sessionCache.isNil:
-      result = newSlot(cast[TlsSessionCache](cfg.sessionCache), origin)
-
   proc driveHandshake(ssl: SslPtr, fd: AsyncFD, host: string) {.async.} =
     ## Non-blocking SSL_connect, awaiting readiness only when OpenSSL asks.
     while true:
@@ -135,20 +128,10 @@ when defined(ssl):
       of SSL_ERROR_WANT_WRITE: await waitWrite(c.fd)
       else: result.setLen(0); return   # ZERO_RETURN / reset -> EOF
 
-proc proxyConnect(fd: AsyncFD, host: string, port: int, user, pass: string) {.async.} =
-  ## Establish a CONNECT tunnel to `host:port` through an already-connected HTTP
-  ## proxy, sending Proxy-Authorization when credentials are supplied.
-  let target = host & ":" & $port
-  var req = "CONNECT " & target & " HTTP/1.1\r\nHost: " & target & "\r\n"
-  if user.len > 0 or pass.len > 0:
-    req.add("Proxy-Authorization: Basic " & encode(user & ":" & pass) & "\r\n")
-  req.add("\r\n")
-  await send(fd, req)
-  let resp = await recv(fd, 1024)
-  if not resp.startsWith("HTTP/1.1 200") and not resp.startsWith("HTTP/1.0 200"):
-    raise newException(ValueError, "navi: proxy CONNECT failed: " & resp.splitLines()[0])
+# Byte-I/O primitives the shared tunnel drivers (backend/tunnel) mix in.
+proc sockWrite(fd: AsyncFD, s: string): Future[void] = send(fd, s)
 
-proc recvExactly(fd: AsyncFD, n: int): Future[string] {.async.} =
+proc sockReadExactly(fd: AsyncFD, n: int): Future[string] {.async.} =
   ## Read exactly `n` bytes or raise; SOCKS5 replies are fixed-size frames.
   result = ""
   while result.len < n:
@@ -156,28 +139,14 @@ proc recvExactly(fd: AsyncFD, n: int): Future[string] {.async.} =
     if chunk.len == 0: raise newException(IOError, "navi: SOCKS5 proxy closed the connection")
     result.add chunk
 
+proc sockReadSome(fd: AsyncFD, max: int): Future[string] = recv(fd, max)
+  ## One read of up to `max` bytes (the proxy CONNECT reply fits in one recv).
+
+proc proxyConnect(fd: AsyncFD, host: string, port: int, user, pass: string) {.async.} =
+  proxyConnectDriver(fd, host, port, user, pass)
+
 proc socksConnect(fd: AsyncFD, host: string, port: int, user, pass: string) {.async.} =
-  ## SOCKS5 handshake to tunnel to `host:port` (RFC 1928 + RFC 1929). The target is
-  ## sent as a domain name so the proxy resolves DNS.
-  let hasAuth = user.len > 0 or pass.len > 0
-  await send(fd, greeting(hasAuth))
-  case selectedMethod(await recvExactly(fd, 2))
-  of methodUserPass:
-    if not hasAuth:
-      raise newException(ValueError, "navi: SOCKS5 proxy requires authentication")
-    await send(fd, authRequest(user, pass))
-    checkAuthReply(await recvExactly(fd, 2))
-  of methodNoAuth: discard
-  else: raise newException(ValueError, "navi: SOCKS5 proxy rejected the offered auth methods")
-  await send(fd, connectRequest(host, port))
-  let header = await recvExactly(fd, 4)
-  let status = replyStatus(header)
-  if status != 0: raiseReply(status)
-  let tail = boundTailLen(int(uint8(header[3])))
-  if tail >= 0: discard await recvExactly(fd, tail)
-  else:
-    let dlen = int(uint8((await recvExactly(fd, 1))[0]))
-    discard await recvExactly(fd, dlen + 2)
+  socksConnectDriver(fd, host, port, user, pass)
 
 proc unixConnect(path: string): Future[AsyncFD] {.async.} =
   ## Connect a non-blocking AF_UNIX/SOCK_STREAM socket to `path`, awaiting
@@ -455,34 +424,3 @@ proc close*(c: Conn): Future[void] {.async.} =
   freeConn(c)
 
 proc sleep*(ms: int): Future[void] = sleepAsync(ms)
-
-proc newTlsStore*(cfg: TlsConfig): RootRef =
-  ## The per-client TLS session cache, or nil when resumption is off or
-  ## unavailable (non-`-d:ssl` build). The entry puts it on `config.tls.sessionCache`.
-  when defined(ssl):
-    if cfg.wantsResume: result = newTlsSessionCache()
-  else:
-    discard cfg
-
-proc closeTlsStore*(store: RootRef) =
-  ## Free the sessions held by a `newTlsStore` cache. The entry calls this in `close`.
-  when defined(ssl):
-    if not store.isNil: close(cast[TlsSessionCache](store))
-  else:
-    discard store
-
-proc newTlsCtxStore*(cfg: TlsConfig): RootRef =
-  ## The per-client shared TLS-context store (empty until the first TLS connect),
-  ## or nil on a non-`-d:ssl` build. The entry puts it on `config.tls.contextStore`.
-  when defined(ssl):
-    result = newTlsContextStore()
-  else:
-    discard cfg
-
-proc closeTlsCtxStore*(store: RootRef) =
-  ## Free the shared contexts held by a `newTlsCtxStore`. The entry calls this in
-  ## `close`, after `closeIdle` has shut the pooled connections.
-  when defined(ssl):
-    if not store.isNil: close(cast[TlsContextStore](store))
-  else:
-    discard store

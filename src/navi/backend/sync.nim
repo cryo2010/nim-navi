@@ -8,7 +8,7 @@
 ## `await`-shaped body compiles to straight-line blocking code.
 
 import std/[os, strutils, nativesockets, monotimes, times, base64]
-import ./api, ./openssl_ctx, ./happyeyeballs
+import ./api, ./openssl_ctx, ./happyeyeballs, ./tls_store, ./tunnel
 import ../core/response  # for navi's TimeoutError
 import ../core/socks
 when defined(ssl):
@@ -16,7 +16,7 @@ when defined(ssl):
 when defined(posix):
   from std/posix import Sockaddr_un, TSa_Family
 
-export api
+export api, tls_store
 
 type
   BodySink* = proc(data: string) {.closure, raises: [CatchableError].}
@@ -133,22 +133,12 @@ proc sendRaw(fd: SocketHandle, data: string) =
     if n <= 0: raise newException(IOError, "navi: socket write failed")
     off += n
 
-proc proxyConnect(fd: SocketHandle, host: string, port: int, user, pass: string) =
-  ## Establish a CONNECT tunnel to `host:port` through an already-connected HTTP
-  ## proxy, sending Proxy-Authorization when credentials are supplied.
-  let target = host & ":" & $port
-  var req = "CONNECT " & target & " HTTP/1.1\r\nHost: " & target & "\r\n"
-  if user.len > 0 or pass.len > 0:
-    req.add("Proxy-Authorization: Basic " & encode(user & ":" & pass) & "\r\n")
-  req.add("\r\n")
-  sendRaw(fd, req)
-  var resp = newString(1024)
-  let n = sysRecv(fd, addr resp[0], resp.len)
-  resp.setLen(max(n, 0))
-  if not resp.startsWith("HTTP/1.1 200") and not resp.startsWith("HTTP/1.0 200"):
-    raise newException(ValueError, "navi: proxy CONNECT failed: " & resp.splitLines()[0])
+# Byte-I/O primitives the shared tunnel drivers (backend/tunnel) mix in. `await`
+# is the identity template above, so the drivers' `await sockWrite(...)` etc run
+# these synchronously.
+proc sockWrite(fd: SocketHandle, s: string) = sendRaw(fd, s)
 
-proc recvExactly(fd: SocketHandle, n: int): string =
+proc sockReadExactly(fd: SocketHandle, n: int): string =
   ## Read exactly `n` bytes or raise; SOCKS5 replies are fixed-size frames.
   result = newString(n)
   var off = 0
@@ -157,29 +147,17 @@ proc recvExactly(fd: SocketHandle, n: int): string =
     if r <= 0: raise newException(IOError, "navi: SOCKS5 proxy closed the connection")
     off += r
 
+proc sockReadSome(fd: SocketHandle, max: int): string =
+  ## One read of up to `max` bytes (the proxy CONNECT reply fits in one recv).
+  result = newString(max)
+  let n = sysRecv(fd, addr result[0], max)
+  result.setLen(system.max(n, 0))
+
+proc proxyConnect(fd: SocketHandle, host: string, port: int, user, pass: string) =
+  proxyConnectDriver(fd, host, port, user, pass)
+
 proc socksConnect(fd: SocketHandle, host: string, port: int, user, pass: string) =
-  ## Perform the SOCKS5 handshake to tunnel to `host:port` through a connected
-  ## proxy (RFC 1928 + RFC 1929 user/pass). The target is sent as a domain name so
-  ## the proxy resolves DNS.
-  let hasAuth = user.len > 0 or pass.len > 0
-  sendRaw(fd, greeting(hasAuth))
-  case selectedMethod(recvExactly(fd, 2))
-  of methodUserPass:
-    if not hasAuth:
-      raise newException(ValueError, "navi: SOCKS5 proxy requires authentication")
-    sendRaw(fd, authRequest(user, pass))
-    checkAuthReply(recvExactly(fd, 2))
-  of methodNoAuth: discard
-  else: raise newException(ValueError, "navi: SOCKS5 proxy rejected the offered auth methods")
-  sendRaw(fd, connectRequest(host, port))
-  let header = recvExactly(fd, 4)
-  let status = replyStatus(header)
-  if status != 0: raiseReply(status)
-  let tail = boundTailLen(int(uint8(header[3])))   # discard BND.ADDR + BND.PORT
-  if tail >= 0: discard recvExactly(fd, tail)
-  else:
-    let dlen = int(uint8(recvExactly(fd, 1)[0]))
-    discard recvExactly(fd, dlen + 2)
+  socksConnectDriver(fd, host, port, user, pass)
 
 # --- Happy Eyeballs (RFC 8305) -----------------------------------------
 # `heAttemptDelayMs`, `interleaveFamilies`, and `resolveAddrs` are shared with the
@@ -294,13 +272,6 @@ proc happyConnect(ips: seq[string], port: int,
   raise newException(IOError, "navi: could not connect: " & lastErr)
 
 when defined(ssl):
-  proc resumeSlot(cfg: TlsConfig, origin: string): SessionSlot =
-    ## When resumption is on and the client has a session cache, return a slot keyed
-    ## by `origin`; otherwise nil. The context itself is armed once in
-    ## `obtainContext`, so this only mints the per-connection link.
-    if cfg.wantsResume and not cfg.sessionCache.isNil:
-      result = newSlot(cast[TlsSessionCache](cfg.sessionCache), origin)
-
   proc connectAcross*(ctx: SslContext, ips: openArray[string], sni: string,
                       port: int, verify: bool, slot: SessionSlot = nil,
                       connectMs = 0): Conn =
@@ -490,34 +461,3 @@ proc close*(c: Conn) =
     # unshared one (bare TlsConfig, e.g. interop tests) is destroyed per connection.
     if c.ownsCtx and not c.ctx.isNil: c.ctx.destroyContext()
 
-proc newTlsStore*(cfg: TlsConfig): RootRef =
-  ## The per-client TLS session cache for this backend, or nil when resumption is
-  ## off or unavailable (a non-`-d:ssl` build). Entries put it on
-  ## `config.tls.sessionCache` in `newNavi`.
-  when defined(ssl):
-    if cfg.wantsResume: result = newTlsSessionCache()
-  else:
-    discard cfg
-
-proc closeTlsStore*(store: RootRef) =
-  ## Free the sessions held by a `newTlsStore` cache. Entries call this in `close`.
-  when defined(ssl):
-    if not store.isNil: close(cast[TlsSessionCache](store))
-  else:
-    discard store
-
-proc newTlsCtxStore*(cfg: TlsConfig): RootRef =
-  ## The per-client shared TLS-context store (empty until the first TLS connect),
-  ## or nil on a non-`-d:ssl` build. Entries put it on `config.tls.contextStore`.
-  when defined(ssl):
-    result = newTlsContextStore()
-  else:
-    discard cfg
-
-proc closeTlsCtxStore*(store: RootRef) =
-  ## Free the shared contexts held by a `newTlsCtxStore`. Entries call this in
-  ## `close`, after `closeIdle` has shut the pooled connections.
-  when defined(ssl):
-    if not store.isNil: close(cast[TlsContextStore](store))
-  else:
-    discard store
