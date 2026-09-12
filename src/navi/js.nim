@@ -213,8 +213,8 @@ type
     controller: JsObject       ## AbortController for the body stream
     cancel: CancelToken
     cap: int
-    drained: bool              ## body fully read
-    closed: bool               ## body aborted without draining
+    phase: StreamPhase         ## spOpen -> spDrained (body fully read) or spClosed
+                               ## (body aborted without draining); see StreamPhase
     reader: JsObject           ## body ReadableStream reader (lazy, for readChunk)
     readerReady: bool
     seen: int
@@ -229,8 +229,8 @@ proc close*(sr: StreamResponse): Future[void] {.async.} =
   ## Dispose a streaming handle whose body will not be drained: aborts the fetch
   ## body stream so the runtime frees the connection. Idempotent; a no-op once the
   ## body has been drained. Async for parity with the native backends' `close`.
-  if sr.drained or sr.closed: return
-  sr.closed = true
+  if sr.phase != spOpen: return
+  sr.phase = spClosed
   if not sr.cancel.isNil: sr.cancel.disarmHook()
   abortBody(sr.controller)
 
@@ -266,18 +266,18 @@ proc readChunk*(sr: StreamResponse): Future[seq[byte]] {.async.} =
   ## js the runtime owns connections, so there is no pool return; drop or `close` an
   ## unfinished handle to free it. Chunks are `seq[byte]` (from a JS Uint8Array), as
   ## with the js sink.
-  if sr.drained or sr.closed: return newSeq[byte](0)
+  if sr.phase != spOpen: return newSeq[byte](0)
   if not sr.readerReady:
     sr.reader = bodyReader(sr.res)
     sr.readerReady = true
   var bytes = await readOne(sr.reader)
   if bytes.len == 0:                      # end of body
-    sr.drained = true
+    sr.phase = spDrained
     if not sr.cancel.isNil: sr.cancel.disarmHook()
     return bytes
   sr.seen += bytes.len
   if sr.cap > 0 and sr.seen > sr.cap:
-    sr.drained = true
+    sr.phase = spDrained
     abortBody(sr.controller)
     if not sr.cancel.isNil: sr.cancel.disarmHook()
     raise newException(ResponseTooLargeError,
@@ -289,14 +289,14 @@ proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
   ## per chunk so a slow sink paces reads from the stream. Consumes the handle:
   ## call once. On error the body is left aborted and the error re-raised. Prefer
   ## the `each` template for the common case.
-  if sr.drained or sr.closed:
+  if sr.phase != spOpen:
     raise newException(IOError, "navi: stream already drained or closed")
   throwIfCancelled(sr.cancel)
   try:
     await drainToSink(sr.res, sink, sr.cap)
-    sr.drained = true
+    sr.phase = spDrained
   except CatchableError:
-    sr.drained = true
+    sr.phase = spDrained
     raise
   finally:
     if not sr.cancel.isNil: sr.cancel.disarmHook()

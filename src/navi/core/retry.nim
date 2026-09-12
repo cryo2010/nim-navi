@@ -13,6 +13,16 @@ proc isIdempotent*(verb: HttpVerb): bool =
   ## PATCH are excluded, so they are never silently replayed.
   verb in {GET, HEAD, PUT, DELETE, OPTIONS}
 
+proc isReplayable*(req: Request): bool =
+  ## Whether a request may be re-sent on a fresh connection (stale-connection
+  ## retry), a redirect hop, or a digest one-shot. A pull-based body producer
+  ## (`bodyStream`) cannot rewind: it may already have been partially drained on
+  ## the first attempt, so replaying it would send a truncated body. Everything
+  ## else (a buffered `body`, or no body) is safe to replay. This is orthogonal to
+  ## `isIdempotent`, which governs *whether* a processed request should be retried;
+  ## a non-replayable body is never retried regardless of method.
+  req.bodyStream == nil
+
 proc isRetryableStatus*(status: int, policy: RetryPolicy): bool =
   ## Whether `status` should trigger a retry under `policy`.
   status in policy.statuses

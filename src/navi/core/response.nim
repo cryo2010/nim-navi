@@ -5,6 +5,15 @@ import ./headers, ./charset
 export json
 
 type
+  StreamPhase* = enum
+    ## Lifecycle of a pull-based streaming-download handle (`StreamResponse`), one
+    ## field in place of the former correlated `drained`/`closed` bool pair. The two
+    ## terminal states are mutually exclusive, so a single enum makes that invariant
+    ## explicit and collapses every `if drained or closed` guard to `phase != spOpen`.
+    spOpen                     ## body not yet fully read and not disposed
+    spDrained                  ## body fully read; connection returned/finished
+    spClosed                   ## disposed without draining (early close)
+
   Response* = object
     status*: int
     reason*: string

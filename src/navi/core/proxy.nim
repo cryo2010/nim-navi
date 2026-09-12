@@ -40,7 +40,7 @@ proc resolveProxy*(opts: NaviConfigBase, url: Url): ProxyTarget =
   let scheme = u.raw.scheme.toLowerAscii
   let socks = scheme == "socks5" or scheme == "socks5h" or scheme == "socks"
   let port =
-    if u.raw.port.len > 0: parseInt(u.raw.port)
+    if u.raw.port.len > 0: u.port   # validated + range-checked, clear error on garbage
     elif socks: 1080
     else: 80
   ProxyTarget(kind: if socks: pkSocks5 else: pkHttp,

@@ -94,6 +94,28 @@ proc releaseSlot(mux: H2Mux) =
       s.complete()
       break
 
+proc resetError(mux: H2Mux, sid: uint32): ref CatchableError {.gcsafe, raises: [].} =
+  ## The exception a RST_STREAM maps to, classified from the recorded stream flags:
+  ## oversize -> ResponseTooLargeError, provably-unprocessed -> UnprocessedError
+  ## (retryable), else a generic reset. Read the flags before `takeResponse` clears
+  ## them. Shared by every reset path (reader dispatch, header-wait, body read).
+  if mux.h2.streamTooLarge(sid):
+    newException(ResponseTooLargeError, "navi: response exceeded maxResponseBytes")
+  elif mux.h2.streamUnprocessed(sid):
+    newException(UnprocessedError, "navi: http/2 request not processed")
+  else:
+    newException(IOError, "navi: http/2 stream reset")
+
+proc detachSink(mux: H2Mux, sid: uint32) =
+  ## Drop a sink stream that failed while its response headers were still awaited
+  ## (connection closed, stream reset, or gone-away-unprocessed): remove its
+  ## bookkeeping and drop the stream via `takeResponse` -- no RST, since it is
+  ## already dead or the peer has gone away -- and release its concurrency slot.
+  mux.sinkStreams.excl sid
+  mux.recvq.del(sid)
+  discard mux.h2.takeResponse(sid)
+  mux.releaseSlot()
+
 proc dispatch(mux: H2Mux) =
   ## Resolve any buffered streams that finished after the latest feed. Streaming
   ## (`sink`) streams are not in `waiters`; their own drain coroutine handles them.
@@ -111,18 +133,11 @@ proc dispatch(mux: H2Mux) =
       mux.reapStream(sid)
       continue
     if mux.h2.streamReset(sid):
-      let tooLarge = mux.h2.streamTooLarge(sid)
-      let unprocessed = mux.h2.streamUnprocessed(sid)
+      let err = mux.resetError(sid)          # classify before takeResponse clears flags
       discard mux.h2.takeResponse(sid)
       mux.waiters.del(sid)
       mux.releaseSlot()
-      if tooLarge:
-        fut.fail(newException(ResponseTooLargeError,
-          "navi: response exceeded maxResponseBytes"))
-      elif unprocessed:
-        fut.fail(newException(UnprocessedError, "navi: http/2 request not processed"))
-      else:
-        fut.fail(newException(IOError, "navi: http/2 stream reset"))
+      fut.fail(err)
     elif mux.h2.streamEnded(sid):
       let lengthBad = mux.h2.streamLengthMismatch(sid)   # before takeResponse drops it
       let resp = mux.h2.takeResponse(sid)
@@ -321,13 +336,7 @@ proc readChunk*(mux: H2Mux, sid: uint32): Future[string] {.async.} =
         # exit instead of re-parking on a future no wakeup can reach (issue #267).
         raise newException(IOError, "navi: http/2 stream closed")
       if mux.h2.streamReset(sid):
-        if mux.h2.streamTooLarge(sid):
-          raise newException(ResponseTooLargeError,
-            "navi: response exceeded maxResponseBytes")
-        elif mux.h2.streamUnprocessed(sid):
-          raise newException(UnprocessedError, "navi: http/2 request not processed")
-        else:
-          raise newException(IOError, "navi: http/2 stream reset")
+        raise mux.resetError(sid)     # the except below drops the stream
       if mux.recvq.hasKey(sid) and mux.recvq[sid].len > 0:
         var raw = mux.recvq[sid].popFirst()
         let rawLen = raw.len   # window is acked by raw (wire) bytes, captured before the move
@@ -437,34 +446,19 @@ proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: strin
   # await) cannot slip a wake in between: no lost wakeup.
   while true:
     if not mux.alive:
-      mux.sinkStreams.excl sid
-      mux.recvq.del(sid)
-      discard mux.h2.takeResponse(sid)
-      mux.releaseSlot()
+      mux.detachSink(sid)
       raise newException(IOError, "navi: http/2 connection closed")
     if mux.h2.streamReset(sid):
-      let tooLarge = mux.h2.streamTooLarge(sid)
-      let unprocessed = mux.h2.streamUnprocessed(sid)
-      mux.sinkStreams.excl sid
-      mux.recvq.del(sid)
-      discard mux.h2.takeResponse(sid)
-      mux.releaseSlot()
-      if tooLarge:
-        raise newException(ResponseTooLargeError, "navi: response exceeded maxResponseBytes")
-      elif unprocessed:
-        raise newException(UnprocessedError, "navi: http/2 request not processed")
-      else:
-        raise newException(IOError, "navi: http/2 stream reset")
+      let err = mux.resetError(sid)          # classify before detachSink clears flags
+      mux.detachSink(sid)
+      raise err
     if mux.h2.headersReady(sid): break
     if mux.h2.streamEnded(sid): break        # headers-only response (no body)
     if mux.h2.goneAway and mux.h2.streamUnprocessed(sid):
       # Above last-stream-id: not processed, retryable. At or below it, fall through
       # and keep waiting for headers -- the peer may still deliver them, and a real
       # close raises "connection closed" via the `not mux.alive` check above.
-      mux.sinkStreams.excl sid
-      mux.recvq.del(sid)
-      discard mux.h2.takeResponse(sid)
-      mux.releaseSlot()
+      mux.detachSink(sid)
       raise newException(UnprocessedError, "navi: http/2 request not processed")
     let ready = newFuture[void]("h2mux.recvhdr")
     mux.recvReady[sid] = ready

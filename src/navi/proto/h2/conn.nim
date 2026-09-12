@@ -357,6 +357,164 @@ proc unpad(c: H2Conn, f: Frame, frag: var string, outbuf: var string): bool =
   frag = f.payload[1 ..< f.payload.len - padLen]
   true
 
+proc handleSettings(c: H2Conn, f: Frame, outbuf: var string) =
+  ## RFC 9113 6.5: apply the peer's SETTINGS (or process an ACK). Rejects a
+  ## non-zero stream, a bad length, and out-of-range values; adjusts every open
+  ## stream's send window on an INITIAL_WINDOW_SIZE change and ACKs.
+  if f.streamId != 0:                          # RFC 9113 6.5: SETTINGS is connection-level
+    c.connFail(errProtocolError, "SETTINGS on a non-zero stream", outbuf); return
+  if (f.flags and flagAck) != 0:
+    if f.payload.len != 0:                     # RFC 9113 6.5: an ACK carries no payload
+      c.connFail(errFrameSizeError, "SETTINGS ACK with a payload", outbuf)
+    return
+  if f.payload.len mod 6 != 0:                 # RFC 9113 6.5: length is a multiple of 6
+    c.connFail(errFrameSizeError, "SETTINGS length not a multiple of 6", outbuf); return
+  c.sawSettings = true                       # the peer's initial settings are in
+  for (id, value) in parseSettings(f.payload):
+    if id == settingsMaxFrameSize:
+      if value < 16384'u32 or value > 16777215'u32:   # RFC 9113 6.5.2: [2^14, 2^24-1]
+        c.connFail(errProtocolError, "SETTINGS_MAX_FRAME_SIZE out of range", outbuf)
+        return
+      c.maxFrameSize = int(value)
+    elif id == settingsEnablePush:
+      if value > 1'u32:                               # RFC 9113 6.5.2: must be 0 or 1
+        c.connFail(errProtocolError, "SETTINGS_ENABLE_PUSH must be 0 or 1", outbuf)
+        return
+    elif id == settingsMaxConcurrentStreams:
+      c.maxConcurrent = int(value)
+    elif id == settingsEnableConnectProtocol:
+      c.peerConnectProtocol = value == 1'u32   # RFC 8441: 1 enables Extended CONNECT
+    elif id == settingsInitialWindowSize:
+      # A value above 2^31-1 is a FLOW_CONTROL_ERROR (RFC 9113 6.5.2); reject
+      # it before the delta arithmetic can corrupt every stream's send window.
+      if value > 0x7fffffff'u32:
+        c.connFail(errFlowControlError, "SETTINGS_INITIAL_WINDOW_SIZE too large", outbuf)
+        return
+      # Adjust every open stream's send window by the delta (RFC 9113 6.9.2),
+      # then release any body the new room allows. A delta that pushes any stream
+      # window past 2^31-1 is a FLOW_CONTROL_ERROR (RFC 9113 6.9.2 MUST) -- the
+      # WINDOW_UPDATE path bounds this too, but the delta path did not.
+      let delta = int(value) - c.peerInitialWindow
+      c.peerInitialWindow = int(value)
+      for sid, s in c.streams:
+        if s.sendWindow.int64 + delta.int64 > 0x7fffffff'i64:
+          c.connFail(errFlowControlError,
+            "SETTINGS_INITIAL_WINDOW_SIZE delta overflows a stream send window", outbuf)
+          return
+        s.sendWindow += delta
+        c.flushSend(sid, s, outbuf)
+  outbuf.add encodeSettingsAck()
+
+proc handleData(c: H2Conn, f: Frame, outbuf: var string) =
+  ## RFC 9113 6.1: accept DATA on a live stream (appending to the body, enforcing
+  ## the size cap and per-stream/connection flow-control windows) or account for
+  ## and discard it on a reset/ended/unknown stream so the windows stay in sync.
+  if f.streamId == 0:                          # RFC 9113 6.1: DATA is never on stream 0
+    c.connFail(errProtocolError, "DATA on stream 0", outbuf); return
+  # Every DATA payload -- pad length byte and padding included (RFC 9113 6.9.1)
+  # -- counts against the connection flow-control window, even on a stream we
+  # have reset or never opened. Skipping that leaks the window and eventually
+  # stalls a long-lived pooled/mux connection. Debit the window we granted and
+  # fail the connection if the peer overran it (a peer that ignores flow control).
+  c.connRecvWindow -= f.payload.len
+  if c.connRecvWindow < 0:
+    c.connFail(errFlowControlError, "connection flow-control window exceeded", outbuf)
+    return
+  let s = c.streams.getOrDefault(f.streamId)
+  if s != nil and s.ended and not s.reset:
+    # DATA after END_STREAM: STREAM_CLOSED (RFC 9113 5.1). The response already
+    # completed, so drop the stray bytes -- appending would grow memory without
+    # bound when maxBodyBytes==0, or corrupt the delivered body when the extra DATA
+    # rides the same feed batch -- and RST the stream; keep the conn window in sync.
+    outbuf.add encodeRstStream(f.streamId, errStreamClosed)
+    if f.payload.len > 0: c.replenishConn(f.payload.len, outbuf)
+  elif s != nil and not s.reset:
+    s.recvWindow -= f.payload.len
+    if s.recvWindow < 0:
+      # Peer sent more than the per-stream receive window we advertised: a stream
+      # FLOW_CONTROL_ERROR (RFC 9113 6.9.1). RST it; the connection survives (its
+      # window was already debited and validated above).
+      outbuf.add encodeRstStream(f.streamId, errFlowControlError)
+      s.reset = true; s.ended = true
+    else:
+      # Unpadded is the common case: append the frame payload straight into the body
+      # with no intermediate copy. Only a padded frame needs a stripped buffer (via
+      # `unpad`, which slices the content out).
+      let padded = (f.flags and flagPadded) != 0
+      var contentLen: int
+      if padded:
+        var data = f.payload
+        if not c.unpad(f, data, outbuf): return
+        contentLen = data.len
+        s.resp.body.add data
+      else:
+        contentLen = f.payload.len
+        s.resp.body.add f.payload
+      s.bodyTotal += contentLen
+      if c.maxBodyBytes > 0 and s.bodyTotal > c.maxBodyBytes:  # over the size cap: RST
+        outbuf.add encodeRstStream(f.streamId, errCancel)
+        s.reset = true; s.ended = true; s.tooLarge = true
+        c.replenishConn(f.payload.len, outbuf)   # still owe the connection window
+      else:
+        if f.payload.len > 0:
+          if s.sinkMode:
+            # Hold the stream window for the BODY bytes until the sink consumes
+            # them (via ackRecv); still replenish the shared connection window so
+            # other streams don't stall. The padding overhead (pad length byte +
+            # padding) is debited from the stream window too (RFC 9113 6.9.1) but
+            # is never delivered to the sink, so ackRecv would never return it --
+            # return it to the stream window now, or the window leaks (1 + padLen)
+            # per padded frame and the download eventually stalls at window 0.
+            let padOverhead = f.payload.len - contentLen
+            if padOverhead > 0: c.replenishStream(f.streamId, s, padOverhead, outbuf)
+            c.replenishConn(f.payload.len, outbuf)
+          else:
+            c.replenishRecv(f.streamId, s, f.payload.len, outbuf)
+        if (f.flags and flagEndStream) != 0: s.ended = true
+  elif f.payload.len > 0:
+    c.replenishConn(f.payload.len, outbuf)     # reset/unknown stream: keep the conn window in sync
+
+proc handleWindowUpdate(c: H2Conn, f: Frame, outbuf: var string) =
+  ## RFC 9113 6.9: grow the connection or a stream's send window (rejecting a bad
+  ## length, a zero increment, and an overflow past 2^31-1) and release any queued
+  ## body the new room allows.
+  if f.payload.len != 4:                       # RFC 9113 6.9: exactly 4 octets
+    c.connFail(errFrameSizeError, "WINDOW_UPDATE length not 4", outbuf)
+    return
+  let inc = int(readU32(f.payload, 0) and 0x7fffffff'u32)
+  if inc == 0:                                 # RFC 9113 6.9: a 0 increment is illegal --
+    if f.streamId == 0:                        # connection error, or a stream error (RST)
+      c.connFail(errProtocolError, "WINDOW_UPDATE increment 0 on the connection", outbuf)
+    else:
+      let s = c.streams.getOrDefault(f.streamId)
+      if s != nil:
+        outbuf.add encodeRstStream(f.streamId, errProtocolError)   # live stream: RST it
+        s.reset = true; s.ended = true
+      elif f.streamId mod 2 == 0'u32 or f.streamId >= c.nextId:
+        # Idle stream: RFC 9113 5.1/6.4 forbid RST_STREAM on an idle stream, so a bad
+        # WINDOW_UPDATE here is a connection PROTOCOL_ERROR, not a stream RST.
+        c.connFail(errProtocolError, "WINDOW_UPDATE(0) on an idle stream", outbuf)
+      # else a closed stream we have already forgotten: ignore
+    return
+  if f.streamId == 0:                        # connection-level: release all streams
+    # A window that would exceed 2^31-1 is a FLOW_CONTROL_ERROR (RFC 9113 6.9.1);
+    # rejecting it also prevents `connSendWindow` from overflowing to a negative.
+    if c.connSendWindow.int64 + inc.int64 > 0x7fffffff'i64:
+      c.connFail(errFlowControlError, "connection send window overflow", outbuf)
+      return
+    c.connSendWindow += inc
+    for sid, s in c.streams:
+      c.flushSend(sid, s, outbuf)
+  else:
+    let s = c.streams.getOrDefault(f.streamId)
+    if s != nil:
+      if s.sendWindow.int64 + inc.int64 > 0x7fffffff'i64:  # stream error: RST it
+        outbuf.add encodeRstStream(f.streamId, errFlowControlError)
+        s.reset = true; s.ended = true
+      else:
+        s.sendWindow += inc
+        c.flushSend(f.streamId, s, outbuf)
+
 proc handle(c: H2Conn, f: Frame, outbuf: var string) =
   if c.fatal.len > 0: return
     # A fatal connection error already sent GOAWAY. RFC 9113 5.4.1: stop processing --
@@ -380,50 +538,7 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
     return
   case f.typ
   of uint8(ftSettings):
-    if f.streamId != 0:                          # RFC 9113 6.5: SETTINGS is connection-level
-      c.connFail(errProtocolError, "SETTINGS on a non-zero stream", outbuf); return
-    if (f.flags and flagAck) != 0:
-      if f.payload.len != 0:                     # RFC 9113 6.5: an ACK carries no payload
-        c.connFail(errFrameSizeError, "SETTINGS ACK with a payload", outbuf)
-      return
-    if f.payload.len mod 6 != 0:                 # RFC 9113 6.5: length is a multiple of 6
-      c.connFail(errFrameSizeError, "SETTINGS length not a multiple of 6", outbuf); return
-    block:
-      c.sawSettings = true                       # the peer's initial settings are in
-      for (id, value) in parseSettings(f.payload):
-        if id == settingsMaxFrameSize:
-          if value < 16384'u32 or value > 16777215'u32:   # RFC 9113 6.5.2: [2^14, 2^24-1]
-            c.connFail(errProtocolError, "SETTINGS_MAX_FRAME_SIZE out of range", outbuf)
-            return
-          c.maxFrameSize = int(value)
-        elif id == settingsEnablePush:
-          if value > 1'u32:                               # RFC 9113 6.5.2: must be 0 or 1
-            c.connFail(errProtocolError, "SETTINGS_ENABLE_PUSH must be 0 or 1", outbuf)
-            return
-        elif id == settingsMaxConcurrentStreams:
-          c.maxConcurrent = int(value)
-        elif id == settingsEnableConnectProtocol:
-          c.peerConnectProtocol = value == 1'u32   # RFC 8441: 1 enables Extended CONNECT
-        elif id == settingsInitialWindowSize:
-          # A value above 2^31-1 is a FLOW_CONTROL_ERROR (RFC 9113 6.5.2); reject
-          # it before the delta arithmetic can corrupt every stream's send window.
-          if value > 0x7fffffff'u32:
-            c.connFail(errFlowControlError, "SETTINGS_INITIAL_WINDOW_SIZE too large", outbuf)
-            return
-          # Adjust every open stream's send window by the delta (RFC 9113 6.9.2),
-          # then release any body the new room allows. A delta that pushes any stream
-          # window past 2^31-1 is a FLOW_CONTROL_ERROR (RFC 9113 6.9.2 MUST) -- the
-          # WINDOW_UPDATE path bounds this too, but the delta path did not.
-          let delta = int(value) - c.peerInitialWindow
-          c.peerInitialWindow = int(value)
-          for sid, s in c.streams:
-            if s.sendWindow.int64 + delta.int64 > 0x7fffffff'i64:
-              c.connFail(errFlowControlError,
-                "SETTINGS_INITIAL_WINDOW_SIZE delta overflows a stream send window", outbuf)
-              return
-            s.sendWindow += delta
-            c.flushSend(sid, s, outbuf)
-      outbuf.add encodeSettingsAck()
+    c.handleSettings(f, outbuf)
   of uint8(ftPing):
     if f.streamId != 0:                          # RFC 9113 6.7: PING is connection-level
       c.connFail(errProtocolError, "PING on a non-zero stream", outbuf); return
@@ -507,70 +622,7 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
           return
         c.discardHdr.setLen(0)
   of uint8(ftData):
-    if f.streamId == 0:                          # RFC 9113 6.1: DATA is never on stream 0
-      c.connFail(errProtocolError, "DATA on stream 0", outbuf); return
-    # Every DATA payload -- pad length byte and padding included (RFC 9113 6.9.1)
-    # -- counts against the connection flow-control window, even on a stream we
-    # have reset or never opened. Skipping that leaks the window and eventually
-    # stalls a long-lived pooled/mux connection. Debit the window we granted and
-    # fail the connection if the peer overran it (a peer that ignores flow control).
-    c.connRecvWindow -= f.payload.len
-    if c.connRecvWindow < 0:
-      c.connFail(errFlowControlError, "connection flow-control window exceeded", outbuf)
-      return
-    let s = c.streams.getOrDefault(f.streamId)
-    if s != nil and s.ended and not s.reset:
-      # DATA after END_STREAM: STREAM_CLOSED (RFC 9113 5.1). The response already
-      # completed, so drop the stray bytes -- appending would grow memory without
-      # bound when maxBodyBytes==0, or corrupt the delivered body when the extra DATA
-      # rides the same feed batch -- and RST the stream; keep the conn window in sync.
-      outbuf.add encodeRstStream(f.streamId, errStreamClosed)
-      if f.payload.len > 0: c.replenishConn(f.payload.len, outbuf)
-    elif s != nil and not s.reset:
-      s.recvWindow -= f.payload.len
-      if s.recvWindow < 0:
-        # Peer sent more than the per-stream receive window we advertised: a stream
-        # FLOW_CONTROL_ERROR (RFC 9113 6.9.1). RST it; the connection survives (its
-        # window was already debited and validated above).
-        outbuf.add encodeRstStream(f.streamId, errFlowControlError)
-        s.reset = true; s.ended = true
-      else:
-        # Unpadded is the common case: append the frame payload straight into the body
-        # with no intermediate copy. Only a padded frame needs a stripped buffer (via
-        # `unpad`, which slices the content out).
-        let padded = (f.flags and flagPadded) != 0
-        var contentLen: int
-        if padded:
-          var data = f.payload
-          if not c.unpad(f, data, outbuf): return
-          contentLen = data.len
-          s.resp.body.add data
-        else:
-          contentLen = f.payload.len
-          s.resp.body.add f.payload
-        s.bodyTotal += contentLen
-        if c.maxBodyBytes > 0 and s.bodyTotal > c.maxBodyBytes:  # over the size cap: RST
-          outbuf.add encodeRstStream(f.streamId, errCancel)
-          s.reset = true; s.ended = true; s.tooLarge = true
-          c.replenishConn(f.payload.len, outbuf)   # still owe the connection window
-        else:
-          if f.payload.len > 0:
-            if s.sinkMode:
-              # Hold the stream window for the BODY bytes until the sink consumes
-              # them (via ackRecv); still replenish the shared connection window so
-              # other streams don't stall. The padding overhead (pad length byte +
-              # padding) is debited from the stream window too (RFC 9113 6.9.1) but
-              # is never delivered to the sink, so ackRecv would never return it --
-              # return it to the stream window now, or the window leaks (1 + padLen)
-              # per padded frame and the download eventually stalls at window 0.
-              let padOverhead = f.payload.len - contentLen
-              if padOverhead > 0: c.replenishStream(f.streamId, s, padOverhead, outbuf)
-              c.replenishConn(f.payload.len, outbuf)
-            else:
-              c.replenishRecv(f.streamId, s, f.payload.len, outbuf)
-          if (f.flags and flagEndStream) != 0: s.ended = true
-    elif f.payload.len > 0:
-      c.replenishConn(f.payload.len, outbuf)     # reset/unknown stream: keep the conn window in sync
+    c.handleData(f, outbuf)
   of uint8(ftRstStream):
     if f.streamId == 0:                          # RFC 9113 6.4: RST_STREAM never on stream 0
       c.connFail(errProtocolError, "RST_STREAM on stream 0", outbuf); return
@@ -588,42 +640,7 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
       s.reset = true
       s.ended = true
   of uint8(ftWindowUpdate):
-    if f.payload.len != 4:                       # RFC 9113 6.9: exactly 4 octets
-      c.connFail(errFrameSizeError, "WINDOW_UPDATE length not 4", outbuf)
-      return
-    let inc = int(readU32(f.payload, 0) and 0x7fffffff'u32)
-    if inc == 0:                                 # RFC 9113 6.9: a 0 increment is illegal --
-      if f.streamId == 0:                        # connection error, or a stream error (RST)
-        c.connFail(errProtocolError, "WINDOW_UPDATE increment 0 on the connection", outbuf)
-      else:
-        let s = c.streams.getOrDefault(f.streamId)
-        if s != nil:
-          outbuf.add encodeRstStream(f.streamId, errProtocolError)   # live stream: RST it
-          s.reset = true; s.ended = true
-        elif f.streamId mod 2 == 0'u32 or f.streamId >= c.nextId:
-          # Idle stream: RFC 9113 5.1/6.4 forbid RST_STREAM on an idle stream, so a bad
-          # WINDOW_UPDATE here is a connection PROTOCOL_ERROR, not a stream RST.
-          c.connFail(errProtocolError, "WINDOW_UPDATE(0) on an idle stream", outbuf)
-        # else a closed stream we have already forgotten: ignore
-      return
-    if f.streamId == 0:                        # connection-level: release all streams
-      # A window that would exceed 2^31-1 is a FLOW_CONTROL_ERROR (RFC 9113 6.9.1);
-      # rejecting it also prevents `connSendWindow` from overflowing to a negative.
-      if c.connSendWindow.int64 + inc.int64 > 0x7fffffff'i64:
-        c.connFail(errFlowControlError, "connection send window overflow", outbuf)
-        return
-      c.connSendWindow += inc
-      for sid, s in c.streams:
-        c.flushSend(sid, s, outbuf)
-    else:
-      let s = c.streams.getOrDefault(f.streamId)
-      if s != nil:
-        if s.sendWindow.int64 + inc.int64 > 0x7fffffff'i64:  # stream error: RST it
-          outbuf.add encodeRstStream(f.streamId, errFlowControlError)
-          s.reset = true; s.ended = true
-        else:
-          s.sendWindow += inc
-          c.flushSend(f.streamId, s, outbuf)
+    c.handleWindowUpdate(f, outbuf)
   of uint8(ftPushPromise):
     # We advertised SETTINGS_ENABLE_PUSH=0, so a PUSH_PROMISE is a PROTOCOL_ERROR.
     c.connFail(errProtocolError, "unexpected PUSH_PROMISE (push disabled)", outbuf)

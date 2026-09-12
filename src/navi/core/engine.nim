@@ -158,6 +158,33 @@ template h1ReadChunk*(transport, parser, capped: typed): string =
       break
     res
 
+template raiseH2Terminal*(connErr: string;
+                          tooLarge, unprocessed, wasReset, done, lengthBad,
+                          decoderComplete: bool) =
+  ## The canonical "h2 stream reached a terminal point" -> exception cascade,
+  ## shared by every h2 read path (`h2ReadChunk`, `h2Stream`, `h2DrainBody`). The
+  ## per-stream flags are cleared by `takeResponse`, so each caller captures them
+  ## first and passes them here. Order is load-bearing: a connection error and the
+  ## oversize/unprocessed/reset outcomes take precedence over the truncation
+  ## checks. `done` is whether END_STREAM was seen (false => the peer died
+  ## mid-stream, a truncation); `decoderComplete` is whether the body decoder ended
+  ## cleanly (a compressed body cut short is also a truncation). Falls through
+  ## silently on a clean end.
+  if connErr.len > 0: raise newException(IOError, "navi: http/2 " & connErr)
+  if tooLarge:
+    raise newException(ResponseTooLargeError,
+      "navi: response exceeded maxResponseBytes")
+  if unprocessed:
+    raise newException(UnprocessedError, "navi: http/2 request not processed")
+  if wasReset:
+    raise newException(IOError, "navi: http/2 request did not complete")
+  if not done:
+    raise newException(IOError, h2TruncatedErr)
+  if lengthBad:
+    raise newException(IOError, bodyLengthErr)
+  if not decoderComplete:
+    raise newException(IOError, truncatedBodyErr)
+
 template h2ReadChunk*(transport, h2, sid, capped: typed): string =
   ## Pull the next decoded body chunk of an h2 stream over `transport` (the sync
   ## single-connection h2 path), or "" at end of stream, having dropped the stream.
@@ -182,18 +209,9 @@ template h2ReadChunk*(transport, h2, sid, capped: typed): string =
         let connErr = h2.connError
         let lengthBad = h2.streamLengthMismatch(sid)  # capture before takeResponse
         discard h2.takeResponse(sid)
-        if connErr.len > 0: raise newException(IOError, "navi: http/2 " & connErr)
-        if tooLarge:
-          raise newException(ResponseTooLargeError,
-            "navi: response exceeded maxResponseBytes")
-        if unprocessed:
-          raise newException(UnprocessedError, "navi: http/2 request not processed")
-        if wasReset:
-          raise newException(IOError, "navi: http/2 request did not complete")
-        if lengthBad:
-          raise newException(IOError, bodyLengthErr)
-        if not capped.streamComplete:         # compressed stream cut short mid-decode
-          raise newException(IOError, truncatedBodyErr)
+        # Reached only once streamDone is true, so END_STREAM was seen (done=true).
+        raiseH2Terminal(connErr, tooLarge, unprocessed, wasReset, true, lengthBad,
+                        capped.streamComplete)
         break                                 # clean end: res ""
       let chunk = await recvSome(transport)
       if chunk.len == 0:                       # transport EOF before END_STREAM:
@@ -213,16 +231,18 @@ template h1Exchange*(transport, req, sink, keep, decompress, cap: typed): Respon
     h1DrainBody(transport, parser, sink, keep, decompress, cap)
     parser.toResponse()
 
-template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
-  ## One HTTP/2 request/response on a new stream of the shared connection `h2`.
+template h2SendRequest*(transport, h2, req: typed): uint32 =
+  ## Open a new h2 stream and send `req` on it, returning the stream id (response
+  ## still to be read). A buffered body goes in one shot; a streamed body
+  ## (`bodyStream`) is sent as DATA pulled from the producer, reading between frames
+  ## so the peer's WINDOW_UPDATE releases more of the body -- the producer is pulled
+  ## only once the queued bytes are on the wire, so buffered upload memory stays
+  ## ~one chunk. This is the h2 analog of h1's `sendRequest`; both h2Stream and
+  ## h2SendAndReadHeaders drive their read loop from the id it returns.
+  mixin await, sendAll, recvSome
   block:
-    mixin BodySink
     let sid = h2.openStream()
     if req.bodyStream != nil:
-      # Stream the request body: HEADERS now, then DATA frames pulled from the
-      # producer. When the send window closes, read so the peer's WINDOW_UPDATE
-      # releases more of the body; the producer is pulled only once the queued
-      # bytes are on the wire, so buffered upload memory stays ~one chunk.
       await sendAll(transport, h2.encodeRequestHead(sid, h2HeaderList(req)))
       var sending = true
       while sending and h2.connError.len == 0 and not h2.streamDone(sid):
@@ -242,6 +262,13 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
     else:
       await sendAll(transport,
         h2.encodeRequest(sid, h2HeaderList(req), req.body, h2TrailerList(req)))
+    sid
+
+template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
+  ## One HTTP/2 request/response on a new stream of the shared connection `h2`.
+  block:
+    mixin BodySink
+    let sid = h2SendRequest(transport, h2, req)
     # Deliver the body to the sink incrementally as DATA arrives (bounded memory),
     # or buffer it for a non-streaming request. The decoder is built once the
     # response headers are in (so content-encoding is known); the loop runs once
@@ -269,21 +296,10 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
     let done = h2.streamDone(sid)  # END_STREAM seen (else the loop broke on transport EOF)
     let lengthBad = h2.streamLengthMismatch(sid)   # capture before takeResponse drops it
     var r = toResponse(h2.takeResponse(sid))
-    if connErr.len > 0:            # bad preface / oversized frame / unexpected push
-      raise newException(IOError, "navi: http/2 " & connErr)
-    if tooLarge:
-      raise newException(ResponseTooLargeError,
-        "navi: response exceeded maxResponseBytes")
-    if unprocessed:                # REFUSED_STREAM / above GOAWAY: safe to retry
-      raise newException(UnprocessedError, "navi: http/2 request not processed")
-    if wasReset or r.status == 0:  # reset, or gone away before a response
-      raise newException(IOError, "navi: http/2 request did not complete")
-    if not done:                   # headers seen but the connection died mid-body:
-      raise newException(IOError, h2TruncatedErr)   # don't return a partial body
-    if lengthBad:                  # cleanly ended, but body != declared Content-Length
-      raise newException(IOError, bodyLengthErr)
-    if not sink.isNil and not cd.streamComplete:   # compressed stream cut short mid-decode
-      raise newException(IOError, truncatedBodyErr)
+    # `r.status == 0` (gone away before a response) is treated as a reset here; on the
+    # buffered path the decoder-complete check only applies when streaming to a sink.
+    raiseH2Terminal(connErr, tooLarge, unprocessed, wasReset or r.status == 0, done,
+                    lengthBad, sink.isNil or cd.streamComplete)
     if not sink.isNil: r.body = ""  # delivered incrementally above
     r
 
@@ -295,27 +311,7 @@ template h2SendAndReadHeaders*(transport, h2, req: typed): uint32 =
   ## retry/redirect loop can react), mirroring `h2Stream`'s terminal errors.
   mixin await, sendAll, recvSome
   block:
-    let sid = h2.openStream()
-    if req.bodyStream != nil:
-      await sendAll(transport, h2.encodeRequestHead(sid, h2HeaderList(req)))
-      var sending = true
-      while sending and h2.connError.len == 0 and not h2.streamDone(sid):
-        if h2.sendDrained(sid):
-          var chunk: string
-          {.cast(gcsafe).}: chunk = req.bodyStream()
-          if chunk.len == 0:
-            await sendAll(transport, h2.finishSend(sid, h2TrailerList(req)))
-            sending = false
-          else:
-            await sendAll(transport, h2.queueSend(sid, chunk))
-        else:
-          let inbound = await recvSome(transport)
-          if inbound.len == 0: break
-          let toSend = h2.feed(inbound)
-          if toSend.len > 0: await sendAll(transport, toSend)
-    else:
-      await sendAll(transport,
-        h2.encodeRequest(sid, h2HeaderList(req), req.body, h2TrailerList(req)))
+    let sid = h2SendRequest(transport, h2, req)
     while not h2.headersReady(sid) and not h2.streamDone(sid):
       let chunk = await recvSome(transport)
       if chunk.len == 0: break
@@ -360,20 +356,42 @@ template h2DrainBody*(transport, h2, sid, sink, decompress, cap: typed) =
     let done = h2.streamDone(sid)      # END_STREAM seen (else the loop broke on EOF)
     let lengthBad = h2.streamLengthMismatch(sid)   # capture before takeResponse
     discard h2.takeResponse(sid)       # body delivered; drop the stream
-    if connErr.len > 0: raise newException(IOError, "navi: http/2 " & connErr)
-    if tooLarge:
-      raise newException(ResponseTooLargeError,
-        "navi: response exceeded maxResponseBytes")
-    if unprocessed:
-      raise newException(UnprocessedError, "navi: http/2 request not processed")
-    if wasReset:
-      raise newException(IOError, "navi: http/2 request did not complete")
-    if not done:                       # connection died mid-body: don't truncate silently
-      raise newException(IOError, h2TruncatedErr)
-    if lengthBad:                      # cleanly ended, but body != declared Content-Length
-      raise newException(IOError, bodyLengthErr)
-    if not cd.streamComplete:          # compressed stream cut short mid-decode
-      raise newException(IOError, truncatedBodyErr)
+    raiseH2Terminal(connErr, tooLarge, unprocessed, wasReset, done, lengthBad,
+                    cd.streamComplete)
+
+template serveOnce(client, pc, rq, sink, key, gotResponse: typed): Response =
+  ## Run one request/response over the pooled connection `pc` -- reused or freshly
+  ## opened -- then return `pc` to the idle pool if it may be kept, else close it.
+  ## `pc.h2` set means an established h2 connection; otherwise HTTP/1.1, unless the
+  ## transport just negotiated "h2" on a fresh connection (`pc.h2` still nil), in
+  ## which case the h2 connection is initialized and its client preamble sent first.
+  ## `gotResponse` is set false while an h1 request is in flight and true once the
+  ## response headers arrive, so a caller's stale-retry logic can tell a pre- from a
+  ## post-response failure (h2 signals its own unprocessed case via UnprocessedError,
+  ## so it leaves `gotResponse` true). The caller must guard the call so a raised
+  ## exchange closes the transport before re-raising; the pool/close below runs only
+  ## on success, so a pooled connection is never double-closed.
+  mixin sendAll, await, BodySink
+  block:
+    var r: Response
+    var keep = false
+    if pc.h2 != nil or pc.transport.protocol == "h2":
+      if pc.h2 == nil:
+        pc.h2 = initH2Conn(client.config.maxResponseBytes)
+        await sendAll(pc.transport, pc.h2.preamble())
+      r = h2Stream(pc.transport, pc.h2, rq, sink,
+                   client.config.wantsDecompress, client.config.maxResponseBytes)
+      keep = pc.h2.canReuse
+    else:
+      gotResponse = false
+      var parser = h1SendAndReadHeaders(pc.transport, rq, not sink.isNil)
+      gotResponse = true
+      h1DrainBody(pc.transport, parser, sink, keep,
+                  client.config.wantsDecompress, client.config.maxResponseBytes)
+      r = parser.toResponse()
+    if not (keep and pushIdle(client.pool, key, pc)):
+      await close(pc.transport)
+    r
 
 template poolTransport*(client, req, sink: typed): Response =
   ## Pool-based transport: reuse a pooled connection (http/1.1 or a persistent
@@ -401,21 +419,7 @@ template poolTransport*(client, req, sink: typed): Response =
       # case via UnprocessedError, so treat its failures as post-response.
       var gotResponse = true
       try:
-        if pc.h2 != nil:
-          resp = h2Stream(pc.transport, pc.h2, rq, sink,
-                          client.config.wantsDecompress, client.config.maxResponseBytes)
-          if not (pc.h2.canReuse and pushIdle(client.pool, key, pc)):
-            await close(pc.transport)
-        else:
-          var keep = false
-          gotResponse = false
-          var parser = h1SendAndReadHeaders(pc.transport, rq, not sink.isNil)
-          gotResponse = true
-          h1DrainBody(pc.transport, parser, sink, keep,
-                      client.config.wantsDecompress, client.config.maxResponseBytes)
-          resp = parser.toResponse()
-          if not (keep and pushIdle(client.pool, key, pc)):
-            await close(pc.transport)
+        resp = serveOnce(client, pc, rq, sink, key, gotResponse)
         served = true
       except CatchableError as e:
         await close(pc.transport)  # pooled connection was stale
@@ -427,7 +431,7 @@ template poolTransport*(client, req, sink: typed): Response =
         # process it, so only an idempotent method (or a proven-unprocessed peer
         # signal: h2 REFUSED_STREAM / above GOAWAY) may be replayed. A non-replayable
         # streamed body (`bodyStream`) is never retried (its producer cannot rewind).
-        let replayable = req.bodyStream == nil
+        let replayable = isReplayable(req)
         if not (replayable and
                 (not gotResponse or isIdempotent(req.verb) or (e of UnprocessedError))):
           raise
@@ -438,28 +442,16 @@ template poolTransport*(client, req, sink: typed): Response =
                                     client.config.connectMs, client.config.readMs,
                                     client.config.totalMs)
       var npc = PooledConn[typeof(transport)](transport: transport)
-      var keep = false
-      # Guard the exchange so a failure (e.g. h1Exchange raising IOError on a
-      # truncated body, or the h2 preamble/stream raising) closes the just-opened
-      # transport before re-raising, instead of leaking the fd/TLS handle. Without
-      # this, each retry attempt would leak another connection. The pool/close
-      # decision runs once afterwards so a successfully pooled connection is not
-      # double-closed. Mirrors the pooled branch's cleanup.
+      var gotResponse = true   # unused on the fresh path (nothing to replay onto)
+      # Guard the exchange so a failure (h1/h2 send, the h2 preamble/stream, or a
+      # truncated body) closes the just-opened transport before re-raising, instead
+      # of leaking the fd/TLS handle. serveOnce's pool/close decision runs only on
+      # success, so a pooled connection is never double-closed.
       try:
-        if transport.protocol == "h2":
-          npc.h2 = initH2Conn(client.config.maxResponseBytes)
-          await sendAll(transport, npc.h2.preamble())
-          resp = h2Stream(transport, npc.h2, rq, sink,
-                          client.config.wantsDecompress, client.config.maxResponseBytes)
-          keep = npc.h2.canReuse
-        else:
-          resp = h1Exchange(transport, rq, sink, keep,
-                            client.config.wantsDecompress, client.config.maxResponseBytes)
+        resp = serveOnce(client, npc, rq, sink, key, gotResponse)
       except CatchableError:
         await close(transport)
         raise
-      if not (keep and pushIdle(client.pool, key, npc)):
-        await close(transport)
     resp
 
 template run(client, req, sink: typed): Response =
@@ -489,7 +481,7 @@ template maybeDigest(client, rreq, resp, digestOrigin: typed) =
   # truncated (empty) body. Return the 401 to the caller instead (mirrors the
   # retry layer's guard and the 307/308 guard in followRedirects).
   if resp.status == 401 and client.config.auth.kind == akDigest and
-     rreq.bodyStream == nil and
+     isReplayable(rreq) and
      not rreq.headers.contains("authorization") and
      originKey(rreq.url) == digestOrigin:
     let chal = bestChallenge(resp.headers.getAll("www-authenticate"))
@@ -543,7 +535,7 @@ template performRequest*(client, req0: typed; cancel: CancelToken = nil): Respon
     # advanced, so replaying it would send a truncated body. Such a request is never
     # retried -- not even a provably-unprocessed one, since the producer may already
     # have been pulled during the attempt.
-    let bodyReplayable = req.bodyStream == nil
+    let bodyReplayable = isReplayable(req)
     while true:
       throwIfCancelled(cancel)
       var gotResp = false

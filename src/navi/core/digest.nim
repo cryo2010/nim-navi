@@ -108,6 +108,18 @@ proc pickQop(offered: string): string =
       return "auth"
   ""
 
+proc quoteEscape(s: string): string =
+  ## Escape a value for a Digest quoted-string parameter (RFC 7616 quoted-pair):
+  ## backslash-escape `\` and `"`, and drop CR/LF/NUL so a crafted username cannot
+  ## inject header content or terminate the quoted string. The digest hash (ha1) is
+  ## computed over the raw credentials; only the echoed `username="..."` is escaped.
+  result = newStringOfCap(s.len)
+  for c in s:
+    case c
+    of '\r', '\n', '\0': discard
+    of '\\', '"': result.add('\\'); result.add(c)
+    else: result.add(c)
+
 proc newCnonce(): string =
   var rng = initRand(getTime().toUnix xor getTime().nanosecond)
   for _ in 0 ..< 16:
@@ -145,7 +157,7 @@ proc digestAuthHeader*(user, pass, httpMethod, uri: string,
     else:
       h(ha1 & ":" & ch.nonce & ":" & ha2)
 
-  result = "Digest username=\"" & user & "\", realm=\"" & ch.realm &
+  result = "Digest username=\"" & quoteEscape(user) & "\", realm=\"" & ch.realm &
            "\", nonce=\"" & ch.nonce & "\", uri=\"" & uri &
            "\", response=\"" & response & "\""
   if qop.len > 0:

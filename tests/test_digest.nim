@@ -68,6 +68,17 @@ suite "digest computation":
   test "parseChallenge should ignore a non-Digest scheme":
     check parseChallenge("Basic realm=\"x\"").isNone
 
+  test "digestAuthHeader should escape a username that contains a quote or backslash":
+    # A username with a double-quote must not terminate the quoted-string (header
+    # injection); RFC 7616 quoted-pair backslash-escaping is used. The response
+    # hash is still computed over the raw credentials.
+    let ch = parseChallenge("Digest realm=\"r\", nonce=\"n\", qop=\"auth\"")
+    let header = digestAuthHeader("ev\"il\\name", "p", "GET", "/", ch.get,
+      cnonce = "abc")
+    check "username=\"ev\\\"il\\\\name\"" in header
+    # The realm boundary after the escaped username stays intact.
+    check ", realm=\"r\"" in header
+
   test "digestAuthHeader should omit qop, nc, and cnonce when the challenge has no qop":
     let ch = parseChallenge("Digest realm=\"r\", nonce=\"n\"")
     let header = digestAuthHeader("u", "p", "GET", "/", ch.get)

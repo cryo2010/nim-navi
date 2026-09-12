@@ -11,13 +11,14 @@ import std/[strutils, base64]
 import pkg/chronos, pkg/chronos/transports/stream
 import pkg/chronos/streams/asyncstream
 import ./api
+import ./tls_store, ./tunnel
 import ../core/response  # for navi's TimeoutError
 import ../core/socks
 from ./happyeyeballs import heAttemptDelayMs
 when defined(ssl):
   import ./openssl_ctx, ./chronos_tls
 
-export api, chronos
+export api, chronos, tls_store
 
 type
   BodySink* = proc(data: string): Future[void] {.closure.}
@@ -40,42 +41,7 @@ type
     protocol*: string    ## negotiated ALPN protocol ("h2" / "http/1.1" / "")
     readMs: int          ## per-read stall timeout in ms; 0 blocks indefinitely
 
-proc newTlsStore*(cfg: TlsConfig): RootRef =
-  ## The per-client TLS session cache, or nil when resumption is off or on a
-  ## non-`-d:ssl` build. The entry puts it on `config.tls.sessionCache`.
-  when defined(ssl):
-    if cfg.wantsResume: result = newTlsSessionCache()
-  else:
-    discard cfg
-
-proc closeTlsStore*(store: RootRef) =
-  when defined(ssl):
-    if not store.isNil: close(cast[TlsSessionCache](store))
-  else:
-    discard store
-
-proc newTlsCtxStore*(cfg: TlsConfig): RootRef =
-  ## The per-client shared TLS-context store (empty until the first TLS connect),
-  ## or nil on a non-`-d:ssl` build. The entry puts it on `config.tls.contextStore`.
-  when defined(ssl):
-    result = newTlsContextStore()
-  else:
-    discard cfg
-
-proc closeTlsCtxStore*(store: RootRef) =
-  when defined(ssl):
-    if not store.isNil: close(cast[TlsContextStore](store))
-  else:
-    discard store
-
 when defined(ssl):
-  proc resumeSlot(cfg: TlsConfig, origin: string): SessionSlot =
-    ## When resumption is on and the client has a session cache, return a slot keyed
-    ## by `origin`; otherwise nil. The context is armed once in `obtainContext`, so
-    ## this only mints the per-connection link.
-    if cfg.wantsResume and not cfg.sessionCache.isNil:
-      result = newSlot(cast[TlsSessionCache](cfg.sessionCache), origin)
-
   # openssl_ctx builds contexts through std/net, whose procs are declared
   # `raises: [Exception]`. chronos's `{.async.}` tracks effects strictly and
   # forbids a bare `Exception`, so these thin wrappers narrow it to navi's
@@ -93,21 +59,11 @@ when defined(ssl):
     except CatchableError: discard
     except Exception: discard
 
-proc proxyConnect(transport: StreamTransport, host: string, port: int,
-                  user, pass: string) {.async.} =
-  let target = host & ":" & $port
-  var req = "CONNECT " & target & " HTTP/1.1\r\nHost: " & target & "\r\n"
-  if user.len > 0 or pass.len > 0:
-    req.add("Proxy-Authorization: Basic " & encode(user & ":" & pass) & "\r\n")
-  req.add("\r\n")
-  discard await transport.write(req)
-  var buf = newString(1024)
-  let n = await transport.readOnce(addr buf[0], buf.len)
-  buf.setLen(n)
-  if not (buf.startsWith("HTTP/1.1 200") or buf.startsWith("HTTP/1.0 200")):
-    raise newException(ValueError, "navi: proxy CONNECT failed: " & buf.splitLines()[0])
+# Byte-I/O primitives the shared tunnel drivers (backend/tunnel) mix in.
+proc sockWrite(transport: StreamTransport, s: string) {.async.} =
+  discard await transport.write(s)
 
-proc recvExactly(transport: StreamTransport, n: int): Future[string] {.async.} =
+proc sockReadExactly(transport: StreamTransport, n: int): Future[string] {.async.} =
   ## Read exactly `n` bytes or raise; SOCKS5 replies are fixed-size frames.
   var buf = newString(n)
   var off = 0
@@ -117,29 +73,20 @@ proc recvExactly(transport: StreamTransport, n: int): Future[string] {.async.} =
     off += r
   buf
 
+proc sockReadSome(transport: StreamTransport, max: int): Future[string] {.async.} =
+  ## One read of up to `max` bytes (the proxy CONNECT reply fits in one read).
+  var buf = newString(max)
+  let n = await transport.readOnce(addr buf[0], max)
+  buf.setLen(n)
+  buf
+
+proc proxyConnect(transport: StreamTransport, host: string, port: int,
+                  user, pass: string) {.async.} =
+  proxyConnectDriver(transport, host, port, user, pass)
+
 proc socksConnect(transport: StreamTransport, host: string, port: int,
                   user, pass: string) {.async.} =
-  ## SOCKS5 handshake to tunnel to `host:port` (RFC 1928 + RFC 1929). The target is
-  ## sent as a domain name so the proxy resolves DNS.
-  let hasAuth = user.len > 0 or pass.len > 0
-  discard await transport.write(greeting(hasAuth))
-  case selectedMethod(await recvExactly(transport, 2))
-  of methodUserPass:
-    if not hasAuth:
-      raise newException(ValueError, "navi: SOCKS5 proxy requires authentication")
-    discard await transport.write(authRequest(user, pass))
-    checkAuthReply(await recvExactly(transport, 2))
-  of methodNoAuth: discard
-  else: raise newException(ValueError, "navi: SOCKS5 proxy rejected the offered auth methods")
-  discard await transport.write(connectRequest(host, port))
-  let header = await recvExactly(transport, 4)
-  let status = replyStatus(header)
-  if status != 0: raiseReply(status)
-  let tail = boundTailLen(int(uint8(header[3])))
-  if tail >= 0: discard await recvExactly(transport, tail)
-  else:
-    let dlen = int(uint8((await recvExactly(transport, 1))[0]))
-    discard await recvExactly(transport, dlen + 2)
+  socksConnectDriver(transport, host, port, user, pass)
 
 proc interleaveTAddr(addrs: seq[TransportAddress]): seq[TransportAddress] =
   ## RFC 8305 §4 family interleaving over resolved transport addresses, leading

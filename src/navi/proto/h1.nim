@@ -237,9 +237,9 @@ proc step(p: var H1Parser): bool =
     if line.len == 0:
       p.finishHeaders()
     else:
-      let colon = line.find(':')
-      if colon > 0:
-        p.headers.add(line[0 ..< colon].strip(), line[colon + 1 .. ^1].strip())
+      let (name, value, ok) = parseHeaderLine(line)
+      if ok:
+        p.headers.add(name, value)
     true
   of stBody:
     let avail = p.buf.len - p.pos
@@ -291,9 +291,9 @@ proc step(p: var H1Parser): bool =
     if line.len == 0:
       p.state = stDone
     else:
-      let colon = line.find(':')
-      if colon > 0:
-        p.trailers.add(line[0 ..< colon].strip(), line[colon + 1 .. ^1].strip())
+      let (name, value, ok) = parseHeaderLine(line)
+      if ok:
+        p.trailers.add(name, value)
     true
   of stDone:
     false

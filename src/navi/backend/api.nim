@@ -3,10 +3,17 @@
 ## A backend provides a `Conn` type and four operations, each blocking in the
 ## sync backend and returning a Future in the async backends:
 ##
-##   connect(host, port, tls, cfg) -> Conn
+##   connect(host, port, tls, cfg, proxy, alpn = @[],
+##           connectMs = 0, readMs = 0, totalMs = 0) -> Conn
 ##   sendAll(conn, data)
 ##   recvSome(conn) -> string        ## "" signals the peer closed
 ##   close(conn)
+##
+## All three native backends declare `connect` with the same signature (including
+## `totalMs`) so the shared engine can call it uniformly. `connectMs` bounds
+## establishment; `readMs` is the per-read stall limit; `totalMs` is the overall
+## per-attempt deadline (enforced inside `connect` on the sync backend, and by the
+## async entry's `guard` on asyncdispatch/chronos, where the parameter is unused).
 ##
 ## The shared engine (`core/engine.nim`) drives these through `await`, which is
 ## the real await in async backends and an identity template in the sync one.
