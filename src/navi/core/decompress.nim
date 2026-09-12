@@ -255,15 +255,25 @@ proc decodeZstd(src: string, limit: int): string =
 
 type
   DecoderKind = enum dkZlib, dkBrotli, dkZstd
+  DecoderState = enum
+    ## Lifecycle of a streaming decoder, tracked as one explicit state instead of
+    ## the former (everFed, atEnd, done) bool trio whose valid combinations were
+    ## implicit. It advances one way: dsIdle -> {dsMidMember | dsAtBoundary} while
+    ## input flows, then dsDone once the stream terminates for good.
+    dsIdle       ## no non-empty chunk decoded yet (the decoder was never fed)
+    dsMidMember  ## the last update stopped mid-member (more input expected); a
+                 ## stream ending here is truncated
+    dsAtBoundary ## the last update ended exactly at a clean stream boundary
+                 ## (Z_STREAM_END at a gzip member edge). More members may follow;
+                 ## a stream ending here is complete
+    dsDone       ## a terminal stream boundary was reached (brotli success / a
+                 ## completed zstd frame); no more input is decoded. Also a clean
+                 ## end, so a stream ending here is complete
   StreamDecoderObj = object
-    done: bool
+    state: DecoderState      ## lifecycle position (see DecoderState)
     scratch: string          ## reused decode-output buffer (grown once, not per chunk)
     lastOut: int             ## size of the previous decode output, to pre-reserve the
                              ## next one and avoid growing it from empty every chunk
-    everFed: bool            ## at least one non-empty input chunk was decoded
-    atEnd: bool              ## the last update ended exactly at a clean stream boundary
-                             ## (Z_STREAM_END / brotli success / a completed zstd frame);
-                             ## false means the decoder is mid-member (truncated at EOF)
     allowRawRetry: bool      ## a `deflate` decoder may fall back to raw (headerless)
                              ## deflate if the auto-detecting decoder fails on chunk 1
     triedRaw: bool           ## already switched to raw window bits (retry only once)
@@ -291,14 +301,13 @@ proc newZlibDecoder(windowBits: cint, allowRawRetry = false): StreamDecoder =
     raise newException(ValueError, "navi: zlib inflateInit failed")
 
 proc updateZlib(d: StreamDecoder, input: openArray[byte], capRemaining: int): string =
-  if d.done or input.len == 0: return ""
+  if d.state == dsDone or input.len == 0: return ""
   # `input` is a contiguous, GC-owned buffer that is stable for this synchronous
   # call, so point the FFI straight at it -- no throwaway copy.
-  let isFirst = not d.everFed
+  let isFirst = d.state == dsIdle
   d.zs.nextIn = cast[ptr uint8](unsafeAddr input[0])
   d.zs.availIn = cuint(input.len)
-  d.everFed = true
-  d.atEnd = false
+  d.state = dsMidMember
   result = newStringOfCap(max(decodeScratchSize, d.lastOut))
   while true:
     d.zs.nextOut = cast[ptr uint8](addr d.scratch[0])
@@ -329,18 +338,17 @@ proc updateZlib(d: StreamDecoder, input: openArray[byte], capRemaining: int): st
       if inflateReset(addr d.zs) != zOk:
         raise newException(ValueError, "navi: zlib inflateReset failed")
       if d.zs.availIn == 0:
-        d.atEnd = true                         # ended exactly at a member boundary
+        d.state = dsAtBoundary                 # ended exactly at a member boundary
         break
       continue
-    if d.zs.availIn == 0: break                # mid-member: more input expected (atEnd stays false)
+    if d.zs.availIn == 0: break                # mid-member: more input expected (state stays dsMidMember)
   d.lastOut = result.len
 
 proc updateBrotli(d: StreamDecoder, input: openArray[byte], capRemaining: int): string =
-  if d.done or input.len == 0: return ""
+  if d.state == dsDone or input.len == 0: return ""
   var availIn = csize_t(input.len)
   var nextIn = cast[ptr uint8](unsafeAddr input[0])
-  d.everFed = true
-  d.atEnd = false
+  d.state = dsMidMember
   result = newStringOfCap(max(decodeScratchSize, d.lastOut))
   while true:
     var availOut = csize_t(d.scratch.len)
@@ -349,18 +357,17 @@ proc updateBrotli(d: StreamDecoder, input: openArray[byte], capRemaining: int): 
     result.addBytes(d.scratch, d.scratch.len - int(availOut))
     if capRemaining >= 0 and result.len > capRemaining:  # bound peak output per chunk
       raise newException(ResponseTooLargeError, "navi: response exceeded maxResponseBytes")
-    if r == brSuccess: d.done = true; d.atEnd = true; break
+    if r == brSuccess: d.state = dsDone; break
     if r == brNeedOutput: continue             # output full, keep draining
     if r < brSuccess: raise newException(ValueError, "navi: malformed brotli body")
     break                                       # needs more input: wait for the next chunk
   d.lastOut = result.len
 
 proc updateZstd(d: StreamDecoder, input: openArray[byte], capRemaining: int): string =
-  if d.done or input.len == 0: return ""
+  if d.state == dsDone or input.len == 0: return ""
   var inb = ZstdBuffer(buf: cast[typeof(ZstdBuffer().buf)](unsafeAddr input[0]),
                        size: csize_t(input.len), pos: 0)
-  d.everFed = true
-  d.atEnd = false
+  d.state = dsMidMember
   result = newStringOfCap(max(decodeScratchSize, d.lastOut))
   while inb.pos < inb.size:
     var outb = ZstdBuffer(buf: cast[typeof(ZstdBuffer().buf)](addr d.scratch[0]),
@@ -371,7 +378,7 @@ proc updateZstd(d: StreamDecoder, input: openArray[byte], capRemaining: int): st
     result.addBytes(d.scratch, int(outb.pos))
     if capRemaining >= 0 and result.len > capRemaining:  # bound peak output per chunk
       raise newException(ResponseTooLargeError, "navi: response exceeded maxResponseBytes")
-    if r == 0: d.done = true; d.atEnd = true; break   # a full frame completed
+    if r == 0: d.state = dsDone; break   # a full frame completed
     if outb.pos == 0: break                     # no progress: needs more input
   d.lastOut = result.len
 
@@ -459,7 +466,7 @@ proc streamComplete*(cd: CappedDecoder): bool =
   ## stream was cut short mid-member, so the caller should raise `truncatedBodyErr`
   ## rather than deliver a partial body as complete. An identity body, or one whose
   ## decoder was never fed, is complete.
-  cd.dec == nil or not cd.dec.everFed or cd.dec.atEnd
+  cd.dec == nil or cd.dec.state != dsMidMember
 
 proc decodeBody*(resp: var Response, opts: NaviConfigBase) =
   ## Decompress the body in place per Content-Encoding, then drop the headers that
