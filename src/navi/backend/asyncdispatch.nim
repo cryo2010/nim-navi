@@ -46,13 +46,26 @@ else:
 const invalidFd = AsyncFD(-1)
 
 type
+  ConnectionState = enum
+    ## Explicit teardown state for a `Conn`. Only two states are ever observed:
+    ## a connection is either open or torn down. `close`/`closeSync` transition
+    ## `csOpen -> csClosed` exactly once (idempotent: a second call is a no-op),
+    ## and a parked `sslRead` reads it to detect a concurrent teardown. There is
+    ## no distinct "closing" phase to observe: the flag flips atomically and the
+    ## fd is freed within the same close call, so a mid-teardown state would never
+    ## be seen by any reader.
+    csOpen
+    csClosed
   Conn* = object
     fd: AsyncFD
     protocol*: string   ## ALPN-negotiated protocol ("h2" or "", meaning http/1.1)
     readMs: int         ## per-read stall timeout in ms; 0 blocks indefinitely
-    closed: ref bool    ## shared across value copies: set by `close`, checked by a
-                        ## parked `sslRead` so closing under an in-flight read yields
-                        ## EOF instead of dereferencing the freed SSL (a UAF crash)
+    state: ref ConnectionState
+                        ## shared across value copies: set to csClosed by `close`,
+                        ## checked by a parked `sslRead` so closing under an in-flight
+                        ## read yields EOF instead of dereferencing the freed SSL (a
+                        ## UAF crash). A `ref` so all copies of the Conn value observe
+                        ## the same transition.
     when defined(ssl):
       ssl: SslPtr       ## the TLS connection; nil for plain http
       ctx: SslContext   ## the (usually shared) SSL_CTX this connection used
@@ -118,7 +131,7 @@ when defined(ssl):
       # rather than returning "" (a clean peer-EOF), which the h1 body reader would
       # take as "read more" on an unfinished stream and spin. The stream layer
       # treats this as a drop.
-      if not c.closed.isNil and c.closed[]:
+      if not c.state.isNil and c.state[] == csClosed:
         raise newException(IOError, "navi: connection closed")
       let n = SSL_read(c.ssl, addr result[0], result.len.cint).int
       if n > 0:
@@ -284,7 +297,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   var conn: Conn
   conn.fd = invalidFd
   conn.readMs = readMs
-  conn.closed = new(bool)   # shared teardown flag (see Conn.closed)
+  conn.state = new(ConnectionState)   # csOpen; shared teardown state (see Conn.state)
 
   proc establish() {.async.} =
     if proxy.kind == pkUnix:
@@ -390,7 +403,7 @@ proc shutdownConn*(c: Conn) =
 
 proc freeConn(c: Conn) =
   ## The raw teardown: free the SSL and close the fd. Callers set/guard the
-  ## `closed` flag first.
+  ## `state` flag first.
   when defined(ssl):
     if not c.ssl.isNil:
       discard SSL_shutdown(c.ssl)
@@ -405,9 +418,9 @@ proc closeSync*(c: Conn) =
   ## Synchronous close, for a destructor that cannot `await` (an abandoned
   ## streaming handle reclaimed by GC). No read is parked on a GC-reclaimed handle,
   ## so freeing directly is safe; `close` handles the read-in-flight case.
-  if not c.closed.isNil:
-    if c.closed[]: return               # idempotent; stops a double-free
-    c.closed[] = true
+  if not c.state.isNil:
+    if c.state[] == csClosed: return    # idempotent; stops a double-free
+    c.state[] = csClosed
   freeConn(c)
 
 proc close*(c: Conn): Future[void] {.async.} =
@@ -416,9 +429,9 @@ proc close*(c: Conn): Future[void] {.async.} =
   ## tick so the dispatcher delivers that wake (the read observes EOF via the flag)
   ## before we free the fd. Freeing in the same atomic step would lose the wake and
   ## hang the reader on an unregistered fd.
-  if not c.closed.isNil:
-    if c.closed[]: return
-    c.closed[] = true
+  if not c.state.isNil:
+    if c.state[] == csClosed: return
+    c.state[] = csClosed
     shutdownConn(c)
     await sleepAsync(0)
   freeConn(c)
