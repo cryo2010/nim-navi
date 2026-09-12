@@ -909,32 +909,43 @@ proc h2Close(w: WsH2) =
   try: w.sock.close()
   except CatchableError: discard
 
+# The h3 arm of each transport dispatcher, with the -d:naviHttp3 guard defined
+# once per op instead of inline in every dispatcher below. Constructing a
+# WsTransport of kind wkH3 already requires the h3 build, so the else branches
+# are reached only on a misconfigured call.
+proc h3Send(ws: WebSocket, data: string) =
+  when defined(naviHttp3): wsSend(ws.tr.pump, data)
+  else: raise newException(ValueError, "navi: h3 WebSocket without -d:naviHttp3")
+proc h3Recv(ws: WebSocket): string =
+  when defined(naviHttp3): wsRecv(ws.tr.pump)
+  else: raise newException(ValueError, "navi: h3 WebSocket without -d:naviHttp3")
+proc h3DataWaiting(ws: WebSocket, ms: int): bool =
+  when defined(naviHttp3): wsDataWaiting(ws.tr.pump, ms)
+  else: false
+proc h3Close(ws: WebSocket) =
+  when defined(naviHttp3): wsClose(ws.tr.pump)
+  else: discard
+
 proc sendRaw(ws: WebSocket, data: string) =
   ## Write raw bytes to the transport (an encoded WS frame).
   case ws.tr.kind
   of wkH1: ws.tr.conn.sendAll(data)
   of wkH2: h2Send(ws.tr.h2c, data)
-  of wkH3:
-    when defined(naviHttp3): wsSend(ws.tr.pump, data)
-    else: raise newException(ValueError, "navi: h3 WebSocket without -d:naviHttp3")
+  of wkH3: h3Send(ws, data)
 
 proc recvRaw(ws: WebSocket): string =
   ## Block for the next inbound chunk ("" on EOF / peer half-close).
   case ws.tr.kind
   of wkH1: ws.tr.conn.recvSome()
   of wkH2: h2Recv(ws.tr.h2c)
-  of wkH3:
-    when defined(naviHttp3): wsRecv(ws.tr.pump)
-    else: raise newException(ValueError, "navi: h3 WebSocket without -d:naviHttp3")
+  of wkH3: h3Recv(ws)
 
 proc dataWaitingRaw(ws: WebSocket, ms: int): bool =
   ## Whether an inbound chunk is available within ~`ms` (for keepalive).
   case ws.tr.kind
   of wkH1: ws.tr.conn.dataWaiting(ms)
   of wkH2: h2DataWaiting(ws.tr.h2c, ms)
-  of wkH3:
-    when defined(naviHttp3): wsDataWaiting(ws.tr.pump, ms)
-    else: false
+  of wkH3: h3DataWaiting(ws, ms)
 
 proc closeRaw(ws: WebSocket) =
   ## Tear down the transport exactly once (h3: stop + join the pump thread, then free
@@ -946,9 +957,7 @@ proc closeRaw(ws: WebSocket) =
   case ws.tr.kind
   of wkH1: ws.tr.conn.close()
   of wkH2: h2Close(ws.tr.h2c)
-  of wkH3:
-    when defined(naviHttp3): wsClose(ws.tr.pump)
-    else: discard
+  of wkH3: h3Close(ws)
 
 proc `=destroy`(o: var WebSocketObj) =
   ## Backstop: a WebSocket dropped without close() still releases its transport. For
