@@ -259,6 +259,23 @@ proc validateRequest*(req: Request) =
       raise newException(ValueError,
         "navi: invalid trailer '" & k & "' (name or value contains CR, LF, or NUL)")
 
+proc resolveBody(body: string, json: JsonNode, form: seq[(string, string)],
+                 multipart: Multipart): tuple[body, contentType: string] =
+  ## Resolve the mutually-exclusive body arguments into a concrete body string plus
+  ## the Content-Type it implies ("" means the caller keeps any existing header).
+  ## Precedence, highest first: `json`, `multipart`, `form`, then the raw `body`;
+  ## only the highest-precedence argument that is set is used, the rest ignored.
+  ## Single place the body-source precedence lives, so it stays consistent and
+  ## testable as body kinds are added.
+  if json != nil:
+    ($json, "application/json")
+  elif multipart.len > 0:
+    encodeMultipart(multipart)
+  elif form.len > 0:
+    (encodeQuery(form), "application/x-www-form-urlencoded")
+  else:
+    (body, "")
+
 proc buildRequest*(opts: NaviConfigBase, verb: HttpVerb, target: string,
                    headers: Headers = initHeaders(), body = "",
                    json: JsonNode = nil, form: seq[(string, string)] = @[],
@@ -279,21 +296,10 @@ proc buildRequest*(opts: NaviConfigBase, verb: HttpVerb, target: string,
   result.headers = merge(opts.headers, headers)
   result.trailers = trailers
   result.bodyStream = bodyStream
-  if json != nil:
-    result.body = $json
-    if not result.headers.contains("content-type"):
-      result.headers.add("content-type", "application/json")
-  elif multipart.len > 0:
-    let (body, contentType) = encodeMultipart(multipart)
-    result.body = body
-    if not result.headers.contains("content-type"):
-      result.headers.add("content-type", contentType)
-  elif form.len > 0:
-    result.body = encodeQuery(form)
-    if not result.headers.contains("content-type"):
-      result.headers.add("content-type", "application/x-www-form-urlencoded")
-  else:
-    result.body = body
+  let (resolvedBody, contentType) = resolveBody(body, json, form, multipart)
+  result.body = resolvedBody
+  if contentType.len > 0 and not result.headers.contains("content-type"):
+    result.headers.add("content-type", contentType)
   # Digest can't be precomputed (it needs the server's nonce), so its header is
   # empty here and added by the engine after the 401 challenge.
   if opts.auth.header.len > 0 and not result.headers.contains("authorization"):
