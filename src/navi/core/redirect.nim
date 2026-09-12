@@ -5,6 +5,15 @@ import ./headers, ./url, ./request
 proc isRedirect*(status: int): bool =
   status in [301, 302, 303, 307, 308]
 
+proc shouldFollowRedirect*(status, hops, limit: int; location: string): bool =
+  ## Whether a completed response should be auto-followed as a redirect: the
+  ## redirect limit is enabled and unspent, the status is a redirect, and a
+  ## Location was supplied. This is the gate shared by every request path (the
+  ## buffered engine, the streaming pull paths, and the parallel batch loop).
+  ## A non-replayable streamed body (307/308) is a separate concern the caller
+  ## guards before rewriting; a batch is GET-only and never carries one.
+  limit > 0 and hops < limit and isRedirect(status) and location.len > 0
+
 proc dropBody(r: var Request) =
   ## Clear the request body when a redirect rewrites the method to GET; the
   ## trailers belong to the dropped body and go with it.

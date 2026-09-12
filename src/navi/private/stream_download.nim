@@ -184,7 +184,7 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
           rreq.headers["authorization"] = auth
           continue
     let location = handle.headers.get("location")
-    if limit > 0 and hops < limit and isRedirect(handle.status) and location.len > 0:
+    if shouldFollowRedirect(handle.status, hops, limit, location):
       handle.close()
       rreq = redirectRequest(rreq, handle.status, location)
       inc hops

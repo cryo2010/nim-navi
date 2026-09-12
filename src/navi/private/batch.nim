@@ -146,14 +146,15 @@ proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
         decodeBody(resp, client.config)
         storeCookies(client.jar, item.req.url, resp)
         let location = resp.headers.get("location")
-        if client.config.redirectLimit > 0 and item.hops < client.config.redirectLimit and
-           isRedirect(resp.status) and location.len > 0:
+        # Same redirect gate and retry predicate the single-request engine uses
+        # (followRedirects / shouldRetryAfterResponse in core), applied per batch
+        # item so the shared connection can be reused for the round that follows.
+        if shouldFollowRedirect(resp.status, item.hops, client.config.redirectLimit, location):
           item.req = redirectRequest(item.req, resp.status, location)
           inc item.hops
           nextRound.add item
-        elif item.attempt < client.config.retry.limit and
-             isRetryableVerb(item.req.verb, client.config.retry) and
-             isRetryableStatus(resp.status, client.config.retry):
+        elif shouldRetryAfterResponse(item.attempt, resp.status, isReplayable(item.req),
+                                      item.req.verb, client.config.retry):
           inc item.attempt
           backoff = max(backoff, backoffMs(item.attempt, resp, client.config.retry))
           nextRound.add item

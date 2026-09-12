@@ -515,7 +515,7 @@ template followRedirects(client, startReq, resp: typed) =
     maybeDigest(client, rreq, resp, digestOrigin)
     decodeBody(resp, client.config)
     let location = resp.headers.get("location")
-    if limit > 0 and hops < limit and isRedirect(resp.status) and location.len > 0:
+    if shouldFollowRedirect(resp.status, hops, limit, location):
       # 307/308 preserve the method and body (redirect.nim). A streamed body
       # (`bodyStream`) can't be rewound after the first attempt pulled its
       # producer, so auto-following would send a truncated body. Return the
