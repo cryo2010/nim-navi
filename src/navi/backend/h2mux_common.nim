@@ -17,6 +17,27 @@
 ## only that one stream (backpressure) without blocking the reader or other streams.
 
 type
+  MuxState = enum
+    ## Transport teardown lifecycle (chronos only; asyncdispatch stays `msActive`
+    ## throughout, its reader always owning the transport close unconditionally).
+    ## A linear progression -- there is no path back to an earlier state:
+    ##   msActive          -- connection live, no teardown initiated.
+    ##   msClosing         -- chronos `close` has taken over the teardown, so the
+    ##                        reader's self-exit path must defer to it (it EOFs the
+    ##                        transport via `closeWait` rather than have the reader
+    ##                        close it out from under a parked read).
+    ##   msTransportClosed -- `be.close(transport)` has been performed. Whichever
+    ##                        path (reader self-exit or `close`) reaches this state
+    ##                        first owns the single `be.close`; the other sees the
+    ##                        state and skips, so the transport's unshared SSL_CTX is
+    ##                        never freed twice (issue #314).
+    ## Transitions: msActive -> msClosing (chronos `close`); msActive -> msTransportClosed
+    ## (reader self-exit wins the close); msClosing -> msTransportClosed (`close` performs
+    ## the close). The reader's self-exit teardown runs only from `msActive` -- once
+    ## `close` has moved to `msClosing`/`msTransportClosed` the reader defers.
+    msActive
+    msClosing
+    msTransportClosed
   H2Mux* = ref object
     transport: be.Conn
     h2: H2Conn
@@ -49,14 +70,14 @@ type
     readerFut: Future[void]  ## the reader task itself, held so chronos `close` can join
                              ## it (reaping its parked read cleanly). Unused on the
                              ## asyncdispatch backend, whose reader is `asyncCheck`ed.
-    closing: bool            ## set by chronos `close`, so the reader defers the transport
-                             ## teardown to it. Never set on asyncdispatch.
-    transportClosed: bool    ## chronos only: whoever (the reader's self-exit teardown or
-                             ## `close`) flips this first owns the single `be.close`. The
-                             ## `closing` flag alone can't prevent a double close -- the
-                             ## reader may already be parked mid-teardown when `close`
-                             ## arrives -- and a second `be.close` frees the transport's
-                             ## unshared SSL_CTX twice (issue #314). Unused on asyncdispatch.
+    state: MuxState          ## transport teardown lifecycle (see `MuxState`). `msClosing`
+                             ## tells the reader's self-exit teardown to defer to `close`;
+                             ## `msTransportClosed` gates the single `be.close` so it never
+                             ## runs twice (a single-bool `closing` flag can't prevent that
+                             ## -- the reader may already be parked mid-teardown when `close`
+                             ## arrives, and a double `be.close` frees the transport's
+                             ## unshared SSL_CTX twice, issue #314). Chronos only; the
+                             ## asyncdispatch reader always owns the close, staying msActive.
     keepAliveMs: int            ## PING keepalive interval (0 = off); see `keepAlive`
     sawFrameSinceTick: bool     ## the reader saw an inbound frame since the last
                                 ## keepalive tick (any frame proves liveness)

@@ -5,17 +5,17 @@
 # --- Streaming downloads (pull-based handle) ---
 
 type
+  StreamKind = enum skH1, skH2, skH3
   StreamResponseObj = object
     ## The response of a streaming request: status/headers are available
     ## immediately while the body is drained on demand. Holds the checked-out
     ## connection (removed from the pool) until `drain` returns it or `close`
-    ## disposes it.
+    ## disposes it. The protocol is a discriminated union (mirroring the async
+    ## `impl_stream.nim` StreamResponse), so dispatch is `case sr.kind` rather
+    ## than the old nil-pointer-as-tag (`pc.h2 != nil` / `qc != nil`).
     resp: Response             ## header snapshot (status/headers; empty body)
     client: Navi
     key: string                ## origin key, for returning the connection to the pool
-    pc: PooledConn[Conn]       ## the checked-out connection (h2 conn when pc.h2 != nil)
-    parser: H1Parser           ## used when pc.h2 == nil (http/1.1)
-    sid: uint32                ## used when pc.h2 != nil (http/2 stream id)
     decompress: bool
     cap: int
     cancel: CancelToken
@@ -25,9 +25,18 @@ type
                                ## before drain/close (see navi/private/streamguard)
     capped: CappedDecoder      ## decode + size-cap state carried across readChunk
                                ## calls (the decoder is chosen on the first chunk)
-    when defined(naviHttp3):
-      qc: QuicConn             ## h3 connection (non-nil marks an h3 stream; pc unused)
-      h3sid: int64             ## its h3 stream id
+    case kind: StreamKind
+    of skH1:
+      pc: PooledConn[Conn]     ## the checked-out connection (returned to the pool at EOF)
+      parser: H1Parser
+    of skH2:
+      h2pc: PooledConn[Conn]   ## the checked-out h2 connection (h2pc.h2 != nil)
+      sid: uint32              ## our http/2 stream id on it
+    of skH3:
+      when defined(naviHttp3):
+        qc: QuicConn           ## the per-stream h3 connection (no sync h3 pooling)
+        h3sid: int64           ## its h3 stream id
+      else: discard
   StreamResponse* = ref StreamResponseObj
 
 proc close*(sr: StreamResponse) =
@@ -82,9 +91,9 @@ proc openStream(client: Navi, req0: Request): StreamResponse =
           else:
             try:
               let (status, hdrs) = conn.awaitHeaders(sid)
-              return StreamResponse(resp: initResponse(status, "", "HTTP/3",
-                initHeaders(hdrs), ""), client: client, key: key, qc: conn,
-                h3sid: sid, decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
+              return StreamResponse(kind: skH3, qc: conn, h3sid: sid,
+                resp: initResponse(status, "", "HTTP/3", initHeaders(hdrs), ""),
+                client: client, key: key, decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
             except CatchableError:
               conn.freeStream(sid); conn.close(); raise
         except QuicError: discard   # fall back to the h2/h1 transport below
@@ -96,12 +105,14 @@ proc openStream(client: Navi, req0: Request): StreamResponse =
     try:
       if pc.h2 != nil:
         let sid = h2SendAndReadHeaders(pc.transport, pc.h2, rq)
-        return StreamResponse(resp: toResponse(pc.h2.respSnapshot(sid)), client: client,
-                              key: key, pc: pc, sid: sid, decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
+        return StreamResponse(kind: skH2, h2pc: pc, sid: sid,
+                              resp: toResponse(pc.h2.respSnapshot(sid)), client: client,
+                              key: key, decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
       else:
         let parser = h1SendAndReadHeaders(pc.transport, rq, true)
-        return StreamResponse(resp: parser.toResponse(), client: client, key: key,
-                              pc: pc, parser: parser, decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
+        return StreamResponse(kind: skH1, pc: pc, parser: parser,
+                              resp: parser.toResponse(), client: client, key: key,
+                              decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
     except CatchableError:
       try: pc.transport.close()          # pooled connection was stale; open a fresh one
       except CatchableError: discard
@@ -114,12 +125,14 @@ proc openStream(client: Navi, req0: Request): StreamResponse =
     npc.h2 = initH2Conn(client.config.maxResponseBytes)
     transport.sendAll(npc.h2.preamble())
     let sid = h2SendAndReadHeaders(transport, npc.h2, rq)
-    result = StreamResponse(resp: toResponse(npc.h2.respSnapshot(sid)), client: client,
-                            key: key, pc: npc, sid: sid, decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
+    result = StreamResponse(kind: skH2, h2pc: npc, sid: sid,
+                            resp: toResponse(npc.h2.respSnapshot(sid)), client: client,
+                            key: key, decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
   else:
     let parser = h1SendAndReadHeaders(transport, rq, true)
-    result = StreamResponse(resp: parser.toResponse(), client: client, key: key,
-                            pc: npc, parser: parser, decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
+    result = StreamResponse(kind: skH1, pc: npc, parser: parser,
+                            resp: parser.toResponse(), client: client, key: key,
+                            decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
 
 proc stream*(client: Navi, verb: HttpVerb, target: string,
              headers = initHeaders(), params: seq[(string, string)] = @[],
@@ -149,22 +162,28 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
           client.altSvc.record("https", rreq.url.host, rreq.url.port, alt)
     # Arm the leak-guard: if the handle is dropped without drain/close, close its
     # connection. Captures only the connection essentials (not `handle`, which cycles).
-    var armed = false
-    when defined(naviHttp3):
-      if handle.qc != nil:
+    case handle.kind
+    of skH1:
+      let pc = handle.pc
+      handle.guard = newStreamGuard(proc() {.gcsafe, raises: [].} =
+        {.cast(gcsafe).}:
+          try: pc.transport.close()
+          except Exception: discard)   # best-effort finalizer: never propagate
+    of skH2:
+      let pc = handle.h2pc
+      handle.guard = newStreamGuard(proc() {.gcsafe, raises: [].} =
+        {.cast(gcsafe).}:
+          try: pc.transport.close()
+          except Exception: discard)
+    of skH3:
+      when defined(naviHttp3):
         let qc = handle.qc
         let sid = handle.h3sid
         handle.guard = newStreamGuard(proc() {.gcsafe, raises: [].} =
           {.cast(gcsafe).}:
             try: qc.freeStream(sid); qc.close()
             except Exception: discard)
-        armed = true
-    if not armed:
-      let pc = handle.pc
-      handle.guard = newStreamGuard(proc() {.gcsafe, raises: [].} =
-        {.cast(gcsafe).}:
-          try: pc.transport.close()
-          except Exception: discard)   # best-effort finalizer: never propagate
+      else: discard
     storeCookies(client.jar, rreq.url, handle.resp)
     # 401 Digest challenge: re-open with an Authorization header (mirrors the
     # buffered path's maybeDigest), discarding the challenge body. The origin
@@ -184,7 +203,7 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
           rreq.headers["authorization"] = auth
           continue
     let location = handle.headers.get("location")
-    if limit > 0 and hops < limit and isRedirect(handle.status) and location.len > 0:
+    if shouldFollowRedirect(handle.status, hops, limit, location):
       handle.close()
       rreq = redirectRequest(rreq, handle.status, location)
       inc hops
@@ -199,8 +218,32 @@ proc readChunk*(sr: StreamResponse): string =
   ## (a `while (let c = sr.readChunk(); c.len > 0)` loop) that the SSE reader builds
   ## on; `drain`/`each` remain the push form.
   if sr.phase != spOpen: return ""
-  when defined(naviHttp3):
-    if sr.qc != nil:
+  case sr.kind
+  of skH2:
+    try:
+      result = h2ReadChunk(sr.h2pc.transport, sr.h2pc.h2, sr.sid, sr.capped)
+      if result.len == 0:                       # end of stream
+        sr.phase = spDrained
+        if sr.h2pc.h2.canReuse and pushIdle(sr.client.pool, sr.key, sr.h2pc): disarm(sr.guard)
+        else: closeNow(sr.guard)
+    except CatchableError:
+      if sr.phase == spOpen: sr.phase = spDrained  # consumed; the guard must not re-close
+      closeNow(sr.guard)
+      raise
+  of skH1:
+    try:
+      result = h1ReadChunk(sr.pc.transport, sr.parser, sr.capped)
+      if result.len == 0:                       # end of body
+        sr.phase = spDrained
+        if sr.parser.keepAliveAfter() and pushIdle(sr.client.pool, sr.key, sr.pc):
+          disarm(sr.guard)
+        else: closeNow(sr.guard)
+    except CatchableError:
+      if sr.phase == spOpen: sr.phase = spDrained  # consumed; the guard must not re-close
+      closeNow(sr.guard)
+      raise
+  of skH3:
+    when defined(naviHttp3):
       # h3 body arrives raw; apply the same streamed decode + size-cap as h1, then
       # close the per-stream connection at EOF (a reset surfaces as an error). The
       # guard does freeStream + close, so closeNow both frees and tears down.
@@ -229,24 +272,7 @@ proc readChunk*(sr: StreamResponse): string =
         if sr.phase == spOpen: sr.phase = spDrained
         closeNow(sr.guard)
         raise
-  try:
-    if sr.pc.h2 != nil:
-      result = h2ReadChunk(sr.pc.transport, sr.pc.h2, sr.sid, sr.capped)
-      if result.len == 0:                       # end of stream
-        sr.phase = spDrained
-        if sr.pc.h2.canReuse and pushIdle(sr.client.pool, sr.key, sr.pc): disarm(sr.guard)
-        else: closeNow(sr.guard)
-    else:
-      result = h1ReadChunk(sr.pc.transport, sr.parser, sr.capped)
-      if result.len == 0:                       # end of body
-        sr.phase = spDrained
-        if sr.parser.keepAliveAfter() and pushIdle(sr.client.pool, sr.key, sr.pc):
-          disarm(sr.guard)
-        else: closeNow(sr.guard)
-  except CatchableError:
-    if sr.phase == spOpen: sr.phase = spDrained  # consumed; the guard must not re-close
-    closeNow(sr.guard)
-    raise
+    else: discard
 
 proc drain*(sr: StreamResponse, sink: BodySink) =
   ## Deliver the response body to `sink` as it arrives (decoded and size-capped),

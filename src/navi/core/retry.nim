@@ -27,6 +27,22 @@ proc isRetryableStatus*(status: int, policy: RetryPolicy): bool =
   ## Whether `status` should trigger a retry under `policy`.
   status in policy.statuses
 
+proc shouldRetryAfterError*(attempt: int; bodyReplayable, unprocessed: bool;
+                            verb: HttpVerb; policy: RetryPolicy): bool =
+  ## Whether a raised transport error should be retried: attempts remain, the
+  ## body can be replayed, and either the verb is retryable or the peer proved
+  ## the request was not processed (h2 REFUSED_STREAM / above GOAWAY -- safe to
+  ## replay even when non-idempotent).
+  attempt < policy.limit and bodyReplayable and
+    (isRetryableVerb(verb, policy) or unprocessed)
+
+proc shouldRetryAfterResponse*(attempt, status: int; bodyReplayable: bool;
+                               verb: HttpVerb; policy: RetryPolicy): bool =
+  ## Whether a completed response should be retried: attempts remain, the body
+  ## can be replayed, and both the verb and the status are retryable.
+  attempt < policy.limit and bodyReplayable and
+    isRetryableVerb(verb, policy) and isRetryableStatus(status, policy)
+
 proc retryAfterMs(resp: Response): int =
   ## `Retry-After` as milliseconds, or -1 when absent/unparseable. Accepts both
   ## the delta-seconds form ("120") and the HTTP-date form ("Wed, 21 Oct 2015

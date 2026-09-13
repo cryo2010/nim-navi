@@ -38,12 +38,17 @@ type
     ## verification entirely, set `verify=false` and do all the checking here.
 
   TlsConfig* = object
-    ## TLS options, including the client certificate for mTLS. The client
-    ## credential can come from several sources; precedence is `pkcs12File`, then
-    ## in-memory (`certPem`/`keyPem`), then the `certFile`/`keyFile` pair. Files
-    ## may be PEM or DER (detected by content). Honored on all three native
-    ## backends (sync, asyncdispatch, chronos), which run OpenSSL; `navi/js` does
-    ## not present client certificates.
+    ## TLS options, including the client certificate for mTLS. Honored on all
+    ## three native backends (sync, asyncdispatch, chronos), which run OpenSSL;
+    ## `navi/js` does not present client certificates.
+    ##
+    ## The fields fall into four groups, laid out in order below: peer
+    ## verification, the client credential (mTLS), session/context reuse, and
+    ## protocol/cipher selection. (They are kept as flat fields rather than
+    ## nested sub-objects so the documented `TlsConfig(caFile: "ca.pem")`
+    ## construction idiom keeps working; the grouping is expressed by layout.)
+
+    # --- Peer verification -------------------------------------------------
     verify*: bool          ## verify the cert chain and hostname (default on)
     caFile*: string        ## custom CA bundle path; "" uses the system trust store
     caBundle*: string      ## additional trusted CA certificates as an in-memory PEM
@@ -53,12 +58,19 @@ type
                            ## the peer's public key must match one pin or the
                            ## connection is rejected -- checked after chain + hostname
     verifyCallback*: CertVerifyProc ## optional post-verification hook (see CertVerifyProc)
-    certFile*: string      ## client certificate file (PEM or DER) for mTLS
-    keyFile*: string       ## private key file for `certFile`; "" reuses certFile
-    password*: string      ## passphrase for an encrypted key, or the PKCS#12 bundle password
+
+    # --- Client credential for mTLS ----------------------------------------
+    # The credential can come from several sources; precedence is `pkcs12File`,
+    # then in-memory (`certPem`/`keyPem`), then the `certFile`/`keyFile` pair.
+    # Files may be PEM or DER (detected by content).
     pkcs12File*: string    ## a PKCS#12/PFX bundle (cert + key + chain); highest precedence
     certPem*: string       ## client certificate as an in-memory PEM string (may hold a chain)
     keyPem*: string        ## private key as an in-memory PEM string ("" reuses `certPem`)
+    certFile*: string      ## client certificate file (PEM or DER) for mTLS
+    keyFile*: string       ## private key file for `certFile`; "" reuses certFile
+    password*: string      ## passphrase for an encrypted key, or the PKCS#12 bundle password
+
+    # --- Session + context reuse (performance) -----------------------------
     resumeSessions*: bool  ## reuse TLS sessions across connections to the same origin
                            ## (abbreviated handshake); on by default via `defaultTls()`
     sessionCache*: RootRef ## per-client session store, set by `newNavi`; the TLS
@@ -66,6 +78,8 @@ type
     contextStore*: RootRef ## per-client shared TLS-context store, set by `newNavi`;
                            ## lets every connection reuse one SSL_CTX instead of
                            ## rebuilding it. Backend-owned type; not user-configurable.
+
+    # --- Protocol version + cipher selection -------------------------------
     minVersion*: TlsVersion ## lowest TLS version to negotiate (`tlsDefault` = unset)
     maxVersion*: TlsVersion ## highest TLS version to negotiate (`tlsDefault` = unset)
     ciphers*: string       ## TLS <=1.2 cipher list, OpenSSL format (colon-separated,

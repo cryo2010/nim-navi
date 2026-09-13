@@ -515,6 +515,120 @@ proc handleWindowUpdate(c: H2Conn, f: Frame, outbuf: var string) =
         s.sendWindow += inc
         c.flushSend(f.streamId, s, outbuf)
 
+proc handleHeadersOrContinuation(c: H2Conn, f: Frame, outbuf: var string) =
+  ## RFC 9113 6.2/6.10: assemble a (possibly multi-frame) header block on a stream.
+  ## Strips HEADERS padding/priority, buffers the fragment across CONTINUATION, and
+  ## on END_HEADERS decodes it -- delivering to the stream, or (for a reset/unknown
+  ## stream) decode-then-discard to keep the shared HPACK table in sync. The 6.10
+  ## open/close gate and the CONTINUATION-flood size cap run here too.
+  if f.streamId == 0:                          # RFC 9113 6.2/6.10: never on stream 0
+    c.connFail(errProtocolError, "HEADERS/CONTINUATION on stream 0", outbuf); return
+  let s = c.streams.getOrDefault(f.streamId)
+  # A HEADERS opening a server-initiated (even) or never-allocated (idle, at/above
+  # nextId) stream is illegal for a client (RFC 9113 5.1.1); a late frame on an
+  # already-completed odd stream below nextId (s == nil) stays tolerated. The 6.10
+  # gate already rejects a stray CONTINUATION, so this guards HEADERS only.
+  if f.typ == uint8(ftHeaders) and s == nil and
+     (f.streamId mod 2 == 0'u32 or f.streamId >= c.nextId):
+    c.connFail(errProtocolError, "HEADERS on an idle or server-initiated stream", outbuf)
+    return
+  # Open (or close) the header block per END_HEADERS, so the 6.10 gate above knows
+  # whether a CONTINUATION must follow -- tracked even for an unknown stream.
+  c.contHeaderStream = if (f.flags and flagEndHeaders) != 0: 0'u32 else: f.streamId
+  var frag = f.payload
+  if f.typ == uint8(ftHeaders):
+    # Only HEADERS carries padding / priority; a CONTINUATION is a raw
+    # fragment. Strip the pad byte + trailing padding, then the 5-byte
+    # priority block (stream dependency + weight), so what is left is the
+    # header block fragment HPACK expects. Done for every stream (including a
+    # reset/unknown one) so the fragment fed to HPACK is correct.
+    if (f.flags and flagPadded) != 0 and not c.unpad(f, frag, outbuf): return
+    if (f.flags and flagPriority) != 0:
+      if frag.len < 5:                       # missing the 5-byte priority block:
+        c.connFail(errFrameSizeError, "HEADERS priority block truncated", outbuf)  # RFC 9113 4.2
+        return
+      frag = frag[5 ..< frag.len]
+  if s != nil and not s.reset:
+    s.hdrBuf.add frag
+    if s.hdrBuf.len > maxHeaderListBytes:       # CONTINUATION flood (CVE-2024-27316):
+      # fail the whole connection, not just the stream. An undecoded header block
+      # can't be skipped without desyncing the connection-wide HPACK table, and a
+      # stream RST would leave the 6.10 gate armed -- so GOAWAY, as Go/nghttp2 do.
+      c.connFail(errEnhanceYourCalm, "header block exceeds the size cap", outbuf)
+      return
+    else:
+      if f.typ == uint8(ftHeaders):
+        s.hdrEndStream = (f.flags and flagEndStream) != 0
+      if (f.flags and flagEndHeaders) != 0:
+        # Any HPACK decoding failure (truncated block, integer overflow, a
+        # table-size update over the advertised max, or a header list past
+        # SETTINGS_MAX_HEADER_LIST_SIZE) is a connection-level COMPRESSION_ERROR.
+        try: c.applyHeaders(s, f.streamId, outbuf)
+        except ValueError as e:
+          c.connFail(errCompressionError, e.msg, outbuf)
+          return
+  else:
+    # Reset or already-deleted (cancelled / never-opened) stream. HPACK is
+    # stateful: EVERY header block on the connection must still be decoded to
+    # keep the shared dynamic table in sync (RFC 7541), or a later indexed
+    # reference on a reused connection resolves to the wrong pair -- silently
+    # misattributed headers, or a spurious COMPRESSION_ERROR. So decode the
+    # block and discard the result; only delivery is skipped. Buffer across
+    # CONTINUATION frames the same way, decoding on END_HEADERS.
+    c.discardHdr.add frag
+    if c.discardHdr.len > maxHeaderListBytes:    # CONTINUATION flood: GOAWAY, as above
+      c.connFail(errEnhanceYourCalm, "header block exceeds the size cap", outbuf)
+      return
+    if (f.flags and flagEndHeaders) != 0:
+      try: discard c.dec.decode(c.discardHdr)
+      except ValueError as e:
+        c.connFail(errCompressionError, e.msg, outbuf)
+        return
+      c.discardHdr.setLen(0)
+
+proc handleGoAway(c: H2Conn, f: Frame, outbuf: var string) =
+  ## RFC 9113 6.8: a GOAWAY is at least 8 octets (lastStreamId + errorCode) on the
+  ## connection; record the peer's shutdown so `streamDone`/`streamUnprocessed` can
+  ## draw the graceful-vs-abrupt boundary.
+  if f.streamId != 0:                          # RFC 9113 6.8: GOAWAY is connection-level
+    c.connFail(errProtocolError, "GOAWAY on a non-zero stream", outbuf); return
+  if f.payload.len < 8:
+    c.connFail(errFrameSizeError, "GOAWAY frame too short", outbuf)
+    return
+  c.goneAway = true
+  c.goAwayLastId = readU32(f.payload, 0) and 0x7fffffff'u32
+  c.goAwayErr = readU32(f.payload, 4)
+
+proc handlePing(c: H2Conn, f: Frame, outbuf: var string) =
+  ## RFC 9113 6.7: PING is connection-level and exactly 8 octets; echo a non-ACK
+  ## PING back with the ACK flag set.
+  if f.streamId != 0:                          # RFC 9113 6.7: PING is connection-level
+    c.connFail(errProtocolError, "PING on a non-zero stream", outbuf); return
+  if f.payload.len != 8:                        # RFC 9113 6.7: exactly 8 octets
+    c.connFail(errFrameSizeError, "PING length not 8", outbuf); return
+  if (f.flags and flagAck) == 0:
+    outbuf.add encodePing(f.payload, ack = true)
+
+proc handleRstStream(c: H2Conn, f: Frame, outbuf: var string) =
+  ## RFC 9113 6.4: RST_STREAM is exactly 4 octets and never on stream 0; it ends the
+  ## stream (recording REFUSED_STREAM as safe-to-retry), but a RST that arrives after
+  ## END_STREAM is ignored for delivery so an already-complete response is kept.
+  if f.streamId == 0:                          # RFC 9113 6.4: RST_STREAM never on stream 0
+    c.connFail(errProtocolError, "RST_STREAM on stream 0", outbuf); return
+  if f.payload.len != 4:                        # RFC 9113 6.4: exactly 4 octets
+    c.connFail(errFrameSizeError, "RST_STREAM length not 4", outbuf); return
+  let s = c.streams.getOrDefault(f.streamId)
+  if s != nil and not s.ended:
+    # RFC 9113 8.1: a server may send END_STREAM and then RST_STREAM(NO_ERROR) to
+    # abort the request body after answering early (e.g. 413). A client MUST NOT
+    # discard the already-complete response because of that trailing RST. So once
+    # the stream has ended, ignore a subsequent RST for delivery (issue #259);
+    # only a RST that arrives before END_STREAM aborts the response.
+    if readU32(f.payload, 0) == errRefusedStream:
+      s.refused = true                       # not processed -> safe to retry
+    s.reset = true
+    s.ended = true
+
 proc handle(c: H2Conn, f: Frame, outbuf: var string) =
   if c.fatal.len > 0: return
     # A fatal connection error already sent GOAWAY. RFC 9113 5.4.1: stop processing --
@@ -540,105 +654,15 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
   of uint8(ftSettings):
     c.handleSettings(f, outbuf)
   of uint8(ftPing):
-    if f.streamId != 0:                          # RFC 9113 6.7: PING is connection-level
-      c.connFail(errProtocolError, "PING on a non-zero stream", outbuf); return
-    if f.payload.len != 8:                        # RFC 9113 6.7: exactly 8 octets
-      c.connFail(errFrameSizeError, "PING length not 8", outbuf); return
-    if (f.flags and flagAck) == 0:
-      outbuf.add encodePing(f.payload, ack = true)
+    c.handlePing(f, outbuf)
   of uint8(ftGoAway):
-    # A GOAWAY is at least 8 octets: lastStreamId (4) + errorCode (4), RFC 9113 6.8.
-    if f.streamId != 0:                          # RFC 9113 6.8: GOAWAY is connection-level
-      c.connFail(errProtocolError, "GOAWAY on a non-zero stream", outbuf); return
-    if f.payload.len < 8:
-      c.connFail(errFrameSizeError, "GOAWAY frame too short", outbuf)
-      return
-    c.goneAway = true
-    c.goAwayLastId = readU32(f.payload, 0) and 0x7fffffff'u32
-    c.goAwayErr = readU32(f.payload, 4)
+    c.handleGoAway(f, outbuf)
   of uint8(ftHeaders), uint8(ftContinuation):
-    if f.streamId == 0:                          # RFC 9113 6.2/6.10: never on stream 0
-      c.connFail(errProtocolError, "HEADERS/CONTINUATION on stream 0", outbuf); return
-    let s = c.streams.getOrDefault(f.streamId)
-    # A HEADERS opening a server-initiated (even) or never-allocated (idle, at/above
-    # nextId) stream is illegal for a client (RFC 9113 5.1.1); a late frame on an
-    # already-completed odd stream below nextId (s == nil) stays tolerated. The 6.10
-    # gate already rejects a stray CONTINUATION, so this guards HEADERS only.
-    if f.typ == uint8(ftHeaders) and s == nil and
-       (f.streamId mod 2 == 0'u32 or f.streamId >= c.nextId):
-      c.connFail(errProtocolError, "HEADERS on an idle or server-initiated stream", outbuf)
-      return
-    # Open (or close) the header block per END_HEADERS, so the 6.10 gate above knows
-    # whether a CONTINUATION must follow -- tracked even for an unknown stream.
-    c.contHeaderStream = if (f.flags and flagEndHeaders) != 0: 0'u32 else: f.streamId
-    var frag = f.payload
-    if f.typ == uint8(ftHeaders):
-      # Only HEADERS carries padding / priority; a CONTINUATION is a raw
-      # fragment. Strip the pad byte + trailing padding, then the 5-byte
-      # priority block (stream dependency + weight), so what is left is the
-      # header block fragment HPACK expects. Done for every stream (including a
-      # reset/unknown one) so the fragment fed to HPACK is correct.
-      if (f.flags and flagPadded) != 0 and not c.unpad(f, frag, outbuf): return
-      if (f.flags and flagPriority) != 0:
-        if frag.len < 5:                       # missing the 5-byte priority block:
-          c.connFail(errFrameSizeError, "HEADERS priority block truncated", outbuf)  # RFC 9113 4.2
-          return
-        frag = frag[5 ..< frag.len]
-    if s != nil and not s.reset:
-      s.hdrBuf.add frag
-      if s.hdrBuf.len > maxHeaderListBytes:       # CONTINUATION flood (CVE-2024-27316):
-        # fail the whole connection, not just the stream. An undecoded header block
-        # can't be skipped without desyncing the connection-wide HPACK table, and a
-        # stream RST would leave the 6.10 gate armed -- so GOAWAY, as Go/nghttp2 do.
-        c.connFail(errEnhanceYourCalm, "header block exceeds the size cap", outbuf)
-        return
-      else:
-        if f.typ == uint8(ftHeaders):
-          s.hdrEndStream = (f.flags and flagEndStream) != 0
-        if (f.flags and flagEndHeaders) != 0:
-          # Any HPACK decoding failure (truncated block, integer overflow, a
-          # table-size update over the advertised max, or a header list past
-          # SETTINGS_MAX_HEADER_LIST_SIZE) is a connection-level COMPRESSION_ERROR.
-          try: c.applyHeaders(s, f.streamId, outbuf)
-          except ValueError as e:
-            c.connFail(errCompressionError, e.msg, outbuf)
-            return
-    else:
-      # Reset or already-deleted (cancelled / never-opened) stream. HPACK is
-      # stateful: EVERY header block on the connection must still be decoded to
-      # keep the shared dynamic table in sync (RFC 7541), or a later indexed
-      # reference on a reused connection resolves to the wrong pair -- silently
-      # misattributed headers, or a spurious COMPRESSION_ERROR. So decode the
-      # block and discard the result; only delivery is skipped. Buffer across
-      # CONTINUATION frames the same way, decoding on END_HEADERS.
-      c.discardHdr.add frag
-      if c.discardHdr.len > maxHeaderListBytes:    # CONTINUATION flood: GOAWAY, as above
-        c.connFail(errEnhanceYourCalm, "header block exceeds the size cap", outbuf)
-        return
-      if (f.flags and flagEndHeaders) != 0:
-        try: discard c.dec.decode(c.discardHdr)
-        except ValueError as e:
-          c.connFail(errCompressionError, e.msg, outbuf)
-          return
-        c.discardHdr.setLen(0)
+    c.handleHeadersOrContinuation(f, outbuf)
   of uint8(ftData):
     c.handleData(f, outbuf)
   of uint8(ftRstStream):
-    if f.streamId == 0:                          # RFC 9113 6.4: RST_STREAM never on stream 0
-      c.connFail(errProtocolError, "RST_STREAM on stream 0", outbuf); return
-    if f.payload.len != 4:                        # RFC 9113 6.4: exactly 4 octets
-      c.connFail(errFrameSizeError, "RST_STREAM length not 4", outbuf); return
-    let s = c.streams.getOrDefault(f.streamId)
-    if s != nil and not s.ended:
-      # RFC 9113 8.1: a server may send END_STREAM and then RST_STREAM(NO_ERROR) to
-      # abort the request body after answering early (e.g. 413). A client MUST NOT
-      # discard the already-complete response because of that trailing RST. So once
-      # the stream has ended, ignore a subsequent RST for delivery (issue #259);
-      # only a RST that arrives before END_STREAM aborts the response.
-      if readU32(f.payload, 0) == errRefusedStream:
-        s.refused = true                       # not processed -> safe to retry
-      s.reset = true
-      s.ended = true
+    c.handleRstStream(f, outbuf)
   of uint8(ftWindowUpdate):
     c.handleWindowUpdate(f, outbuf)
   of uint8(ftPushPromise):

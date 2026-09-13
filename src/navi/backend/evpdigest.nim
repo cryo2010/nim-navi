@@ -22,11 +22,23 @@ type
   FinalFn = proc(ctx: pointer, md: pointer, s: ptr cuint): cint
               {.cdecl, gcsafe, raises: [].}
 
+type
+  ## Tri-state guard for the lazy FFI probe.
+  ##
+  ## `lsUnloaded` covers both "never attempted" and "attempted but failed": in
+  ## either case the next call re-runs the probe. Only `lsLoaded` (all symbols
+  ## resolved) is a terminal, cached success. A failed probe is deliberately
+  ## *not* cached as terminal so a later call can retry -- the previous code
+  ## flipped a `loaded` flag unconditionally, which pinned a one-off resolution
+  ## failure as permanent and never re-probed.
+  LoadState = enum
+    lsUnloaded   ## not yet loaded, or the last probe failed -- retry on next call
+    lsLoaded     ## all EVP symbols resolved once; cached, never re-probed
+
 var
-  loaded {.threadvar.}: bool         ## per-thread: each thread resolves its own copy,
-  ok {.threadvar.}: bool             ## so first-use resolution never races (works under
-  ctxNew {.threadvar.}: NewFn        ## plain orc, one navi client per thread)
-  ctxFree {.threadvar.}: FreeFn
+  state {.threadvar.}: LoadState     ## per-thread: each thread resolves its own copy,
+  ctxNew {.threadvar.}: NewFn        ## so first-use resolution never races (works under
+  ctxFree {.threadvar.}: FreeFn      ## plain orc, one navi client per thread)
   md5Md {.threadvar.}: MdFn
   sha1Md {.threadvar.}: MdFn
   sha256Md {.threadvar.}: MdFn
@@ -35,9 +47,11 @@ var
   digestFinal {.threadvar.}: FinalFn
 
 proc ensureLoaded() {.gcsafe.} =
+  ## Resolve the EVP entry points once per thread. Idempotent after a success;
+  ## on failure it leaves `state == lsUnloaded` so a subsequent call retries the
+  ## probe rather than caching the failure forever.
   {.cast(gcsafe).}:
-    if loaded: return
-    loaded = true
+    if state == lsLoaded: return
     when defined(linux):
       # Standard libcrypto sonames; the first that loads wins. On Linux loadLib of
       # a missing name just returns nil (no abort), and libcrypto.so.3 is standard.
@@ -46,7 +60,7 @@ proc ensureLoaded() {.gcsafe.} =
       for name in names:
         lib = loadLib(name)
         if lib != nil: break
-      if lib == nil: return
+      if lib == nil: return          # stays lsUnloaded -> retried next call
       ctxNew = cast[NewFn](lib.symAddr("EVP_MD_CTX_new"))
       ctxFree = cast[FreeFn](lib.symAddr("EVP_MD_CTX_free"))
       md5Md = cast[MdFn](lib.symAddr("EVP_md5"))
@@ -55,15 +69,18 @@ proc ensureLoaded() {.gcsafe.} =
       digestInit = cast[InitFn](lib.symAddr("EVP_DigestInit_ex"))
       digestUpdate = cast[UpdateFn](lib.symAddr("EVP_DigestUpdate"))
       digestFinal = cast[FinalFn](lib.symAddr("EVP_DigestFinal_ex"))
-      ok = ctxNew != nil and ctxFree != nil and md5Md != nil and sha1Md != nil and
-           sha256Md != nil and digestInit != nil and digestUpdate != nil and
-           digestFinal != nil
+      if ctxNew != nil and ctxFree != nil and md5Md != nil and sha1Md != nil and
+         sha256Md != nil and digestInit != nil and digestUpdate != nil and
+         digestFinal != nil:
+        state = lsLoaded             # cached success; never re-probed
+      # else: leave lsUnloaded so a partial resolution is retried next call
 
 proc evpAvailable*(): bool {.gcsafe.} =
   ## True once libcrypto's EVP digest entry points are resolved (Linux only).
-  ## Cheap after the first call. Callers gate on this and fall back to `checksums`.
+  ## Cheap after the first successful call. Callers gate on this and fall back
+  ## to `checksums`; a probe that has never succeeded is retried each call.
   ensureLoaded()
-  {.cast(gcsafe).}: ok
+  {.cast(gcsafe).}: state == lsLoaded
 
 proc evpDigest(md: MdFn, s: string): string {.gcsafe.} =
   {.cast(gcsafe).}:

@@ -49,6 +49,9 @@ when defined(ssl):
   # add_extra_chain_cert (via SSL_CTX_ctrl) transfers ownership, so we do not.
 
   const SSL_CTRL_EXTRA_CHAIN_CERT = 14
+  const X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT = 0x1.cuint
+    ## X509_VERIFY_PARAM flag: always compare the subject CN, not only when the
+    ## certificate carries no subjectAltName. Passed to X509_check_host below.
 
   proc SSL_CTX_use_certificate(ctx: SslCtx, x: PX509): cint
     {.cdecl, dynlib: DLLSSLName, importc.}
@@ -123,14 +126,24 @@ when defined(ssl):
     defer: discard BIO_free(bio)
     let leaf = PEM_read_bio_X509(bio, nil, nil, nil)
     if leaf.isNil: fail("no certificate found in the PEM data")
+    # SSL_CTX_use_certificate bumps the object's refcount, so we free our
+    # reference on every exit path (success or failure) once the leaf exists.
+    defer: X509_free(leaf)
     if SSL_CTX_use_certificate(ctx, leaf) != 1:
-      X509_free(leaf); fail("could not use the client certificate")
-    X509_free(leaf)
+      fail("could not use the client certificate")
     while true:
-      let extra = PEM_read_bio_X509(bio, nil, nil, nil)
+      var extra = PEM_read_bio_X509(bio, nil, nil, nil)
       if extra.isNil: break                      # end of certs (or the key block)
-      if not addChainCert(ctx, extra):
-        X509_free(extra); fail("could not add an intermediate certificate")
+      # addChainCert transfers ownership of `extra` to `ctx` on success, so we do
+      # NOT free it then; on failure ownership stays with us, so we free it. The
+      # defer covers both: null `extra` after a successful transfer so it is only
+      # freed when the transfer failed (before `fail` unwinds this iteration).
+      defer:
+        if not extra.isNil: X509_free(extra)
+      if addChainCert(ctx, extra):
+        extra = nil
+      else:
+        fail("could not add an intermediate certificate")
 
   proc useKeyPem(ctx: SslCtx, pem, password: string) =
     let bio = memBio(pem)
@@ -139,9 +152,11 @@ when defined(ssl):
     let u = if password.len > 0: password.cstring else: nil
     let pkey = PEM_read_bio_PrivateKey(bio, nil, nil, u)
     if pkey.isNil: fail("could not read the private key (wrong password?)")
+    # SSL_CTX_use_PrivateKey bumps the object's refcount, so we free our
+    # reference on every exit path (success or failure) once the key exists.
+    defer: EVP_PKEY_free(pkey)
     if SSL_CTX_use_PrivateKey(ctx, pkey) != 1:
-      EVP_PKEY_free(pkey); fail("the private key does not match the certificate")
-    EVP_PKEY_free(pkey)
+      fail("the private key does not match the certificate")
 
   proc usePkcs12(ctx: SslCtx, data, password: string) =
     ## Install the leaf certificate and key from a PKCS#12 bundle. The bundle's
@@ -158,12 +173,15 @@ when defined(ssl):
     if PKCS12_parse(p12, password.cstring, addr pkey, addr cert, nil) != 1:
       fail("could not decrypt the PKCS#12 bundle (wrong password?)")
     if cert.isNil or pkey.isNil: fail("the PKCS#12 bundle lacks a cert or key")
+    # PKCS12_parse hands us fresh references to both the cert and the key.
+    # SSL_CTX_use_certificate/PrivateKey bump their refcounts, so we free our
+    # references on every exit path (success or failure) once they exist.
+    defer: X509_free(cert)
+    defer: EVP_PKEY_free(pkey)
     if SSL_CTX_use_certificate(ctx, cert) != 1:
-      X509_free(cert); fail("could not use the PKCS#12 certificate")
-    X509_free(cert)
+      fail("could not use the PKCS#12 certificate")
     if SSL_CTX_use_PrivateKey(ctx, pkey) != 1:
-      EVP_PKEY_free(pkey); fail("the PKCS#12 key does not match the certificate")
-    EVP_PKEY_free(pkey)
+      fail("the PKCS#12 key does not match the certificate")
 
   proc isDer(data: string): bool =
     ## DER starts with the ASN.1 SEQUENCE tag (0x30); PEM starts with '-'.
@@ -217,8 +235,10 @@ when defined(ssl):
     while true:
       let cert = PEM_read_bio_X509(bio, nil, nil, nil)
       if cert.isNil: break
-      discard X509_STORE_add_cert(store, cert)   # bumps refcount; free ours after
-      X509_free(cert)
+      # X509_STORE_add_cert bumps the object's refcount, so we free our reference
+      # after handing it over; the defer covers this iteration's exit either way.
+      defer: X509_free(cert)
+      discard X509_STORE_add_cert(store, cert)
       inc added
     if added == 0: fail("no certificate found in TlsConfig.caBundle")
 
@@ -439,7 +459,6 @@ when defined(ssl):
     ## it for IP literals (as std/net does): X509_check_host matches DNS names.
     let cert = SSL_get_peer_certificate(ssl)
     if cert.isNil: fail("server presented no certificate")
-    const X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT = 0x1.cuint
     let match = X509_check_host(cert, host.cstring, host.len.cint,
                                 X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT, nil)
     X509_free(cert)

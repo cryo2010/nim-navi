@@ -6,6 +6,8 @@
 ## "socks5h" behavior), letting the proxy resolve DNS -- which is the point of a
 ## SOCKS proxy on a network the client cannot resolve or reach directly.
 
+import bytewriter
+
 type SocksError* = object of CatchableError
 
 const
@@ -26,11 +28,13 @@ proc fail(msg: string) {.noreturn.} =
 proc greeting*(hasAuth: bool): string =
   ## The client method-selection message: offer no-auth, plus user/pass when creds
   ## are available.
-  result.add char(ver)
+  var w = initByteWriter()
+  w.addByte(ver)
   if hasAuth:
-    result.add char(2); result.add char(methodNoAuth); result.add char(methodUserPass)
+    w.addByte(2); w.addByte(methodNoAuth); w.addByte(methodUserPass)
   else:
-    result.add char(1); result.add char(methodNoAuth)
+    w.addByte(1); w.addByte(methodNoAuth)
+  w.buf
 
 proc selectedMethod*(reply: string): int =
   ## Parse the 2-byte method-selection reply; returns the chosen method byte.
@@ -42,9 +46,11 @@ proc authRequest*(user, pass: string): string =
   ## The username/password subnegotiation request (RFC 1929).
   if user.len > 255 or pass.len > 255:
     fail("SOCKS5 username/password must be at most 255 bytes")
-  result.add char(authVer)
-  result.add char(user.len); result.add user
-  result.add char(pass.len); result.add pass
+  var w = initByteWriter()
+  w.addByte(authVer)
+  w.addLenPrefixed(user)
+  w.addLenPrefixed(pass)
+  w.buf
 
 proc checkAuthReply*(reply: string) =
   ## Validate the 2-byte auth reply; a non-zero status means bad credentials.
@@ -58,10 +64,12 @@ proc connectRequest*(host: string, port: int): string =
   ## proxy performs DNS resolution.
   if host.len == 0 or host.len > 255:
     fail("SOCKS5 target host must be 1..255 bytes")
-  result.add char(ver); result.add char(cmdConnect); result.add char(0)  # RSV
-  result.add char(atypDomain)
-  result.add char(host.len); result.add host
-  result.add char((port shr 8) and 0xFF); result.add char(port and 0xFF)
+  var w = initByteWriter()
+  w.addByte(ver); w.addByte(cmdConnect); w.addByte(0)  # RSV
+  w.addByte(atypDomain)
+  w.addLenPrefixed(host)
+  w.addU16BE(uint16(port))
+  w.buf
 
 proc replyStatus*(header: string): int =
   ## Validate the 4-byte reply header (VER,REP,RSV,ATYP) and return REP (0 = ok).

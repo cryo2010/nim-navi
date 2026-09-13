@@ -157,12 +157,31 @@ proc digestAuthHeader*(user, pass, httpMethod, uri: string,
     else:
       h(ha1 & ":" & ch.nonce & ":" & ha2)
 
-  result = "Digest username=\"" & quoteEscape(user) & "\", realm=\"" & ch.realm &
-           "\", nonce=\"" & ch.nonce & "\", uri=\"" & uri &
-           "\", response=\"" & response & "\""
+  result = "Digest "
+  var first = true
+  # A `name="value"` (quoted) or `name=value` (bare token) Digest parameter,
+  # comma-separated. Grouping the repeated `", name=\"...\""` splices into one
+  # place keeps the quoting and separators consistent across the params below.
+  template param(name, value: string, quoted: bool) =
+    if not first: result.add ", "
+    first = false
+    result.add name
+    result.add '='
+    if quoted:
+      result.add '"'; result.add value; result.add '"'
+    else:
+      result.add value
+
+  param("username", quoteEscape(user), true)
+  param("realm", ch.realm, true)
+  param("nonce", ch.nonce, true)
+  param("uri", uri, true)
+  param("response", response, true)
   if qop.len > 0:
-    result.add ", qop=" & qop & ", nc=" & nc & ", cnonce=\"" & cnonce & "\""
+    param("qop", qop, false)
+    param("nc", nc, false)
+    param("cnonce", cnonce, true)
   if ch.opaque.len > 0:
-    result.add ", opaque=\"" & ch.opaque & "\""
+    param("opaque", ch.opaque, true)
   if ch.algorithm.len > 0:
-    result.add ", algorithm=" & ch.algorithm
+    param("algorithm", ch.algorithm, false)

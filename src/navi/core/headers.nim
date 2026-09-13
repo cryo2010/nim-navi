@@ -47,6 +47,25 @@ proc parseHeaderLine*(line: string): tuple[name, value: string, ok: bool] =
   else:
     ("", "", false)
 
+proc splitParam*(part: string): tuple[key, value: string, hasValue: bool] =
+  ## Split one delimited `key=value` token at its FIRST `=`, returning the raw
+  ## (unstripped, unlowered) key and value so each caller can apply its own
+  ## trimming and case rules. `hasValue` is false when there is no `=` at all,
+  ## in which case `key` is the whole token and `value` is "" (a valueless
+  ## attribute such as Set-Cookie `Secure`). A leading `=` yields an empty key.
+  ##
+  ## Used by the Set-Cookie attribute parser, which pre-splits the list on its
+  ## own delimiter (`;`) and then needs the first-`=` cut per token. Splitting
+  ## only on the FIRST `=` keeps any `=` in the value intact. This does NOT
+  ## tokenize the list itself: the Digest challenge parser needs a single
+  ## quote-aware positional pass (a `,` inside a quoted value is not a
+  ## delimiter), so it is deliberately not expressed in terms of this. (Alt-Svc
+  ## has a similar first-`=` idiom but a stricter empty-key guard, so it keeps
+  ## its own split.)
+  let eq = part.find('=')
+  if eq < 0: (part, "", false)
+  else: (part[0 ..< eq], part[eq + 1 .. ^1], true)
+
 proc del*(h: var Headers, name: string) =
   ## Remove all fields matching `name` (case-insensitive).
   var i = 0
