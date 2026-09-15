@@ -99,7 +99,7 @@ proc initNaviConfig*(): NaviConfig =
     retry: defaultRetryPolicy(), maxResponseBytes: 0,
     auth: Auth(), proxy: "", unixSocket: "",
     maxIdleConns: 0, maxIdleConnsPerHost: 0, idleConnTimeout: 0,
-    timeouts: Timeouts(), middleware: @[])
+    timeouts: Timeouts(), resolvedProxy: nil, middleware: @[])
 
 proc newNavi*(config = initNaviConfig()): Navi =
   ## Create a client. `config` supplies defaults (prefixUrl, headers, TLS,
@@ -117,6 +117,7 @@ proc newNavi*(config = initNaviConfig()): Navi =
   cfg.tls.sessionCache = newTlsStore(cfg.tls)   # always its own cache, so a config
   cfg.tls.contextStore = newTlsCtxStore(cfg.tls) # cloned from another client (e.g.
                                                  # newNavi(other.config)) is isolated
+  cfg.resolvedProxy = buildResolvedProxy(cfg)    # resolve env/proxy/NO_PROXY once (#361)
   result = Navi(config: cfg,
     pool: newPool[PooledConn[Conn]](cfg.idlePerHost, cfg.idleGlobal, cfg.idleTimeoutMs),
     jar: newCookieJar())
@@ -129,6 +130,10 @@ proc extend*(client: Navi, config: NaviConfig): Navi =
   merged.middleware = client.config.middleware & config.middleware
   merged.tls.sessionCache = newTlsStore(merged.tls)  # its own cache, not the parent's
   merged.tls.contextStore = newTlsCtxStore(merged.tls)  # its own contexts too
+  merged.resolvedProxy = buildResolvedProxy(merged)  # its own resolved proxy (#361):
+                                                     # an extended client with a
+                                                     # different proxy must not inherit
+                                                     # the parent's cache
   result = Navi(config: merged,
     pool: newPool[PooledConn[Conn]](merged.idlePerHost, merged.idleGlobal, merged.idleTimeoutMs),
     jar: newCookieJar())

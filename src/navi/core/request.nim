@@ -102,6 +102,10 @@ type
     idleConnTimeout*: int           ## ms an idle pooled connection may live before it is
                                     ## evicted and closed; 0 (default) = no timeout
     timeouts*: Timeouts             ## per-phase deadlines (connect/read/total)
+    resolvedProxy*: ResolvedProxy   ## proxy config resolved once at construction
+                                    ## (env reads + URL parse + NO_PROXY split);
+                                    ## nil until `newNavi`/`extend` build it. Set by
+                                    ## the client, not the caller; see core/proxy.nim.
 
   BodyProducer* = proc(): string {.closure, raises: [CatchableError].}
     ## Pull-based upload source: returns the next chunk, or "" at end of body.
