@@ -19,6 +19,7 @@ when not defined(naviHttp3):
 import std/[strutils, atomics, os, times]
 import ../core/altsvc
 import ../core/response   # ResponseTooLargeError, raised when a body exceeds maxResponseBytes
+import ./timing           # establishMs precedence + shared timeout wording
 export altsvc.AltSvcEndpoint
 
 # Link the h3 stack via pkg-config so the build follows wherever the libraries
@@ -462,9 +463,9 @@ proc openWsH3*(host: string, port: int, sni, caFile: string, verify: bool,
   let sid = navi_h3_open_connect(h, path.cstring, reqHdr.cstring, "websocket".cstring)
   if sid < 0:
     navi_h3_close(h); raise newException(QuicError, "navi: h3 Extended CONNECT failed")
-  let handshakeMs = if connectMs > 0: connectMs         # connectMs wins, then totalMs,
-                    elif totalMs > 0: totalMs           # else a 30s default (as the sync
-                    else: 30_000                        # `connect` resolves establishMs)
+  # connectMs wins, then totalMs, else a 30s handshake default (mirroring how the
+  # sync `connect` resolves establishMs, but with an explicit backend floor).
+  let handshakeMs = establishMs(connectMs, totalMs, 30_000)
   let deadline = epochTime() + float(handshakeMs) / 1000.0
   var status: clong
   var hbuf = newString(16 * 1024)
@@ -520,8 +521,7 @@ proc wsRecv*(p: WsH3Pump): string =
   ## read is bounded by readMs. With `readMs` 0 this is the original blocking recv.
   if p.readMs <= 0: return p.toApp.recv()
   if not p.wsDataWaiting(p.readMs):
-    raise newException(response.TimeoutError, "navi: read timed out after " &
-      $p.readMs & " ms")
+    raise newException(response.TimeoutError, readTimeoutMsg(p.readMs))
   p.toApp.recv()
 
 proc wsClose*(p: WsH3Pump) =

@@ -10,7 +10,7 @@
 ## async: the per-connection cost drops to roughly the sync backend's.
 
 import std/[asyncdispatch, nativesockets, strutils, monotimes, times, base64]
-import ./api, ./openssl_ctx, ./happyeyeballs, ./tls_store, ./tunnel
+import ./api, ./openssl_ctx, ./happyeyeballs, ./tls_store, ./tunnel, ./timing
 import ../core/response  # for navi's TimeoutError
 import ../core/socks
 when defined(ssl):
@@ -364,8 +364,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   # the same contract as the whole-request guard.
   let estFut = establish()
   if connectMs > 0 and not await withTimeout(estFut, connectMs):
-    raise newException(response.TimeoutError,
-                       "navi: connect timed out after " & $connectMs & " ms")
+    raise newException(response.TimeoutError, connectTimeoutMsg(connectMs))
   await estFut
   return conn
 
@@ -394,8 +393,7 @@ proc recvSome*(c: Conn): Future[string] {.async.} =
   else:
     readFut = recv(c.fd, naviReadBufSize)
   if c.readMs > 0 and not await withTimeout(readFut, c.readMs):
-    raise newException(response.TimeoutError,
-                       "navi: read timed out after " & $c.readMs & " ms")
+    raise newException(response.TimeoutError, readTimeoutMsg(c.readMs))
   return await readFut
 
 proc shutdownConn*(c: Conn) =

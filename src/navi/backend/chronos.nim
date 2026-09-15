@@ -11,7 +11,7 @@ import std/[strutils, base64]
 import pkg/chronos, pkg/chronos/transports/stream
 import pkg/chronos/streams/asyncstream
 import ./api
-import ./tls_store, ./tunnel
+import ./tls_store, ./tunnel, ./timing
 import ../core/response  # for navi's TimeoutError
 import ../core/socks
 from ./happyeyeballs import heAttemptDelayMs
@@ -289,8 +289,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
 
   if connectMs > 0:
     if not await withTimeout(establish(), connectMs.milliseconds):
-      raise newException(response.TimeoutError,
-                         "navi: connect timed out after " & $connectMs & " ms")
+      raise newException(response.TimeoutError, connectTimeoutMsg(connectMs))
   else:
     await establish()
   return conn
@@ -332,8 +331,7 @@ proc recvSome*(c: Conn): Future[string] {.async.} =
     readFut = plaintextRead(c)
   if c.readMs > 0:
     if not await withTimeout(readFut, c.readMs.milliseconds):
-      raise newException(response.TimeoutError,
-                         "navi: read timed out after " & $c.readMs & " ms")
+      raise newException(response.TimeoutError, readTimeoutMsg(c.readMs))
   result = await readFut
 
 proc close*(c: Conn): Future[void] {.async.} =
