@@ -7,6 +7,8 @@ onward (pre-1.0, minor versions may include breaking changes).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-15
+
 ### Added
 - **WebSocket over Extended CONNECT.** `websocket()` now tunnels over HTTP/2
   (RFC 8441) when `config.http = {H2}` and HTTP/3 (RFC 9220, `-d:naviHttp3`) when
@@ -38,12 +40,22 @@ onward (pre-1.0, minor versions may include breaking changes).
   via `writer.write`, closing it automatically at block exit. Mirrors HTTP
   `stream()`/`bodyStream`. On `navi/js` (which owns framing) a read yields the whole
   message as one chunk and a write buffers until the block exits.
+- **SSE idle timeout on the sync backend.** `sse(..., idleTimeoutMs)` (default 45 s)
+  now also exists on the sync client, matching async: it bounds each read and each
+  (re)open, so a server that sends headers then goes silent raises `TimeoutError`
+  instead of hanging `next()` forever. Any received byte (including a keep-alive `:`
+  comment) resets it; `0` disables it.
 
 ### Changed
 - WebSocket masking keys and the handshake nonce now come from the OS CSPRNG
   (`std/sysrand`) instead of a time-seeded `std/random`, matching RFC 6455 5.3's
   requirement of a strong entropy source (native backends; `navi/js` uses the
   runtime's WebSocket).
+- Proxy configuration (the `config.proxy` URL and the `HTTPS_PROXY`/`ALL_PROXY`/
+  `NO_PROXY` env vars) is resolved once at client construction instead of re-read
+  and re-parsed on every request attempt; only the cheap `NO_PROXY` host match
+  remains per request. A malformed proxy URL now raises `ValueError` when the
+  client is built rather than on the first request.
 
 ### Fixed
 - HTTP/3: certificate verification now runs after the handshake completes (checking
@@ -54,6 +66,22 @@ onward (pre-1.0, minor versions may include breaking changes).
   of raising `QuicError`. navi now rejects an untrusted or hostname-mismatched peer
   cleanly, before any request is sent, matching the post-handshake verification the
   TCP backends already use.
+- WebSocket over HTTP/3 now honors `config.timeouts.read` (a per-read stall bound)
+  and `total` (a handshake deadline); previously only `connect` applied, so a
+  stalled h3 WebSocket read hung forever regardless of configured timeouts.
+- Async `stream()` opens (connect + TLS + request + response headers, across every
+  redirect/digest hop) are bounded by `config.timeouts.total`, and the body reads
+  share that same single budget, matching the sync backend's connect-time deadline.
+  Previously the open phase was unbounded.
+- Sync and batch retries honor `config.timeouts.total` as an overall deadline:
+  backoff sleeps are capped to the remaining budget and retrying stops once it is
+  spent, per the documented "whole request, including retries/redirects" contract.
+  Previously only the async backends enforced this.
+- Reused pooled connections re-apply the live `config.timeouts` (read timeout and
+  the per-attempt total budget), and reused HTTP/2 connections pick up
+  `config.timeouts.h2KeepAlive` changes, including enabling or disabling keepalive,
+  honoring the documented live-config contract. Previously the values captured at
+  connect time stuck for the connection's lifetime.
 
 ## [0.9.0] - 2026-08-29
 
@@ -429,7 +457,8 @@ across four backends.
 - TLS certificates verified by default; HPACK bounds, negative `Content-Length`
   rejection, chunk-size bounds, and malformed-input rejection instead of crashes.
 
-[Unreleased]: https://github.com/cryo2010/nim-navi/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/cryo2010/nim-navi/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/cryo2010/nim-navi/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/cryo2010/nim-navi/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/cryo2010/nim-navi/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/cryo2010/nim-navi/compare/v0.6.0...v0.7.0
