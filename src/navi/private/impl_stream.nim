@@ -18,6 +18,10 @@ type
     decompress: bool
     cap: int
     cancel: CancelToken
+    deadline: MonoTime         ## absolute whole-exchange deadline (from totalMs),
+                               ## persisted across body reads for sync parity; see
+                               ## `bounded`
+    bounded: bool              ## whether `deadline` is active (totalMs configured)
     phase: StreamPhase         ## spOpen -> spDrained (body fully read) or spClosed
                                ## (disposed without draining); see StreamPhase
     guard: StreamGuard         ## closes/resets if the handle is dropped before
@@ -147,16 +151,15 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
       resp: parser.toResponse(), client: client, key: origin,
       decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
 
-proc stream*(client: Navi, verb: HttpVerb, target: string,
-             headers = initHeaders(), params: seq[(string, string)] = @[],
-             cancel: CancelToken = nil): Future[StreamResponse] {.async.} =
-  ## Open a streaming response: perform the request, follow redirects and digest
-  ## auth to the final response, and return a handle whose status/headers are
-  ## available immediately while the body streams on demand via `each`/`drain`.
-  ##
-  ## Unlike `request`, this does NOT throw on a non-2xx status (inspect `status`),
-  ## and middleware is not applied. Redirect/digest hops are closed. Consume the
-  ## returned handle with `each`/`drain`, or `close` it to skip the body.
+proc streamOpen(client: Navi, verb: HttpVerb, target: string,
+                headers: Headers, params: seq[(string, string)],
+                cancel: CancelToken): Future[StreamResponse] {.async.} =
+  ## The OPEN phase of `stream`: perform the request, follow redirects and digest
+  ## auth to the final response, and return the handle with its body pending. This
+  ## is what `stream` wraps in `guard(totalMs, ...)` so connect + response headers +
+  ## every redirect/digest hop stay within the total deadline (the buffered path
+  ## bounds the same span via `guard` in `request`; the async backends' `connect`
+  ## `discard totalMs` precisely because callers wrap with this outer guard).
   var rreq = buildRequest(client.config, verb, target, headers, params = params)
   let digestOrigin = originKey(rreq.url)   # digest creds only for this origin
   var hops = 0
@@ -218,7 +221,44 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
     else:
       return handle
 
-proc readChunk*(sr: StreamResponse): Future[string] {.async.} =
+proc stream*(client: Navi, verb: HttpVerb, target: string,
+             headers = initHeaders(), params: seq[(string, string)] = @[],
+             cancel: CancelToken = nil): Future[StreamResponse] {.async.} =
+  ## Open a streaming response: perform the request, follow redirects and digest
+  ## auth to the final response, and return a handle whose status/headers are
+  ## available immediately while the body streams on demand via `each`/`drain`.
+  ##
+  ## Unlike `request`, this does NOT throw on a non-2xx status (inspect `status`),
+  ## and middleware is not applied. Redirect/digest hops are closed. Consume the
+  ## returned handle with `each`/`drain`, or `close` it to skip the body.
+  ##
+  ## `totalMs` bounds the OPEN phase (connect + TLS + request + response headers,
+  ## across every redirect/digest hop) via `guard`, consistent with the buffered
+  ## `request` path, and then -- matching the sync backend's absolute `Conn`
+  ## deadline -- continues to bound the body reads: the same total budget is an
+  ## absolute wall-clock deadline on the returned handle that `readChunk`/`drain`
+  ## enforce, so a wedged peer cannot stall the body forever either.
+  let totalMs = client.config.totalMs
+  let handle = await guard(totalMs,
+                           streamOpen(client, verb, target, headers, params, cancel),
+                           cancel)
+  if totalMs > 0:
+    # Arm the whole-exchange deadline that body reads honour (sync parity). It is
+    # set once the headers are in hand so it brackets the body read span, just as
+    # sync's Conn.deadline (set at connect) persists from connect through the body.
+    handle.deadline = getMonoTime() + initDuration(milliseconds = totalMs)
+    handle.bounded = true
+  return handle
+
+proc remainingMs(sr: StreamResponse): int =
+  ## Milliseconds left on the whole-exchange deadline for a body read; a positive
+  ## value to guard the read by, or <= 0 once the budget is spent (the caller raises
+  ## TimeoutError). `int.high` when unbounded (no totalMs), meaning "do not bound".
+  if not sr.bounded: return int.high
+  result = (sr.deadline - getMonoTime()).inMilliseconds.int
+  if result <= 0: result = 0    # spent; the caller turns this into a timeout
+
+proc readChunkRaw(sr: StreamResponse): Future[string] {.async.} =
   ## Pull the next decoded body chunk, or "" once the body is fully read. At end an
   ## h1 connection is returned to the pool (or closed) and an h2 stream is dropped
   ## on the shared connection, and the guard is disarmed; a cap breach or h2 reset
@@ -283,6 +323,41 @@ proc readChunk*(sr: StreamResponse): Future[string] {.async.} =
         raise
     else: discard
 
+proc readChunk*(sr: StreamResponse): Future[string] {.async.} =
+  ## Pull the next decoded body chunk, or "" once the body is fully read. At end an
+  ## h1 connection is returned to the pool (or closed) and an h2 stream is dropped
+  ## on the shared connection, and the guard is disarmed; a cap breach or h2 reset
+  ## closes/drops and reraises. The guard stays armed across the incremental reads,
+  ## so a handle dropped before EOF is still cleaned up by it.
+  ##
+  ## Each read is bounded by what remains of the stream's total deadline (set from
+  ## `totalMs` at open), so a wedged peer trips TimeoutError rather than hanging the
+  ## body forever -- matching the sync backend, whose `Conn` deadline persists from
+  ## connect across every body read. Unbounded (totalMs == 0) reads plainly.
+  if sr.phase != spOpen: return ""
+  if not sr.bounded:
+    return await readChunkRaw(sr)
+  let budget = sr.remainingMs()
+  if budget <= 0:
+    # Budget already spent before this read: tear down as a timed-out read would
+    # (readChunkRaw's own except arm does this on a guard-raised timeout), then raise.
+    if sr.phase == spOpen: sr.phase = spDrained
+    case sr.kind
+    of skH1:
+      disarm(sr.guard); await close(sr.transport)
+    of skH2:
+      disarm(sr.guard)
+    of skH3:
+      when defined(naviHttp3):
+        disarm(sr.guard); sr.qc.freeStream(sr.h3sid)
+      else: discard
+    raise newException(TimeoutError, "navi: request timed out")
+  # guard the read by the remaining budget (no cancel token: cancellation is the
+  # caller's via throwIfCancelled on the stream's own `cancel`, applied in `drain`);
+  # on expiry guard raises TimeoutError and readChunkRaw's except arm has already
+  # torn the connection down.
+  return await guard(budget, readChunkRaw(sr), nil)
+
 proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
   ## Deliver the response body to `sink` as it arrives (decoded and size-capped),
   ## awaiting it per chunk so a slow sink backpressures the peer. Then return an
@@ -293,10 +368,20 @@ proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
     raise newException(IOError, "navi: stream already drained or closed")
   throwIfCancelled(sr.cancel)
   disarm(sr.guard)                      # from here `drain` owns the teardown
+  # Bound the whole body drain by what remains of the total deadline (sync parity):
+  # guard the draining future by the remaining budget. When unbounded (no totalMs)
+  # `budget` is int.high and `bounded` is false, so we await the drain plainly; when
+  # the budget is already spent it is 0, and guard fires immediately (TimeoutError).
+  let budget = if sr.bounded: sr.remainingMs() else: 0
   case sr.kind
   of skH2:
     try:
-      await sr.mux.drainDownload(sr.sid, sink)
+      # `guard` is generic over the guarded future's result and has no void arm, so
+      # give the drain a bool result to bound it by the remaining budget.
+      proc drainH2(): Future[bool] {.async.} =
+        await sr.mux.drainDownload(sr.sid, sink); return true
+      if sr.bounded: discard await guard(budget, drainH2(), nil)
+      else: discard await drainH2()
       sr.phase = spDrained                 # drainDownload freed the stream
     except CatchableError:
       sr.phase = spDrained                 # ...on error too, so the guard won't double-free
@@ -304,7 +389,10 @@ proc drain*(sr: StreamResponse, sink: BodySink): Future[void] {.async.} =
   of skH1:
     try:
       var keep = false
-      h1DrainBody(sr.transport, sr.parser, sink, keep, sr.decompress, sr.cap)
+      proc drainH1(): Future[bool] {.async.} =
+        h1DrainBody(sr.transport, sr.parser, sink, keep, sr.decompress, sr.cap); return true
+      if sr.bounded: discard await guard(budget, drainH1(), nil)
+      else: discard await drainH1()
       sr.phase = spDrained
       if not (keep and pushIdle(sr.client.pool, sr.key, PooledConn[Conn](transport: sr.transport))):
         await close(sr.transport)

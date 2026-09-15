@@ -4,6 +4,8 @@ import unittest
 import std/[asyncdispatch, strutils]
 import navi/asyncdispatch
 import navi/core/pool      # for pool.idleCount in the streaming lifecycle tests
+import navi/core/response as naviresp  # navi's TimeoutError (std/net also defines one)
+import std/[monotimes, times]
 import ./support
 
 suite "asyncdispatch entry end to end":
@@ -109,6 +111,30 @@ suite "asyncdispatch entry end to end":
       except IOError: return true
       return false
     check waitFor run()
+    joinThread(th)
+
+  test "stream open is bounded by totalMs (a wedged server trips TimeoutError, #358)":
+    # The server accepts and reads the request but never sends response headers, so
+    # openStreamConn would block reading them forever. With totalMs configured, the
+    # OPEN phase must be guarded (as the buffered path is) and trip TimeoutError near
+    # the bound instead of hanging on the server's ~600ms hold.
+    var port = 0
+    var th: Thread[ServerCtx]
+    startHang(th, port)                    # accepts, reads the request, never replies
+    var cfg = initNaviConfig()
+    cfg.timeouts.total = 150               # tight total deadline
+    let api = newNavi(cfg)
+    proc run(): Future[(bool, int)] {.async.} =
+      let t0 = getMonoTime()
+      var raised = false
+      try:
+        discard await api.stream(GET, "http://127.0.0.1:" & $port & "/")
+      except naviresp.TimeoutError:
+        raised = true
+      return (raised, (getMonoTime() - t0).inMilliseconds.int)
+    let (raised, elapsed) = waitFor run()
+    check raised                           # bounded, not a forever-hang
+    check elapsed < 500                    # fired near the 150ms bound, not the 600ms hold
     joinThread(th)
 
   test "stream should expose headers before the body and deliver it via each":

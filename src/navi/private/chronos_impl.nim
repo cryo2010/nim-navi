@@ -14,6 +14,8 @@ import navi/proto/h1
 import navi/proto/ws
 import navi/backend/[chronos, h2mux_chronos]
 from std/strutils import startsWith, find, splitLines, contains, toLowerAscii
+from std/monotimes import getMonoTime, MonoTime, `+`, `-`  # stream whole-exchange
+from std/times import Duration, initDuration, inMilliseconds  # deadline (sync parity)
 when defined(naviHttp3):
   import navi/core/altsvc
   import navi/backend/quic_chronos
