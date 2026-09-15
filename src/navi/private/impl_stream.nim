@@ -239,14 +239,15 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
   ## absolute wall-clock deadline on the returned handle that `readChunk`/`drain`
   ## enforce, so a wedged peer cannot stall the body forever either.
   let totalMs = client.config.totalMs
+  # The whole-exchange deadline starts before the open, so the open and the body
+  # reads share ONE total budget, just as sync's Conn.deadline (set at connect)
+  # persists from connect through the body.
+  let deadline = getMonoTime() + initDuration(milliseconds = totalMs)
   let handle = await guard(totalMs,
                            streamOpen(client, verb, target, headers, params, cancel),
                            cancel)
   if totalMs > 0:
-    # Arm the whole-exchange deadline that body reads honour (sync parity). It is
-    # set once the headers are in hand so it brackets the body read span, just as
-    # sync's Conn.deadline (set at connect) persists from connect through the body.
-    handle.deadline = getMonoTime() + initDuration(milliseconds = totalMs)
+    handle.deadline = deadline
     handle.bounded = true
   return handle
 
