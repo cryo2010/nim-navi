@@ -8,7 +8,7 @@
 ## `await`-shaped body compiles to straight-line blocking code.
 
 import std/[os, strutils, nativesockets, monotimes, times, base64]
-import ./api, ./openssl_ctx, ./happyeyeballs, ./tls_store, ./tunnel
+import ./api, ./openssl_ctx, ./happyeyeballs, ./tls_store, ./tunnel, ./timing
 import ../core/response  # for navi's TimeoutError
 import ../core/socks
 when defined(ssl):
@@ -114,8 +114,7 @@ proc tcpConnect(host: string, port: int, connectMs = 0): SocketHandle =
         elif not connectInProgress():
           lastErr = osErrorMsg(osLastError()); close(fd)
         elif not waitWritable(fd, connectMs):
-          timedOut = true
-          lastErr = "connect timed out after " & $connectMs & " ms"; close(fd)
+          timedOut = true; close(fd)
         elif getSockOptInt(fd, SOL_SOCKET.int, SO_ERROR.int) != 0:
           lastErr = "connection refused"; close(fd)
         else:
@@ -123,7 +122,7 @@ proc tcpConnect(host: string, port: int, connectMs = 0): SocketHandle =
     it = it.ai_next
   if result == osInvalidSocket:
     if timedOut:
-      raise newException(response.TimeoutError, "navi: " & lastErr)
+      raise newException(response.TimeoutError, connectTimeoutMsg(connectMs))
     raise newException(IOError, "navi: could not connect to " & host & ": " & lastErr)
 
 proc sendRaw(fd: SocketHandle, data: string) =
@@ -246,7 +245,7 @@ proc happyConnect(ips: seq[string], port: int,
     if inflight.len == 0: break          # nothing pending and nothing left to start
     var waitMs = heAttemptDelayMs
     if connectMs > 0:
-      let remaining = connectMs - (getMonoTime() - start).inMilliseconds.int
+      let remaining = remainingMs(start + initDuration(milliseconds = connectMs))
       if remaining <= 0: timedOut = true; break
       waitMs = min(waitMs, remaining)
     var fds = newSeq[SocketHandle](inflight.len)
@@ -267,8 +266,7 @@ proc happyConnect(ips: seq[string], port: int,
           lastErr = "connection refused"; close(ready); inflight.delete(pos)
   for e in inflight: close(e.fd)
   if timedOut:
-    raise newException(response.TimeoutError,
-                       "navi: connect timed out after " & $connectMs & " ms")
+    raise newException(response.TimeoutError, connectTimeoutMsg(connectMs))
   raise newException(IOError, "navi: could not connect: " & lastErr)
 
 when defined(ssl):
@@ -311,7 +309,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   ## connect + TLS handshake; `readMs` is the per-read stall limit; `totalMs` is
   ## the overall (per-attempt) deadline. TLS requires `-d:ssl`.
   # A total deadline also caps establishment when no explicit connect limit is set.
-  let establishMs = if connectMs > 0: connectMs else: totalMs
+  let establishMs = establishMs(connectMs, totalMs)
   result.fd = osInvalidSocket
   result.readMs = readMs
   if totalMs > 0:
@@ -392,6 +390,19 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     if tls: postHandshakeVerify(result.ssl, host, cfg)
   established = true
 
+proc rearm*(c: var Conn, readMs = 0, totalMs = 0) =
+  ## Re-apply the current config's read timeout and per-attempt total deadline to a
+  ## connection taken from the idle pool, so a reused connection honors navi's live-
+  ## config contract (`client.config.timeouts.*` read live per request) rather than
+  ## carrying the values it was opened with (issue #360). `readMs` bounds each read;
+  ## `totalMs` arms a fresh absolute deadline (0 = unbounded, clearing any prior one).
+  c.readMs = readMs
+  if totalMs > 0:
+    c.deadline = getMonoTime() + initDuration(milliseconds = totalMs)
+    c.bounded = true
+  else:
+    c.bounded = false
+
 proc sendAll*(c: Conn, data: string) =
   if data.len == 0: return
   when defined(ssl):
@@ -428,12 +439,12 @@ proc recvSome*(c: Conn): string =
   result = newStringUninit(naviReadBufSize)   # overwritten by the read then setLen(n): no zero-fill
   var waitMs = c.readMs
   if c.bounded:
-    let remaining = (c.deadline - getMonoTime()).inMilliseconds.int
+    let remaining = remainingMs(c.deadline)
     if remaining <= 0:
       raise newException(response.TimeoutError, "navi: request timed out")
     waitMs = if waitMs <= 0: remaining else: min(waitMs, remaining)
   if waitMs > 0 and not c.waitReadable(waitMs):
-    if c.bounded and (c.deadline - getMonoTime()).inMilliseconds.int <= 0:
+    if c.bounded and remainingMs(c.deadline) <= 0:
       raise newException(response.TimeoutError, "navi: request timed out")
     raise newException(response.TimeoutError, "navi: read timed out")
   var n: int

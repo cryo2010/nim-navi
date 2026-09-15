@@ -19,6 +19,7 @@ type
     baseRetryMs: int          ## reconnect base delay (the server's retry: overrides)
     retryMs: int              ## current delay (backs off on repeated failures)
     maxRetryMs: int
+    idleTimeoutMs: int        ## bound on a single read / (re)open wait; 0 = unbounded
     handle: StreamResponse    ## current underlying stream, nil between reconnects
     parser: SseParser
     started: bool
@@ -47,7 +48,7 @@ proc sse*(client: Navi, target: string, verb = GET,
           headers = initHeaders(), body = "",
           params: seq[(string, string)] = @[],
           lastEventId = "", reconnect = true,
-          retryMs = 3000, maxRetryMs = 30_000,
+          retryMs = 3000, maxRetryMs = 30_000, idleTimeoutMs = 45_000,
           cancel: CancelToken = nil): SseStream =
   ## Open a Server-Sent Events stream. The initial response is validated up front:
   ## a non-200 or non `text/event-stream` response raises. Consume events with
@@ -56,11 +57,27 @@ proc sse*(client: Navi, target: string, verb = GET,
   ## honoring the server's retry: with exponential backoff up to `maxRetryMs` --
   ## unless `reconnect` is false. `verb`/`body`/headers allow POST-SSE and auth,
   ## which the platform EventSource cannot do. The underlying stream runs with the
-  ## size cap and read/total timeouts off (SSE is long-lived) and shares the
-  ## client's cookie jar.
+  ## size cap and total timeout off (SSE is long-lived) and shares the client's
+  ## cookie jar.
+  ##
+  ## `idleTimeoutMs` bounds how long a single read or (re)open may block before the
+  ## stream is treated as wedged and reconnected (resending Last-Event-ID), so a
+  ## parked read cannot hang forever -- the failure mode when all timeouts are off
+  ## and a server sends headers then goes silent. It drives the internal client's
+  ## per-read (and connect) stall limit, so any byte -- including a keep-alive `:`
+  ## comment -- resets it and a live-but-quiet stream is not disturbed; set 0 to
+  ## disable (only for a server known to go silent for long stretches without
+  ## sending keep-alives).
   var cfg = client.config
   cfg.maxResponseBytes = 0
-  cfg.timeouts.read = 0
+  # Bound each read (and each (re)open's header read / connect) by idleTimeoutMs so a
+  # wedged server that goes silent surfaces a TimeoutError that the reconnect loop in
+  # `next` drives back through backoff, instead of a read that blocks forever. 0 keeps
+  # reads unbounded (only for a server known to go quiet without keep-alives). The
+  # total timeout stays off because an SSE stream is long-lived by design.
+  cfg.timeouts.read = idleTimeoutMs
+  if idleTimeoutMs > 0 and (cfg.timeouts.connect <= 0 or cfg.timeouts.connect > idleTimeoutMs):
+    cfg.timeouts.connect = idleTimeoutMs
   cfg.timeouts.total = 0
   var h = headers
   if not h.contains("accept"): h["accept"] = "text/event-stream"
@@ -73,7 +90,7 @@ proc sse*(client: Navi, target: string, verb = GET,
     client: sc,
     verb: verb, target: target, headers: h, params: params, cancel: cancel,
     reconnect: reconnect, baseRetryMs: retryMs, retryMs: retryMs,
-    maxRetryMs: maxRetryMs, parser: initSseParser(lastEventId))
+    maxRetryMs: maxRetryMs, idleTimeoutMs: idleTimeoutMs, parser: initSseParser(lastEventId))
   result.openConn()            # eager: validate the initial response, fail fast
   result.started = true
 

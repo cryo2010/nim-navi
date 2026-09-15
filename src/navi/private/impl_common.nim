@@ -53,7 +53,8 @@ proc initNaviConfig*(): NaviConfig =
     retry: defaultRetryPolicy(), maxResponseBytes: 0,
     auth: Auth(), proxy: "", unixSocket: "",
     maxIdleConns: 0, maxIdleConnsPerHost: 0, idleConnTimeout: 0,
-    timeouts: Timeouts(h2KeepAlive: defaultH2KeepAliveMs), middleware: @[])
+    timeouts: Timeouts(h2KeepAlive: defaultH2KeepAliveMs), resolvedProxy: nil,
+    middleware: @[])
 
 when not defined(naviHttp3):
   var h3BuildWarned {.threadvar.}: bool   # per-thread once-flag (a shared global races)
@@ -70,6 +71,7 @@ proc newNavi*(config = initNaviConfig()): Navi =
   cfg.tls.sessionCache = newTlsStore(cfg.tls)   # always its own cache, so a config
   cfg.tls.contextStore = newTlsCtxStore(cfg.tls) # cloned from another client (e.g.
                                                  # newNavi(other.config)) is isolated
+  cfg.resolvedProxy = buildResolvedProxy(cfg)    # resolve env/proxy/NO_PROXY once (#361)
   result = Navi(config: cfg,
        pool: newPool[PooledConn[Conn]](cfg.idlePerHost, cfg.idleGlobal, cfg.idleTimeoutMs),
        jar: newCookieJar(),
@@ -85,6 +87,10 @@ proc extend*(client: Navi, config: NaviConfig): Navi =
   merged.middleware = client.config.middleware & config.middleware
   merged.tls.sessionCache = newTlsStore(merged.tls)  # its own cache, not the parent's
   merged.tls.contextStore = newTlsCtxStore(merged.tls)  # its own contexts too
+  merged.resolvedProxy = buildResolvedProxy(merged)  # its own resolved proxy (#361):
+                                                     # an extended client with a
+                                                     # different proxy must not inherit
+                                                     # the parent's cache
   result = Navi(config: merged,
        pool: newPool[PooledConn[Conn]](merged.idlePerHost, merged.idleGlobal, merged.idleTimeoutMs),
        jar: newCookieJar(),
@@ -221,10 +227,14 @@ proc transportInner(client: Navi, req: Request, sink: BodySink): Future[Response
   if wantH2:
     # 1. A live shared connection, or one currently being established.
     if client.muxes.hasKey(origin) and client.muxes[origin].canReuse:
+      # A reused mux adopts the CURRENT keepalive interval, not the one it was opened
+      # with, honoring navi's live-config contract (issue #360).
+      client.muxes[origin].applyKeepAlive(client.config.h2KeepAliveMs)
       return await client.muxRequest(client.muxes[origin], req, sink)
     if client.pendingMux.hasKey(origin):
       let mux = await client.pendingMux[origin]
       if mux != nil and mux.canReuse:
+        mux.applyKeepAlive(client.config.h2KeepAliveMs)
         return await client.muxRequest(mux, req, sink)
       # else: turned out http/1.1, fall through
 
@@ -233,6 +243,10 @@ proc transportInner(client: Navi, req: Request, sink: BodySink): Future[Response
     await close(dead.transport)
   var (found, pc) = popIdle(client.pool, origin)
   if found:
+    # A pooled connection adopts the CURRENT config read timeout, not the one it was
+    # opened with, honoring navi's live-config contract (issue #360). The whole-request
+    # deadline is enforced by the async entry's `guard`, so only `readMs` is re-armed.
+    rearm(pc.transport, client.config.readMs)
     # `gotResponse` distinguishes a reused-connection failure BEFORE any response
     # byte (unprocessed: safe to replay any method) from one AFTER the response began
     # (processed: only an idempotent method may be replayed).

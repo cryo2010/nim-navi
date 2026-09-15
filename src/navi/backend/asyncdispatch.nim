@@ -10,7 +10,7 @@
 ## async: the per-connection cost drops to roughly the sync backend's.
 
 import std/[asyncdispatch, nativesockets, strutils, monotimes, times, base64]
-import ./api, ./openssl_ctx, ./happyeyeballs, ./tls_store, ./tunnel
+import ./api, ./openssl_ctx, ./happyeyeballs, ./tls_store, ./tunnel, ./timing
 import ../core/response  # for navi's TimeoutError
 import ../core/socks
 when defined(ssl):
@@ -364,8 +364,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   # the same contract as the whole-request guard.
   let estFut = establish()
   if connectMs > 0 and not await withTimeout(estFut, connectMs):
-    raise newException(response.TimeoutError,
-                       "navi: connect timed out after " & $connectMs & " ms")
+    raise newException(response.TimeoutError, connectTimeoutMsg(connectMs))
   await estFut
   return conn
 
@@ -374,6 +373,15 @@ proc sendAll*(c: Conn, data: string): Future[void] {.async.} =
     if not c.ssl.isNil:
       await sslWrite(c, data); return
   await send(c.fd, data)
+
+proc rearm*(c: var Conn, readMs = 0, totalMs = 0) =
+  ## Re-apply the current config's read timeout to a connection taken from the idle
+  ## pool, so a reused connection honors navi's live-config contract rather than the
+  ## value it was opened with (issue #360). `totalMs` is accepted for signature parity
+  ## with the sync backend but ignored: the async entry's outer `guard` enforces the
+  ## whole-request deadline, so there is no per-conn deadline to re-arm here.
+  discard totalMs
+  c.readMs = readMs
 
 proc recvSome*(c: Conn): Future[string] {.async.} =
   ## One chunk of up to `naviReadBufSize` bytes; "" means the peer closed. Bounded by
@@ -385,8 +393,7 @@ proc recvSome*(c: Conn): Future[string] {.async.} =
   else:
     readFut = recv(c.fd, naviReadBufSize)
   if c.readMs > 0 and not await withTimeout(readFut, c.readMs):
-    raise newException(response.TimeoutError,
-                       "navi: read timed out after " & $c.readMs & " ms")
+    raise newException(response.TimeoutError, readTimeoutMsg(c.readMs))
   return await readFut
 
 proc shutdownConn*(c: Conn) =

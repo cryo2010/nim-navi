@@ -78,7 +78,13 @@ type
                              ## arrives, and a double `be.close` frees the transport's
                              ## unshared SSL_CTX twice, issue #314). Chronos only; the
                              ## asyncdispatch reader always owns the close, staying msActive.
-    keepAliveMs: int            ## PING keepalive interval (0 = off); see `keepAlive`
+    keepAliveMs: int            ## PING keepalive interval (0 = off); see `keepAlive`.
+                                ## Read live by the `keepAlive` loop each tick and
+                                ## re-applied from config on mux reuse (issue #360), so
+                                ## a config change takes effect on the next interval.
+    keepAliveRunning: bool      ## whether a `keepAlive` loop is currently spawned, so
+                                ## reuse can start one (config just enabled keepalive on
+                                ## a mux opened with it off) without double-spawning
     sawFrameSinceTick: bool     ## the reader saw an inbound frame since the last
                                 ## keepalive tick (any frame proves liveness)
     pingOutstanding: bool       ## a keepalive PING is awaiting any inbound frame

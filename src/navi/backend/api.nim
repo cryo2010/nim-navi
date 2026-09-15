@@ -105,6 +105,21 @@ type
     user*: string
     pass*: string
 
+  ResolvedProxy* = ref object
+    ## The proxy configuration resolved ONCE at client construction (see
+    ## core/proxy.nim `buildResolvedProxy`), so per-request resolution is a cheap
+    ## NO_PROXY host match rather than repeated env reads and URL parsing. Held by
+    ## `ref` so copying a config by value shares the immutable cache. `unix` (when
+    ## its kind is `pkUnix`) short-circuits everything: a Unix socket bypasses
+    ## proxies. Otherwise `httpTarget`/`httpsTarget` are the pre-parsed dial
+    ## targets the request scheme selects between (identical when `proxy` is set,
+    ## since an explicit proxy applies to both), and `noProxy` is the prepared
+    ## exclusion list.
+    unix*: ProxyTarget
+    httpTarget*: ProxyTarget
+    httpsTarget*: ProxyTarget
+    noProxy*: seq[string]
+
 proc wantsVerify*(tls: TlsConfig): bool = tls.verify
   ## Whether to verify the cert chain and hostname. `defaultTls()` /
   ## `initNaviConfig()` turn it on; a bare `TlsConfig()` leaves it off, so build

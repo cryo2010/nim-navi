@@ -30,7 +30,14 @@ proc keepAlive(mux: H2Mux) {.async.} =
   ## Waking on `readerDone` too lets it exit promptly when the connection closes.
   try:
     while mux.alive:
-      await (sleepAsync(mux.keepAliveMs) or mux.readerDone)
+      let interval = mux.keepAliveMs   # read live: config may change it between ticks (#360)
+      if interval <= 0:
+        # Keepalive disabled (config set it to 0 on a reused mux): idle until the
+        # connection closes rather than busy-spinning on a zero-length sleep. A later
+        # re-enable spawns a fresh loop via `applyKeepAlive`, so this one can exit.
+        mux.keepAliveRunning = false
+        break
+      await (sleepAsync(interval) or mux.readerDone)
       if not mux.alive or mux.readerDone.finished: break
       if mux.sawFrameSinceTick:
         mux.sawFrameSinceTick = false
@@ -56,6 +63,18 @@ proc keepAlive(mux: H2Mux) {.async.} =
         mux.pingOutstanding = true
   except CatchableError:
     discard   # a failed send/transport tears down via the reader; nothing to do here
+  mux.keepAliveRunning = false   # cleared on every exit so `applyKeepAlive` can respawn
+
+proc applyKeepAlive*(mux: H2Mux, keepAliveMs: int) =
+  ## Re-apply the current config's keepalive interval to a reused mux, honoring
+  ## navi's live-config contract (issue #360). The running loop reads `keepAliveMs`
+  ## live each tick, so an interval change takes effect next tick and a 0 makes the
+  ## loop idle out. Enabling keepalive on a mux opened with it off (no loop running)
+  ## spawns one here; a value of 0 leaves none running.
+  mux.keepAliveMs = keepAliveMs
+  if keepAliveMs > 0 and not mux.keepAliveRunning and mux.alive:
+    mux.keepAliveRunning = true
+    asyncCheck keepAlive(mux)
 
 proc reader(mux: H2Mux) {.async.} =
   try:
@@ -118,7 +137,9 @@ proc newH2Mux*(transport: be.Conn, maxBody = 0, decompress = false,
     await be.close(transport)
     raise
   asyncCheck reader(mux)
-  if keepAliveMs > 0: asyncCheck keepAlive(mux)
+  if keepAliveMs > 0:
+    mux.keepAliveRunning = true
+    asyncCheck keepAlive(mux)
   result = mux
 
 proc close*(mux: H2Mux) {.async.} =

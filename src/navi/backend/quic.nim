@@ -19,6 +19,7 @@ when not defined(naviHttp3):
 import std/[strutils, atomics, os, times]
 import ../core/altsvc
 import ../core/response   # ResponseTooLargeError, raised when a body exceeds maxResponseBytes
+import ./timing           # establishMs precedence + shared timeout wording
 export altsvc.AltSvcEndpoint
 
 # Link the h3 stack via pkg-config so the build follows wherever the libraries
@@ -396,6 +397,7 @@ type
   WsH3PumpObj = object
     conn: pointer                  ## H3Conn*; the pump thread drives it, wsClose frees it
     sid: int64
+    readMs: int                    ## per-read stall bound for wsRecv; 0 = block indefinitely
     toApp: Channel[string]         ## inbound frame bytes; "" signals peer-close / error
     toNet: Channel[string]         ## outbound frame bytes queued by the app thread
     stop: Atomic[bool]             ## wsClose asks the pump to wind down
@@ -442,12 +444,16 @@ proc wsPumpLoop(p: ptr WsH3PumpObj) {.thread.} =
 
 proc openWsH3*(host: string, port: int, sni, caFile: string, verify: bool,
                path: string, headers: seq[(string, string)],
-               connectMs = 0): tuple[pump: WsH3Pump, status: int] =
+               connectMs = 0, readMs = 0, totalMs = 0):
+               tuple[pump: WsH3Pump, status: int] =
   ## Open a dedicated h3 connection, do the Extended CONNECT handshake on this
   ## (single) thread, then hand the connection to a pump thread. Returns the pump
-  ## and the response :status (the caller checks 200). `connectMs` (0 = a 30s
-  ## default) bounds the handshake so a server that stalls after QUIC completes
-  ## cannot hang the caller forever.
+  ## and the response :status (the caller checks 200). The handshake is bounded by
+  ## `connectMs` (or, falling back like the sync `connect`, `totalMs`; 0 = a 30s
+  ## default) so a server that stalls after QUIC completes cannot hang the caller
+  ## forever. `readMs` (0 = block indefinitely) is carried to the pump as the
+  ## per-read stall bound `wsRecv` enforces, mirroring h1/h2 where each read is
+  ## bounded by the configured readMs.
   let name = if sni.len > 0: sni else: host
   let h = navi_h3_open(host.cstring, ($port).cstring, name.cstring,
                        caFile.cstring, (if verify: 1.cint else: 0.cint),
@@ -457,7 +463,10 @@ proc openWsH3*(host: string, port: int, sni, caFile: string, verify: bool,
   let sid = navi_h3_open_connect(h, path.cstring, reqHdr.cstring, "websocket".cstring)
   if sid < 0:
     navi_h3_close(h); raise newException(QuicError, "navi: h3 Extended CONNECT failed")
-  let deadline = epochTime() + float(if connectMs > 0: connectMs else: 30_000) / 1000.0
+  # connectMs wins, then totalMs, else a 30s handshake default (mirroring how the
+  # sync `connect` resolves establishMs, but with an explicit backend floor).
+  let handshakeMs = establishMs(connectMs, totalMs, 30_000)
+  let deadline = epochTime() + float(handshakeMs) / 1000.0
   var status: clong
   var hbuf = newString(16 * 1024)
   var ready: cint
@@ -475,6 +484,7 @@ proc openWsH3*(host: string, port: int, sni, caFile: string, verify: bool,
   let p = cast[WsH3Pump](allocShared0(sizeof(WsH3PumpObj)))
   p.conn = h
   p.sid = sid
+  p.readMs = readMs
   p.toApp.open()
   p.toNet.open()
   p.stop.store(false)
@@ -492,10 +502,6 @@ proc wsSend*(p: WsH3Pump, data: string) =
   p.toNet.send(data)
   navi_h3_wake(p.conn)
 
-proc wsRecv*(p: WsH3Pump): string =
-  ## Block for the next inbound chunk; "" once the connection has closed.
-  p.toApp.recv()
-
 proc wsDataWaiting*(p: WsH3Pump, ms: int): bool =
   ## True if an inbound chunk is queued within ~`ms` (coarse poll; for ws keepalive).
   var left = ms
@@ -505,6 +511,18 @@ proc wsDataWaiting*(p: WsH3Pump, ms: int): bool =
     let step = min(left, 5)
     sleep(step)
     left -= step
+
+proc wsRecv*(p: WsH3Pump): string =
+  ## Block for the next inbound chunk; "" once the connection has closed. With
+  ## `readMs` set, the block is bounded by that per-read stall limit: the pump thread
+  ## owns the QUIC state, so (unlike h1/h2's socket recv) we poll the inbound channel
+  ## to a deadline instead of parking on a blocking `recv()`, and raise navi's
+  ## TimeoutError once it lapses with nothing delivered -- matching h1/h2, where each
+  ## read is bounded by readMs. With `readMs` 0 this is the original blocking recv.
+  if p.readMs <= 0: return p.toApp.recv()
+  if not p.wsDataWaiting(p.readMs):
+    raise newException(response.TimeoutError, readTimeoutMsg(p.readMs))
+  p.toApp.recv()
 
 proc wsClose*(p: WsH3Pump) =
   ## Stop the pump, join it, then free the connection and shared state. Idempotent

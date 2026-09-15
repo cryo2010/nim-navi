@@ -1,7 +1,7 @@
 ## End-to-end test of the sync entry module against an in-process TCP server.
 
 import unittest
-import std/[net, os, strutils, tables]
+import std/[net, os, strutils, tables, times, monotimes]
 import navi
 import navi/core/pool
 import navi/core/response  # for the `response.TimeoutError` qualifier
@@ -87,6 +87,31 @@ suite "sync entry end to end":
     joinThread(th)
     check accepts == 1  # both requests used the one connection
 
+  test "a reused pooled connection adopts the current config read timeout (#360)":
+    # navi's live-config contract: `client.config.timeouts.*` are read per request.
+    # A connection opened with no read timeout, then reused after the config lowers
+    # `timeouts.read`, must trip at the NEW timeout, not hang on the stale (0) value.
+    var port = 0
+    var th: Thread[KeepAliveStallCtx]
+    startKeepAliveStall(th, port, stallMs = 8000)   # stall well past the new read bound
+
+    let api = newNavi()                             # opened with timeouts.read == 0
+    let key = "http://127.0.0.1:" & $port
+    check api.get(key & "/").status == 200          # conn 1, then pooled
+    check api.pool.idleCount(key) == 1
+
+    api.config.timeouts.read = 400                  # tighten the LIVE config
+    let t0 = getMonoTime()
+    var raised = false
+    try:
+      discard api.get(key & "/")                    # reuses the pooled conn; server is silent
+    except response.TimeoutError:
+      raised = true
+    let elapsed = (getMonoTime() - t0).inMilliseconds.int
+    check raised                                    # the new read timeout fired
+    check elapsed < 4000                            # near the 400ms bound, not the 8s stall
+    joinThread(th)
+
   test "a non-idempotent request is replayed on a fresh connection when the pooled one was closed before any response":
     # The keep-alive race: the server silently closes a pooled connection, then the
     # client reuses it for a POST. The failure comes before any response byte, so the
@@ -141,6 +166,34 @@ suite "sync entry end to end":
     check handle.status == 200                   # headers arrived fine
     expect IOError:                              # draining the short body must raise,
       handle.each(chunk): discard                # not spin forever
+    joinThread(th)
+
+  test "sync retries stop at the total deadline instead of exhausting the retry limit":
+    # The server always answers 503 (retryable), so only the total-deadline budget
+    # can stop the loop. With a high retry limit but a tight `total`, the client must
+    # give up early -- surfacing the last 503 -- rather than running every attempt
+    # with its backoff sleeps (which would blow past `total`). Regression for #359.
+    var port = 0
+    var count = 0
+    var th: Thread[ServerCtx]
+    startAlways503(th, port, addr count)
+
+    var cfg = initNaviConfig()
+    cfg.retry.limit = 10                   # would be 11 attempts if the deadline were ignored
+    cfg.timeouts.total = 150               # attempt1 backoff 100ms fits; attempt2 (200ms) cannot
+    cfg.throwHttpErrors = false            # inspect the surfaced 503 rather than raise on it
+    let api = newNavi(cfg)
+
+    let started = epochTime()
+    let res = api.get("http://127.0.0.1:" & $port & "/")
+    let elapsedMs = (epochTime() - started) * 1000
+
+    check res.status == 503                # last response surfaced, not raised
+    check count < 11                       # did NOT run the full retry limit
+    check count <= 3                       # ~2 attempts fit before the budget lapses
+    check elapsedMs < 600                  # nowhere near the ~1.5s the full backoff would take
+
+    api.close()                            # drop the connection so the server loop exits
     joinThread(th)
 
   test "close should drain the connection pool":

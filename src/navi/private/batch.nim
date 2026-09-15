@@ -8,6 +8,8 @@ type BatchItem = object
   idx: int          ## position in the caller's target list
   req: Request
   attempt, hops: int
+  lastResp: Response  ## the most recent response; returned in place of a retry that
+                      ## the total-deadline budget no longer allows (issue #359)
 
 proc transportGroup(client: Navi, items: seq[BatchItem],
                     members: seq[int]): seq[Response] =
@@ -24,11 +26,16 @@ proc transportGroup(client: Navi, items: seq[BatchItem],
   var h2: H2Conn
   if found:
     transport = pc.transport
+    # A pooled connection adopts the CURRENT config timeouts, not the ones it was
+    # opened with, honoring navi's live-config contract (issue #360).
+    rearm(transport, client.config.readMs,
+          totalMsFor(client.config, items[members[0]].req))
     h2 = pc.h2
   else:
     transport = connect(url0.host, url0.port, url0.isTls, client.config.tls,
                         resolveProxy(client.config, url0), alpn,
-                        client.config.connectMs, client.config.readMs, client.config.totalMs)
+                        client.config.connectMs, client.config.readMs,
+                        totalMsFor(client.config, items[members[0]].req))
     pc = PooledConn[Conn](transport: transport)
     if transport.protocol == "h2":
       h2 = initH2Conn(client.config.maxResponseBytes)
@@ -100,7 +107,8 @@ proc transportGroup(client: Navi, items: seq[BatchItem],
         transport.close()
         transport = connect(url0.host, url0.port, url0.isTls, client.config.tls,
                             resolveProxy(client.config, url0), alpn,
-                            client.config.connectMs, client.config.readMs, client.config.totalMs)
+                            client.config.connectMs, client.config.readMs,
+                            totalMsFor(client.config, items[members[k]].req))
         pc = PooledConn[Conn](transport: transport)
 
 proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
@@ -128,15 +136,22 @@ proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
   for i, target in targets:
     pending.add BatchItem(idx: i, req: buildRequest(client.config, GET, target))
 
+  # `config.timeouts.total` bounds the whole batch (every round, its connects, and
+  # the backoff sleeps between rounds), the same contract the single-request engine
+  # honors via `RetryDeadline` (issue #359). Armed once, before the first round.
+  var deadline = initRetryDeadline(client.config.totalMs)
   while pending.len > 0:
+    let remaining = deadline.attemptBudgetMs   # this round's connects get what remains
     for pi in 0 ..< pending.len:
       applyCookies(client.jar, pending[pi].req)
+      pending[pi].req.deadlineMs = remaining
 
     var groups: OrderedTable[string, seq[int]]
     for pi in 0 ..< pending.len:
       groups.mgetOrPut(originKey(pending[pi].req.url), @[]).add pi
 
     var nextRound: seq[BatchItem]
+    var retriers: seq[BatchItem]   # items that want another attempt after a backoff
     var backoff = 0
     for origin, members in groups:
       let raw = client.transportGroup(pending, members)
@@ -157,8 +172,18 @@ proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
                                       item.req.verb, client.config.retry):
           inc item.attempt
           backoff = max(backoff, backoffMs(item.attempt, resp, client.config.retry))
-          nextRound.add item
+          item.lastResp = resp   # surface this if the deadline forbids the retry
+          retriers.add item
         else:
           result[item.idx] = resp
-    if backoff > 0: sleep(backoff)
+    # Bound the inter-round backoff by the remaining budget. When it is exhausted (or
+    # a backoff sleep would overrun it) the retry candidates give up and their last
+    # response is returned, matching the single-request engine's `if gotResp: break`
+    # and keeping `parallel`'s non-throwing contract.
+    let sleepMs = backoffWithinDeadline(deadline, backoff)
+    if sleepMs < 0:
+      for item in retriers: result[item.idx] = item.lastResp
+    else:
+      if sleepMs > 0: sleep(sleepMs)
+      for item in retriers: nextRound.add item
     pending = nextRound
