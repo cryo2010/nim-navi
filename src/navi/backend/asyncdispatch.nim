@@ -375,6 +375,15 @@ proc sendAll*(c: Conn, data: string): Future[void] {.async.} =
       await sslWrite(c, data); return
   await send(c.fd, data)
 
+proc rearm*(c: var Conn, readMs = 0, totalMs = 0) =
+  ## Re-apply the current config's read timeout to a connection taken from the idle
+  ## pool, so a reused connection honors navi's live-config contract rather than the
+  ## value it was opened with (issue #360). `totalMs` is accepted for signature parity
+  ## with the sync backend but ignored: the async entry's outer `guard` enforces the
+  ## whole-request deadline, so there is no per-conn deadline to re-arm here.
+  discard totalMs
+  c.readMs = readMs
+
 proc recvSome*(c: Conn): Future[string] {.async.} =
   ## One chunk of up to `naviReadBufSize` bytes; "" means the peer closed. Bounded by
   ## `readMs` (the per-read stall timeout) when set; on expiry the pending read is

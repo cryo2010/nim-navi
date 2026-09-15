@@ -406,7 +406,7 @@ template poolTransport*(client, req, sink: typed): Response =
   ## Pool-based transport: reuse a pooled connection (http/1.1 or a persistent
   ## h2 connection) or open a fresh one, negotiating the protocol via ALPN.
   ## One request at a time per connection. Used by the sync and chronos entries.
-  mixin connect, sendAll, recvSome, close, await, BodySink
+  mixin connect, sendAll, recvSome, close, rearm, await, BodySink
   block:
     var rq = req
     let proxy = resolveProxy(client.config, rq.url)
@@ -422,6 +422,10 @@ template poolTransport*(client, req, sink: typed): Response =
                                             # not close them, so sweep here too (issue #313)
     var (found, pc) = popIdle(client.pool, key)
     if found:
+      # navi's live-config contract: `client.config.timeouts.*` are read per request,
+      # so a connection taken from the idle pool must adopt the CURRENT read timeout
+      # and per-attempt total deadline, not the ones it was opened with (issue #360).
+      rearm(pc.transport, client.config.readMs, totalMsFor(client.config, rq))
       # `gotResponse` splits a reused-connection failure into "before any response"
       # (the request never reached a working server -> unprocessed) vs "after the
       # response began" (the server processed it). h2 signals its own unprocessed

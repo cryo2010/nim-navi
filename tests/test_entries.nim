@@ -1,7 +1,7 @@
 ## End-to-end test of the sync entry module against an in-process TCP server.
 
 import unittest
-import std/[net, os, strutils, tables, times]
+import std/[net, os, strutils, tables, times, monotimes]
 import navi
 import navi/core/pool
 import navi/core/response  # for the `response.TimeoutError` qualifier
@@ -86,6 +86,31 @@ suite "sync entry end to end":
     check second.body == "n=1"
     joinThread(th)
     check accepts == 1  # both requests used the one connection
+
+  test "a reused pooled connection adopts the current config read timeout (#360)":
+    # navi's live-config contract: `client.config.timeouts.*` are read per request.
+    # A connection opened with no read timeout, then reused after the config lowers
+    # `timeouts.read`, must trip at the NEW timeout, not hang on the stale (0) value.
+    var port = 0
+    var th: Thread[KeepAliveStallCtx]
+    startKeepAliveStall(th, port, stallMs = 8000)   # stall well past the new read bound
+
+    let api = newNavi()                             # opened with timeouts.read == 0
+    let key = "http://127.0.0.1:" & $port
+    check api.get(key & "/").status == 200          # conn 1, then pooled
+    check api.pool.idleCount(key) == 1
+
+    api.config.timeouts.read = 400                  # tighten the LIVE config
+    let t0 = getMonoTime()
+    var raised = false
+    try:
+      discard api.get(key & "/")                    # reuses the pooled conn; server is silent
+    except response.TimeoutError:
+      raised = true
+    let elapsed = (getMonoTime() - t0).inMilliseconds.int
+    check raised                                    # the new read timeout fired
+    check elapsed < 4000                            # near the 400ms bound, not the 8s stall
+    joinThread(th)
 
   test "a non-idempotent request is replayed on a fresh connection when the pooled one was closed before any response":
     # The keep-alive race: the server silently closes a pooled connection, then the

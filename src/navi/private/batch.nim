@@ -26,6 +26,10 @@ proc transportGroup(client: Navi, items: seq[BatchItem],
   var h2: H2Conn
   if found:
     transport = pc.transport
+    # A pooled connection adopts the CURRENT config timeouts, not the ones it was
+    # opened with, honoring navi's live-config contract (issue #360).
+    rearm(transport, client.config.readMs,
+          totalMsFor(client.config, items[members[0]].req))
     h2 = pc.h2
   else:
     transport = connect(url0.host, url0.port, url0.isTls, client.config.tls,

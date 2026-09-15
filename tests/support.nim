@@ -374,6 +374,49 @@ proc serveKeepAlive(ctx: KeepAliveCtx) {.thread.} =
   client.close()
   server.close()
 
+type KeepAliveStallCtx* = object
+  portOut: ptr int      ## bind an ephemeral port and report it here
+  ready: ptr bool
+  stallMs: int          ## how long to hold the second request silent
+
+proc serveKeepAliveStall(ctx: KeepAliveStallCtx) {.thread.} =
+  ## Answer the first keep-alive request in full, then read the second request and
+  ## go silent (send nothing) for `stallMs`, modeling a wedged server. Reuses the one
+  ## pooled connection, so the second request's response read stalls and must trip the
+  ## client's CURRENT read timeout (issue #360: config changed between the two).
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(0), "127.0.0.1")
+  server.listen()
+  ctx.portOut[] = server.getLocalAddr()[1].int
+  ctx.ready[] = true
+  var client = acceptClient(server)
+  proc readReq() =
+    var req = ""
+    while true:
+      let c = client.recv(1)
+      if c.len == 0: break
+      req.add c
+      if req.len >= 4 and req[^4 .. ^1] == "\r\n\r\n": break
+  readReq()
+  let body = "ok"
+  client.send("HTTP/1.1 200 OK\r\n" &
+              "Content-Length: " & $body.len & "\r\n" &
+              "Connection: keep-alive\r\n\r\n" & body)
+  readReq()               # second request lands on the reused connection
+  sleep(ctx.stallMs)      # go silent: no response bytes, so the client read stalls
+  try: client.close() except CatchableError: discard
+  try: server.close() except CatchableError: discard
+
+proc startKeepAliveStall*(th: var Thread[KeepAliveStallCtx], port: var int,
+                          stallMs: int) =
+  ## Launch the stall-on-second-request keep-alive server and block until it is
+  ## listening. Binds an ephemeral port, reported via `port`.
+  var ready = false
+  createThread(th, serveKeepAliveStall,
+    KeepAliveStallCtx(portOut: addr port, ready: addr ready, stallMs: stallMs))
+  while not ready: discard
+
 proc recvUntil(c: Socket, terminator: string): string =
   while not result.endsWith(terminator):
     let ch = c.recv(1)

@@ -392,6 +392,19 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     if tls: postHandshakeVerify(result.ssl, host, cfg)
   established = true
 
+proc rearm*(c: var Conn, readMs = 0, totalMs = 0) =
+  ## Re-apply the current config's read timeout and per-attempt total deadline to a
+  ## connection taken from the idle pool, so a reused connection honors navi's live-
+  ## config contract (`client.config.timeouts.*` read live per request) rather than
+  ## carrying the values it was opened with (issue #360). `readMs` bounds each read;
+  ## `totalMs` arms a fresh absolute deadline (0 = unbounded, clearing any prior one).
+  c.readMs = readMs
+  if totalMs > 0:
+    c.deadline = getMonoTime() + initDuration(milliseconds = totalMs)
+    c.bounded = true
+  else:
+    c.bounded = false
+
 proc sendAll*(c: Conn, data: string) =
   if data.len == 0: return
   when defined(ssl):

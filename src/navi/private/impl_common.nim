@@ -221,10 +221,14 @@ proc transportInner(client: Navi, req: Request, sink: BodySink): Future[Response
   if wantH2:
     # 1. A live shared connection, or one currently being established.
     if client.muxes.hasKey(origin) and client.muxes[origin].canReuse:
+      # A reused mux adopts the CURRENT keepalive interval, not the one it was opened
+      # with, honoring navi's live-config contract (issue #360).
+      client.muxes[origin].applyKeepAlive(client.config.h2KeepAliveMs)
       return await client.muxRequest(client.muxes[origin], req, sink)
     if client.pendingMux.hasKey(origin):
       let mux = await client.pendingMux[origin]
       if mux != nil and mux.canReuse:
+        mux.applyKeepAlive(client.config.h2KeepAliveMs)
         return await client.muxRequest(mux, req, sink)
       # else: turned out http/1.1, fall through
 
@@ -233,6 +237,10 @@ proc transportInner(client: Navi, req: Request, sink: BodySink): Future[Response
     await close(dead.transport)
   var (found, pc) = popIdle(client.pool, origin)
   if found:
+    # A pooled connection adopts the CURRENT config read timeout, not the one it was
+    # opened with, honoring navi's live-config contract (issue #360). The whole-request
+    # deadline is enforced by the async entry's `guard`, so only `readMs` is re-armed.
+    rearm(pc.transport, client.config.readMs)
     # `gotResponse` distinguishes a reused-connection failure BEFORE any response
     # byte (unprocessed: safe to replay any method) from one AFTER the response began
     # (processed: only an idempotent method may be replayed).
