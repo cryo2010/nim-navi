@@ -16,46 +16,60 @@ onward (pre-1.0, minor versions may include breaking changes).
   clients (sync, asyncdispatch, chronos); the sync h2 path uses a dedicated blocking
   h2 connection and the sync h3 path runs a background pump thread (needs
   `--threads:on`). Over h2/h3 the handshake uses the `:protocol` pseudo-header (no
-  `Sec-WebSocket-Key`/`Accept`). The public API is unchanged.
+  `Sec-WebSocket-Key`/`Accept`). The public API is unchanged (#190).
 - **Request trailers.** `req.trailers` (a `Headers`, the same shape as `req.headers`)
   sends trailing header fields after the body: chunked transfer-encoding with a
   `Trailer` header on HTTP/1.1, and a trailing HEADERS section on HTTP/2 and HTTP/3
   (e.g. `grpc-status` for a gRPC-style request). Available on `request` and
   `buildRequest` via a `trailers` argument. A buffered body is sent chunked when
   trailers are present. Not supported on the js backend (fetch cannot send request
-  trailers; setting them raises). Sync, asyncdispatch, and chronos backends.
+  trailers; setting them raises). Sync, asyncdispatch, and chronos backends (#178).
 - **HTTP/3 response trailers.** `res.trailers` now also surfaces the trailing HEADERS
-  section of an HTTP/3 response, matching the existing HTTP/1.1 and HTTP/2 support.
+  section of an HTTP/3 response, matching the existing HTTP/1.1 and HTTP/2 support
+  (#178).
 - **WebSocket message-size cap.** `websocket(..., maxMessageBytes)` bounds a
   reassembled message across its fragments (the per-frame 64 MiB cap did not); past
   it `receive` closes with 1009 and raises `WsMessageTooLarge`. `0` (default) is
-  unlimited. On `navi/js` it is a delivery-time check for parity.
+  unlimited. On `navi/js` it is a delivery-time check for parity (#180).
 - **WebSocket keepalive.** `websocket(..., keepAlive)` (ms) pings after an idle
   interval while a `receive` is in progress and raises `TimeoutError` (closing the
   connection) if another interval passes with no response, so a dead peer is detected
-  instead of blocking forever. `0` (default) is off; a no-op on `navi/js`.
+  instead of blocking forever. `0` (default) is off; a no-op on `navi/js` (#180).
 - **WebSocket message streaming.** `ws.stream()` returns a reader for the next inbound
   message consumed a frame at a time with `each`/`readChunk` (no whole-message
   buffering); `ws.stream(writer): …` (and `streamBinary`) sends a message as fragments
   via `writer.write`, closing it automatically at block exit. Mirrors HTTP
   `stream()`/`bodyStream`. On `navi/js` (which owns framing) a read yields the whole
-  message as one chunk and a write buffers until the block exits.
+  message as one chunk and a write buffers until the block exits (#181).
+- **HTTP/2 keepalive PING.** `config.timeouts.h2KeepAlive` (default 20 s) pings an
+  idle HTTP/2 connection and closes it when the peer stops answering, so a dead
+  pooled connection is detected instead of wedging the next request (#232).
 - **SSE idle timeout on the sync backend.** `sse(..., idleTimeoutMs)` (default 45 s)
   now also exists on the sync client, matching async: it bounds each read and each
   (re)open, so a server that sends headers then goes silent raises `TimeoutError`
   instead of hanging `next()` forever. Any received byte (including a keep-alive `:`
-  comment) resets it; `0` disables it.
+  comment) resets it; `0` disables it (#357).
 
 ### Changed
 - WebSocket masking keys and the handshake nonce now come from the OS CSPRNG
   (`std/sysrand`) instead of a time-seeded `std/random`, matching RFC 6455 5.3's
   requirement of a strong entropy source (native backends; `navi/js` uses the
-  runtime's WebSocket).
+  runtime's WebSocket) (#180).
 - Proxy configuration (the `config.proxy` URL and the `HTTPS_PROXY`/`ALL_PROXY`/
   `NO_PROXY` env vars) is resolved once at client construction instead of re-read
   and re-parsed on every request attempt; only the cheap `NO_PROXY` host match
   remains per request. A malformed proxy URL now raises `ValueError` when the
-  client is built rather than on the first request.
+  client is built rather than on the first request (#361).
+- Performance: fewer copies and syscalls on the SSE and streaming read paths
+  (#230); multi-member gzip decoding and other hot-path items (#244, #246);
+  digest and WebSocket hashing use OpenSSL EVP (hardware SHA) on Linux (#194,
+  #197); WebSocket masking works word-at-a-time (#186); h2 DATA padding no longer
+  costs an extra payload copy, content-encoding is resolved once per stream, and
+  the streaming decoder reuses its output buffer (#307, #308, #309).
+- Internal: the asyncdispatch/chronos backend twins (engine, h2mux, quic,
+  middleware) were unified behind shared include fragments (#242, #248-#256), and
+  two design-pattern sweeps tightened the codebase with no public API changes
+  (#319-#334, #336-#353).
 
 ### Fixed
 - HTTP/3: certificate verification now runs after the handshake completes (checking
@@ -65,23 +79,70 @@ onward (pre-1.0, minor versions may include breaking changes).
   assertion (`crypto_ossl_ctx_release_crypto_data`) and killing the process instead
   of raising `QuicError`. navi now rejects an untrusted or hostname-mismatched peer
   cleanly, before any request is sent, matching the post-handshake verification the
-  TCP backends already use.
+  TCP backends already use (#179).
+- SSE: reads and reconnects are bounded by `idleTimeoutMs` so a wedged stream
+  raises instead of hanging forever (#229, #231), and the asyncdispatch SSE reader
+  no longer grows without bound under a flooding server (#257).
+- RFC frame validation is enforced for HTTP/2 frames, HPACK Huffman coding, and
+  WebSocket frames, with follow-up hardening (#207, #208-#213).
+- WebSocket: the h1 and h2 handshakes honor `config.timeouts.read` on all backends
+  (#206), and async teardown is idempotent on close and EOF (#202).
+- Correctness batch (#234-#241): streaming digest retry no longer sends
+  credentials cross-origin; HPACK dynamic-table desync on reset streams;
+  `Retry-After` overflow crash; redirect/digest retries replaying an exhausted
+  `bodyStream`; a transport leak in `poolTransport`; rejected `Set-Cookie` still
+  evicting the stored cookie; h2 GOAWAY truncating in-flight bodies; and padded
+  DATA frames leaking stream window credit.
+- HTTP/2 batch (#258-#266): chronos cancellation wedging the send chain;
+  RST_STREAM after a complete response discarding it; aborted downloads leaving
+  server-side zombie streams; leaked waiters and concurrency slots; keepalive PING
+  blocked behind a stalled send; `openConnect` hanging when the peer never sends
+  SETTINGS; and HPACK desync from `resetStream` during an open header block.
+- HTTP/1.1 batch (#269-#273): truncated batch responses returned as complete;
+  IPv6 host literals losing their brackets; lenient framing-header parsing
+  (chunked substring, TE+CL, multiple/signed `Content-Length`); `Connection:
+  close` on a second header line missed; and caller-supplied chunked
+  `Transfer-Encoding` sending an unframed body.
+- HTTP/3: buffered bodies over 64 KiB were truncated and `maxResponseBytes`
+  ignored; headers/trailers over 16 KiB desynced the field parser; `awaitHeaders`
+  hung on a stream reset before headers; GOAWAY is now observed (#275-#278);
+  receive windows raised to fix a quinn interop stall (#187, #188); and an async
+  h3 streaming OOM (#182).
+- Streaming downloads (#300-#306): h3 no longer buffers the whole body in C
+  memory without backpressure or cap; the `maxResponseBytes` cap applies to
+  decoded output on every path (decompression bombs); sink exceptions no longer
+  leak the QUIC stream; truncated compressed bodies are rejected instead of
+  silently accepted; h2 receive-window overruns raise `FLOW_CONTROL_ERROR`; and
+  raw (headerless) DEFLATE decodes identically buffered and streamed.
+- Connection lifecycle (#311-#316): transport leaks on a failed h2 preface; dead
+  h2 muxes never evicted from the client; `idleConnTimeout` gaps on the
+  sync/chronos buffered and async streaming paths; a chronos double-close (double
+  `SSL_CTX_free`); `close()` ignoring in-flight connects; and a swallowed
+  `CancelledError` on reader join.
+- `originKey` canonicalizes consistently and `resolveProxy` validates the proxy
+  port (#325); plus the 0.9.0 code-review batch (#191, #193, #195, #196).
 - WebSocket over HTTP/3 now honors `config.timeouts.read` (a per-read stall bound)
   and `total` (a handshake deadline); previously only `connect` applied, so a
-  stalled h3 WebSocket read hung forever regardless of configured timeouts.
+  stalled h3 WebSocket read hung forever regardless of configured timeouts (#356).
 - Async `stream()` opens (connect + TLS + request + response headers, across every
   redirect/digest hop) are bounded by `config.timeouts.total`, and the body reads
   share that same single budget, matching the sync backend's connect-time deadline.
-  Previously the open phase was unbounded.
+  Previously the open phase was unbounded (#358).
 - Sync and batch retries honor `config.timeouts.total` as an overall deadline:
   backoff sleeps are capped to the remaining budget and retrying stops once it is
   spent, per the documented "whole request, including retries/redirects" contract.
-  Previously only the async backends enforced this.
+  Previously only the async backends enforced this (#359).
 - Reused pooled connections re-apply the live `config.timeouts` (read timeout and
   the per-attempt total budget), and reused HTTP/2 connections pick up
   `config.timeouts.h2KeepAlive` changes, including enabling or disabling keepalive,
   honoring the documented live-config contract. Previously the values captured at
-  connect time stuck for the connection's lifetime.
+  connect time stuck for the connection's lifetime (#360).
+
+### Security
+- Digest auth escapes the username when building the `Authorization` header,
+  closing a quoted-string injection via a crafted username (#324). See also the
+  decompression-bomb caps (#301, #302) and RFC frame validation (#207) under
+  Fixed.
 
 ## [0.9.0] - 2026-08-29
 
