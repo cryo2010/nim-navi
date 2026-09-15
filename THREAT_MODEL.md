@@ -70,7 +70,7 @@ Security controls that are **opt-in** (off until you set them):
 **Threat:** a machine-in-the-middle or an imposter server presents a forged or
 mismatched certificate.
 
-**Mitigation:** on the native OpenSSL backends (sync, asyncdispatch) navi builds
+**Mitigation:** on the native OpenSSL backends (sync, asyncdispatch, chronos) navi builds
 the `SSL_CTX` through std/net's `newContext`, then seeds `CVerifyPeer`
 (`SSL_VERIFY_PEER`) from `tls.verify`, so the handshake aborts on an untrusted
 chain. navi additionally confirms `SSL_get_verify_result == X509_V_OK` and
@@ -79,7 +79,8 @@ matches the requested host against the certificate's SAN/CN with `X509_check_hos
 and `defaultTls()` in `src/navi/backend/api.nim`. A private CA is trusted via
 `tls.caFile`; mutual authentication uses a client certificate
 (`certFile`/`pkcs12File`/`certPem`). HTTP/3 performs the same certificate
-verification against the QUIC handshake (`src/navi/backend/quic.nim`). Turning
+verification against the QUIC handshake in the shared C driver
+(`src/navi/backend/h3client.cpp`, driven by `quic.nim`/`quic_async.nim`/`quic_chronos.nim`). Turning
 verification off is a deliberate, explicit `tls.verify = false`.
 
 **Verified by:** `badssl.nim` (rejects invalid certificates, accepts a valid one),
@@ -229,10 +230,11 @@ These are documented boundaries, not open holes:
 
 ## Backend differences
 
-- **chronos** uses BearSSL: verification is on by default (the same `tls.verify`
-  flag) and a custom `caFile` is honored, but client certificates, cipher
-  selection, and TLS 1.3 are not available (cipher selection raises rather than
-  silently ignoring the request).
+- **chronos** now runs OpenSSL (driven over its `StreamTransport` via a memory-BIO
+  pump), reaching parity with the sync/asyncdispatch backends: `tls.verify`,
+  `caFile`/`caBundle`, cipher selection, TLS 1.3, mTLS client certificates, HTTP/2
+  (ALPN), and HTTP/3 (`-d:naviHttp3`) all work. An invalid cipher surfaces OpenSSL's
+  error rather than silently falling back.
 - **navi/js** dials through the runtime's `fetch`, so the TLS handshake,
   certificate verification, and redirect mechanics are the browser's or Node's;
   navi's body cap there counts wire bytes, since the runtime owns decoding.

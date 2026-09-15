@@ -455,7 +455,7 @@ ignored.
 
 #### Client certificates (mTLS)
 
-On the OpenSSL clients (sync, asyncdispatch) navi can present a client certificate for mutual TLS, from several sources. Precedence is `pkcs12File`, then in-memory (`certPem`/`keyPem`), then the `certFile`/`keyFile` pair.
+On the native OpenSSL clients (sync, asyncdispatch, chronos) navi can present a client certificate for mutual TLS, from several sources. Precedence is `pkcs12File`, then in-memory (`certPem`/`keyPem`), then the `certFile`/`keyFile` pair.
 
 ```nim
 # PEM cert + key files (a single PEM may hold both; leave keyFile empty)
@@ -760,8 +760,8 @@ let results = api.parallel(@[
 `parallel` collects every response (it does not raise on non-2xx); inspect
 `.ok` per result.
 
-HTTP/2 runs on the sync and asyncdispatch clients. To disable it and force
-HTTP/1.1, set `http: {H1}` in `NaviConfig`.
+HTTP/2 runs on all three native clients (sync, asyncdispatch, chronos). To
+disable it and force HTTP/1.1, set `http: {H1}` in `NaviConfig`.
 
 ### Keep-alive
 
@@ -927,15 +927,16 @@ let api = newNavi(cfg)
 let ws = await api.websocket("wss://example.com/socket")
 ```
 
-Availability: **h2** Extended CONNECT is supported on `navi/asyncdispatch` and
-`navi/chronos`. **h3** is supported on all three native clients, including
-**`navi` (sync)** -- a sync h3 WebSocket runs a background pump thread that keeps
-the QUIC connection alive between the blocking `send`/`receive` calls (the API is
+Availability: **h2** (RFC 8441) and **h3** (RFC 9220) Extended CONNECT are both
+supported on all three native clients (`navi` sync, `navi/asyncdispatch`,
+`navi/chronos`). The sync h2 path runs over a dedicated blocking h2 connection,
+and a sync h3 WebSocket runs a background pump thread that keeps the QUIC
+connection alive between the blocking `send`/`receive` calls (the API is
 unchanged), so it needs a `--threads:on` build (the default on navi's supported
-Nim). The sync client does not do h2 WebSocket (it has no h2 mux). If `config.http`
-allows no usable transport (e.g. `{H2}` on the sync client, or against a server
-that does not accept Extended CONNECT), `websocket()` raises `ProtocolError` rather
-than silently downgrading.
+Nim). Over h2/h3 the handshake uses the `:protocol` pseudo-header (no
+`Sec-WebSocket-Key`/`Accept`). If `config.http` allows no usable transport (e.g.
+h2/h3 selected without TLS, or against a server that does not accept Extended
+CONNECT), `websocket()` raises `ProtocolError` rather than silently downgrading.
 
 For a large message you can stream it a frame at a time instead of buffering the whole
 thing, mirroring HTTP `stream()`/`bodyStream`. `ws.stream()` returns a reader for the
