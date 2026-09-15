@@ -1,7 +1,7 @@
 ## End-to-end test of the sync entry module against an in-process TCP server.
 
 import unittest
-import std/[net, os, strutils, tables]
+import std/[net, os, strutils, tables, times]
 import navi
 import navi/core/pool
 import navi/core/response  # for the `response.TimeoutError` qualifier
@@ -141,6 +141,34 @@ suite "sync entry end to end":
     check handle.status == 200                   # headers arrived fine
     expect IOError:                              # draining the short body must raise,
       handle.each(chunk): discard                # not spin forever
+    joinThread(th)
+
+  test "sync retries stop at the total deadline instead of exhausting the retry limit":
+    # The server always answers 503 (retryable), so only the total-deadline budget
+    # can stop the loop. With a high retry limit but a tight `total`, the client must
+    # give up early -- surfacing the last 503 -- rather than running every attempt
+    # with its backoff sleeps (which would blow past `total`). Regression for #359.
+    var port = 0
+    var count = 0
+    var th: Thread[ServerCtx]
+    startAlways503(th, port, addr count)
+
+    var cfg = initNaviConfig()
+    cfg.retry.limit = 10                   # would be 11 attempts if the deadline were ignored
+    cfg.timeouts.total = 150               # attempt1 backoff 100ms fits; attempt2 (200ms) cannot
+    cfg.throwHttpErrors = false            # inspect the surfaced 503 rather than raise on it
+    let api = newNavi(cfg)
+
+    let started = epochTime()
+    let res = api.get("http://127.0.0.1:" & $port & "/")
+    let elapsedMs = (epochTime() - started) * 1000
+
+    check res.status == 503                # last response surfaced, not raised
+    check count < 11                       # did NOT run the full retry limit
+    check count <= 3                       # ~2 attempts fit before the budget lapses
+    check elapsedMs < 600                  # nowhere near the ~1.5s the full backoff would take
+
+    api.close()                            # drop the connection so the server loop exits
     joinThread(th)
 
   test "close should drain the connection pool":

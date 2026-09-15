@@ -449,7 +449,7 @@ template poolTransport*(client, req, sink: typed): Response =
       let transport = await connect(rq.url.host, rq.url.port, rq.url.isTls,
                                     client.config.tls, proxy, alpn,
                                     client.config.connectMs, client.config.readMs,
-                                    client.config.totalMs)
+                                    totalMsFor(client.config, rq))
       var npc = PooledConn[typeof(transport)](transport: transport)
       var gotResponse = true   # unused on the fresh path (nothing to replay onto)
       # Guard the exchange so a failure (h1/h2 send, the h2 preamble/stream, or a
@@ -540,6 +540,16 @@ template performRequest*(client, req0: typed; cancel: CancelToken = nil): Respon
     var resp: Response
     var attempt = 0
     let policy = client.config.retry
+    # `config.timeouts.total` covers the whole request including retries/redirects
+    # and their backoff sleeps. The async backends enforce that with an outer `guard`
+    # that aborts in-flight IO; the sync/batch paths have no such guard, so they carry
+    # this cooperative deadline: it caps each backoff sleep and stops the retry loop
+    # once the budget is spent, and threads the REMAINING budget into each attempt's
+    # connect deadline via `req.deadlineMs` (issue #359). Armed once, here, so it spans
+    # every attempt. On the async backends `totalMsFor` (via `deadlineMs`) is ignored
+    # at connect and `backoffWithinDeadline` only trims a sleep the guard would preempt
+    # anyway, so behavior there is unchanged.
+    var deadline = initRetryDeadline(client.config.totalMs)
     # A streamed request body (`bodyStream`) can't be rewound once its producer has
     # advanced, so replaying it would send a truncated body. Such a request is never
     # retried -- not even a provably-unprocessed one, since the producer may already
@@ -547,6 +557,7 @@ template performRequest*(client, req0: typed; cancel: CancelToken = nil): Respon
     let bodyReplayable = isReplayable(req)
     while true:
       throwIfCancelled(cancel)
+      req.deadlineMs = deadline.attemptBudgetMs   # this attempt gets the time that remains
       var gotResp = false
       try:
         followRedirects(client, req, resp)
@@ -562,7 +573,15 @@ template performRequest*(client, req0: typed; cancel: CancelToken = nil): Respon
                                       req.verb, policy):
         break
       inc attempt
-      await sleep(backoffMs(attempt, resp, policy))
+      let backoff = backoffWithinDeadline(deadline, backoffMs(attempt, resp, policy))
+      # Budget exhausted (or a backoff sleep would overrun it): stop retrying and
+      # surface what we have -- the last response if one arrived, else the timeout
+      # matching the async guard's expiry (same TimeoutError/message).
+      if backoff < 0:
+        if gotResp: break
+        raise newException(TimeoutError,
+          "navi: request timed out after " & $client.config.totalMs & " ms")
+      await sleep(backoff)
     enforceMaxResponse(resp, client.config.maxResponseBytes)
     enforceProtocol(client.config, resp.httpVersion)  # strict: used proto in config.http
     if client.config.wantsThrow and not resp.ok:

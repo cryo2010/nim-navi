@@ -124,6 +124,14 @@ type
     body*: string
     bodyStream*: BodyProducer  ## when set, the body is streamed chunked
     absoluteForm*: bool         ## use absolute-URI on the request line (http proxy)
+    deadlineMs*: int            ## per-attempt connect/total budget override, in ms; 0
+                                ## means "use config.timeouts.total". The sync and batch
+                                ## retry loops set this to the REMAINING whole-request
+                                ## budget before each attempt so a retried attempt does
+                                ## not get a fresh `totalMs` (issue #359). The async
+                                ## backends ignore it (their outer `guard` bounds the
+                                ## whole request); their connect already `discard`s the
+                                ## total deadline.
 
 proc defaultRetryPolicy*(): RetryPolicy =
   ## Retry idempotent methods up to twice on transient statuses, backing off
@@ -158,6 +166,13 @@ proc readMs*(opts: NaviConfigBase): int = opts.timeouts.read
   ## Per-read stall deadline while waiting for a response chunk, in ms; 0 disables.
 proc totalMs*(opts: NaviConfigBase): int = opts.timeouts.total
   ## Overall request deadline in ms, including retries/redirects; 0 disables.
+proc totalMsFor*(opts: NaviConfigBase, req: Request): int =
+  ## The total/connect budget to use for this attempt: the request's per-attempt
+  ## `deadlineMs` override when set (the remaining whole-request budget threaded by
+  ## the sync/batch retry loop, issue #359), else the config's `total`. Only the
+  ## sync backend acts on this at connect; the async backends bound the whole
+  ## request with their outer `guard` instead.
+  if req.deadlineMs > 0: req.deadlineMs else: opts.timeouts.total
 proc h2KeepAliveMs*(opts: NaviConfigBase): int = opts.timeouts.h2KeepAlive
   ## HTTP/2 PING keepalive interval in ms for a connection with active streams; 0
   ## disables. Detects a dead/wedged connection (no PONG) so its streams fail over.

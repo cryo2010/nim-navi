@@ -30,6 +30,7 @@ type ServerCtx* = object
   ipv6: bool
   payload: string
   failures: int
+  count: ptr int        ## when set, count the requests the server answered
 
 proc hexToBytes*(hex: string): string =
   for i in countup(0, hex.len - 2, 2):
@@ -104,6 +105,39 @@ proc serveHang(ctx: ServerCtx) {.thread.} =
   sleep(600)  # hold the request open past the client's timeout, then clean up
   client.close()
   server.close()
+
+proc serveAlways503(ctx: ServerCtx) {.thread.} =
+  ## Answer every request with 503 on one kept-alive connection, forever, tallying
+  ## each answered request into `count`. For total-deadline retry tests: the client
+  ## keeps retrying a retryable status, so the deadline (not the server) must stop it.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(0), "127.0.0.1")       # ephemeral: no cross-iteration collision
+  server.listen()
+  ctx.portOut[] = server.getLocalAddr()[1].int
+  ctx.ready[] = true
+  var client = acceptClient(server)
+  while true:
+    var req = ""
+    while true:
+      let c = client.recv(1)
+      if c.len == 0: break
+      req.add c
+      if req.len >= 4 and req[^4 .. ^1] == "\r\n\r\n": break
+    if req.len == 0: break
+    client.send("HTTP/1.1 503 Service Unavailable\r\n" &
+                "Content-Length: 0\r\nConnection: keep-alive\r\n\r\n")
+    if ctx.count != nil: inc ctx.count[]
+  client.close()
+  server.close()
+
+proc startAlways503*(th: var Thread[ServerCtx], port: var int, count: ptr int) =
+  ## Serve unlimited 503s on an ephemeral port (written to `port`), counting the
+  ## requests answered into `count`. The connection is kept alive so retries reuse it.
+  var ready = false
+  createThread(th, serveAlways503,
+    ServerCtx(portOut: addr port, ready: addr ready, count: count))
+  while not ready: discard
 
 proc startHang*(th: var Thread[ServerCtx], port: var int) =
   ## Serve a single connection that accepts but never responds. Binds an
