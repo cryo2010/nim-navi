@@ -137,8 +137,8 @@ config.tls.maxVersion = tls13
 
 Default `tlsDefault` leaves the bound to the library. Pin `minVersion` to refuse
 downgrade to a weak protocol; a negotiation outside the pinned range fails the
-handshake. Enforced on the OpenSSL backends (sync, asyncdispatch); chronos
-(BearSSL) tops out at TLS 1.2 and raises if you request `tls13`.
+handshake. Enforced on all three native OpenSSL backends (sync, asyncdispatch,
+chronos), so `tls13` is honored on chronos too.
 
 ### Cipher restriction
 
@@ -163,8 +163,8 @@ config.tls.password   = "secret"
 ```
 
 Off by default. Precedence is `pkcs12File`, then in-memory (`certPem`/`keyPem`),
-then the `certFile`/`keyFile` pair. OpenSSL backends only; chronos and js do not
-present client certificates.
+then the `certFile`/`keyFile` pair. Supported on the native OpenSSL backends
+(sync, asyncdispatch, chronos); js does not present client certificates.
 
 ### Session resumption
 

@@ -8,6 +8,13 @@ onward (pre-1.0, minor versions may include breaking changes).
 ## [Unreleased]
 
 ### Added
+- **WebSocket over Extended CONNECT.** `websocket()` now tunnels over HTTP/2
+  (RFC 8441) when `config.http = {H2}` and HTTP/3 (RFC 9220, `-d:naviHttp3`) when
+  `{H3}`, in addition to the default HTTP/1.1 Upgrade. Supported on all three native
+  clients (sync, asyncdispatch, chronos); the sync h2 path uses a dedicated blocking
+  h2 connection and the sync h3 path runs a background pump thread (needs
+  `--threads:on`). Over h2/h3 the handshake uses the `:protocol` pseudo-header (no
+  `Sec-WebSocket-Key`/`Accept`). The public API is unchanged.
 - **Request trailers.** `req.trailers` (a `Headers`, the same shape as `req.headers`)
   sends trailing header fields after the body: chunked transfer-encoding with a
   `Trailer` header on HTTP/1.1, and a trailing HEADERS section on HTTP/2 and HTTP/3

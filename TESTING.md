@@ -2,7 +2,7 @@
 
 A registry of every test in navi, what it verifies, and how it runs. navi is an
 HTTP **client** with four backends (sync/OpenSSL, asyncdispatch/OpenSSL,
-chronos/BearSSL, js/fetch), and the tests are organized so a single sans-io core
+chronos/OpenSSL, js/fetch), and the tests are organized so a single sans-io core
 is validated once and each backend is validated as a thin adapter over it. Tests
 fall into six groups:
 
@@ -147,7 +147,7 @@ end-to-end suites drive).
 |------|----------|
 | `test_entries.nim` | Sync entry end to end, plus config wiring: TLS session resumption, per-phase timeouts (connect/read/total), TLS version pinning, and TLS cipher selection (incl. an unusable `ciphers`/`cipherSuites` raising rather than being ignored) |
 | `test_async.nim` | asyncdispatch entry end to end |
-| `test_chronos.nim` | chronos entry end to end, plus the chronos TLS config guard (BearSSL rejects cipher selection up front) |
+| `test_chronos.nim` | chronos entry end to end, plus chronos TLS parity now that it runs OpenSSL: an invalid cipher surfaces OpenSSL's error (not a blanket up-front reject) and `tls13` is honored rather than rejected |
 
 ### Features
 
@@ -367,7 +367,7 @@ honest exit code.
 
 | Var | Default | Meaning |
 |------|---------|---------|
-| `NAVI_PROTO` | `h2` | `h1` \| `h2` \| `h3` \| `all`. `all` iterates h1+h2 (h3 is opt-in). `h3` builds the heavier `Dockerfile.h3` (ngtcp2/nghttp3/OpenSSL-3.5 + Caddy) and a `-d:naviHttp3` client |
+| `NAVI_PROTO` | `h2` | `h1` \| `h2` \| `h3` \| `all`. `all` iterates h1+h2+h3 (and uses the h3 image). `h3`/`all` build the heavier `Dockerfile.h3` (ngtcp2/nghttp3/OpenSSL-3.5 + Caddy) and a `-d:naviHttp3` client |
 | `NAVI_BACKEND` | `all` | `sync` \| `asyncdispatch` \| `chronos` \| `js` \| `all` |
 | `NAVI_SERVERS` | `5` | Number of server instances; requests round-robin across them |
 | `NAVI_SECONDS` | `60` | Runtime per (backend × protocol) cell |
@@ -392,6 +392,6 @@ NAVI_SECONDS=600 NAVI_PROTO=all NAVI_BACKEND=chronos \
 
 - `js` + `streamUpload` — `fetch` cannot stream a request body (navi/js buffers it,
   which would defeat a 1 GiB soak), so there is no js upload client.
-- `h3` on `chronos` or `js` — HTTP/3 is sync + asyncdispatch only.
+- `h3` on `js` — js/undici has no HTTP/3. (HTTP/3 runs on sync, asyncdispatch, and chronos.)
 - `h3` without a `-d:naviHttp3` build — use the h3 image (selected automatically when
   `NAVI_PROTO=h3`).

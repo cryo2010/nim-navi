@@ -49,7 +49,8 @@ type
     H2 = "HTTP/2"
     H3 = "HTTP/3"   ## Opt-in only. Unlike H1/H2, H3 is never implied by an empty
                     ## `http` set; it is honored solely in a `-d:naviHttp3` build
-                    ## and negotiated per origin via Alt-Svc (see docs/http3.md).
+                    ## and negotiated per origin via Alt-Svc (see README.md for
+                    ## the HTTP/3 build flag, requirements, and backend support).
 
   RetryPolicy* = object
     ## When and how a request is retried. `initNaviConfig` seeds `defaultRetryPolicy`.
