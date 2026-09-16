@@ -39,11 +39,11 @@ proc main() =
 
   # Pull-based producer: return the next chunk, or "" at end-of-file.
   let res = api.request(POST, "http://127.0.0.1:" & $port & "/", headers = headers,
-    body = BodyProducer(proc(): string =
+    body = proc(): string =
       let n = f.readBuffer(addr buf[0], buf.len)
       if n <= 0: return ""
       sent += n
-      buf[0 ..< n]))
+      buf[0 ..< n])
 
   echo "uploaded: ", sent, " bytes from ", path
   echo "status:   ", res.status, "  echoed back: ", res.body.len, " bytes"

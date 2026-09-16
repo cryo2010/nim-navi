@@ -838,10 +838,10 @@ transfer-encoding. The producer returns the next chunk, or `""` at end of body:
 let parts = @["hello ", "streaming ", "world"]
 var i = 0
 discard api.request(POST, "https://example.com/upload",
-  body = BodyProducer(proc(): string =
+  body = proc(): string =
     if i < parts.len:
       result = parts[i]
-      inc i))
+      inc i)
 ```
 
 A closure `BodyIterator` streams the same way but ends at `finished(it)` rather than

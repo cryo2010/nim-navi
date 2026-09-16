@@ -34,11 +34,11 @@ proc main() {.async.} =
   headers["content-type"] = "application/octet-stream"
 
   let res = await api.request(POST, getEnv("BASE") & "/upload", headers = headers,
-    body = BodyProducer(proc(): string =
+    body = proc(): string =
       let n = f.readBuffer(addr buf[0], buf.len)
       if n <= 0: return ""
       sent += n
-      buf[0 ..< n]))
+      buf[0 ..< n])
 
   doAssert res.status == 200, "unexpected status " & $res.status
   let serverSha = parseJson(res.body){"sha1"}.getStr.toLowerAscii
