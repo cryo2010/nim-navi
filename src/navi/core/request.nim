@@ -348,7 +348,11 @@ proc toBody*[T: not proc](body: T): ResolvedBody =
   ## Catch-all for any other type: serialize with `std/jsonutils.toJson` and send
   ## as application/json. The `not proc` constraint keeps a raw lambda from ranking
   ## into this generic overload (a generic match beats a convertible one) instead
-  ## of the `BodyProducer` overload.
+  ## of the `BodyProducer` overload. A bare `nil` literal would also rank here
+  ## ahead of the ref/proc overloads; reject it, since its intent is ambiguous
+  ## (omit `body` for no body, or pass a typed nil like `JsonNode(nil)`).
+  when body is typeof(nil):
+    {.error: "body = nil is ambiguous; omit `body` instead".}
   ResolvedBody(typed: true, content: $toJson(body), contentType: "application/json")
 
 proc resolveBody(body: ResolvedBody, form: seq[(string, string)]): ResolvedBody =

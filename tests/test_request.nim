@@ -78,6 +78,9 @@ suite "toBody arm selection":
   test "a nil BodyIterator should be a no-op (default ResolvedBody)":
     check toBody(BodyIterator(nil)) == ResolvedBody()
 
+  test "a bare nil body should be rejected at compile time":
+    check not compiles(toBody(nil))
+
   test "a ResolvedBody should pass through unchanged":
     let r = ResolvedBody(typed: true, content: "x", contentType: "text/plain")
     check toBody(r) == r
