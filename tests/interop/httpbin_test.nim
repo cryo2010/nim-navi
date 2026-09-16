@@ -76,7 +76,7 @@ template runAll() =
     (await api().post(base & "/post", body = "hello body")).data["data"].getStr == "hello body"
 
   check "POST /post encodes a JSON body and sets Content-Type":
-    let r = await api().post(base & "/post", json = %*{"a": 1, "b": "two"})
+    let r = await api().post(base & "/post", body = %*{"a": 1, "b": "two"})
     r.data["json"]["a"].getInt == 1 and r.data["json"]["b"].getStr == "two" and
       r.data["headers"]["Content-Type"].getStr.contains("application/json")
 
@@ -225,10 +225,10 @@ template runAll() =
     # on h2); httpbin echoes the received body, which must equal what we produced.
     let chunk = repeat("s", 10_000)
     var left = 3                          # 3 x 10k, produced across several calls
-    let r = await api().request(POST, base & "/post", bodyStream = proc(): string =
+    let r = await api().request(POST, base & "/post", body = BodyProducer(proc(): string =
       if left == 0: return ""
       dec left
-      chunk)
+      chunk))
     r.data["data"].getStr == repeat("s", 30_000)
 
   check "/stream/5 yields five newline-delimited JSON objects":
@@ -246,7 +246,7 @@ template runAll() =
     r.status == 200 and r.headers["content-type"].toLowerAscii.contains("utf-8") and r.body.len > 0
 
   check "/anything echoes method and JSON":
-    let r = await api().post(base & "/anything", json = %*{"k": "v"})
+    let r = await api().post(base & "/anything", body = %*{"k": "v"})
     r.data["method"].getStr == "POST" and r.data["json"]["k"].getStr == "v"
 
   # --- batteries middleware (navi/mw), end to end over real h2+TLS ----------

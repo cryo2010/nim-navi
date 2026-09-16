@@ -372,10 +372,10 @@ suite "sync entry end to end":
     let parts = @["hello ", "streaming ", "world"]
     var i = 0
     let res = api.request(POST, "http://127.0.0.1:" & $port & "/",
-      bodyStream = proc(): string =
+      body = BodyProducer(proc(): string =
         if i < parts.len:
           result = parts[i]
-          inc i)
+          inc i))
     check res.status == 200
     check res.body == "hello streaming world"
     joinThread(th)
@@ -500,7 +500,7 @@ suite "sync entry end to end":
     startBodyEcho(th, port)
 
     let api = newNavi()
-    let res = api.post("http://127.0.0.1:" & $port & "/", json = %*{"a": 1})
+    let res = api.post("http://127.0.0.1:" & $port & "/", body = %*{"a": 1})
     check res.body == """{"a":1}"""
     check res.headers.get("x-echo-content-type") == "application/json"
     joinThread(th)
@@ -523,7 +523,7 @@ suite "sync entry end to end":
     startBodyEcho(th, port)
 
     let api = newNavi()
-    let res = api.post("http://127.0.0.1:" & $port & "/", multipart = @[
+    let res = api.post("http://127.0.0.1:" & $port & "/", body = @[
       field("title", "hello"),
       filePart("file", "a.txt", "file body", "text/plain")])
     let ct = res.headers.get("x-echo-content-type")
@@ -537,6 +537,55 @@ suite "sync entry end to end":
       "Content-Type: text/plain\r\n\r\n" &
       "file body\r\n" &
       "--" & boundary & "--\r\n"
+    joinThread(th)
+
+  test "a closure-iterator body should stream and reassemble, skipping empty yields":
+    const port = 8997
+    var th: Thread[ServerCtx]
+    startUploadEcho(th, port)
+
+    let api = newNavi()
+    let parts = @["hello ", "", "streaming ", "world"]
+    let it = iterator (): string {.closure.} =
+      for p in parts: yield p
+    let res = api.request(POST, "http://127.0.0.1:" & $port & "/", body = it)
+    check res.status == 200
+    check res.body == "hello streaming world"
+    joinThread(th)
+
+  test "an object body should be serialized as JSON with an application/json type":
+    const port = 8998
+    var th: Thread[ServerCtx]
+    startBodyEcho(th, port)
+
+    let api = newNavi()
+    let res = api.post("http://127.0.0.1:" & $port & "/",
+                       body = (name: "ada", age: 36))
+    check res.body == """{"name":"ada","age":36}"""
+    check res.headers.get("x-echo-content-type") == "application/json"
+    joinThread(th)
+
+  test "a seq body should be serialized as JSON with an application/json type":
+    const port = 8999
+    var th: Thread[ServerCtx]
+    startBodyEcho(th, port)
+
+    let api = newNavi()
+    let res = api.post("http://127.0.0.1:" & $port & "/", body = @[1, 2, 3])
+    check res.body == "[1,2,3]"
+    check res.headers.get("x-echo-content-type") == "application/json"
+    joinThread(th)
+
+  test "a typed body should win over form on the wire":
+    const port = 9001
+    var th: Thread[ServerCtx]
+    startBodyEcho(th, port)
+
+    let api = newNavi()
+    let res = api.post("http://127.0.0.1:" & $port & "/",
+                       body = %*{"a": 1}, form = @[("b", "2")])
+    check res.body == """{"a":1}"""
+    check res.headers.get("x-echo-content-type") == "application/json"
     joinThread(th)
 
   test "bearerAuth should set the Authorization header":
@@ -964,9 +1013,9 @@ suite "streamed request body is not retried":
     cfg.throwHttpErrors = false
     let api = newNavi(cfg)
     var sent = false
-    proc producer(): string =
+    let producer: BodyProducer = proc(): string =
       if sent: "" else: (sent = true; "streamed-body")
     let res = api.request(PUT, "http://127.0.0.1:" & $port & "/",
-                          bodyStream = producer)
+                          body = producer)
     check res.status == 503        # not retried
     joinThread(th)

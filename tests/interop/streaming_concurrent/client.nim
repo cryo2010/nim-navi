@@ -45,11 +45,11 @@ proc uploadOne(api: Navi, base: string, i: int) {.async.} =
   var headers = initHeaders()
   headers["content-type"] = "application/octet-stream"
   let res = await api.request(POST, base & "/upload", headers = headers,
-    bodyStream = proc(): string =
+    body = BodyProducer(proc(): string =
       if off >= payload.len: return ""
       let take = min(chunkSize, payload.len - off)
       result = payload[off ..< off + take]
-      off += take)
+      off += take))
   doAssert res.status == 200, "upload " & $i & " status " & $res.status
   let j = parseJson(res.body)
   doAssert j["size"].getInt == fileSize, "upload " & $i & " size " & $j["size"].getInt

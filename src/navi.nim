@@ -212,24 +212,35 @@ proc next*(ctx: NaviContext) =
     inc ctx.idx
     m(ctx)
 
-proc request*(client: Navi, verb: HttpVerb, target: string,
-              headers = initHeaders(), body = "", json: JsonNode = nil,
-              form: seq[(string, string)] = @[], multipart: Multipart = @[],
-              bodyStream: BodyProducer = nil,
-              params: seq[(string, string)] = @[],
-              cancel: CancelToken = nil,
-              trailers = initHeaders()): Response =
-  ## Perform a request and return the response. `json`/`form`/`multipart` encode
-  ## the body; `bodyStream` uploads a chunked body from a pull-based producer.
-  ## `params` are appended to the URL query; `cancel` aborts the request.
-  ## `trailers` are sent after the body (chunked on h1, a trailing HEADERS block on
-  ## h2/h3). Configured middleware wraps the whole call.
-  let req = buildRequest(client.config, verb, target, headers, body, json,
-                         form, multipart, bodyStream, params, trailers)
+proc requestResolved(client: Navi, verb: HttpVerb, target: string,
+                     headers: Headers, body: ResolvedBody,
+                     form: seq[(string, string)],
+                     params: seq[(string, string)],
+                     cancel: CancelToken,
+                     trailers: Headers): Response =
+  let req = buildRequest(client.config, verb, target, headers, body,
+                         form, params, trailers)
   if client.config.middleware.len == 0: return runCore(client, req, cancel)
   let ctx = NaviContext(req: req, clientv: client, cancel: cancel)
   ctx.next()
   ctx.res
+
+proc request*[B](client: Navi, verb: HttpVerb, target: string,
+                 headers = initHeaders(), body: B = "",
+                 form: seq[(string, string)] = @[],
+                 params: seq[(string, string)] = @[],
+                 cancel: CancelToken = nil,
+                 trailers = initHeaders()): Response =
+  ## Perform a request and return the response. `body` is dispatched by type: a
+  ## `string` is the raw body, a `JsonNode` is sent as JSON, a `Multipart` as
+  ## multipart/form-data, a `BodyProducer` or closure `BodyIterator` streams a
+  ## chunked upload, and any other value is serialized to JSON. `form` encodes a
+  ## urlencoded body and is outranked by a typed `body`. `params` are appended to
+  ## the URL query; `cancel` aborts the request. `trailers` are sent after the body
+  ## (chunked on h1, a trailing HEADERS block on h2/h3). Configured middleware wraps
+  ## the whole call.
+  requestResolved(client, verb, target, headers, toBody(body), form, params,
+                  cancel, trailers)
 
 include navi/private/stream_download
 include navi/private/sse_stream

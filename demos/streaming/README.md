@@ -8,8 +8,8 @@ and verifies the bytes arrived intact by comparing SHA-1 hashes at both ends.
   `POST /upload` consumes the streamed body and returns its SHA-1 and size.
 - **Client** — the **navi/asyncdispatch** backend, whose h2 multiplexer streams
   the request body chunk by chunk:
-  - [`upload.nim`](upload.nim) streams a file via `bodyStream` and checks the
-    server's SHA-1 against the file's own.
+  - [`upload.nim`](upload.nim) streams a file via a `body = <producer>` upload and
+    checks the server's SHA-1 against the file's own.
   - [`download.nim`](download.nim) streams the response to disk via `stream()`/`each`
     and checks the file's SHA-1 against the `x-sha1` header.
 

@@ -25,23 +25,23 @@ proc options*[P](client: Navi, target: string, headers = initHeaders(),
                  params: P = seq[(string, string)].default, cancel: CancelToken = nil): auto =
   client.request(OPTIONS, target, headers, params = toQuery(params), cancel = cancel)
 
-proc post*[P](client: Navi, target: string, body = "", json: JsonNode = nil,
-              form: seq[(string, string)] = @[], multipart: Multipart = @[],
-              headers = initHeaders(), params: P = seq[(string, string)].default,
-              cancel: CancelToken = nil): auto =
-  client.request(POST, target, headers, body, json, form, multipart,
+proc post*[P, B](client: Navi, target: string, body: B = "",
+                 form: seq[(string, string)] = @[],
+                 headers = initHeaders(), params: P = seq[(string, string)].default,
+                 cancel: CancelToken = nil): auto =
+  client.request(POST, target, headers, body, form,
                  params = toQuery(params), cancel = cancel)
 
-proc put*[P](client: Navi, target: string, body = "", json: JsonNode = nil,
-             form: seq[(string, string)] = @[], multipart: Multipart = @[],
-             headers = initHeaders(), params: P = seq[(string, string)].default,
-             cancel: CancelToken = nil): auto =
-  client.request(PUT, target, headers, body, json, form, multipart,
+proc put*[P, B](client: Navi, target: string, body: B = "",
+                form: seq[(string, string)] = @[],
+                headers = initHeaders(), params: P = seq[(string, string)].default,
+                cancel: CancelToken = nil): auto =
+  client.request(PUT, target, headers, body, form,
                  params = toQuery(params), cancel = cancel)
 
-proc patch*[P](client: Navi, target: string, body = "", json: JsonNode = nil,
-               form: seq[(string, string)] = @[], multipart: Multipart = @[],
-               headers = initHeaders(), params: P = seq[(string, string)].default,
-               cancel: CancelToken = nil): auto =
-  client.request(PATCH, target, headers, body, json, form, multipart,
+proc patch*[P, B](client: Navi, target: string, body: B = "",
+                  form: seq[(string, string)] = @[],
+                  headers = initHeaders(), params: P = seq[(string, string)].default,
+                  cancel: CancelToken = nil): auto =
+  client.request(PATCH, target, headers, body, form,
                  params = toQuery(params), cancel = cancel)

@@ -1,7 +1,7 @@
 ## End-to-end test of the asyncdispatch entry module.
 
 import unittest
-import std/[asyncdispatch, strutils]
+import std/[asyncdispatch, strutils, json]
 import navi/asyncdispatch
 import navi/core/pool      # for pool.idleCount in the streaming lifecycle tests
 import navi/core/response as naviresp  # navi's TimeoutError (std/net also defines one)
@@ -235,4 +235,28 @@ suite "asyncdispatch entry end to end":
     let (raised, idle) = waitFor run()
     check raised                                  # the error propagates out of each
     check idle == 0                               # a failed drain closes, never pools
+    joinThread(th)
+
+  test "a closure-iterator body should stream and reassemble over async":
+    const port = 9209
+    var th: Thread[ServerCtx]
+    startUploadEcho(th, port)
+    let parts = @["hello ", "", "streaming ", "world"]
+    proc run(): Future[Response] {.async.} =
+      let it = iterator (): string {.closure.} =
+        for p in parts: yield p
+      return await newNavi().request(POST, "http://127.0.0.1:" & $port & "/", body = it)
+    let res = waitFor run()
+    check res.status == 200
+    check res.body == "hello streaming world"
+    joinThread(th)
+
+  test "a catch-all object body should be JSON over async":
+    const port = 9210
+    var th: Thread[ServerCtx]
+    startBodyEcho(th, port)
+    let res = waitFor newNavi().post("http://127.0.0.1:" & $port & "/",
+                                     body = (name: "ada", age: 36))
+    check res.body == """{"name":"ada","age":36}"""
+    check res.headers.get("x-echo-content-type") == "application/json"
     joinThread(th)

@@ -38,13 +38,13 @@ proc ulThread(a: ptr BenchThread) {.thread, nimcall.} =
       h["content-type"] = "application/octet-stream"
       try:
         let res = api.request(POST, url, headers = h,
-          bodyStream = proc(): string =
+          body = BodyProducer(proc(): string =
             if remaining <= 0: return ""
             let n = min(blockSize, remaining)
             remaining -= n
             let chunk = if n == blockSize: blk else: blk[0 ..< n]
             st.update(chunk); sent += n
-            chunk)
+            chunk))
         if res.status != 200:
           stderr.writeLine cfg.label & " FAIL: /upload -> " & $res.status; quit(1)
         cfg.checkVersion(res.httpVersion)

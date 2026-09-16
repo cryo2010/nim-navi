@@ -59,10 +59,10 @@ template runAll() =
       if scenario == "streamupc": h["content-encoding"] = "gzip"  # nominal: navi does
                                                                   # not compress requests
       let r = await api.request(POST, baseTls & "/upload", headers = h,
-        bodyStream = proc(): string =
+        body = BodyProducer(proc(): string =
           if left == 0: return ""
           dec left
-          result = newString(16384))
+          result = newString(16384)))
       doAssert r.status == 200
       await api.close()
     of "streamdown", "streamdownc":

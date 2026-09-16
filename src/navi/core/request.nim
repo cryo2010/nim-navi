@@ -3,7 +3,7 @@
 ## Nothing here performs I/O: `buildRequest` merges instance defaults with
 ## per-call arguments into a concrete `Request` that any backend can execute.
 
-import std/[options, json, base64, tables, strutils]
+import std/[options, json, jsonutils, base64, tables, strutils]
 from std/uri import encodeQuery
 import ./headers, ./url, ./response, ./multipart, ./version
 import ../backend/api
@@ -115,6 +115,12 @@ type
     ## plain `proc(data: string)` on the sync backend -- both take navi's native
     ## body type, so each chunk is moved to the sink with no copy. The js backend
     ## takes `seq[byte]` instead (its bytes come from a JS Uint8Array).
+
+  BodyIterator* = iterator (): string {.closure, raises: [CatchableError].}
+    ## Closure-iterator upload source. Unlike `BodyProducer`, end of body is
+    ## `finished(it)` (not a "" yield), so an empty chunk in the middle of the
+    ## stream cannot truncate the upload. `toBody` wraps it into a `BodyProducer`
+    ## (see the `BodyIterator` overload).
 
   Request* = object
     verb*: HttpVerb
@@ -279,45 +285,111 @@ proc validateRequest*(req: Request) =
       raise newException(ValueError,
         "navi: invalid trailer '" & k & "' (name or value contains CR, LF, or NUL)")
 
-proc resolveBody(body: string, json: JsonNode, form: seq[(string, string)],
-                 multipart: Multipart): tuple[body, contentType: string] =
-  ## Resolve the mutually-exclusive body arguments into a concrete body string plus
-  ## the Content-Type it implies ("" means the caller keeps any existing header).
-  ## Precedence, highest first: `json`, `multipart`, `form`, then the raw `body`;
-  ## only the highest-precedence argument that is set is used, the rest ignored.
+type
+  ResolvedBody* = object
+    ## A body argument resolved by `toBody` into what the wire needs. Produced by
+    ## the `toBody` overloads (one per accepted body type) and consumed by
+    ## `resolveBody`/`buildRequest`. The default `ResolvedBody()` is the "no typed
+    ## body" case (`typed == false`, empty content): the caller's raw string or
+    ## `form` argument governs the body instead.
+    typed*: bool           ## a typed body arm matched (json/multipart/stream/
+                           ## iterator/catch-all); outranks `form` and raw string
+    content*: string       ## the buffered body bytes (empty for a streamed body)
+    contentType*: string   ## Content-Type the body implies; "" keeps the caller's
+    stream*: BodyProducer  ## set for a streamed (chunked) upload; nil otherwise
+
+proc toBody*(s: string): ResolvedBody =
+  ## Raw string body: not a typed body, so `form` still outranks it. Content is the
+  ## string verbatim, with no implied Content-Type.
+  ResolvedBody(typed: false, content: s)
+
+proc toBody*(json: JsonNode): ResolvedBody =
+  ## JSON body: `$json` with an application/json Content-Type. A nil node is "no
+  ## body", so it does not outrank `form` (returns the default `ResolvedBody`).
+  if json == nil: ResolvedBody()
+  else: ResolvedBody(typed: true, content: $json, contentType: "application/json")
+
+proc toBody*(multipart: Multipart): ResolvedBody =
+  ## multipart/form-data body. An empty part list is "no body" (returns the default
+  ## `ResolvedBody`); otherwise `encodeMultipart` supplies the body and the
+  ## boundary-carrying Content-Type.
+  if multipart.len == 0: ResolvedBody()
+  else:
+    let (body, contentType) = encodeMultipart(multipart)
+    ResolvedBody(typed: true, content: body, contentType: contentType)
+
+proc toBody*(stream: BodyProducer): ResolvedBody =
+  ## Streamed (chunked) upload from a pull-based producer. A nil producer is "no
+  ## body" (returns the default `ResolvedBody`); otherwise the producer is streamed
+  ## with no implied Content-Type.
+  if stream == nil: ResolvedBody()
+  else: ResolvedBody(typed: true, stream: stream)
+
+proc toBody*(it: BodyIterator): ResolvedBody =
+  ## Streamed upload from a closure iterator. A nil iterator is "no body" (returns
+  ## the default `ResolvedBody`). Otherwise the iterator is wrapped into a
+  ## `BodyProducer` whose end-of-body is `finished(it)`, not a "" yield: an empty
+  ## chunk yielded mid-stream is skipped rather than treated as end (so it cannot
+  ## truncate the upload), and once the iterator is finished the producer keeps
+  ## returning "".
+  if it == nil: return ResolvedBody()
+  let producer: BodyProducer = proc(): string {.closure, raises: [CatchableError].} =
+    while true:
+      let chunk = it()
+      if finished(it): return ""    # true end of body; stays "" hereafter
+      if chunk.len == 0: continue    # skip an empty mid-stream yield
+      return chunk
+  ResolvedBody(typed: true, stream: producer)
+
+proc toBody*(body: ResolvedBody): ResolvedBody = body
+  ## Pass-through: an already-resolved body is returned unchanged.
+
+proc toBody*[T: not proc](body: T): ResolvedBody =
+  ## Catch-all for any other type: serialize with `std/jsonutils.toJson` and send
+  ## as application/json. The `not proc` constraint keeps a raw lambda from ranking
+  ## into this generic overload (a generic match beats a convertible one) instead
+  ## of the `BodyProducer` overload.
+  ResolvedBody(typed: true, content: $toJson(body), contentType: "application/json")
+
+proc resolveBody(body: ResolvedBody,
+                 form: seq[(string, string)]): tuple[body, contentType: string,
+                                                     stream: BodyProducer] =
+  ## Resolve the body arguments into a concrete body string (or stream) plus the
+  ## Content-Type it implies ("" means the caller keeps any existing header).
+  ## Precedence, highest first: a typed `body` (json/multipart/stream/iterator/
+  ## catch-all, as chosen by `toBody`), then `form`, then the raw string `body`.
   ## Single place the body-source precedence lives, so it stays consistent and
   ## testable as body kinds are added.
-  if json != nil:
-    ($json, "application/json")
-  elif multipart.len > 0:
-    encodeMultipart(multipart)
+  if body.typed:
+    (body.content, body.contentType, body.stream)
   elif form.len > 0:
-    (encodeQuery(form), "application/x-www-form-urlencoded")
+    (encodeQuery(form), "application/x-www-form-urlencoded", BodyProducer(nil))
   else:
-    (body, "")
+    (body.content, "", BodyProducer(nil))
 
 proc buildRequest*(opts: NaviConfigBase, verb: HttpVerb, target: string,
-                   headers: Headers = initHeaders(), body = "",
-                   json: JsonNode = nil, form: seq[(string, string)] = @[],
-                   multipart: Multipart = @[],
-                   bodyStream: BodyProducer = nil,
+                   headers: Headers = initHeaders(),
+                   body: ResolvedBody = ResolvedBody(),
+                   form: seq[(string, string)] = @[],
                    params: seq[(string, string)] = @[],
                    trailers: Headers = initHeaders()): Request =
   ## Resolve `target` against the client's prefixUrl, merge headers, and encode
-  ## the body. `json`, `form`, and `multipart` take precedence over `body` (in
-  ## that order) and set a matching Content-Type unless the caller supplied one.
-  ## `params` are appended to the resolved URL's query string (url-encoded).
-  ## `trailers` are sent after the body (chunked on h1, a trailing HEADERS block on
-  ## h2/h3); they are per-request and not merged with the client's default headers.
+  ## the body. A typed `body` (produced by `toBody` from json/multipart/a producer/
+  ## an iterator/any other value) takes precedence over `form`, which takes
+  ## precedence over a raw string `body`; the winner sets a matching Content-Type
+  ## unless the caller supplied one. `params` are appended to the resolved URL's
+  ## query string (url-encoded). `trailers` are sent after the body (chunked on h1,
+  ## a trailing HEADERS block on h2/h3); they are per-request and not merged with
+  ## the client's default headers.
   result.verb = verb
   result.url = join(opts.prefixUrl, target)
   if params.len > 0:
     result.url = result.url.withQuery(params)
   result.headers = merge(opts.headers, headers)
   result.trailers = trailers
-  result.bodyStream = bodyStream
-  let (resolvedBody, contentType) = resolveBody(body, json, form, multipart)
+  let (resolvedBody, contentType, stream) = resolveBody(body, form)
   result.body = resolvedBody
+  result.bodyStream = stream
   if contentType.len > 0 and not result.headers.contains("content-type"):
     result.headers.add("content-type", contentType)
   # Digest can't be precomputed (it needs the server's nonce), so its header is

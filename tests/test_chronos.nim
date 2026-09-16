@@ -1,7 +1,7 @@
 ## End-to-end test of the chronos entry module.
 
 import unittest
-import std/strutils
+import std/[strutils, json]
 import pkg/chronos
 import navi/chronos
 import navi/core/pool      # for pool.idleCount in the streaming lifecycle tests
@@ -155,6 +155,30 @@ suite "chronos entry end to end":
     let api = newNavi(cfg)
     let res = waitFor api.post("http://127.0.0.1:" & $port & "/", body = "x")
     check res.headers.get("x-echo-authorization") == "Bearer captured-42"
+    joinThread(th)
+
+  test "a closure-iterator body should stream and reassemble over chronos":
+    const port = 9250
+    var th: Thread[ServerCtx]
+    startUploadEcho(th, port)
+    let parts = @["hello ", "", "streaming ", "world"]
+    proc run(): Future[Response] {.async.} =
+      let it = iterator (): string {.closure.} =
+        for p in parts: yield p
+      return await newNavi().request(POST, "http://127.0.0.1:" & $port & "/", body = it)
+    let res = waitFor run()
+    check res.status == 200
+    check res.body == "hello streaming world"
+    joinThread(th)
+
+  test "a catch-all object body should be JSON over chronos":
+    const port = 9251
+    var th: Thread[ServerCtx]
+    startBodyEcho(th, port)
+    let res = waitFor newNavi().post("http://127.0.0.1:" & $port & "/",
+                                     body = (name: "ada", age: 36))
+    check res.body == """{"name":"ada","age":36}"""
+    check res.headers.get("x-echo-content-type") == "application/json"
     joinThread(th)
 
 suite "chronos TLS config":

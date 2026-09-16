@@ -25,14 +25,14 @@ proc oneUpload(api: Navi, cfg: Config, url: string): Future[int] {.async.} =
   var h = initHeaders()
   h["content-type"] = "application/octet-stream"
   let res = await api.request(POST, url, headers = h,
-    bodyStream = proc(): string =
+    body = BodyProducer(proc(): string =
       if remaining <= 0: return ""
       let n = min(blockSize, remaining)
       remaining -= n
       let chunk = if n == blockSize: blk else: blk[0 ..< n]
       st.update(chunk)
       sent += n
-      chunk)
+      chunk))
   if res.status != 200:
     stderr.writeLine cfg.label & " FAIL: /upload -> " & $res.status
     quit(1)
