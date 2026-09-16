@@ -351,21 +351,22 @@ proc toBody*[T: not proc](body: T): ResolvedBody =
   ## of the `BodyProducer` overload.
   ResolvedBody(typed: true, content: $toJson(body), contentType: "application/json")
 
-proc resolveBody(body: ResolvedBody,
-                 form: seq[(string, string)]): tuple[body, contentType: string,
-                                                     stream: BodyProducer] =
-  ## Resolve the body arguments into a concrete body string (or stream) plus the
-  ## Content-Type it implies ("" means the caller keeps any existing header).
-  ## Precedence, highest first: a typed `body` (json/multipart/stream/iterator/
-  ## catch-all, as chosen by `toBody`), then `form`, then the raw string `body`.
-  ## Single place the body-source precedence lives, so it stays consistent and
-  ## testable as body kinds are added.
+proc resolveBody(body: ResolvedBody, form: seq[(string, string)]): ResolvedBody =
+  ## Resolve the body arguments into the winning source, normalized: a concrete
+  ## body string (or stream) plus the Content-Type it implies ("" means the
+  ## caller keeps any existing header). Precedence, highest first: a typed `body`
+  ## (json/multipart/stream/iterator/catch-all, as chosen by `toBody`), then
+  ## `form`, then the raw string `body`. Single place the body-source precedence
+  ## lives, so it stays consistent and testable as body kinds are added. Returns
+  ## a `ResolvedBody`, not a tuple: the js codegen cannot represent a nil closure
+  ## inside a tuple (it emits `null.bind(null)`), while a nil object field is fine.
   if body.typed:
-    (body.content, body.contentType, body.stream)
+    body
   elif form.len > 0:
-    (encodeQuery(form), "application/x-www-form-urlencoded", BodyProducer(nil))
+    ResolvedBody(content: encodeQuery(form),
+                 contentType: "application/x-www-form-urlencoded")
   else:
-    (body.content, "", BodyProducer(nil))
+    ResolvedBody(content: body.content)
 
 proc buildRequest*(opts: NaviConfigBase, verb: HttpVerb, target: string,
                    headers: Headers = initHeaders(),
@@ -387,11 +388,11 @@ proc buildRequest*(opts: NaviConfigBase, verb: HttpVerb, target: string,
     result.url = result.url.withQuery(params)
   result.headers = merge(opts.headers, headers)
   result.trailers = trailers
-  let (resolvedBody, contentType, stream) = resolveBody(body, form)
-  result.body = resolvedBody
-  result.bodyStream = stream
-  if contentType.len > 0 and not result.headers.contains("content-type"):
-    result.headers.add("content-type", contentType)
+  let resolved = resolveBody(body, form)
+  result.body = resolved.content
+  result.bodyStream = resolved.stream
+  if resolved.contentType.len > 0 and not result.headers.contains("content-type"):
+    result.headers.add("content-type", resolved.contentType)
   # Digest can't be precomputed (it needs the server's nonce), so its header is
   # empty here and added by the engine after the 401 challenge.
   if opts.auth.header.len > 0 and not result.headers.contains("authorization"):
