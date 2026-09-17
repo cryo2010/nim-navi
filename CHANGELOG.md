@@ -8,6 +8,23 @@ onward (pre-1.0, minor versions may include breaking changes).
 ## [Unreleased]
 
 ### Added
+- **A response `sink` on the buffered `request()` API (and every verb helper).**
+  Passing `sink =` to `request`/`get`/`post`/`put`/`patch`/`delete`/`head`/`options`
+  streams the response body to a caller callback instead of buffering it into
+  `res.body`, while keeping the full policy layer (redirects, retries, digest,
+  middleware, throw-on-non-2xx). Only the **final surfaced** response's body reaches
+  the sink: redirect hops, digest 401 challenges, retried statuses, and (with
+  `throwHttpErrors` on) thrown non-2xx bodies never do (the `HttpError` still carries
+  its buffered body). A **bool** sink (`GatedBodySink`) returns `false` to stop the
+  download early, in which case the request returns normally with the new
+  `res.bodyTruncated == true` and `res.body == ""`; a **void** sink (`BodySink`)
+  always continues. The sink is awaited on the async backends (backpressure) and
+  synchronous on the sync backend; chunks are `string` on the native clients and
+  `seq[byte]` on `navi/js`. A gzip/deflate/br/zstd body is decoded before delivery,
+  the size cap is enforced through the sinked path, and trailers surface on a full
+  drain (absent on an early stop). `HEAD`/`204`/`304` never call the sink. On a
+  `-d:naviHttp3` build the h3 leg buffers the final body and delivers it in one call;
+  the h1/h2 legs stream it incrementally. Passing no `sink` is unchanged (#369).
 - **An async body producer arm for streamed uploads on the async backends.**
   `body` on `navi/asyncdispatch` and `navi/chronos` now accepts an async producer
   (`proc(): Future[string]`) alongside the synchronous `BodyProducer`: the engine

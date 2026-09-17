@@ -18,6 +18,9 @@ type
                              ## outside `req` (its Future type is backend-specific);
                              ## nil for a buffered/sync-streamed body. `next` forwards
                              ## it to the transport once the middleware chain is spent.
+    userSink: BodySink       ## wrapped gated response sink (nil for a buffered call);
+                             ## forwarded to the request core once the chain is spent
+    gate: SinkGate           ## the sink's delivery gate (nil for a buffered call)
   NaviMiddleware* = proc(ctx: NaviContext): Future[void] {.naviMwClosure.}
     ## A middleware step; may be async. A closure, so it can capture: read/modify
     ## `ctx.req`, `await ctx.next()` to proceed -- or skip it to short-circuit --
@@ -148,21 +151,67 @@ when defined(naviHttp3):
 
 proc muxRequest(client: Navi, mux: H2Mux, req: Request,
                 sink: BodySink,
-                asyncStream: AsyncBodyProducer = nil): Future[Response] {.async.} =
+                asyncStream: AsyncBodyProducer = nil,
+                userSink: BodySink = nil, gate: SinkGate = nil): Future[Response] {.async.} =
   # The mux delivers a streaming request's body to `sink` incrementally (decoding
   # content-encoding as it arrives), so the returned response's body is empty.
   # A non-streaming request (sink == nil) still buffers into r.body as before.
   # `asyncStream` (when set) streams the request body up, awaited chunk by chunk.
-  result = toResponse(await mux.request(h2HeaderList(req), req.body, req.bodyStream,
-                                        sink, h2TrailerList(req), asyncStream))
+  #
+  # `userSink`/`gate` (when set) are the buffered `request()` gated-sink path. The real
+  # h2 mux streaming path is sendAndReadHeaders + drainDownload (H2Mux.request's own
+  # `sink` param is dead code), so route it here: read headers, snapshot, register a
+  # trailer capture, then either drain to the gated sink (gate wants this response) or
+  # buffer via an accumulator sink for the policy layer. `mux.readChunk` returns DECODED
+  # bytes (per-sid CappedDecoder), so a buffered body is already plaintext -- mark it
+  # decoded so `decodeBody` upstream does not inflate it twice.
+  if userSink.isNil or gate.isNil:
+    # The buffered request path: `sink` is always nil here (stream() drains via the
+    # handle's own sendAndReadHeaders, not muxRequest), so this buffers into r.body.
+    result = toResponse(await mux.request(h2HeaderList(req), req.body, req.bodyStream,
+                                          h2TrailerList(req), asyncStream))
+    return
+  let sid = await mux.sendAndReadHeaders(h2HeaderList(req), req.body, req.bodyStream,
+                                         h2TrailerList(req), false, asyncStream)
+  var snap = toResponse(mux.respSnapshot(sid))
+  mux.captureTrailers(sid)                 # so a full drain keeps the trailing HEADERS
+  let eff = (if gate.wantsDelivery(snap.httpVersion, snap.status, snap.headers):
+               userSink else: BodySink(nil))
+  if not eff.isNil:
+    try:
+      await mux.drainDownload(sid, eff)     # its except RSTs + frees via endStream
+    except SinkStopSignal:
+      await mux.abandon(sid)                # stop the peer; the connection stays up
+      snap.bodyTruncated = true
+      snap.body = ""
+      return snap
+    snap.body = ""
+    snap.trailers = initHeaders(mux.takeTrailers(sid))
+    return snap
+  # Not the final response: buffer the body so the policy layer can decide. Accumulate
+  # via a sink into a local, then attach it (already decoded) to the snapshot.
+  var buf = ""
+  let acc: BodySink = proc(data: string): Future[void] {.async.} =
+    buf.add data
+  await mux.drainDownload(sid, acc)
+  snap.body = buf
+  snap.trailers = initHeaders(mux.takeTrailers(sid))
+  markStreamDecoded(snap)                   # readChunk already decoded content-encoding
+  result = snap
 
 proc h1OnConn(client: Navi, conn: Conn, origin: string, req: Request,
               sink: BodySink,
-              asyncStream: AsyncBodyProducer = nil): Future[Response] {.async.} =
+              asyncStream: AsyncBodyProducer = nil,
+              userSink: BodySink = nil, gate: SinkGate = nil): Future[Response] {.async.} =
   var keep = false
-  result = h1Exchange(conn, req, sink, keep,
-                      client.config.wantsDecompress, client.config.maxResponseBytes,
-                      asyncStream)
+  if not userSink.isNil and not gate.isNil:
+    var parser = h1SendAndReadHeaders(conn, req, true, asyncStream)
+    result = h1GatedFinish(conn, parser, userSink, gate, keep,
+                           client.config.wantsDecompress, client.config.maxResponseBytes)
+  else:
+    result = h1Exchange(conn, req, sink, keep,
+                        client.config.wantsDecompress, client.config.maxResponseBytes,
+                        asyncStream)
   let pc = PooledConn[Conn](transport: conn)
   if not (keep and pushIdle(client.pool, origin, pc)):
     await close(conn)
@@ -225,11 +274,14 @@ proc openFreshConn(client: Navi, rq: Request, origin: string,
     raise
 
 proc transportInner(client: Navi, req: Request, sink: BodySink,
-                    asyncStream: AsyncBodyProducer = nil): Future[Response] {.async.} =
+                    asyncStream: AsyncBodyProducer = nil,
+                    userSink: BodySink = nil, gate: SinkGate = nil): Future[Response] {.async.} =
   ## Multiplex over a shared h2 connection when available/negotiable; otherwise
   ## pool http/1.1. Concurrent connects to the same new origin are coalesced so a
   ## cold burst still ends up on one h2 connection. `asyncStream` (when set) is an
   ## awaited pull-based upload producer, streamed up in place of a buffered body.
+  ## `userSink`/`gate` (when set) stream the FINAL response body to the caller's gated
+  ## sink (the buffered `request()` sink path).
   let origin = originKey(req.url)
   let wantH2 = client.config.wantsH2 and req.url.isTls
   client.pruneDeadMuxes()          # evict muxes that died since the last request (#312)
@@ -240,12 +292,13 @@ proc transportInner(client: Navi, req: Request, sink: BodySink,
       # A reused mux adopts the CURRENT keepalive interval, not the one it was opened
       # with, honoring navi's live-config contract (issue #360).
       client.muxes[origin].applyKeepAlive(client.config.h2KeepAliveMs)
-      return await client.muxRequest(client.muxes[origin], req, sink, asyncStream)
+      return await client.muxRequest(client.muxes[origin], req, sink, asyncStream,
+                                     userSink, gate)
     if client.pendingMux.hasKey(origin):
       let mux = await client.pendingMux[origin]
       if mux != nil and mux.canReuse:
         mux.applyKeepAlive(client.config.h2KeepAliveMs)
-        return await client.muxRequest(mux, req, sink, asyncStream)
+        return await client.muxRequest(mux, req, sink, asyncStream, userSink, gate)
       # else: turned out http/1.1, fall through
 
   # 2. A pooled http/1.1 connection.
@@ -261,17 +314,25 @@ proc transportInner(client: Navi, req: Request, sink: BodySink,
     # byte (unprocessed: safe to replay any method) from one AFTER the response began
     # (processed: only an idempotent method may be replayed).
     var gotResponse = false
+    let gated = not userSink.isNil and not gate.isNil
     try:
       var keep = false
-      var parser = h1SendAndReadHeaders(pc.transport, req, not sink.isNil, asyncStream)
+      var parser = h1SendAndReadHeaders(pc.transport, req, not sink.isNil or gated,
+                                        asyncStream)
       gotResponse = true
-      h1DrainBody(pc.transport, parser, sink, keep,
-                  client.config.wantsDecompress, client.config.maxResponseBytes)
-      result = parser.toResponse()
+      if gated:
+        result = h1GatedFinish(pc.transport, parser, userSink, gate, keep,
+                               client.config.wantsDecompress, client.config.maxResponseBytes)
+      else:
+        h1DrainBody(pc.transport, parser, sink, keep,
+                    client.config.wantsDecompress, client.config.maxResponseBytes)
+        result = parser.toResponse()
       if not (keep and pushIdle(client.pool, origin, pc)): await close(pc.transport)
       return
     except CatchableError as e:
       await close(pc.transport)  # stale
+      # A half-delivered gated body must never be replayed onto a fresh connection.
+      if gate != nil and gate.fed: raise
       # Safe to replay on a fresh connection when the request was not processed (a
       # reused connection dropped before any response) or the method is idempotent /
       # provably unprocessed; never replay a non-rewindable streamed body.
@@ -286,9 +347,9 @@ proc transportInner(client: Navi, req: Request, sink: BodySink,
   rq.absoluteForm = usesAbsoluteForm(resolveProxy(client.config, rq.url), rq.url.isTls)
   let (conn, mux) = await client.openFreshConn(rq, origin, wantH2)
   if mux != nil:
-    result = await client.muxRequest(mux, rq, sink, asyncStream)
+    result = await client.muxRequest(mux, rq, sink, asyncStream, userSink, gate)
   else:
-    result = await client.h1OnConn(conn, origin, rq, sink, asyncStream)
+    result = await client.h1OnConn(conn, origin, rq, sink, asyncStream, userSink, gate)
 
 when defined(naviHttp3):
   proc recordAltSvc(client: Navi, req: Request, resp: Response) =
@@ -356,12 +417,15 @@ when defined(naviHttp3):
       raise
 
 proc transport(client: Navi, req: Request, sink: BodySink,
-               asyncStream: AsyncBodyProducer = nil): Future[Response] {.async.} =
+               asyncStream: AsyncBodyProducer = nil,
+               userSink: BodySink = nil, gate: SinkGate = nil): Future[Response] {.async.} =
   ## The wire transport `run` calls. In a `-d:naviHttp3` build, a buffered-body
   ## request to an origin that has advertised h3 (Alt-Svc) goes over HTTP/3, with
   ## any QUIC failure falling back to h2/h1; `alt-svc` on h2/h1 responses is
   ## captured for later upgrades. `asyncStream` (when set) is an awaited upload
-  ## producer streamed up in place of a buffered body.
+  ## producer streamed up in place of a buffered body. `userSink`/`gate` (when set)
+  ## stream the FINAL response body to the caller's gated sink; the h3 leg stays
+  ## buffered (the performRequest fallback delivers its final body).
   var rq = req
   var producer = asyncStream
   when defined(naviHttp3):
@@ -393,13 +457,14 @@ proc transport(client: Navi, req: Request, sink: BodySink,
           rq = h3rq
         try: return await h3Transport(client, h3rq, ep.get)
         except QuicError: discard   # fall back to h2/h1 below (rq now buffered)
-  result = await transportInner(client, rq, sink, producer)
+  result = await transportInner(client, rq, sink, producer, userSink, gate)
   when defined(naviHttp3):
     client.recordAltSvc(rq, result)
 
 proc doRequest(client: Navi, req: Request,
-               asyncStream: AsyncBodyProducer = nil): Future[Response] {.async.} =
-  result = performRequest(client, req, nil, asyncStream)
+               asyncStream: AsyncBodyProducer = nil,
+               userSink: BodySink = nil, gate: SinkGate = nil): Future[Response] {.async.} =
+  result = performRequest(client, req, nil, asyncStream, userSink, gate)
 
 proc client*(ctx: NaviContext): Navi = ctx.clientv
   ## The client handling this request (e.g. to read `ctx.client.config`).
@@ -409,7 +474,8 @@ proc next*(ctx: NaviContext): Future[void] {.async.} =
   ## exhausted -- the request itself. The outcome lands in `ctx.res`.
   let mws = ctx.clientv.config.middleware
   if ctx.idx >= mws.len:
-    ctx.res = await doRequest(ctx.clientv, ctx.req, ctx.asyncStream)
+    ctx.res = await doRequest(ctx.clientv, ctx.req, ctx.asyncStream,
+                              ctx.userSink, ctx.gate)
   else:
     let m = mws[ctx.idx]
     inc ctx.idx
@@ -424,25 +490,57 @@ proc runChain(ctx: NaviContext): Future[Response] {.async.} =
   await ctx.next()
   return ctx.res
 
+proc wrapSink(s: GatedBodySink, gate: SinkGate): BodySink =
+  ## Adapt a caller's gated sink into the internal `BodySink` the engine drains into:
+  ## mark the gate as fed (so the replay guards bar a retry) before each delivery, and
+  ## turn a `false` result into a `SinkStopSignal` the drain site catches and converts
+  ## to a normal early stop. The engine awaits the sink, so this awaits `s`. Chronos's
+  ## strict gcsafe/raises obligation on the portable `s` is discharged with a cast, as
+  ## the deliverChunk path does. Nil in -> nil out.
+  if s.isNil: return nil
+  result = proc(data: string): Future[void] {.async.} =
+    gate.fed = true
+    var keep: bool
+    {.cast(gcsafe).}:
+      {.cast(raises: [CatchableError]).}:
+        keep = await s(data)
+    if not keep:
+      raise newException(SinkStopSignal, "navi: sink requested early stop")
+
+proc wrapSink(s: BodySink, gate: SinkGate): BodySink =
+  ## Adapt a caller's void sink (always continue) into the internal `BodySink`, marking
+  ## the gate as fed before each delivery. Nil in -> nil out.
+  if s.isNil: return nil
+  result = proc(data: string): Future[void] {.async.} =
+    gate.fed = true
+    {.cast(gcsafe).}:
+      {.cast(raises: [CatchableError]).}:
+        await s(data)
+
 proc requestResolved(client: Navi, verb: HttpVerb, target: string,
                      headers: Headers, body: ResolvedBody,
                      form: seq[(string, string)],
                      params: seq[(string, string)],
                      cancel: CancelToken,
                      trailers: Headers,
-                     asyncStream: AsyncBodyProducer = nil): Future[Response] {.async.} =
+                     asyncStream: AsyncBodyProducer = nil,
+                     userSink: BodySink = nil,
+                     gate: SinkGate = nil): Future[Response] {.async.} =
   ## `asyncStream` (default nil) is an awaited pull-based upload producer, threaded
   ## alongside the built `Request` because its Future type is backend-specific (it
   ## cannot be a field on the core `Request`/`ResolvedBody`). When set, `body` is the
   ## default `ResolvedBody()` (no buffered body) and the request is flagged
-  ## non-replayable, mirroring a sync `bodyStream`.
+  ## non-replayable, mirroring a sync `bodyStream`. `userSink`/`gate` (when set) stream
+  ## the FINAL response body to the caller's gated sink.
   var req = buildRequest(client.config, verb, target, headers, body,
                          form, params, trailers)
   if asyncStream != nil:
     req.hasStreamedBody = true   # non-replayable: pulled once, cannot rewind
   if client.config.middleware.len == 0:
-    return await guard(client.config.totalMs, doRequest(client, req, asyncStream), cancel)
-  let ctx = NaviContext(req: req, clientv: client, asyncStream: asyncStream)
+    return await guard(client.config.totalMs,
+                       doRequest(client, req, asyncStream, userSink, gate), cancel)
+  let ctx = NaviContext(req: req, clientv: client, asyncStream: asyncStream,
+                        userSink: userSink, gate: gate)
   return await guard(client.config.totalMs, runChain(ctx), cancel)
 
 proc request*[B](client: Navi, verb: HttpVerb, target: string,
@@ -468,6 +566,45 @@ proc request*[B](client: Navi, verb: HttpVerb, target: string,
   else:
     requestResolved(client, verb, target, headers, toBody(body), form, params,
                     cancel, trailers)
+
+proc request*[B](client: Navi, verb: HttpVerb, target: string,
+                 headers: Headers, body: B, sink: GatedBodySink,
+                 form: seq[(string, string)] = @[],
+                 params: seq[(string, string)] = @[],
+                 cancel: CancelToken = nil,
+                 trailers = initHeaders()): Future[Response] =
+  ## Like `request`, but streams the FINAL response body to `sink` instead of
+  ## buffering it into `res.body`. The full policy layer still runs (redirects,
+  ## retries, digest, middleware, throw-on-non-2xx): only the body of the response
+  ## actually surfaced to you reaches the sink; redirect/retry/digest/thrown-error
+  ## bodies never do (an `HttpError` still carries its buffered body). `sink` returns
+  ## `bool`: `true` keeps going, `false` stops the download early -- the request then
+  ## returns normally with `res.body == ""` and `res.bodyTruncated == true`. On a full
+  ## drain `res.body` is "" and any trailers are populated; HEAD/204/304 never call it.
+  let gate = newSinkGate()
+  when B is AsyncBodyProducer:
+    requestResolved(client, verb, target, headers, ResolvedBody(), form, params,
+                    cancel, trailers, body, wrapSink(sink, gate), gate)
+  else:
+    requestResolved(client, verb, target, headers, toBody(body), form, params,
+                    cancel, trailers, nil, wrapSink(sink, gate), gate)
+
+proc request*[B](client: Navi, verb: HttpVerb, target: string,
+                 headers: Headers, body: B, sink: BodySink,
+                 form: seq[(string, string)] = @[],
+                 params: seq[(string, string)] = @[],
+                 cancel: CancelToken = nil,
+                 trailers = initHeaders()): Future[Response] =
+  ## Like the gated `request` overload, but `sink` is a void `BodySink` (always
+  ## continue): the FINAL response body streams to it and cannot be stopped early, so
+  ## `res.bodyTruncated` is never set by it.
+  let gate = newSinkGate()
+  when B is AsyncBodyProducer:
+    requestResolved(client, verb, target, headers, ResolvedBody(), form, params,
+                    cancel, trailers, body, wrapSink(sink, gate), gate)
+  else:
+    requestResolved(client, verb, target, headers, toBody(body), form, params,
+                    cancel, trailers, nil, wrapSink(sink, gate), gate)
 
 include navi/private/impl_stream
 include navi/private/impl_sse

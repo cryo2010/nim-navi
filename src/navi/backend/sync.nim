@@ -26,6 +26,15 @@ type
     ## body type (`string`, an 8-bit-clean byte buffer), so the engine moves each
     ## chunk in with no copy; write it to a stream/file or index it as bytes.
 
+  GatedBodySink* = proc(data: string): bool {.closure, raises: [CatchableError].}
+    ## A response sink for `request()` that can stop the download early. Like
+    ## `BodySink` it receives decoded body chunks of the FINAL surfaced response, but
+    ## returns `bool`: `true` keeps the transfer going, `false` stops it cleanly (the
+    ## request returns normally with `res.body == ""` and `res.bodyTruncated == true`).
+    ## Only the final response's body is delivered; redirect/retry/digest/thrown-error
+    ## bodies never reach it. Sync form (no backpressure needed: a blocking read only
+    ## pulls the next chunk once this returns).
+
 when defined(windows):
   import std/winlean
   # winlean exports SOL_SOCKET/TCP_NODELAY but not the timeout options; pull them

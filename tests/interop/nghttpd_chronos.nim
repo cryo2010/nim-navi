@@ -72,6 +72,45 @@ suite "nghttpd interop (chronos, http/2 mux)":
     check total == 262144                 # 256 KiB body delivered in full
     check calls > 1                       # ...incrementally, not buffered into one call
 
+  test "streams a response body to a gated sink over the mux":
+    proc run(base, cert: string): Future[(int, int, Response)] {.async.} =
+      var cfg = initNaviConfig()
+      cfg.tls.caFile = cert
+      let api = newNavi(cfg)
+      var calls, total = 0
+      let sink = proc(data: string): Future[bool] {.async.} =
+        inc calls
+        total += data.len
+        return true
+      let res = await api.get(base & "/large.bin", sink = sink)
+      return (calls, total, res)
+    let (calls, total, res) = waitFor run(base, cert)
+    check res.status == 200
+    check res.httpVersion == "HTTP/2"
+    check res.body == ""
+    check total == 262144
+    check calls > 1
+
+  test "a sink stopping early over the mux resets the stream and keeps it usable":
+    proc run(base, cert: string): Future[(int, Response, Response)] {.async.} =
+      var cfg = initNaviConfig()
+      cfg.tls.caFile = cert
+      let api = newNavi(cfg)
+      var calls = 0
+      let sink = proc(data: string): Future[bool] {.async.} =
+        inc calls
+        return false                     # stop after the first chunk
+      let stopped = await api.get(base & "/large.bin", sink = sink)
+      let again = await api.get(base & "/small.txt")   # mux must survive the RST
+      return (calls, stopped, again)
+    let (calls, stopped, again) = waitFor run(base, cert)
+    check stopped.status == 200
+    check stopped.bodyTruncated
+    check stopped.body == ""
+    check calls == 1
+    check again.status == 200
+    check again.body == "hello from nghttpd\n"
+
   test "concurrent GETs multiplex over a single connection":
     proc run(base, cert: string): Future[seq[Response]] {.async.} =
       var cfg = initNaviConfig()

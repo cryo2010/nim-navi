@@ -56,6 +56,38 @@ suite "nghttpd interop (sync, http/2)":
     check res.httpVersion == "HTTP/2"
     check res.body == repeat("y", 250_000)
 
+  test "streams a response body to a gated sink over h2":
+    # The gated h2 path (h2GatedStream): a 256 KiB body > the 64 KiB window must
+    # arrive at the sink in more than one chunk, with res.body left empty.
+    var collected = ""
+    var calls = 0
+    let sink = proc(data: string): bool {.closure, raises: [CatchableError].} =
+      collected.add data
+      inc calls
+      true
+    let res = client().get(base & "/large.bin", sink = sink)
+    check res.status == 200
+    check res.httpVersion == "HTTP/2"
+    check res.body == ""
+    check collected.len == 262144
+    check calls > 1
+
+  test "a sink stopping early over h2 resets the stream and keeps the mux usable":
+    var calls = 0
+    let sink = proc(data: string): bool {.closure, raises: [CatchableError].} =
+      inc calls
+      false                              # stop after the first chunk
+    let api = client()
+    let res = api.get(base & "/large.bin", sink = sink)
+    check res.status == 200
+    check res.bodyTruncated
+    check res.body == ""
+    check calls == 1
+    # The stream was RST but the connection survives: a follow-up works.
+    let again = api.get(base & "/small.txt")
+    check again.status == 200
+    check again.body == "hello from nghttpd\n"
+
   test "parallel multiplexes several requests over one connection":
     let res = client().parallel(
       @[base & "/small.txt", base & "/small.txt", base & "/small.txt"])

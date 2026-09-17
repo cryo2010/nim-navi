@@ -29,6 +29,16 @@ type
     ## crosses an `await` so it must be owned, not a borrowed view; being navi's own
     ## body type lets the engine move each chunk in with no copy.
 
+  GatedBodySink* = proc(data: string): Future[bool] {.closure.}
+    ## A response sink for `request()` that can stop the download early. Like
+    ## `BodySink` it receives decoded body chunks of the FINAL surfaced response and
+    ## is awaited (backpressure), but returns `Future[bool]`: `true` keeps the
+    ## transfer going, `false` stops it cleanly (the request returns normally with
+    ## `res.body == ""` and `res.bodyTruncated == true`). Only the final response's
+    ## body is delivered; redirect/retry/digest/thrown-error bodies never reach it. A
+    ## bare closure (no chronos raises annotation, portable spelling); the wrap site
+    ## discharges chronos's strict gcsafe/raises obligation with a cast.
+
   AsyncBodyProducer* = proc(): Future[string] {.closure.}
     ## Pull-based upload source for the chronos backend: returns the next body chunk
     ## (or "" at end of body). The engine `await`s each call, so producing a chunk may

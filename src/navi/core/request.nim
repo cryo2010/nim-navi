@@ -224,20 +224,32 @@ proc wantsH3*(opts: NaviConfigBase): bool =
   ## native transport upgrades to h3 per origin after Alt-Svc discovery.
   H3 in opts.http
 
-proc enforceProtocol*(opts: NaviConfigBase, httpVersion: string) =
-  ## Strict protocol selection: the HTTP version actually used (`httpVersion`, as
-  ## it appears on `Response.httpVersion`) must be allowed by `opts.http`, else
-  ## raise `ProtocolError`. An empty `http` set allows anything. The one exemption
-  ## is the h3 Alt-Svc discovery leg: when h3 is the *only* requested protocol, an
-  ## h1/h2 bootstrap is required to discover it, so that leg is permitted (the
-  ## upgrade to h3 happens on the following requests).
-  if opts.http.card == 0: return
+proc protocolAllowed*(http: set[HttpVersion], httpVersion: string): bool =
+  ## Whether the HTTP version actually used (`httpVersion`, as it appears on
+  ## `Response.httpVersion`) is permitted by the requested `http` set. An empty set
+  ## allows anything. The one exemption is the h3 Alt-Svc discovery leg: when h3 is
+  ## the *only* requested protocol, an h1/h2 bootstrap is required to discover it, so
+  ## that leg is permitted (the upgrade to h3 happens on the following requests).
+  ## Factored out of `enforceProtocol` so the sink gate can consult the same rule
+  ## when deciding whether a response is certain to be surfaced (a protocol-rejected
+  ## response is thrown, so its body must not reach the sink).
+  if http.card == 0: return true
   let used =
     if httpVersion.startsWith("HTTP/3"): H3
     elif httpVersion.startsWith("HTTP/2"): H2
     else: H1
-  if used in opts.http: return
-  if opts.http == {H3} and used in {H1, H2}: return
+  if used in http: return true
+  if http == {H3} and used in {H1, H2}: return true
+  false
+
+proc enforceProtocol*(opts: NaviConfigBase, httpVersion: string) =
+  ## Strict protocol selection: the HTTP version actually used must be allowed by
+  ## `opts.http`, else raise `ProtocolError`. Delegates the rule to `protocolAllowed`.
+  if protocolAllowed(opts.http, httpVersion): return
+  let used =
+    if httpVersion.startsWith("HTTP/3"): H3
+    elif httpVersion.startsWith("HTTP/2"): H2
+    else: H1
   raise newException(ProtocolError,
     "navi: negotiated " & $used & ", which config.http (" & $opts.http &
     ") does not allow; widen config.http or accept the downgrade")

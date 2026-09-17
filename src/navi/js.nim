@@ -31,6 +31,7 @@ import navi/proto/sse
 import navi/core/public
 export sse.SseEvent
 import navi/core/retry
+import navi/core/sinkgate
 import navi/backend/js
 import navi/backend/jsws
 
@@ -51,6 +52,8 @@ type
     clientv: Navi            ## the owning client (see `client`); a shared ref
     cancel: CancelToken      ## caller's cancellation token, or nil
     idx: int                 ## index of the next middleware to run
+    userSink: BodySink       ## wrapped gated response sink (nil for a buffered call)
+    gate: SinkGate           ## the sink's delivery gate (nil for a buffered call)
   NaviMiddleware* = proc(ctx: NaviContext): Future[void] {.closure.}
     ## A middleware step; may be async. A closure, so it can capture: read/modify
     ## `ctx.req`, `await ctx.next()` to proceed -- or skip it to short-circuit --
@@ -119,22 +122,37 @@ proc maybeThrow(client: Navi, req: Request, resp: Response) =
       msg: $req.verb & " " & $req.url & " -> " & $resp.status & " " & resp.reason,
       response: resp)
 
-proc runCore(client: Navi, req0: Request, cancel: CancelToken): Future[Response] {.async.} =
+proc runCore(client: Navi, req0: Request, cancel: CancelToken,
+             userSink: BodySink = nil, gate: SinkGate = nil): Future[Response] {.async.} =
   ## The innermost `next`: buffered request with the policy navi owns here (cookie
   ## jar, retries with backoff, size cap, throw-on-non-2xx). Redirects and decoding
-  ## are the runtime's.
+  ## are the runtime's. `userSink`/`gate` (when set) stream the FINAL response body to
+  ## the caller's gated sink.
   var req = req0
   var resp: Response
   var attempt = 0
   let policy = client.config.retry
+  if gate != nil:
+    # js uploads are buffered (fetch cannot stream), so a js request body is always
+    # replayable; redirects/digest are the runtime's, so those mirrors stay inert.
+    gate.retryReplayable = true
+    gate.retryVerb = req.verb
+    gate.policy = policy
+    gate.wantsThrow = client.config.wantsThrow
+    gate.http = client.config.http
   while true:
     throwIfCancelled(cancel)
+    if gate != nil: gate.attempt = attempt
     var failed = false
     if not client.jar.isNil: applyCookies(client.jar, req)
     try:
-      resp = await fetchExchange(req, nil, client.config.totalMs, cancel)
+      resp = await fetchExchange(req, nil, client.config.totalMs, cancel,
+                                 client.config.maxResponseBytes, userSink, gate)
     except CatchableError:
       throwIfCancelled(cancel)   # a cancel is not a retryable failure
+      # A half-delivered gated body must never be re-issued (double-feed): once the
+      # sink has been fed, propagate rather than retry.
+      if gate != nil and gate.fed: raise
       if not (attempt < policy.limit and isRetryableVerb(req.verb, policy)):
         raise   # not retryable: propagate the fetch error
       failed = true
@@ -147,7 +165,20 @@ proc runCore(client: Navi, req0: Request, cancel: CancelToken): Future[Response]
     inc attempt
     await sleep(backoffMs(attempt, resp, policy))
   enforceMaxResponse(resp, client.config.maxResponseBytes)
-  client.maybeThrow(req, resp)
+  client.maybeThrow(req, resp)      # HttpError carries the buffered body
+  # Delivery-rule fallback: deliver a surfaced final body that was buffered (a gate
+  # miss, e.g. a retry-budget-exhausted final with throwHttpErrors off) to the sink in
+  # one call, then clear it. Mirrors the native engine fallback. The buffered body came
+  # from `.text()`, so this shares that path's text lossiness (the streamed sink path
+  # above stays binary-clean); a gate miss on js is the rare exception, not the norm.
+  if not userSink.isNil and resp.body.len > 0 and not resp.bodyTruncated:
+    var bytes = newSeq[byte](resp.body.len)
+    for i in 0 ..< resp.body.len: bytes[i] = byte(resp.body[i])
+    try:
+      await userSink(bytes)
+    except SinkStopSignal:
+      discard
+    resp.body = ""
   result = resp
 
 proc client*(ctx: NaviContext): Navi = ctx.clientv
@@ -158,7 +189,7 @@ proc next*(ctx: NaviContext): Future[void] {.async.} =
   ## exhausted -- the request itself. The outcome lands in `ctx.res`.
   let mws = ctx.clientv.config.middleware
   if ctx.idx >= mws.len:
-    ctx.res = await runCore(ctx.clientv, ctx.req, ctx.cancel)
+    ctx.res = await runCore(ctx.clientv, ctx.req, ctx.cancel, ctx.userSink, ctx.gate)
   else:
     let m = mws[ctx.idx]
     inc ctx.idx
@@ -168,13 +199,33 @@ proc runChain(ctx: NaviContext): Future[Response] {.async.} =
   await ctx.next()
   return ctx.res
 
+proc wrapSink(s: GatedBodySink, gate: SinkGate): BodySink =
+  ## Adapt a caller's gated js sink into the internal `BodySink` (`seq[byte]`) the
+  ## fetch drain awaits: mark the gate as fed before each delivery, and raise a
+  ## `SinkStopSignal` on a `false` result (which aborts the fetch body). Nil in -> nil.
+  if s.isNil: return nil
+  result = proc(data: seq[byte]): Future[void] {.async.} =
+    gate.fed = true
+    if not (await s(data)):
+      raise newException(SinkStopSignal, "navi: sink requested early stop")
+
+proc wrapSink(s: BodySink, gate: SinkGate): BodySink =
+  ## Adapt a caller's void js sink (always continue) into the internal `BodySink`,
+  ## marking the gate as fed before each delivery. Nil in -> nil out.
+  if s.isNil: return nil
+  result = proc(data: seq[byte]): Future[void] {.async.} =
+    gate.fed = true
+    await s(data)
+
 proc requestResolved(client: Navi, verb: HttpVerb, target: string,
                      headers: Headers, body: ResolvedBody,
                      form: seq[(string, string)],
                      params: seq[(string, string)],
                      cancel: CancelToken,
                      trailers: Headers,
-                     asyncStream: AsyncBodyProducer = nil): Future[Response] {.async.} =
+                     asyncStream: AsyncBodyProducer = nil,
+                     userSink: BodySink = nil,
+                     gate: SinkGate = nil): Future[Response] {.async.} =
   ## `fetch` cannot reliably stream a request body (`ReadableStream` +
   ## `duplex: "half"` support is uneven across runtimes), so a streamed body
   ## (`BodyProducer`, closure `BodyIterator`, or an `AsyncBodyProducer`) is
@@ -205,8 +256,10 @@ proc requestResolved(client: Navi, verb: HttpVerb, target: string,
     resolved.stream = nil
   let req = buildRequest(client.config, verb, target, headers, resolved,
                          form, params)
-  if client.config.middleware.len == 0: return await runCore(client, req, cancel)
-  let ctx = NaviContext(req: req, clientv: client, cancel: cancel)
+  if client.config.middleware.len == 0:
+    return await runCore(client, req, cancel, userSink, gate)
+  let ctx = NaviContext(req: req, clientv: client, cancel: cancel,
+                        userSink: userSink, gate: gate)
   return await runChain(ctx)
 
 proc request*[B](client: Navi, verb: HttpVerb, target: string,
@@ -231,6 +284,42 @@ proc request*[B](client: Navi, verb: HttpVerb, target: string,
   else:
     requestResolved(client, verb, target, headers, toBody(body), form, params,
                     cancel, trailers)
+
+proc request*[B](client: Navi, verb: HttpVerb, target: string,
+                 headers: Headers, body: B, sink: GatedBodySink,
+                 form: seq[(string, string)] = @[],
+                 params: seq[(string, string)] = @[],
+                 cancel: CancelToken = nil,
+                 trailers = initHeaders()): Future[Response] =
+  ## Like `request`, but streams the FINAL response body to `sink` (chunks are
+  ## `seq[byte]`, from the fetch `ReadableStream`) instead of buffering it into
+  ## `res.body`. The policy navi owns still runs (retries, throw-on-non-2xx,
+  ## middleware); only the surfaced response's body reaches the sink. `sink` returns
+  ## `bool`: `false` stops the download early -- the fetch body is aborted and the
+  ## request returns normally with `res.body == ""` and `res.bodyTruncated == true`.
+  let gate = newSinkGate()
+  when B is AsyncBodyProducer:
+    requestResolved(client, verb, target, headers, ResolvedBody(), form, params,
+                    cancel, trailers, body, wrapSink(sink, gate), gate)
+  else:
+    requestResolved(client, verb, target, headers, toBody(body), form, params,
+                    cancel, trailers, nil, wrapSink(sink, gate), gate)
+
+proc request*[B](client: Navi, verb: HttpVerb, target: string,
+                 headers: Headers, body: B, sink: BodySink,
+                 form: seq[(string, string)] = @[],
+                 params: seq[(string, string)] = @[],
+                 cancel: CancelToken = nil,
+                 trailers = initHeaders()): Future[Response] =
+  ## Like the gated `request` overload, but `sink` is a void `BodySink` (always
+  ## continue): the FINAL response body streams to it and cannot be stopped early.
+  let gate = newSinkGate()
+  when B is AsyncBodyProducer:
+    requestResolved(client, verb, target, headers, ResolvedBody(), form, params,
+                    cancel, trailers, body, wrapSink(sink, gate), gate)
+  else:
+    requestResolved(client, verb, target, headers, toBody(body), form, params,
+                    cancel, trailers, nil, wrapSink(sink, gate), gate)
 
 # --- Streaming downloads (pull-based handle) ---
 

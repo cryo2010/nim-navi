@@ -22,12 +22,27 @@ type
     trailers*: Headers         ## trailing fields after the body (chunked/h2); empty
                                ## when the response carried none
     body*: string
+    bodyTruncated*: bool        ## set only when a gated response sink returned `false`
+                               ## to stop the download early: the request still
+                               ## completed normally (no exception), but the body was
+                               ## not fully transferred, so `body` is "" and any
+                               ## trailers are absent. On h1 the connection is closed
+                               ## (not pooled); on h2 the stream is reset while the
+                               ## connection is kept; on js the fetch body is aborted.
+                               ## Always false on a full drain or a buffered request.
     dataCache: ref JsonNode    ## lazily-parsed, cached JSON (see `data`)
 
   HttpError* = object of CatchableError
     ## Raised for non-2xx responses when `throwHttpErrors` is on (the default).
     ## The full response is attached for inspection.
     response*: Response
+
+  SinkStopSignal* = object of CatchableError
+    ## Internal control signal, raised by the wrapped gated sink when the caller's
+    ## sink returns `false` (stop the download early). It unwinds the body-drain
+    ## loop and is caught at the drain site, which turns it into a normal return with
+    ## `bodyTruncated = true`. It must NEVER escape `request()`; catching it anywhere
+    ## it might leak to a user is a bug.
 
   TimeoutError* = object of CatchableError
     ## Raised when a request exceeds the configured `timeout`.
