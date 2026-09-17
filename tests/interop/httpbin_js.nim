@@ -153,6 +153,18 @@ proc main() {.async.} =
       "chunk-"))
     r.data["data"].getStr == "chunk-chunk-chunk-"
 
+  check "an async body producer upload is drained (awaiting) and arrives intact":
+    # fetch cannot stream an upload, so an async producer is drained into a buffered
+    # body on js -- awaiting each chunk (so producing may await), like the native
+    # backends' awaited send. The received body must equal what it yielded.
+    var n = 0
+    proc getChunks(): Future[string] {.async.} =
+      if n >= 3: return ""
+      inc n
+      return "part" & $n & "-"
+    let r = await api().put(base & "/put", body = getChunks)
+    r.data["data"].getStr == "part1-part2-part3-"
+
   # --- misc response formats -----------------------------------------------
   check "/html is served as text/html":
     (await api().get(base & "/html")).headers["content-type"].contains("text/html")

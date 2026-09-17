@@ -29,6 +29,18 @@ type
     ## crosses an `await` so it must be owned, not a borrowed view; being navi's own
     ## body type lets the engine move each chunk in with no copy.
 
+  AsyncBodyProducer* = proc(): Future[string] {.closure.}
+    ## Pull-based upload source for the chronos backend: returns the next body chunk
+    ## (or "" at end of body). The engine `await`s each call, so producing a chunk may
+    ## itself await -- e.g. reading from a streaming download to pipe it into the
+    ## upload in constant memory. The async analog of the sync `BodyProducer`
+    ## (`core/request.nim`); its Future type is backend-specific, so it lives here
+    ## rather than on `Request` and threads through the send paths (mirroring
+    ## `BodySink`). A bare closure so a plain `{.async.}` proc assigns to it directly
+    ## (no chronos raises annotation, portable spelling); the send site discharges
+    ## chronos's strict gcsafe/raises obligation with a cast, as the sink path does.
+    ## Not replayable, like `bodyStream`.
+
 type
   Conn* = object
     transport: StreamTransport

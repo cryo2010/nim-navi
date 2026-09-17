@@ -14,6 +14,10 @@ type
     res*: Response           ## the response; set by `next`, adjust it after
     clientv: Navi            ## the owning client (see `client`)
     idx: int                 ## index of the next middleware to run
+    asyncStream: AsyncBodyProducer  ## awaited pull-based upload producer, threaded
+                             ## outside `req` (its Future type is backend-specific);
+                             ## nil for a buffered/sync-streamed body. `next` forwards
+                             ## it to the transport once the middleware chain is spent.
   NaviMiddleware* = proc(ctx: NaviContext): Future[void] {.naviMwClosure.}
     ## A middleware step; may be async. A closure, so it can capture: read/modify
     ## `ctx.req`, `await ctx.next()` to proceed -- or skip it to short-circuit --
@@ -143,18 +147,22 @@ when defined(naviHttp3):
     ## Live multiplexed HTTP/3 connections; for tests/introspection.
 
 proc muxRequest(client: Navi, mux: H2Mux, req: Request,
-                sink: BodySink): Future[Response] {.async.} =
+                sink: BodySink,
+                asyncStream: AsyncBodyProducer = nil): Future[Response] {.async.} =
   # The mux delivers a streaming request's body to `sink` incrementally (decoding
   # content-encoding as it arrives), so the returned response's body is empty.
   # A non-streaming request (sink == nil) still buffers into r.body as before.
+  # `asyncStream` (when set) streams the request body up, awaited chunk by chunk.
   result = toResponse(await mux.request(h2HeaderList(req), req.body, req.bodyStream,
-                                        sink, h2TrailerList(req)))
+                                        sink, h2TrailerList(req), asyncStream))
 
 proc h1OnConn(client: Navi, conn: Conn, origin: string, req: Request,
-              sink: BodySink): Future[Response] {.async.} =
+              sink: BodySink,
+              asyncStream: AsyncBodyProducer = nil): Future[Response] {.async.} =
   var keep = false
   result = h1Exchange(conn, req, sink, keep,
-                      client.config.wantsDecompress, client.config.maxResponseBytes)
+                      client.config.wantsDecompress, client.config.maxResponseBytes,
+                      asyncStream)
   let pc = PooledConn[Conn](transport: conn)
   if not (keep and pushIdle(client.pool, origin, pc)):
     await close(conn)
@@ -216,10 +224,12 @@ proc openFreshConn(client: Navi, rq: Request, origin: string,
     if not pending.finished: pending.fail(e)
     raise
 
-proc transportInner(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
+proc transportInner(client: Navi, req: Request, sink: BodySink,
+                    asyncStream: AsyncBodyProducer = nil): Future[Response] {.async.} =
   ## Multiplex over a shared h2 connection when available/negotiable; otherwise
   ## pool http/1.1. Concurrent connects to the same new origin are coalesced so a
-  ## cold burst still ends up on one h2 connection.
+  ## cold burst still ends up on one h2 connection. `asyncStream` (when set) is an
+  ## awaited pull-based upload producer, streamed up in place of a buffered body.
   let origin = originKey(req.url)
   let wantH2 = client.config.wantsH2 and req.url.isTls
   client.pruneDeadMuxes()          # evict muxes that died since the last request (#312)
@@ -230,12 +240,12 @@ proc transportInner(client: Navi, req: Request, sink: BodySink): Future[Response
       # A reused mux adopts the CURRENT keepalive interval, not the one it was opened
       # with, honoring navi's live-config contract (issue #360).
       client.muxes[origin].applyKeepAlive(client.config.h2KeepAliveMs)
-      return await client.muxRequest(client.muxes[origin], req, sink)
+      return await client.muxRequest(client.muxes[origin], req, sink, asyncStream)
     if client.pendingMux.hasKey(origin):
       let mux = await client.pendingMux[origin]
       if mux != nil and mux.canReuse:
         mux.applyKeepAlive(client.config.h2KeepAliveMs)
-        return await client.muxRequest(mux, req, sink)
+        return await client.muxRequest(mux, req, sink, asyncStream)
       # else: turned out http/1.1, fall through
 
   # 2. A pooled http/1.1 connection.
@@ -253,7 +263,7 @@ proc transportInner(client: Navi, req: Request, sink: BodySink): Future[Response
     var gotResponse = false
     try:
       var keep = false
-      var parser = h1SendAndReadHeaders(pc.transport, req, not sink.isNil)
+      var parser = h1SendAndReadHeaders(pc.transport, req, not sink.isNil, asyncStream)
       gotResponse = true
       h1DrainBody(pc.transport, parser, sink, keep,
                   client.config.wantsDecompress, client.config.maxResponseBytes)
@@ -276,9 +286,9 @@ proc transportInner(client: Navi, req: Request, sink: BodySink): Future[Response
   rq.absoluteForm = usesAbsoluteForm(resolveProxy(client.config, rq.url), rq.url.isTls)
   let (conn, mux) = await client.openFreshConn(rq, origin, wantH2)
   if mux != nil:
-    result = await client.muxRequest(mux, rq, sink)
+    result = await client.muxRequest(mux, rq, sink, asyncStream)
   else:
-    result = await client.h1OnConn(conn, origin, rq, sink)
+    result = await client.h1OnConn(conn, origin, rq, sink, asyncStream)
 
 when defined(naviHttp3):
   proc recordAltSvc(client: Navi, req: Request, resp: Response) =
@@ -345,23 +355,51 @@ when defined(naviHttp3):
         client.h3conns.del(origin)       # drop a dead connection
       raise
 
-proc transport(client: Navi, req: Request, sink: BodySink): Future[Response] {.async.} =
+proc transport(client: Navi, req: Request, sink: BodySink,
+               asyncStream: AsyncBodyProducer = nil): Future[Response] {.async.} =
   ## The wire transport `run` calls. In a `-d:naviHttp3` build, a buffered-body
   ## request to an origin that has advertised h3 (Alt-Svc) goes over HTTP/3, with
   ## any QUIC failure falling back to h2/h1; `alt-svc` on h2/h1 responses is
-  ## captured for later upgrades.
+  ## captured for later upgrades. `asyncStream` (when set) is an awaited upload
+  ## producer streamed up in place of a buffered body.
+  var rq = req
+  var producer = asyncStream
   when defined(naviHttp3):
-    if client.config.wantsH3 and req.url.isTls:   # buffered or streamed (bodyStream) body
-      let ep = client.altSvc.h3Endpoint("https", req.url.host, req.url.port)
+    if client.config.wantsH3 and rq.url.isTls:   # buffered or streamed body
+      let ep = client.altSvc.h3Endpoint("https", rq.url.host, rq.url.port)
       if ep.isSome:
-        try: return await h3Transport(client, req, ep.get)
-        except QuicError: discard   # fall back to h2/h1 below
-  result = await transportInner(client, req, sink)
+        # The h3 request body is pulled by a synchronous C callback (h3PullThunk),
+        # which cannot await, so an async producer cannot feed it incrementally. Drain
+        # it into a buffered body before the h3 attempt (constant-memory piping is lost
+        # only on the h3 leg; the h2/h1 fallback below still streams it, since a QUIC
+        # failure means the producer was never pulled). buildRequest set
+        # hasStreamedBody; a buffered body is replayable, so clear the flag for the h3
+        # request. On QUIC failure we fall back with the ORIGINAL producer (rq/producer
+        # here are locals; the drained buffer stays on the h3-only `h3rq`).
+        var h3rq = rq
+        if producer != nil:
+          var buffered = ""
+          while true:
+            # bare closure (portable spelling): discharge chronos's gcsafe/raises here.
+            var chunk: string
+            {.cast(gcsafe).}:
+              {.cast(raises: [CatchableError]).}:
+                chunk = await producer()
+            if chunk.len == 0: break
+            buffered.add chunk
+          h3rq.body = buffered
+          h3rq.hasStreamedBody = false
+          producer = nil   # already drained: the fallback sends h3rq's buffered body
+          rq = h3rq
+        try: return await h3Transport(client, h3rq, ep.get)
+        except QuicError: discard   # fall back to h2/h1 below (rq now buffered)
+  result = await transportInner(client, rq, sink, producer)
   when defined(naviHttp3):
-    client.recordAltSvc(req, result)
+    client.recordAltSvc(rq, result)
 
-proc doRequest(client: Navi, req: Request): Future[Response] {.async.} =
-  result = performRequest(client, req)
+proc doRequest(client: Navi, req: Request,
+               asyncStream: AsyncBodyProducer = nil): Future[Response] {.async.} =
+  result = performRequest(client, req, nil, asyncStream)
 
 proc client*(ctx: NaviContext): Navi = ctx.clientv
   ## The client handling this request (e.g. to read `ctx.client.config`).
@@ -371,7 +409,7 @@ proc next*(ctx: NaviContext): Future[void] {.async.} =
   ## exhausted -- the request itself. The outcome lands in `ctx.res`.
   let mws = ctx.clientv.config.middleware
   if ctx.idx >= mws.len:
-    ctx.res = await doRequest(ctx.clientv, ctx.req)
+    ctx.res = await doRequest(ctx.clientv, ctx.req, ctx.asyncStream)
   else:
     let m = mws[ctx.idx]
     inc ctx.idx
@@ -391,12 +429,20 @@ proc requestResolved(client: Navi, verb: HttpVerb, target: string,
                      form: seq[(string, string)],
                      params: seq[(string, string)],
                      cancel: CancelToken,
-                     trailers: Headers): Future[Response] {.async.} =
-  let req = buildRequest(client.config, verb, target, headers, body,
+                     trailers: Headers,
+                     asyncStream: AsyncBodyProducer = nil): Future[Response] {.async.} =
+  ## `asyncStream` (default nil) is an awaited pull-based upload producer, threaded
+  ## alongside the built `Request` because its Future type is backend-specific (it
+  ## cannot be a field on the core `Request`/`ResolvedBody`). When set, `body` is the
+  ## default `ResolvedBody()` (no buffered body) and the request is flagged
+  ## non-replayable, mirroring a sync `bodyStream`.
+  var req = buildRequest(client.config, verb, target, headers, body,
                          form, params, trailers)
+  if asyncStream != nil:
+    req.hasStreamedBody = true   # non-replayable: pulled once, cannot rewind
   if client.config.middleware.len == 0:
-    return await guard(client.config.totalMs, doRequest(client, req), cancel)
-  let ctx = NaviContext(req: req, clientv: client)
+    return await guard(client.config.totalMs, doRequest(client, req, asyncStream), cancel)
+  let ctx = NaviContext(req: req, clientv: client, asyncStream: asyncStream)
   return await guard(client.config.totalMs, runChain(ctx), cancel)
 
 proc request*[B](client: Navi, verb: HttpVerb, target: string,
@@ -412,9 +458,16 @@ proc request*[B](client: Navi, verb: HttpVerb, target: string,
   ## JSON. `form` encodes a urlencoded body and is outranked by a typed `body`.
   ## `params` are appended to the URL query; `cancel` aborts the in-flight request.
   ## `trailers` are sent after the body (chunked on h1, a trailing HEADERS block on
-  ## h2/h3).
-  requestResolved(client, verb, target, headers, toBody(body), form, params,
-                  cancel, trailers)
+  ## h2/h3). An `AsyncBodyProducer` (`proc(): Future[string]`) streams a chunked
+  ## upload pulled with `await` -- one call per chunk, "" ends the body -- so
+  ## producing a chunk can itself await (e.g. piping a streaming download into the
+  ## upload). Like `bodyStream` it is not replayable (no retry/redirect/digest replay).
+  when B is AsyncBodyProducer:
+    requestResolved(client, verb, target, headers, ResolvedBody(), form, params,
+                    cancel, trailers, asyncStream = body)
+  else:
+    requestResolved(client, verb, target, headers, toBody(body), form, params,
+                    cancel, trailers)
 
 include navi/private/impl_stream
 include navi/private/impl_sse

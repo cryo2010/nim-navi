@@ -181,6 +181,66 @@ suite "chronos entry end to end":
     check res.headers.get("x-echo-content-type") == "application/json"
     joinThread(th)
 
+  test "an async body producer should stream a chunked upload (awaiting between chunks)":
+    const port = 9252
+    var th: Thread[ServerCtx]
+    startUploadEcho(th, port)
+    proc run(): Future[Response] {.async.} =
+      # `parts`/`idx` are locals of `run` (a ref for the counter): a chronos async
+      # proc rejects capturing a suite-scope global as "not GC-safe".
+      let parts = @["alpha ", "beta ", "gamma"]
+      let idx = new int
+      proc getChunks(): Future[string] {.async.} =
+        if idx[] >= parts.len: return ""
+        let p = parts[idx[]]
+        inc idx[]
+        await sleepAsync(1.milliseconds)   # producing a chunk itself awaits
+        return p
+      return await newNavi().put("http://127.0.0.1:" & $port & "/", body = getChunks)
+    let res = waitFor run()
+    check res.status == 200
+    check res.body == "alpha beta gamma"
+    joinThread(th)
+
+  test "an async producer should pipe a streaming download into an upload":
+    const srcPort = 9253
+    const dstPort = 9254
+    var srcTh, dstTh: Thread[ServerCtx]
+    let payload = "the quick brown fox jumps over the lazy dog"
+    startRaw(srcTh, srcPort, "HTTP/1.1 200 OK\r\nContent-Length: " & $payload.len &
+             "\r\nConnection: close\r\n\r\n" & payload)
+    startUploadEcho(dstTh, dstPort)
+    proc run(): Future[Response] {.async.} =
+      let api = newNavi()
+      let sr = await api.stream(GET, "http://127.0.0.1:" & $srcPort & "/")
+      return await api.put("http://127.0.0.1:" & $dstPort & "/",
+        body = proc(): Future[string] {.async.} = return await sr.readChunk())
+    let res = waitFor run()
+    check res.status == 200
+    check res.body == payload
+    joinThread(srcTh)
+    joinThread(dstTh)
+
+  test "an async producer PUT should not be retried (non-replayable body)":
+    var port = 0
+    var count = 0
+    var th: Thread[ServerCtx]
+    start503Once(th, port, addr count)
+    let url = "http://127.0.0.1:" & $port & "/"
+    proc run(u: string): Future[Response] {.async.} =
+      let idx = new int
+      proc getChunks(): Future[string] {.async.} =
+        if idx[] >= 2: return ""
+        inc idx[]
+        return "x"
+      var cfg = initNaviConfig()
+      cfg.throwHttpErrors = false
+      return await newNavi(cfg).put(u, body = getChunks)
+    let res = waitFor run(url)
+    check res.status == 503
+    check count == 1
+    joinThread(th)
+
 suite "chronos TLS config":
   # chronos now runs OpenSSL, so cipher selection and TLS 1.3 are honored rather
   # than rejected as they were under BearSSL. (Real negotiation is covered by the

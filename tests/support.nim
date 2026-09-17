@@ -189,6 +189,83 @@ proc startBodyEcho*(th: var Thread[ServerCtx], port: int) =
   createThread(th, serveBodyEcho, ServerCtx(port: port, ready: addr ready))
   while not ready: discard
 
+proc readChunkedBody(client: Socket): string =
+  ## Decode a chunked transfer-encoding request body: repeatedly read a hex length
+  ## line, then that many bytes plus the trailing CRLF, until the 0-length chunk.
+  ## Trailers (if any) after the terminator are drained but not returned.
+  while true:
+    var sizeLine = ""
+    while true:                       # read up to CRLF (the chunk-size line)
+      let c = client.recv(1)
+      if c.len == 0: return
+      sizeLine.add c
+      if sizeLine.len >= 2 and sizeLine[^2 .. ^1] == "\r\n": break
+    let n = parseHexInt(sizeLine.strip.split(';')[0])   # ignore any chunk extensions
+    if n == 0:
+      # trailer section (possibly empty): read until the terminating CRLF
+      var trl = ""
+      while true:
+        let c = client.recv(1)
+        if c.len == 0: break
+        trl.add c
+        if trl.len >= 2 and trl[^2 .. ^1] == "\r\n" and
+           (trl.len == 2 or trl[^4 .. ^1] == "\r\n\r\n"): break
+      return
+    var got = 0
+    while got < n:
+      let part = client.recv(n - got)
+      if part.len == 0: return
+      result.add part
+      got += part.len
+    discard client.recv(2)            # the CRLF after the chunk data
+
+proc serve503Once(ctx: ServerCtx) {.thread.} =
+  ## Answer exactly one request with 503, reading its body (Content-Length or
+  ## chunked) so the socket stays framed, then close and exit. `Connection: close`
+  ## so the client releases the socket rather than pooling it (the thread's read
+  ## then returns "" and it can join cleanly). For the non-replayable-body test: a
+  ## retryable-by-method PUT whose body is a streamed producer must NOT be retried,
+  ## so exactly one request is answered (`count == 1`) and the client sees the 503.
+  ## A wrongful retry would open a second connection this server never accepts, so
+  ## the client would surface an error instead of the clean 503 the test asserts.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(0), "127.0.0.1")
+  server.listen()
+  ctx.portOut[] = server.getLocalAddr()[1].int
+  ctx.ready[] = true
+  var client = acceptClient(server)
+  var head = ""
+  while true:
+    let c = client.recv(1)
+    if c.len == 0: break
+    head.add c
+    if head.len >= 4 and head[^4 .. ^1] == "\r\n\r\n": break
+  if head.len > 0:
+    if cmpIgnoreCase(headerValue(head, "transfer-encoding"), "chunked") == 0:
+      discard readChunkedBody(client)
+    else:
+      let cl = headerValue(head, "content-length")
+      let n = if cl.len > 0: parseInt(cl) else: 0
+      var got = 0
+      while got < n:
+        let part = client.recv(n - got)
+        if part.len == 0: break
+        got += part.len
+    if ctx.count != nil: inc ctx.count[]
+    client.send("HTTP/1.1 503 Service Unavailable\r\n" &
+                "Content-Length: 0\r\nConnection: close\r\n\r\n")
+  client.close()
+  server.close()
+
+proc start503Once*(th: var Thread[ServerCtx], port: var int, count: ptr int) =
+  ## Serve exactly one 503 on an ephemeral connection (port written to `port`),
+  ## counting the answered request into `count`, then exit.
+  var ready = false
+  createThread(th, serve503Once,
+    ServerCtx(portOut: addr port, ready: addr ready, count: count))
+  while not ready: discard
+
 proc serveProxy(ctx: ServerCtx) {.thread.} =
   ## Minimal HTTP proxy: echoes back the absolute-URI request target so a test
   ## can confirm the client dialed the proxy and used absolute form.
