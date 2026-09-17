@@ -36,11 +36,11 @@ proc runUpload() =
   var headers = initHeaders()
   headers["content-type"] = "application/octet-stream"
   let res = api.request(POST, base & "/echo", headers = headers,
-    bodyStream = proc(): string =
+    body = BodyProducer(proc(): string =
       let n = f.readBuffer(addr buf[0], buf.len)
       if n <= 0: return ""
       sent += n
-      buf[0 ..< n])
+      buf[0 ..< n]))
   doAssert res.status == 200, "unexpected status " & $res.status
   doAssert res.httpVersion == proto,
     "expected " & proto & " but negotiated " & res.httpVersion

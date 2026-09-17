@@ -1,7 +1,7 @@
 ## End-to-end test of the chronos entry module.
 
 import unittest
-import std/strutils
+import std/[strutils, json]
 import pkg/chronos
 import navi/chronos
 import navi/core/pool      # for pool.idleCount in the streaming lifecycle tests
@@ -155,6 +155,90 @@ suite "chronos entry end to end":
     let api = newNavi(cfg)
     let res = waitFor api.post("http://127.0.0.1:" & $port & "/", body = "x")
     check res.headers.get("x-echo-authorization") == "Bearer captured-42"
+    joinThread(th)
+
+  test "a closure-iterator body should stream and reassemble over chronos":
+    const port = 9250
+    var th: Thread[ServerCtx]
+    startUploadEcho(th, port)
+    let parts = @["hello ", "", "streaming ", "world"]
+    proc run(): Future[Response] {.async.} =
+      let it = iterator (): string {.closure.} =
+        for p in parts: yield p
+      return await newNavi().request(POST, "http://127.0.0.1:" & $port & "/", body = it)
+    let res = waitFor run()
+    check res.status == 200
+    check res.body == "hello streaming world"
+    joinThread(th)
+
+  test "a catch-all object body should be JSON over chronos":
+    const port = 9251
+    var th: Thread[ServerCtx]
+    startBodyEcho(th, port)
+    let res = waitFor newNavi().post("http://127.0.0.1:" & $port & "/",
+                                     body = (name: "ada", age: 36))
+    check res.body == """{"name":"ada","age":36}"""
+    check res.headers.get("x-echo-content-type") == "application/json"
+    joinThread(th)
+
+  test "an async body producer should stream a chunked upload (awaiting between chunks)":
+    const port = 9252
+    var th: Thread[ServerCtx]
+    startUploadEcho(th, port)
+    proc run(): Future[Response] {.async.} =
+      # `parts`/`idx` are locals of `run` (a ref for the counter): a chronos async
+      # proc rejects capturing a suite-scope global as "not GC-safe".
+      let parts = @["alpha ", "beta ", "gamma"]
+      let idx = new int
+      proc getChunks(): Future[string] {.async.} =
+        if idx[] >= parts.len: return ""
+        let p = parts[idx[]]
+        inc idx[]
+        await sleepAsync(1.milliseconds)   # producing a chunk itself awaits
+        return p
+      return await newNavi().put("http://127.0.0.1:" & $port & "/", body = getChunks)
+    let res = waitFor run()
+    check res.status == 200
+    check res.body == "alpha beta gamma"
+    joinThread(th)
+
+  test "an async producer should pipe a streaming download into an upload":
+    const srcPort = 9253
+    const dstPort = 9254
+    var srcTh, dstTh: Thread[ServerCtx]
+    let payload = "the quick brown fox jumps over the lazy dog"
+    startRaw(srcTh, srcPort, "HTTP/1.1 200 OK\r\nContent-Length: " & $payload.len &
+             "\r\nConnection: close\r\n\r\n" & payload)
+    startUploadEcho(dstTh, dstPort)
+    proc run(): Future[Response] {.async.} =
+      let api = newNavi()
+      let sr = await api.stream(GET, "http://127.0.0.1:" & $srcPort & "/")
+      return await api.put("http://127.0.0.1:" & $dstPort & "/",
+        body = proc(): Future[string] {.async.} = return await sr.readChunk())
+    let res = waitFor run()
+    check res.status == 200
+    check res.body == payload
+    joinThread(srcTh)
+    joinThread(dstTh)
+
+  test "an async producer PUT should not be retried (non-replayable body)":
+    var port = 0
+    var count = 0
+    var th: Thread[ServerCtx]
+    start503Once(th, port, addr count)
+    let url = "http://127.0.0.1:" & $port & "/"
+    proc run(u: string): Future[Response] {.async.} =
+      let idx = new int
+      proc getChunks(): Future[string] {.async.} =
+        if idx[] >= 2: return ""
+        inc idx[]
+        return "x"
+      var cfg = initNaviConfig()
+      cfg.throwHttpErrors = false
+      return await newNavi(cfg).put(u, body = getChunks)
+    let res = waitFor run(url)
+    check res.status == 503
+    check count == 1
     joinThread(th)
 
 suite "chronos TLS config":

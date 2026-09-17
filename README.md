@@ -165,8 +165,9 @@ Every client shares the same API, and the below table details where they differ.
 Legend: ✓ supported · ✗ not supported · **opt-in** = requires a `-d:naviHttp3`
 build (ngtcp2 + nghttp3 + OpenSSL >= 3.5), reached transparently via Alt-Svc ·
 **runtime** = provided by the
-browser/Node platform rather than navi · **buffered** = `bodyStream` is accepted
-but drained and sent as one body (`fetch` cannot reliably stream a request body) ·
+browser/Node platform rather than navi · **buffered** = a streamed request body
+(`body = <producer>`) is accepted but drained and sent as one body (`fetch` cannot
+reliably stream a request body) ·
 **pull download** = `stream()` returns a headers-first handle consumed with
 `each`/`drain`, which back-pressures the peer per chunk (see
 [Streaming](#streaming)); `chunk` is a `string` on the native clients and
@@ -317,7 +318,7 @@ Every field, and the default `initNaviConfig()` gives it:
 ```nim
 discard api.get("path", headers = initHeaders({"accept": "application/json"}))
 discard api.post("path", body = """{"name":"navi"}""")
-discard api.post("path", json = %*{"name": "navi"})          # sets application/json
+discard api.post("path", body = %*{"name": "navi"})          # JsonNode -> application/json
 discard api.post("path", form = @[("a", "1"), ("b", "2")])   # url-encoded
 discard api.put("path", body = payload)
 discard api.delete("path")
@@ -824,15 +825,66 @@ of the body piling up in memory. Over HTTP/1.1 the awaited consumer pauses the r
 loop, which back-pressures the peer through TCP. The size cap
 (`maxResponseBytes`) is enforced incrementally on the streamed bytes.
 
-Stream an upload from a pull-based producer, sent as chunked transfer-encoding:
+The request `body` is dispatched by type. A `string` is the raw body; a `JsonNode`
+is sent as JSON; a `Multipart` as `multipart/form-data`; a `BodyProducer`, a closure
+`BodyIterator`, or (on the async backends) an async producer (`proc(): Future[string]`)
+streams a chunked upload; and any other value is serialized to JSON via
+`std/jsonutils`. `form` still encodes a urlencoded body and is outranked by a typed
+`body`.
+
+Stream an upload from a pull-based producer (`BodyProducer`), sent as chunked
+transfer-encoding. The producer returns the next chunk, or `""` at end of body:
 
 ```nim
 let parts = @["hello ", "streaming ", "world"]
 var i = 0
-discard api.request(POST, "https://example.com/upload", bodyStream = proc(): string =
-  if i < parts.len:
-    result = parts[i]
-    inc i)
+discard api.request(POST, "https://example.com/upload",
+  body = proc(): string =
+    if i < parts.len:
+      result = parts[i]
+      inc i)
+```
+
+A closure `BodyIterator` streams the same way but ends at `finished(it)` rather than
+a `""` yield, so an empty chunk in the middle of the stream cannot truncate the
+upload (it is skipped):
+
+```nim
+let parts = @["hello ", "", "streaming ", "world"]   # the empty chunk is skipped
+let it = iterator (): string {.closure.} =
+  for p in parts: yield p
+discard api.request(POST, "https://example.com/upload", body = it)
+```
+
+On the **async backends** (`navi/asyncdispatch`, `navi/chronos`) `body` also accepts
+an **async producer** (`proc(): Future[string]`): the engine `await`s each call, so
+producing a chunk can itself await. That lets you pipe a streaming download into a
+streaming upload in constant memory, without a thread or buffering the whole body:
+
+```nim
+proc pipe() {.async.} =
+  let api = newNavi()
+  let src = await api.stream(GET, "https://example.com/big")   # download handle
+  # Each pull reads one chunk from the download and streams it straight up:
+  discard await api.put("https://example.com/upload",
+    body = proc(): Future[string] {.async.} = return await src.readChunk())
+```
+
+Like the synchronous `BodyProducer`, an async producer is **not replayable**: a
+request carrying one is sent once and never auto-retried, redirected (307/308), or
+digest-replayed, since its producer cannot rewind. The sync backend rejects an async
+producer at compile time (it has no event loop to await it). Two paths buffer instead
+of streaming, awaiting each chunk into a full body before sending: HTTP/3 (its C-side
+body pull is synchronous) and `navi/js` (`fetch` cannot stream a request body), so
+the constant-memory property holds on h1 and h2.
+
+Any other value is serialized as JSON (`application/json`) via the catch-all arm, so
+an object, ref, or seq can be posted directly:
+
+```nim
+type Note = object
+  title, body: string
+discard api.post("https://example.com/notes", body = Note(title: "hi", body: "there"))
 ```
 
 ### Server-Sent Events
@@ -939,7 +991,7 @@ h2/h3 selected without TLS, or against a server that does not accept Extended
 CONNECT), `websocket()` raises `ProtocolError` rather than silently downgrading.
 
 For a large message you can stream it a frame at a time instead of buffering the whole
-thing, mirroring HTTP `stream()`/`bodyStream`. `ws.stream()` returns a reader for the
+thing, mirroring HTTP `stream()` and a streamed request body. `ws.stream()` returns a reader for the
 next inbound message (`kind` tells you text vs binary); consume it with `each` (one
 chunk per frame). `ws.stream(writer): …` sends the next message as fragments, `write`
 each chunk, and the final frame is sent automatically on block exit (use `streamBinary`

@@ -34,7 +34,7 @@ proc main() {.async.} =
   headers["content-type"] = "application/octet-stream"
 
   let res = await api.request(POST, getEnv("BASE") & "/upload", headers = headers,
-    bodyStream = proc(): string =
+    body = proc(): string =
       let n = f.readBuffer(addr buf[0], buf.len)
       if n <= 0: return ""
       sent += n

@@ -1,7 +1,7 @@
 ## End-to-end test of the asyncdispatch entry module.
 
 import unittest
-import std/[asyncdispatch, strutils]
+import std/[asyncdispatch, strutils, json]
 import navi/asyncdispatch
 import navi/core/pool      # for pool.idleCount in the streaming lifecycle tests
 import navi/core/response as naviresp  # navi's TimeoutError (std/net also defines one)
@@ -235,4 +235,90 @@ suite "asyncdispatch entry end to end":
     let (raised, idle) = waitFor run()
     check raised                                  # the error propagates out of each
     check idle == 0                               # a failed drain closes, never pools
+    joinThread(th)
+
+  test "a closure-iterator body should stream and reassemble over async":
+    const port = 9209
+    var th: Thread[ServerCtx]
+    startUploadEcho(th, port)
+    let parts = @["hello ", "", "streaming ", "world"]
+    proc run(): Future[Response] {.async.} =
+      let it = iterator (): string {.closure.} =
+        for p in parts: yield p
+      return await newNavi().request(POST, "http://127.0.0.1:" & $port & "/", body = it)
+    let res = waitFor run()
+    check res.status == 200
+    check res.body == "hello streaming world"
+    joinThread(th)
+
+  test "a catch-all object body should be JSON over async":
+    const port = 9210
+    var th: Thread[ServerCtx]
+    startBodyEcho(th, port)
+    let res = waitFor newNavi().post("http://127.0.0.1:" & $port & "/",
+                                     body = (name: "ada", age: 36))
+    check res.body == """{"name":"ada","age":36}"""
+    check res.headers.get("x-echo-content-type") == "application/json"
+    joinThread(th)
+
+  test "an async body producer should stream a chunked upload (awaiting between chunks)":
+    const port = 9220
+    var th: Thread[ServerCtx]
+    startUploadEcho(th, port)
+    proc run(): Future[Response] {.async.} =
+      let parts = @["alpha ", "beta ", "gamma"]
+      var i = 0
+      proc getChunks(): Future[string] {.async.} =
+        if i >= parts.len: return ""
+        let p = parts[i]
+        inc i
+        await sleepAsync(1)          # producing a chunk itself awaits
+        return p
+      return await newNavi().put("http://127.0.0.1:" & $port & "/", body = getChunks)
+    let res = waitFor run()
+    check res.status == 200
+    check res.body == "alpha beta gamma"
+    joinThread(th)
+
+  test "an async producer should pipe a streaming download into an upload":
+    # The flagship pipe: stream() a body from one server and feed it, chunk by chunk,
+    # into a put() on another, so a download becomes an upload in constant memory.
+    const srcPort = 9221
+    const dstPort = 9222
+    var srcTh, dstTh: Thread[ServerCtx]
+    let payload = "the quick brown fox jumps over the lazy dog"
+    startRaw(srcTh, srcPort, "HTTP/1.1 200 OK\r\nContent-Length: " & $payload.len &
+             "\r\nConnection: close\r\n\r\n" & payload)
+    startUploadEcho(dstTh, dstPort)
+    proc run(): Future[Response] {.async.} =
+      let api = newNavi()
+      let sr = await api.stream(GET, "http://127.0.0.1:" & $srcPort & "/")
+      return await api.put("http://127.0.0.1:" & $dstPort & "/",
+        body = proc(): Future[string] {.async.} = return await sr.readChunk())
+    let res = waitFor run()
+    check res.status == 200
+    check res.body == payload
+    joinThread(srcTh)
+    joinThread(dstTh)
+
+  test "an async producer PUT should not be retried (non-replayable body)":
+    var port = 0
+    var count = 0
+    var th: Thread[ServerCtx]
+    start503Once(th, port, addr count)
+    proc run(): Future[Response] {.async.} =
+      var i = 0
+      proc getChunks(): Future[string] {.async.} =
+        if i >= 2: return ""
+        inc i
+        return "x"
+      # PUT is retryable by method and 503 is a retryable status, but a streamed
+      # (non-rewindable) body must be sent once and never replayed: the client
+      # returns the 503, and the server sees exactly one request.
+      var cfg = initNaviConfig()
+      cfg.throwHttpErrors = false
+      return await newNavi(cfg).put("http://127.0.0.1:" & $port & "/", body = getChunks)
+    let res = waitFor run()
+    check res.status == 503
+    check count == 1
     joinThread(th)

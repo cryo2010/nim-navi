@@ -48,10 +48,10 @@ suite "nghttpd interop (sync, http/2)":
     # it back, so the response body must equal everything the producer yielded.
     let chunk = repeat("y", 50_000)
     var left = 5                        # 5 x 50k = 250 KB > the 64 KiB send window
-    let res = client().request(POST, base & "/echo", bodyStream = proc(): string =
+    let res = client().request(POST, base & "/echo", body = BodyProducer(proc(): string =
       if left == 0: return ""
       dec left
-      chunk)
+      chunk))
     check res.status == 200
     check res.httpVersion == "HTTP/2"
     check res.body == repeat("y", 250_000)

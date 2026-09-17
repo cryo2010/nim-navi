@@ -28,11 +28,35 @@ proc raiseHttpError(req: Request, resp: Response) =
     msg: $req.verb & " " & $req.url & " -> " & $resp.status & " " & resp.reason,
     response: resp)
 
-template sendRequest(conn, req: typed) =
+template sendRequest(conn, req: typed; asyncStream: typed = nil) =
   ## Write the request, streaming the body as chunked transfer-encoding when a
   ## producer is set. A buffered body with trailers is also sent chunked (trailers
   ## only exist in chunked transfer-encoding); otherwise the body is sent buffered.
-  if req.bodyStream != nil:
+  ##
+  ## `asyncStream` (async backends only) is an awaited pull-based producer: the send
+  ## awaits it once per chunk, so producing a chunk can itself await (e.g. piping a
+  ## streaming download into the upload). It outranks the sync `bodyStream`. On the
+  ## sync backend the awaited branch is dropped at compile time (`await` of a
+  ## Future-returning proc does not compile there), so the sync send stays identical.
+  when compiles(await asyncStream()):
+    let asyncBody = not asyncStream.isNil
+  else:
+    const asyncBody = false
+  if asyncBody:
+    when compiles(await asyncStream()):
+      await sendAll(conn, serializeHead(req, chunked = true))
+      while true:
+        # The producer is a bare closure (portable spelling, no chronos raises
+        # annotation); navi's contract is it raises at most CatchableError. Discharge
+        # chronos's strict gcsafe/raises obligation here, as the sink path does.
+        var chunk: string
+        {.cast(gcsafe).}:
+          {.cast(raises: [CatchableError]).}:
+            chunk = await asyncStream()
+        if chunk.len == 0: break
+        await sendAll(conn, encodeChunk(chunk))
+      await sendAll(conn, finalChunk(req))
+  elif req.bodyStream != nil:
     await sendAll(conn, serializeHead(req, chunked = true))
     while true:
       # single-threaded client; the producer need not be gcsafe (see h1.emitBody)
@@ -55,15 +79,17 @@ template sendRequest(conn, req: typed) =
     if req.body.len > 0:
       await sendAll(conn, req.body)
 
-template h1SendAndReadHeaders*(transport, req, streaming: typed): H1Parser =
+template h1SendAndReadHeaders*(transport, req, streaming: typed;
+                               asyncStream: typed = nil): H1Parser =
   ## Send an HTTP/1.1 request and read up to the end of the response headers,
   ## returning the parser (status/headers available via `toResponse`; body bytes
   ## that arrived alongside the headers stay buffered in the parser for the drain).
   ## The header/body split lets a pull-based caller return a handle here and drain
-  ## the body later.
+  ## the body later. `asyncStream` (async backends only) is an awaited body producer
+  ## passed through to `sendRequest`; nil on the sync path.
   mixin await, sendAll, recvSome
   block:
-    sendRequest(transport, req)
+    sendRequest(transport, req, asyncStream)
     let noBody = req.verb == HEAD          # a HEAD response never carries a body
     # positional args: `streaming` is a template param, so a named `streaming =`
     # would be hygienically renamed and not match initH1Parser's parameter.
@@ -237,14 +263,16 @@ template h2ReadChunk*(transport, h2, sid, capped: typed): string =
       if toSend.len > 0: await sendAll(transport, toSend)
     res
 
-template h1Exchange*(transport, req, sink, keep, decompress, cap: typed): Response =
+template h1Exchange*(transport, req, sink, keep, decompress, cap: typed;
+                     asyncStream: typed = nil): Response =
   ## One HTTP/1.1 request/response over `transport` (send + read headers + drain
   ## the body), composed from the header/body split above. Sets `keep` to whether
-  ## the connection may be reused; does not pool or close.
+  ## the connection may be reused; does not pool or close. `asyncStream` (async
+  ## backends only) is an awaited body producer forwarded to the send; nil on sync.
   block:
     mixin BodySink
     let streaming = not sink.isNil
-    var parser = h1SendAndReadHeaders(transport, req, streaming)
+    var parser = h1SendAndReadHeaders(transport, req, streaming, asyncStream)
     h1DrainBody(transport, parser, sink, keep, decompress, cap)
     parser.toResponse()
 
@@ -368,7 +396,8 @@ template h2DrainBody*(transport, h2, sid, sink, decompress, cap: typed) =
       unprocessed: unprocessed, wasReset: wasReset, done: done,
       lengthBad: lengthBad, decoderComplete: cd.streamComplete))
 
-template serveOnce(client, pc, rq, sink, key, gotResponse: typed): Response =
+template serveOnce(client, pc, rq, sink, key, gotResponse: typed;
+                   asyncStream: typed = nil): Response =
   ## Run one request/response over the pooled connection `pc` -- reused or freshly
   ## opened -- then return `pc` to the idle pool if it may be kept, else close it.
   ## `pc.h2` set means an established h2 connection; otherwise HTTP/1.1, unless the
@@ -393,7 +422,7 @@ template serveOnce(client, pc, rq, sink, key, gotResponse: typed): Response =
       keep = pc.h2.canReuse
     else:
       gotResponse = false
-      var parser = h1SendAndReadHeaders(pc.transport, rq, not sink.isNil)
+      var parser = h1SendAndReadHeaders(pc.transport, rq, not sink.isNil, asyncStream)
       gotResponse = true
       h1DrainBody(pc.transport, parser, sink, keep,
                   client.config.wantsDecompress, client.config.maxResponseBytes)
@@ -402,10 +431,14 @@ template serveOnce(client, pc, rq, sink, key, gotResponse: typed): Response =
       await close(pc.transport)
     r
 
-template poolTransport*(client, req, sink: typed): Response =
+template poolTransport*(client, req, sink: typed; asyncStream: typed = nil): Response =
   ## Pool-based transport: reuse a pooled connection (http/1.1 or a persistent
   ## h2 connection) or open a fresh one, negotiating the protocol via ALPN.
-  ## One request at a time per connection. Used by the sync and chronos entries.
+  ## One request at a time per connection. Used by the sync entry. `asyncStream`
+  ## is accepted for signature parity with `transportInner` (an awaited upload
+  ## producer) but is always nil here: the sync backend has no event loop to await
+  ## a producer, so an async producer never reaches this path (it fails to compile
+  ## at the sync `request` entry).
   mixin connect, sendAll, recvSome, close, rearm, await, BodySink
   block:
     var rq = req
@@ -432,7 +465,7 @@ template poolTransport*(client, req, sink: typed): Response =
       # case via UnprocessedError, so treat its failures as post-response.
       var gotResponse = true
       try:
-        resp = serveOnce(client, pc, rq, sink, key, gotResponse)
+        resp = serveOnce(client, pc, rq, sink, key, gotResponse, asyncStream)
         served = true
       except CatchableError as e:
         await close(pc.transport)  # pooled connection was stale
@@ -461,21 +494,26 @@ template poolTransport*(client, req, sink: typed): Response =
       # of leaking the fd/TLS handle. serveOnce's pool/close decision runs only on
       # success, so a pooled connection is never double-closed.
       try:
-        resp = serveOnce(client, npc, rq, sink, key, gotResponse)
+        resp = serveOnce(client, npc, rq, sink, key, gotResponse, asyncStream)
       except CatchableError:
         await close(transport)
         raise
     resp
 
-template run(client, req, sink: typed): Response =
+template run(client, req, sink: typed; asyncStream: typed = nil): Response =
   ## Cookie handling around the backend's transport step. `transport` is
-  ## resolved per entry: pool-based for sync/chronos, mux-based for asyncdispatch.
+  ## resolved per entry: pool-based for sync, mux-based for the async backends.
+  ## `asyncStream` (async only) is an awaited upload producer forwarded to the
+  ## transport; nil on the sync path, where `transport` takes only (client, rq, sink).
   mixin transport, await
   block:
     var rq = req
     validateRequest(rq)                # reject header/host CR-LF injection
     applyCookies(client.jar, rq)
-    var resp = await transport(client, rq, sink)
+    when compiles(transport(client, rq, sink, asyncStream)):
+      var resp = await transport(client, rq, sink, asyncStream)
+    else:
+      var resp = await transport(client, rq, sink)
     storeCookies(client.jar, rq.url, resp)
     resp
 
@@ -506,16 +544,19 @@ template maybeDigest(client, rreq, resp, digestOrigin: typed) =
         rreq.headers["authorization"] = auth
         resp = run(client, rreq, BodySink(nil))
 
-template followRedirects(client, startReq, resp: typed) =
+template followRedirects(client, startReq, resp: typed; asyncStream: typed = nil) =
   ## Issue `startReq`, following redirects into `resp`. Expands inline so its
-  ## `await`s run in the caller's async proc.
+  ## `await`s run in the caller's async proc. `asyncStream` (async only) is the
+  ## awaited upload producer for the initial send; a streamed request is
+  ## non-replayable, so it breaks before any redirect rewrite (below) and the
+  ## producer is never pulled a second time.
   mixin BodySink
   var rreq = startReq
   let digestOrigin = originKey(startReq.url)   # digest creds only for this origin
   var hops = 0
   let limit = client.config.redirectLimit
   while true:
-    resp = run(client, rreq, BodySink(nil))
+    resp = run(client, rreq, BodySink(nil), asyncStream)
     maybeDigest(client, rreq, resp, digestOrigin)
     decodeBody(resp, client.config)
     let location = resp.headers.get("location")
@@ -525,19 +566,26 @@ template followRedirects(client, startReq, resp: typed) =
       # producer, so auto-following would send a truncated body. Return the
       # redirect response to the caller instead. (301/302/303 rewrite to a
       # bodyless GET, so they carry no stream to replay.)
-      if rreq.bodyStream != nil and (resp.status == 307 or resp.status == 308):
+      if not isReplayable(rreq) and (resp.status == 307 or resp.status == 308):
         break
       rreq = redirectRequest(rreq, resp.status, location)
       inc hops
     else:
       break
 
-template performRequest*(client, req0: typed; cancel: CancelToken = nil): Response =
+template performRequest*(client, req0: typed; cancel: CancelToken = nil;
+                         asyncStream: typed = nil): Response =
   ## Buffered request with the full policy layer: retries with backoff, redirect
   ## following, decompression, size cap, and throw-on-non-2xx. Middleware (which
   ## can wrap, short-circuit, or observe) is composed around this by the entry
   ## module. `cancel` is checked between attempts (cooperative on the sync
   ## backend; the async backends also abort in-flight via their guard).
+  ##
+  ## `asyncStream` (async backends only) is an awaited pull-based upload producer,
+  ## threaded outside the `Request` because its Future type is backend-specific.
+  ## The request that carries one flags `hasStreamedBody`, so `isReplayable` treats
+  ## it as non-replayable: it is sent once and never retried/redirected/digest-replayed,
+  ## exactly like a sync `bodyStream`.
   mixin sleep, BodySink
   block:
     var req = req0
@@ -564,7 +612,7 @@ template performRequest*(client, req0: typed; cancel: CancelToken = nil): Respon
       req.deadlineMs = deadline.attemptBudgetMs   # this attempt gets the time that remains
       var gotResp = false
       try:
-        followRedirects(client, req, resp)
+        followRedirects(client, req, resp, asyncStream)
         gotResp = true
       except CatchableError as e:
         # A provably-unprocessed request (h2 REFUSED_STREAM / above GOAWAY) is

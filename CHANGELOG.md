@@ -7,6 +7,42 @@ onward (pre-1.0, minor versions may include breaking changes).
 
 ## [Unreleased]
 
+### Added
+- **An async body producer arm for streamed uploads on the async backends.**
+  `body` on `navi/asyncdispatch` and `navi/chronos` now accepts an async producer
+  (`proc(): Future[string]`) alongside the synchronous `BodyProducer`: the engine
+  `await`s each call, so producing a chunk can itself await. This enables piping a
+  streaming download into a streaming upload in constant memory
+  (`body = proc(): Future[string] {.async.} = return await src.readChunk()`), which
+  the synchronous producer could not express (the engine called it inline). The
+  producer streams as chunked transfer-encoding (h1) or DATA frames (h2), with
+  trailers, identically to the sync producer, and is **not replayable** (sent once,
+  never retried/redirected/digest-replayed). Two paths buffer instead of stream:
+  h3 drains the producer before sending (its C-side body pull is synchronous), and
+  `navi/js` does the same as `fetch` cannot stream a request body; both still await
+  each chunk. The sync backend rejects an async producer at compile time (no event
+  loop to await it). Its type lives at the backend layer (`AsyncBodyProducer`, like
+  `BodySink`), since the `Future` type differs per backend (#367).
+
+### Changed
+- **BREAKING: the request `body` is now type-dispatched, and the `json`,
+  `multipart`, and `bodyStream` parameters are removed (no deprecation).** The
+  `body` argument of `request`/`post`/`put`/`patch` dispatches on its type: a
+  `string` is the raw body (default `""`), a `JsonNode` is sent as JSON
+  (`application/json`), a `Multipart` as `multipart/form-data`, a `BodyProducer`
+  or a closure `BodyIterator` streams a chunked upload, and any other value is
+  serialized to JSON via `std/jsonutils` (`application/json`). The `BodyIterator`
+  arm ends the body at `finished(it)` rather than a `""` yield, skipping an empty
+  mid-stream chunk so it cannot truncate the upload. Migrate `json = X` /
+  `multipart = @[...]` / `bodyStream = P` to `body = X`. `buildRequest` now takes
+  a `ResolvedBody` (produced by `toBody`) instead of the removed parameters.
+  `post`/`put`/`patch` gain streaming (they forward the typed `body`). The `form`
+  parameter is unchanged and stays outranked by a typed `body` (precedence:
+  typed body > form > raw string). `body = nil` is now a compile error. On the js
+  backend a streamed body is still buffered (`fetch` cannot stream a request
+  body); the iterator wrapper only returns `""` at the true end of body, so
+  buffering cannot truncate it (#365).
+
 ## [0.10.0] - 2026-09-15
 
 ### Added

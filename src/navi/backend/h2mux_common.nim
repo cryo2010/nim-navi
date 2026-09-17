@@ -322,6 +322,28 @@ proc streamBody(mux: H2Mux, sid: uint32, bodyStream: BodyProducer,
     else:
       await mux.waitSendable(sid)
 
+proc streamBodyAsync(mux: H2Mux, sid: uint32, producer: be.AsyncBodyProducer,
+                     trailers: seq[(string, string)] = @[]) {.async.} =
+  ## Like `streamBody`, but the body source is an awaited producer: each chunk is
+  ## pulled with `await producer()` (so producing a chunk can itself await), sent
+  ## only once the previous one has drained onto the wire (window-gated, so buffered
+  ## upload memory stays ~one chunk). "" ends the body; END_STREAM rides the final
+  ## frame via `finishSend` (a trailing HEADERS block when `trailers` is set).
+  while mux.alive and not mux.h2.streamDone(sid):
+    if mux.h2.sendDrained(sid):
+      # The producer is a bare closure (no chronos raises annotation); navi's contract
+      # is it raises at most CatchableError. Discharge chronos's strict effects here.
+      var chunk: string
+      {.cast(gcsafe).}:
+        {.cast(raises: [CatchableError]).}:
+          chunk = await producer()
+      if chunk.len == 0:
+        await mux.send(mux.h2.finishSend(sid, trailers))
+        break
+      await mux.send(mux.h2.queueSend(sid, chunk))
+    else:
+      await mux.waitSendable(sid)
+
 proc endStream(mux: H2Mux, sid: uint32) =
   ## Free a sink stream's per-stream state once it is done (or errored), and release
   ## its concurrency slot so a request parked on MAX_CONCURRENT_STREAMS can proceed.
@@ -429,7 +451,8 @@ proc respSnapshot*(mux: H2Mux, sid: uint32): H2Response =
 proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: string,
                          bodyStream: BodyProducer = nil,
                          trailers: seq[(string, string)] = @[],
-                         connectTunnel = false): Future[uint32] {.async.} =
+                         connectTunnel = false,
+                         asyncStream: be.AsyncBodyProducer = nil): Future[uint32] {.async.} =
   ## Open a sink stream, send the request, and await only until the response HEADERS
   ## arrive; return the stream id with the stream left open and its body queuing into
   ## `recvq` for a later `drainDownload`. The header/body split lets a pull-based
@@ -460,6 +483,9 @@ proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: strin
   try:
     if connectTunnel:
       await mux.send(mux.h2.encodeRequestHead(sid, headers))   # no END_STREAM: send side open
+    elif asyncStream != nil:
+      await mux.send(mux.h2.encodeRequestHead(sid, headers))
+      await mux.streamBodyAsync(sid, asyncStream, trailers)
     elif bodyStream != nil:
       await mux.send(mux.h2.encodeRequestHead(sid, headers))
       await mux.streamBody(sid, bodyStream, trailers)
@@ -567,11 +593,13 @@ proc abandon*(mux: H2Mux, sid: uint32): Future[void] {.async.} =
 proc request*(mux: H2Mux, headers: seq[(string, string)], body: string,
               bodyStream: BodyProducer = nil,
               sink: BodySink = nil,
-              trailers: seq[(string, string)] = @[]): Future[H2Response] {.async.} =
+              trailers: seq[(string, string)] = @[],
+              asyncStream: be.AsyncBodyProducer = nil): Future[H2Response] {.async.} =
   ## Open a stream, send the request, and await this stream's response. Blocks while
   ## the connection is at the peer's MAX_CONCURRENT_STREAMS, resuming when a stream
   ## completes (so a burst of concurrent requests is queued, not RST). When
-  ## `bodyStream` is set the body is streamed chunk by chunk instead of `body`.
+  ## `bodyStream` is set the body is streamed chunk by chunk instead of `body`;
+  ## `asyncStream` (awaited per chunk) outranks both when set.
   if not mux.alive:
     raise newException(IOError, "navi: http/2 connection not usable")
   while mux.alive and mux.activeStreams >= mux.h2.maxConcurrentStreams:
@@ -593,7 +621,10 @@ proc request*(mux: H2Mux, headers: seq[(string, string)], body: string,
   let fut = newFuture[H2Response]("h2mux.stream")
   mux.waiters[sid] = fut
   try:
-    if bodyStream != nil:
+    if asyncStream != nil:
+      await mux.send(mux.h2.encodeRequestHead(sid, headers))
+      await mux.streamBodyAsync(sid, asyncStream, trailers)
+    elif bodyStream != nil:
       await mux.send(mux.h2.encodeRequestHead(sid, headers))
       await mux.streamBody(sid, bodyStream, trailers)
     else:

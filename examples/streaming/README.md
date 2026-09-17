@@ -10,7 +10,7 @@ setup — and the hash check makes the verification real, not cosmetic.
 
 | Example | Streams via | Verifies |
 |---------|-------------|----------|
-| [`upload_file.nim`](upload_file.nim) | `request(POST, url, bodyStream = producer)` — a pull-based producer navi calls for each chunk until it returns `""` | the server echoes the upload; SHA-1(echo) == SHA-1(file) |
+| [`upload_file.nim`](upload_file.nim) | `request(POST, url, body = producer)` — a pull-based `BodyProducer` navi calls for each chunk until it returns `""` | the server echoes the upload; SHA-1(echo) == SHA-1(file) |
 | [`download_file.nim`](download_file.nim) | `stream(GET, url, sink = ...)` — a sink navi hands each chunk as it arrives | SHA-1(downloaded file) == SHA-1(served payload) |
 
 ## Run
@@ -35,8 +35,8 @@ nim c -r examples/streaming/download_file.nim /tmp/out.bin
   is on the wire, and the download sink writes each chunk straight to the file, so
   neither example ever holds the whole file in RAM.
 - **Transport is automatic.** navi negotiates HTTP/2 over ALPN when the server
-  offers it and falls back to HTTP/1.1 otherwise; the `bodyStream` / `sink` API is
-  identical either way. (The local server here is HTTP/1.1; streaming upload over
+  offers it and falls back to HTTP/1.1 otherwise; the streamed-body (`body =
+  producer`) / `sink` API is identical either way. (The local server here is HTTP/1.1; streaming upload over
   real HTTP/2 is covered by navi's interop tests.)
 - **Decompression** happens on the download path before the sink sees the bytes,
   so a `Content-Encoding: gzip` response is written decoded.

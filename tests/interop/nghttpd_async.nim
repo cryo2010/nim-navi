@@ -39,10 +39,10 @@ suite "nghttpd interop (asyncdispatch, http/2 mux)":
       cfg.tls.caFile = cert
       let api = newNavi(cfg)
       var left = 5                        # 5 x 50k = 250 KB > the 64 KiB send window
-      result = await api.request(POST, base & "/echo", bodyStream = proc(): string =
+      result = await api.request(POST, base & "/echo", body = BodyProducer(proc(): string =
         if left == 0: return ""
         dec left
-        repeat("z", 50_000))
+        repeat("z", 50_000)))
     let res = waitFor run()
     check res.status == 200
     check res.httpVersion == "HTTP/2"

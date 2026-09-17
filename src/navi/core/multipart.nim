@@ -2,9 +2,9 @@
 ##
 ## Pure encoding, no I/O: build a `Multipart` from fields and file parts, then
 ## `encodeMultipart` turns it into a body string plus the matching Content-Type
-## (which carries the generated boundary). `buildRequest` calls this when a
-## caller passes `multipart = ...`, so it works uniformly on every backend (the
-## body is just bytes with a header).
+## (which carries the generated boundary). `toBody` calls this when a caller
+## passes a `Multipart` as the request `body`, so it works uniformly on every
+## backend (the body is just bytes with a header).
 
 import std/[random, times, strutils]
 

@@ -168,36 +168,69 @@ proc runChain(ctx: NaviContext): Future[Response] {.async.} =
   await ctx.next()
   return ctx.res
 
-proc request*(client: Navi, verb: HttpVerb, target: string,
-              headers = initHeaders(), body = "", json: JsonNode = nil,
-              form: seq[(string, string)] = @[], multipart: Multipart = @[],
-              bodyStream: BodyProducer = nil,
-              params: seq[(string, string)] = @[],
-              cancel: CancelToken = nil,
-              trailers = initHeaders()): Future[Response] {.async.} =
-  ## Perform a request; configured middleware wraps the whole call. `params` are
-  ## appended to the URL query; `cancel` aborts the fetch.
-  ##
-  ## `bodyStream` is accepted for parity with the native backends, but the js
-  ## backend **buffers** it: `fetch` cannot reliably stream a request body
-  ## (`ReadableStream` + `duplex: "half"` support is uneven across runtimes), so
-  ## the producer is drained into a full body before sending. `trailers` are
-  ## rejected: `fetch` cannot send request trailers.
+proc requestResolved(client: Navi, verb: HttpVerb, target: string,
+                     headers: Headers, body: ResolvedBody,
+                     form: seq[(string, string)],
+                     params: seq[(string, string)],
+                     cancel: CancelToken,
+                     trailers: Headers,
+                     asyncStream: AsyncBodyProducer = nil): Future[Response] {.async.} =
+  ## `fetch` cannot reliably stream a request body (`ReadableStream` +
+  ## `duplex: "half"` support is uneven across runtimes), so a streamed body
+  ## (`BodyProducer`, closure `BodyIterator`, or an `AsyncBodyProducer`) is
+  ## **buffered**: its producer is drained into a full body before sending. The
+  ## iterator wrapper only returns "" at the true end of body, so buffering cannot
+  ## truncate it. `trailers` are rejected: `fetch` cannot send request trailers.
   if trailers.len > 0:
     raise newException(ValueError,
       "navi: request trailers are not supported on the js backend (fetch cannot send them)")
-  var buffered = body
-  if bodyStream != nil:
-    buffered = ""
+  var resolved = body
+  if asyncStream != nil:
+    # Async producer: drain it (awaiting each chunk) into a buffered body. fetch
+    # cannot stream an upload, so this is the js analog of the native awaited send.
+    var buffered = ""
     while true:
-      let chunk = bodyStream()
+      let chunk = await asyncStream()
       if chunk.len == 0: break
       buffered.add chunk
-  let req = buildRequest(client.config, verb, target, headers, buffered, json,
-                         form, multipart, nil, params)
+    resolved = ResolvedBody(typed: true, content: buffered)
+  elif resolved.stream != nil:
+    var buffered = ""
+    let stream = resolved.stream
+    while true:
+      let chunk = stream()
+      if chunk.len == 0: break
+      buffered.add chunk
+    resolved.content = buffered
+    resolved.stream = nil
+  let req = buildRequest(client.config, verb, target, headers, resolved,
+                         form, params)
   if client.config.middleware.len == 0: return await runCore(client, req, cancel)
   let ctx = NaviContext(req: req, clientv: client, cancel: cancel)
   return await runChain(ctx)
+
+proc request*[B](client: Navi, verb: HttpVerb, target: string,
+                 headers = initHeaders(), body: B = "",
+                 form: seq[(string, string)] = @[],
+                 params: seq[(string, string)] = @[],
+                 cancel: CancelToken = nil,
+                 trailers = initHeaders()): Future[Response] =
+  ## Perform a request; configured middleware wraps the whole call. `body` is
+  ## dispatched by type: a `string` is the raw body, a `JsonNode` is sent as JSON,
+  ## a `Multipart` as multipart/form-data, a `BodyProducer` or closure
+  ## `BodyIterator` streams a chunked upload (buffered on js; see below), and any
+  ## other value is serialized to JSON. `form` encodes a urlencoded body and is
+  ## outranked by a typed `body`. An `AsyncBodyProducer` (`proc(): Future[string]`)
+  ## streams a chunked upload on the native async backends; on js `fetch` cannot
+  ## stream an upload, so it is drained (awaited chunk by chunk) into a buffered body,
+  ## like the sync `BodyProducer`. `params` are appended to the URL query; `cancel`
+  ## aborts the fetch.
+  when B is AsyncBodyProducer:
+    requestResolved(client, verb, target, headers, ResolvedBody(), form, params,
+                    cancel, trailers, asyncStream = body)
+  else:
+    requestResolved(client, verb, target, headers, toBody(body), form, params,
+                    cancel, trailers)
 
 # --- Streaming downloads (pull-based handle) ---
 
@@ -376,7 +409,7 @@ proc sse*(client: Navi, target: string, verb = GET,
   if not h.contains("accept"): h["accept"] = "text/event-stream"
   if not h.contains("cache-control"): h["cache-control"] = "no-cache"
   let s = SseStream(
-    client: client, req: buildRequest(client.config, verb, target, h, body,
+    client: client, req: buildRequest(client.config, verb, target, h, toBody(body),
                                       params = params),
     reconnect: reconnect, baseRetryMs: retryMs, retryMs: retryMs,
     maxRetryMs: maxRetryMs, parser: initSseParser(lastEventId))

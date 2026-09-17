@@ -47,7 +47,7 @@ proc main() {.async.} =
     (await api().post(base & "/post", body = "hello body")).data["data"].getStr == "hello body"
 
   check "POST /post encodes a JSON body and sets Content-Type":
-    let r = await api().post(base & "/post", json = %*{"a": 1, "b": "two"})
+    let r = await api().post(base & "/post", body = %*{"a": 1, "b": "two"})
     r.data["json"]["a"].getInt == 1 and r.data["json"]["b"].getStr == "two" and
       r.data["headers"]["Content-Type"].getStr.contains("application/json")
 
@@ -147,18 +147,30 @@ proc main() {.async.} =
     # fetch can't reliably stream a request body, so the js backend buffers the
     # producer -- but the received body must still equal what it yielded.
     var left = 3
-    let r = await api().request(POST, base & "/post", bodyStream = proc(): string =
+    let r = await api().request(POST, base & "/post", body = BodyProducer(proc(): string =
       if left == 0: return ""
       dec left
-      "chunk-")
+      "chunk-"))
     r.data["data"].getStr == "chunk-chunk-chunk-"
+
+  check "an async body producer upload is drained (awaiting) and arrives intact":
+    # fetch cannot stream an upload, so an async producer is drained into a buffered
+    # body on js -- awaiting each chunk (so producing may await), like the native
+    # backends' awaited send. The received body must equal what it yielded.
+    var n = 0
+    proc getChunks(): Future[string] {.async.} =
+      if n >= 3: return ""
+      inc n
+      return "part" & $n & "-"
+    let r = await api().put(base & "/put", body = getChunks)
+    r.data["data"].getStr == "part1-part2-part3-"
 
   # --- misc response formats -----------------------------------------------
   check "/html is served as text/html":
     (await api().get(base & "/html")).headers["content-type"].contains("text/html")
 
   check "/anything echoes method and JSON":
-    let r = await api().post(base & "/anything", json = %*{"k": "v"})
+    let r = await api().post(base & "/anything", body = %*{"k": "v"})
     r.data["method"].getStr == "POST" and r.data["json"]["k"].getStr == "v"
 
   echo ""
