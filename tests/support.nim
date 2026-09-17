@@ -559,6 +559,152 @@ proc startTruncated*(th: var Thread[ServerCtx], port, bodyBytes: int) =
     ServerCtx(port: port, ready: addr ready, failures: bodyBytes))
   while not ready: discard
 
+proc serveChunkedTrailer(ctx: ServerCtx) {.thread.} =
+  ## Send a valid chunked body in several chunks (payload split into `failures`
+  ## pieces), followed by a trailing field `x-checksum: done`. For the response-sink
+  ## tests: proves multi-chunk delivery and that trailers survive a full drain.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.listen()
+  ctx.ready[] = true
+  var client = acceptClient(server)
+  discard client.recvUntil("\r\n\r\n")
+  client.send("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n" &
+              "Trailer: x-checksum\r\n\r\n")
+  let pieces = ["Hello, ", "chunked ", "world!"]
+  for p in pieces:
+    client.send(toHex(p.len, 1) & "\r\n" & p & "\r\n")
+  client.send("0\r\nx-checksum: done\r\n\r\n")
+  client.close()
+  server.close()
+
+proc startChunkedTrailer*(th: var Thread[ServerCtx], port: int) =
+  ## Serve one connection: a 3-chunk body ("Hello, chunked world!") plus a trailer.
+  var ready = false
+  createThread(th, serveChunkedTrailer, ServerCtx(port: port, ready: addr ready))
+  while not ready: discard
+
+proc serveGzipBody(ctx: ServerCtx) {.thread.} =
+  ## Send a gzip-encoded body ({"ok":true}) with Content-Encoding: gzip, so a sink
+  ## test can prove the body arrives DECODED. The gzip bytes are a fixed fixture (the
+  ## same encoding the decompress tests use).
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.listen()
+  ctx.ready[] = true
+  var client = acceptClient(server)
+  discard client.recvUntil("\r\n\r\n")
+  let gz = hexToBytes("1f8b0800000000000003ab56cacf56b22a292a4dad0500905fd4a70b000000")
+  client.send("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n" &
+              "Content-Length: " & $gz.len & "\r\nConnection: close\r\n\r\n" & gz)
+  client.close()
+  server.close()
+
+proc startGzipBody*(th: var Thread[ServerCtx], port: int) =
+  ## Serve one gzip-encoded body ({"ok":true}).
+  var ready = false
+  createThread(th, serveGzipBody, ServerCtx(port: port, ready: addr ready))
+  while not ready: discard
+
+proc serveStatusBody(ctx: ServerCtx) {.thread.} =
+  ## Answer one request with status `failures` (reused as the status code) and
+  ## `payload` as the body. For the throw-on-non-2xx sink test (a 404 with a body).
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.listen()
+  ctx.ready[] = true
+  var client = acceptClient(server)
+  discard client.recvUntil("\r\n\r\n")
+  client.send("HTTP/1.1 " & $ctx.failures & " Status\r\nContent-Length: " &
+              $ctx.payload.len & "\r\nConnection: close\r\n\r\n" & ctx.payload)
+  client.close()
+  server.close()
+
+proc startStatusBody*(th: var Thread[ServerCtx], port, status: int, body: string) =
+  ## Serve one response with an arbitrary `status` and `body`.
+  var ready = false
+  createThread(th, serveStatusBody,
+    ServerCtx(port: port, ready: addr ready, failures: status, payload: body))
+  while not ready: discard
+
+proc serveHeadNoBody(ctx: ServerCtx) {.thread.} =
+  ## Answer a HEAD request with 200 + Content-Length but no body (correct HEAD), so a
+  ## sink test can prove the sink is never called for a HEAD.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.listen()
+  ctx.ready[] = true
+  var client = acceptClient(server)
+  discard client.recvUntil("\r\n\r\n")
+  client.send("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n")
+  client.close()
+  server.close()
+
+proc startHeadNoBody*(th: var Thread[ServerCtx], port: int) =
+  var ready = false
+  createThread(th, serveHeadNoBody, ServerCtx(port: port, ready: addr ready))
+  while not ready: discard
+
+proc serve204(ctx: ServerCtx) {.thread.} =
+  ## Answer one request with 204 No Content (no body at all).
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.listen()
+  ctx.ready[] = true
+  var client = acceptClient(server)
+  discard client.recvUntil("\r\n\r\n")
+  client.send("HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+  client.close()
+  server.close()
+
+proc start204*(th: var Thread[ServerCtx], port: int) =
+  var ready = false
+  createThread(th, serve204, ServerCtx(port: port, ready: addr ready))
+  while not ready: discard
+
+proc serveDigestThenBody(ctx: ServerCtx) {.thread.} =
+  ## Answer the first request 401 with a Digest challenge (and a body that must NOT
+  ## reach the sink), then the retried (Authorization-carrying) request 200 with
+  ## `payload` -- the protected final body that SHOULD stream to the sink. Two
+  ## responses on one kept-alive connection.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.listen()
+  ctx.ready[] = true
+  var client = acceptClient(server)
+  for i in 0 .. 1:
+    var head = ""
+    while true:
+      let c = client.recv(1)
+      if c.len == 0: break
+      head.add c
+      if head.len >= 4 and head[^4 .. ^1] == "\r\n\r\n": break
+    if head.len == 0: break
+    if i == 0:
+      const chalBody = "challenge-body-should-not-reach-sink"
+      client.send("HTTP/1.1 401 Unauthorized\r\n" &
+        "WWW-Authenticate: Digest realm=\"navi\", nonce=\"abc123\", qop=\"auth\"\r\n" &
+        "Content-Length: " & $chalBody.len & "\r\nConnection: keep-alive\r\n\r\n" & chalBody)
+    else:
+      client.send("HTTP/1.1 200 OK\r\nContent-Length: " & $ctx.payload.len &
+                  "\r\nConnection: close\r\n\r\n" & ctx.payload)
+      break
+  client.close()
+  server.close()
+
+proc startDigestThenBody*(th: var Thread[ServerCtx], port: int, body: string) =
+  ## Serve a 401 Digest challenge then a 200 with `body` on the retry.
+  var ready = false
+  createThread(th, serveDigestThenBody,
+    ServerCtx(port: port, ready: addr ready, payload: body))
+  while not ready: discard
+
 proc serveTruncatedChunked(ctx: ServerCtx) {.thread.} =
   ## Send a chunked response but close after one chunk, without the terminating
   ## `0\r\n\r\n` -- a truncated chunked body.

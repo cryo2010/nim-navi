@@ -8,40 +8,54 @@
 ## `params` is generic so a verb accepts any query form -- a seq/array of pairs
 ## (`@[...]`, `@{...}`, `{...}`) or a `Table` / `OrderedTable` -- normalized by
 ## `toQuery`. The typed default keeps the no-params call unambiguous.
+##
+## `sink` is a defaulted generic param (`S = GatedBodySink(nil)`): omitting it
+## dispatches to the buffered `request`; passing a `GatedBodySink` (bool),
+## `BodySink` (void), or a plain `{.async.}` proc (which converts implicitly)
+## dispatches to the gated `request` overload, which streams the FINAL response
+## body to the sink instead of buffering it. On js the element type is `seq[byte]`.
 
-proc get*[P](client: Navi, target: string, headers = initHeaders(),
-             params: P = seq[(string, string)].default, cancel: CancelToken = nil): auto =
-  client.request(GET, target, headers, params = toQuery(params), cancel = cancel)
+proc get*[P, S](client: Navi, target: string, headers = initHeaders(),
+             params: P = seq[(string, string)].default, cancel: CancelToken = nil,
+             sink: S = GatedBodySink(nil)): auto =
+  client.request(GET, target, headers, "", sink,
+                 params = toQuery(params), cancel = cancel)
 
-proc head*[P](client: Navi, target: string, headers = initHeaders(),
-              params: P = seq[(string, string)].default, cancel: CancelToken = nil): auto =
-  client.request(HEAD, target, headers, params = toQuery(params), cancel = cancel)
+proc head*[P, S](client: Navi, target: string, headers = initHeaders(),
+              params: P = seq[(string, string)].default, cancel: CancelToken = nil,
+              sink: S = GatedBodySink(nil)): auto =
+  client.request(HEAD, target, headers, "", sink,
+                 params = toQuery(params), cancel = cancel)
 
-proc delete*[P](client: Navi, target: string, headers = initHeaders(),
-                params: P = seq[(string, string)].default, cancel: CancelToken = nil): auto =
-  client.request(DELETE, target, headers, params = toQuery(params), cancel = cancel)
+proc delete*[P, S](client: Navi, target: string, headers = initHeaders(),
+                params: P = seq[(string, string)].default, cancel: CancelToken = nil,
+                sink: S = GatedBodySink(nil)): auto =
+  client.request(DELETE, target, headers, "", sink,
+                 params = toQuery(params), cancel = cancel)
 
-proc options*[P](client: Navi, target: string, headers = initHeaders(),
-                 params: P = seq[(string, string)].default, cancel: CancelToken = nil): auto =
-  client.request(OPTIONS, target, headers, params = toQuery(params), cancel = cancel)
+proc options*[P, S](client: Navi, target: string, headers = initHeaders(),
+                 params: P = seq[(string, string)].default, cancel: CancelToken = nil,
+                 sink: S = GatedBodySink(nil)): auto =
+  client.request(OPTIONS, target, headers, "", sink,
+                 params = toQuery(params), cancel = cancel)
 
-proc post*[P, B](client: Navi, target: string, body: B = "",
+proc post*[P, B, S](client: Navi, target: string, body: B = "",
                  form: seq[(string, string)] = @[],
                  headers = initHeaders(), params: P = seq[(string, string)].default,
-                 cancel: CancelToken = nil): auto =
-  client.request(POST, target, headers, body, form,
+                 cancel: CancelToken = nil, sink: S = GatedBodySink(nil)): auto =
+  client.request(POST, target, headers, body, sink, form,
                  params = toQuery(params), cancel = cancel)
 
-proc put*[P, B](client: Navi, target: string, body: B = "",
+proc put*[P, B, S](client: Navi, target: string, body: B = "",
                 form: seq[(string, string)] = @[],
                 headers = initHeaders(), params: P = seq[(string, string)].default,
-                cancel: CancelToken = nil): auto =
-  client.request(PUT, target, headers, body, form,
+                cancel: CancelToken = nil, sink: S = GatedBodySink(nil)): auto =
+  client.request(PUT, target, headers, body, sink, form,
                  params = toQuery(params), cancel = cancel)
 
-proc patch*[P, B](client: Navi, target: string, body: B = "",
+proc patch*[P, B, S](client: Navi, target: string, body: B = "",
                   form: seq[(string, string)] = @[],
                   headers = initHeaders(), params: P = seq[(string, string)].default,
-                  cancel: CancelToken = nil): auto =
-  client.request(PATCH, target, headers, body, form,
+                  cancel: CancelToken = nil, sink: S = GatedBodySink(nil)): auto =
+  client.request(PATCH, target, headers, body, sink, form,
                  params = toQuery(params), cancel = cancel)

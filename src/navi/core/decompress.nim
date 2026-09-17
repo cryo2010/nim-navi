@@ -485,6 +485,21 @@ proc streamComplete*(cd: CappedDecoder): bool =
   ## decoder was never fed, is complete.
   cd.dec == nil or cd.dec.state != dsMidMember
 
+proc markStreamDecoded*(resp: var Response) =
+  ## Mark a response whose body was ALREADY decoded downstream (the async h2 mux
+  ## decodes per-sid via its `CappedDecoder` before buffering) as decoded, so a later
+  ## `decodeBody` does not try to inflate an already-plaintext body. When the
+  ## Content-Encoding is a single token we can decode, drop it and set Content-Length
+  ## to the body length -- exactly the header rewrite `decodeBody` performs after it
+  ## decodes -- so the two paths leave identical headers. A stacked or unknown
+  ## encoding is left untouched (the mux did not decode it either).
+  let ce = resp.headers.get("content-encoding")
+  if ce.len == 0: return
+  let e = ce.strip.toLowerAscii
+  if e in ["gzip", "x-gzip", "deflate", "br", "zstd"]:
+    resp.headers.del("content-encoding")
+    resp.headers["content-length"] = $resp.body.len
+
 proc decodeBody*(resp: var Response, opts: NaviConfigBase) =
   ## Decompress the body in place per Content-Encoding, then drop the headers that
   ## described the encoded form. Handles a stacked encoding (e.g. `gzip, br`) by

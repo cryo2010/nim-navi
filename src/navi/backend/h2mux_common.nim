@@ -50,6 +50,14 @@ type
                                             ## a single slot would strand one (issue #263)
     sinkStreams: HashSet[uint32]       ## streams owned by a drainDownload coroutine
                                        ## (their body goes to a sink, not `waiters`)
+    trailerCapture: HashSet[uint32]    ## sink streams whose trailers the buffered
+                                       ## `request()` gated path wants kept: the
+                                       ## streaming drain otherwise drops them, so
+                                       ## `endStream`'s clean-end branch stores this
+                                       ## sid's trailers here for a later `takeTrailers`
+    capturedTrailers: Table[uint32, seq[(string, string)]]  ## trailers stored for registered
+                                       ## sids (see `captureTrailers`/`takeTrailers`);
+                                       ## empty for unregistered or early-stopped streams
     recvq: Table[uint32, Deque[string]]  ## raw body chunks the reader drained per feed,
                                          ## awaiting the drain loop (one entry per feed
                                          ## keeps delivery incremental; bounded by the
@@ -365,7 +373,12 @@ proc endStream(mux: H2Mux, sid: uint32) =
     let rst = mux.h2.resetStream(sid)
     if rst.len > 0: mux.fireSend(rst)
   else:
-    discard mux.h2.takeResponse(sid)
+    # Clean end: the streaming drain normally discards the response (and its trailers).
+    # A registered sid (captureTrailers) wants them kept, so stash them before dropping.
+    let resp = mux.h2.takeResponse(sid)
+    if sid in mux.trailerCapture and resp.trailers.len > 0:
+      mux.capturedTrailers[sid] = resp.trailers
+  mux.trailerCapture.excl sid
   if wasActive: mux.releaseSlot()
 
 proc readChunk*(mux: H2Mux, sid: uint32): Future[string] {.async.} =
@@ -447,6 +460,21 @@ proc respSnapshot*(mux: H2Mux, sid: uint32): H2Response =
   ## Status + headers of a stream whose headers are in, without dropping it (the
   ## body is still to be drained). For the pull-based streaming handle.
   mux.h2.respSnapshot(sid)
+
+proc captureTrailers*(mux: H2Mux, sid: uint32) =
+  ## Register `sid` so `endStream`'s clean-end branch stashes its trailers (which the
+  ## streaming drain otherwise drops) for a later `takeTrailers`. For the buffered
+  ## `request()` gated-sink path, which surfaces the final response's trailers on a
+  ## full drain. The pull-based `stream()` handle never registers, so the capture
+  ## table cannot grow for it.
+  mux.trailerCapture.incl sid
+
+proc takeTrailers*(mux: H2Mux, sid: uint32): seq[(string, string)] =
+  ## Pop the trailers captured for `sid` (empty for an unregistered or early-stopped
+  ## stream). Called once after a full `drainDownload`.
+  if mux.capturedTrailers.hasKey(sid):
+    result = mux.capturedTrailers[sid]
+    mux.capturedTrailers.del(sid)
 
 proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: string,
                          bodyStream: BodyProducer = nil,
@@ -592,7 +620,6 @@ proc abandon*(mux: H2Mux, sid: uint32): Future[void] {.async.} =
 
 proc request*(mux: H2Mux, headers: seq[(string, string)], body: string,
               bodyStream: BodyProducer = nil,
-              sink: BodySink = nil,
               trailers: seq[(string, string)] = @[],
               asyncStream: be.AsyncBodyProducer = nil): Future[H2Response] {.async.} =
   ## Open a stream, send the request, and await this stream's response. Blocks while

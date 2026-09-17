@@ -252,6 +252,11 @@ task jsCookieJar, "navi/js opt-in cookie jar runtime test (Node)":
   # Verifies the opt-in jar replays cookies across requests on Node/undici.
   exec "bash tests/interop/js_cookiejar.sh"
 
+task jsSink, "navi/js response-sink runtime test (Node)":
+  # Verifies the gated response sink on js: chunked delivery, bool-stop truncation,
+  # the void form, the delivery rule, and throw-on-non-2xx never calling the sink.
+  exec "bash tests/interop/js_sink.sh"
+
 task demoWssBrowser, "Browser wss demo: mkcert cert + wss server + page (needs mkcert, python3)":
   # Generates a browser-trusted cert (mkcert), serves the navi/js page over a
   # wss echo server, and prints the URL to open.

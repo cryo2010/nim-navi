@@ -132,6 +132,12 @@ jobs:
       - name: navi/js cookie jar + middleware runtime test
         run: bash tests/interop/js_cookiejar.sh
 
+      # Response sink under Node: chunked delivery, bool-stop truncation, the void
+      # form, the delivery rule, and throw-on-non-2xx never calling the sink. Guards
+      # the navi/js gated-sink path at runtime (nim check -b:js is not enough).
+      - name: navi/js response sink runtime test
+        run: bash tests/interop/js_sink.sh
+
   sanitize:
     runs-on: ubuntu-latest
     name: sanitizers (asan + ubsan)

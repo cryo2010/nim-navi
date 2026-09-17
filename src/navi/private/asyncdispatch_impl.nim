@@ -7,7 +7,7 @@ import navi/private/[entryguard, streamguard, guard_common]
 import navi/proto/sse
 import navi/core/public
 export sse.SseEvent
-import navi/core/[engine, pool, session, proxy, h2glue]
+import navi/core/[engine, pool, session, proxy, h2glue, sinkgate]
 import navi/core/[redirect, cookies, digest, cancel, retry, response]
 import navi/core/decompress   # StreamDecoder, for the readChunk decode state
 import navi/proto/h1

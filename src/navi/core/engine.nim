@@ -13,7 +13,8 @@
 ## attempt is retried once on a fresh connection.
 
 import ./headers, ./url, ./request, ./response, ./pool, ./decompress, ./redirect,
-       ./retry, ./cookies, ./proxy, ./session, ./h2glue, ./digest, ./cancel
+       ./retry, ./cookies, ./proxy, ./session, ./h2glue, ./digest, ./cancel,
+       ./sinkgate
 import ../proto/h1
 import ../proto/h2/conn
 
@@ -309,6 +310,14 @@ template h2SendRequest*(transport, h2, req: typed): uint32 =
         h2.encodeRequest(sid, h2HeaderList(req), req.body, h2TrailerList(req)))
     sid
 
+template effectiveSink(sink, gate, ver, status, headers: typed): untyped =
+  ## The sink to actually drain the body into at this drain site: the caller's
+  ## `sink` when the gate is certain this response will be surfaced normally, else a
+  ## nil sink of the same type (so the body buffers and the policy layer decides).
+  ## A nil gate (no user sink) always yields nil. Evaluated after the headers are in.
+  if gate != nil and gate.wantsDelivery(ver, status, headers): sink
+  else: typeof(sink)(nil)
+
 template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
   ## One HTTP/2 request/response on a new stream of the shared connection `h2`.
   block:
@@ -343,6 +352,57 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
       lengthBad: lengthBad, decoderComplete: sink.isNil or cd.streamComplete))
     if not sink.isNil: r.body = ""  # delivered incrementally above
     r
+
+template h2GatedStream(transport, h2, req, userSink, gate,
+                       decompress, cap: typed): Response =
+  ## The gated h2 variant of `h2Stream` for the buffered `request()` sink path
+  ## (sync + pooled-h2). Sends the request, reads the response headers, then decides
+  ## via the gate whether this response will be surfaced: if so, drains the body to
+  ## `userSink` incrementally; if not, buffers it for the policy layer. A gated stop
+  ## (the sink returned false -> SinkStopSignal) RSTs the stream (the connection is
+  ## kept), returns the snapshot with `bodyTruncated = true`, and skips the terminal
+  ## error cascade. The snapshot is captured BEFORE any reset, since a reset drops
+  ## the stream from the connection.
+  mixin await, sendAll, recvSome, BodySink
+  block:
+    let sid = h2SendAndReadHeaders(transport, h2, req)
+    let snap = toResponse(h2.respSnapshot(sid))
+    let eff = effectiveSink(userSink, gate, snap.httpVersion, snap.status, snap.headers)
+    var cd = initCappedDecoder(decompress, cap)
+    var stopped = false
+    template deliver() =
+      if not eff.isNil:
+        try:
+          deliverChunk(cd, eff, h2.takeBody(sid), h2.respHeader(sid, "content-encoding"))
+        except SinkStopSignal:
+          stopped = true
+    deliver()                            # body queued during the header read
+    while not stopped and not h2.streamDone(sid):
+      let chunk = await recvSome(transport)
+      if chunk.len == 0: break
+      let toSend = h2.feed(chunk)
+      if toSend.len > 0: await sendAll(transport, toSend)
+      deliver()
+    if stopped:
+      let rst = h2.resetStream(sid)      # stop the peer; the connection stays reusable
+      if rst.len > 0: await sendAll(transport, rst)
+      var r = snap
+      r.body = ""
+      r.bodyTruncated = true
+      r
+    else:
+      let wasReset = h2.streamReset(sid)
+      let tooLarge = h2.streamTooLarge(sid)
+      let unprocessed = h2.streamUnprocessed(sid)
+      let connErr = h2.connError
+      let done = h2.streamDone(sid)
+      let lengthBad = h2.streamLengthMismatch(sid)
+      var r = toResponse(h2.takeResponse(sid))
+      raiseH2Terminal(H2Terminal(connErr: connErr, tooLarge: tooLarge,
+        unprocessed: unprocessed, wasReset: wasReset or r.status == 0, done: done,
+        lengthBad: lengthBad, decoderComplete: eff.isNil or cd.streamComplete))
+      if not eff.isNil: r.body = ""      # delivered incrementally above
+      r
 
 template h2SendAndReadHeaders*(transport, h2, req: typed): uint32 =
   ## Open an h2 stream, send the request (including a streamed upload body), and
@@ -396,8 +456,43 @@ template h2DrainBody*(transport, h2, sid, sink, decompress, cap: typed) =
       unprocessed: unprocessed, wasReset: wasReset, done: done,
       lengthBad: lengthBad, decoderComplete: cd.streamComplete))
 
+template h1GatedFinish*(transport, parser, sink, gate, keep,
+                        decompress, cap: typed): Response =
+  ## Finish an h1 exchange whose headers are already parsed, routing the body either
+  ## to the gated `sink` (when the gate wants this response delivered) or to the
+  ## buffered path. Used at the three h1 drain sites when a user sink + gate are set.
+  ## On a gated stop (the sink returned false -> SinkStopSignal) the body is left ""
+  ## and `bodyTruncated` set, and the connection is not kept (keep = false), since a
+  ## partially-read h1 response cannot be pooled.
+  mixin await, recvSome, BodySink
+  block:
+    let snap = parser.toResponse()      # headers-only snapshot for the gate
+    let eff = effectiveSink(sink, gate, snap.httpVersion, snap.status, snap.headers)
+    var truncated = false
+    if eff.isNil:
+      setStreaming(parser, false)       # buffer: bytes that arrived with the headers
+      var k = false                     # migrate from `pending` into `body`
+      h1DrainBody(transport, parser, BodySink(nil), k, decompress, cap)
+      keep = k
+    else:
+      var k = false
+      try:
+        h1DrainBody(transport, parser, eff, k, decompress, cap)
+        keep = k
+      except SinkStopSignal:
+        truncated = true
+        keep = false                    # a stopped h1 body left bytes on the wire
+    var r = parser.toResponse()
+    if not eff.isNil: r.body = ""        # delivered (or partly delivered) to the sink
+    if truncated:
+      r.trailers = initHeaders()         # trailers are absent on an early stop, even
+                                         # when they had already been parsed off the wire
+    r.bodyTruncated = truncated
+    r
+
 template serveOnce(client, pc, rq, sink, key, gotResponse: typed;
-                   asyncStream: typed = nil): Response =
+                   asyncStream: typed = nil; userSink: typed = nil;
+                   gate: typed = nil): Response =
   ## Run one request/response over the pooled connection `pc` -- reused or freshly
   ## opened -- then return `pc` to the idle pool if it may be kept, else close it.
   ## `pc.h2` set means an established h2 connection; otherwise HTTP/1.1, unless the
@@ -411,34 +506,46 @@ template serveOnce(client, pc, rq, sink, key, gotResponse: typed;
   ## on success, so a pooled connection is never double-closed.
   mixin sendAll, await, BodySink
   block:
+    let gated = not userSink.isNil and not gate.isNil
     var r: Response
     var keep = false
     if pc.h2 != nil or pc.transport.protocol == "h2":
       if pc.h2 == nil:
         pc.h2 = initH2Conn(client.config.maxResponseBytes)
         await sendAll(pc.transport, pc.h2.preamble())
-      r = h2Stream(pc.transport, pc.h2, rq, sink,
-                   client.config.wantsDecompress, client.config.maxResponseBytes)
+      if gated:
+        r = h2GatedStream(pc.transport, pc.h2, rq, userSink, gate,
+                          client.config.wantsDecompress, client.config.maxResponseBytes)
+      else:
+        r = h2Stream(pc.transport, pc.h2, rq, sink,
+                     client.config.wantsDecompress, client.config.maxResponseBytes)
       keep = pc.h2.canReuse
     else:
       gotResponse = false
-      var parser = h1SendAndReadHeaders(pc.transport, rq, not sink.isNil, asyncStream)
+      var parser = h1SendAndReadHeaders(pc.transport, rq,
+                     not sink.isNil or gated, asyncStream)
       gotResponse = true
-      h1DrainBody(pc.transport, parser, sink, keep,
-                  client.config.wantsDecompress, client.config.maxResponseBytes)
-      r = parser.toResponse()
+      if gated:
+        r = h1GatedFinish(pc.transport, parser, userSink, gate, keep,
+                          client.config.wantsDecompress, client.config.maxResponseBytes)
+      else:
+        h1DrainBody(pc.transport, parser, sink, keep,
+                    client.config.wantsDecompress, client.config.maxResponseBytes)
+        r = parser.toResponse()
     if not (keep and pushIdle(client.pool, key, pc)):
       await close(pc.transport)
     r
 
-template poolTransport*(client, req, sink: typed; asyncStream: typed = nil): Response =
+template poolTransport*(client, req, sink: typed; asyncStream: typed = nil;
+                        userSink: typed = nil; gate: typed = nil): Response =
   ## Pool-based transport: reuse a pooled connection (http/1.1 or a persistent
   ## h2 connection) or open a fresh one, negotiating the protocol via ALPN.
   ## One request at a time per connection. Used by the sync entry. `asyncStream`
   ## is accepted for signature parity with `transportInner` (an awaited upload
   ## producer) but is always nil here: the sync backend has no event loop to await
   ## a producer, so an async producer never reaches this path (it fails to compile
-  ## at the sync `request` entry).
+  ## at the sync `request` entry). `userSink`/`gate` (when set) stream the FINAL
+  ## response body to the caller's gated sink; nil for the buffered/stream() paths.
   mixin connect, sendAll, recvSome, close, rearm, await, BodySink
   block:
     var rq = req
@@ -465,10 +572,14 @@ template poolTransport*(client, req, sink: typed; asyncStream: typed = nil): Res
       # case via UnprocessedError, so treat its failures as post-response.
       var gotResponse = true
       try:
-        resp = serveOnce(client, pc, rq, sink, key, gotResponse, asyncStream)
+        resp = serveOnce(client, pc, rq, sink, key, gotResponse, asyncStream,
+                         userSink, gate)
         served = true
       except CatchableError as e:
         await close(pc.transport)  # pooled connection was stale
+        # A half-delivered gated body must never be replayed onto a fresh connection
+        # (it would double-feed the sink): once the sink has been fed, propagate.
+        if gate != nil and gate.fed: raise
         # Fall through to a fresh connection only when replaying is safe. A reused
         # keep-alive connection can be dropped by the server at any time; a failure
         # BEFORE any response byte means the request was almost certainly not
@@ -494,30 +605,39 @@ template poolTransport*(client, req, sink: typed; asyncStream: typed = nil): Res
       # of leaking the fd/TLS handle. serveOnce's pool/close decision runs only on
       # success, so a pooled connection is never double-closed.
       try:
-        resp = serveOnce(client, npc, rq, sink, key, gotResponse, asyncStream)
+        resp = serveOnce(client, npc, rq, sink, key, gotResponse, asyncStream,
+                         userSink, gate)
       except CatchableError:
         await close(transport)
         raise
     resp
 
-template run(client, req, sink: typed; asyncStream: typed = nil): Response =
+template run(client, req, sink: typed; asyncStream: typed = nil;
+             userSink: typed = nil; gate: typed = nil): Response =
   ## Cookie handling around the backend's transport step. `transport` is
   ## resolved per entry: pool-based for sync, mux-based for the async backends.
   ## `asyncStream` (async only) is an awaited upload producer forwarded to the
   ## transport; nil on the sync path, where `transport` takes only (client, rq, sink).
+  ## `userSink`/`gate` (when set) stream the final response body to the caller's
+  ## gated sink; the `when compiles` ladder picks the widest form each backend's
+  ## `transport` accepts, so the buffered `stream()`/batch call sites (no gate) and
+  ## the sync path (no asyncStream) all compile unchanged.
   mixin transport, await
   block:
     var rq = req
     validateRequest(rq)                # reject header/host CR-LF injection
     applyCookies(client.jar, rq)
-    when compiles(transport(client, rq, sink, asyncStream)):
+    when compiles(transport(client, rq, sink, asyncStream, userSink, gate)):
+      var resp = await transport(client, rq, sink, asyncStream, userSink, gate)
+    elif compiles(transport(client, rq, sink, asyncStream)):
       var resp = await transport(client, rq, sink, asyncStream)
     else:
       var resp = await transport(client, rq, sink)
     storeCookies(client.jar, rq.url, resp)
     resp
 
-template maybeDigest(client, rreq, resp, digestOrigin: typed) =
+template maybeDigest(client, rreq, resp, digestOrigin: typed;
+                     userSink: typed = nil; gate: typed = nil) =
   ## On a 401 Digest challenge, when digest auth is configured, the request
   ## carries no Authorization yet, and it is still on the origin the credentials
   ## were configured for, compute the response and retry once. The origin check
@@ -525,7 +645,9 @@ template maybeDigest(client, rreq, resp, digestOrigin: typed) =
   ## target (mirroring the Authorization stripping in `redirectRequest`; without
   ## it, digest would bypass that protection since the strip clears the header the
   ## first condition tests). Expands inline so the retry's `await`s run in the
-  ## caller's async proc.
+  ## caller's async proc. `userSink`/`gate` (when set) stream a digest-protected
+  ## FINAL body: the one-shot replay clears `gate.digestReady` first (its response is
+  ## the surfaced one, so its body may reach the sink) and forwards the user sink.
   mixin BodySink
   # A streamed body (`bodyStream`) is never retried: its producer was pulled to
   # EOF on the first attempt and cannot rewind, so a digest replay would send a
@@ -542,22 +664,36 @@ template maybeDigest(client, rreq, resp, digestOrigin: typed) =
         $rreq.verb, rreq.url.requestTarget, chal.get)
       if auth.len > 0:                 # "" means the challenge algorithm is unsupported
         rreq.headers["authorization"] = auth
-        resp = run(client, rreq, BodySink(nil))
+        if gate != nil: gate.digestReady = false  # the replay's response is surfaced
+        resp = run(client, rreq, BodySink(nil), nil, userSink, gate)
 
-template followRedirects(client, startReq, resp: typed; asyncStream: typed = nil) =
+template followRedirects(client, startReq, resp: typed; asyncStream: typed = nil;
+                         userSink: typed = nil; gate: typed = nil) =
   ## Issue `startReq`, following redirects into `resp`. Expands inline so its
   ## `await`s run in the caller's async proc. `asyncStream` (async only) is the
   ## awaited upload producer for the initial send; a streamed request is
   ## non-replayable, so it breaks before any redirect rewrite (below) and the
-  ## producer is never pulled a second time.
+  ## producer is never pulled a second time. `userSink`/`gate` (when set) stream the
+  ## FINAL body: this loop refreshes the gate's per-hop fields (hops, limit, whether
+  ## this hop is replayable, and whether digest is still armed) before each `run`, so
+  ## the drain site can tell whether the response is the surfaced one.
   mixin BodySink
   var rreq = startReq
   let digestOrigin = originKey(startReq.url)   # digest creds only for this origin
   var hops = 0
   let limit = client.config.redirectLimit
   while true:
-    resp = run(client, rreq, BodySink(nil), asyncStream)
-    maybeDigest(client, rreq, resp, digestOrigin)
+    if gate != nil:
+      gate.hops = hops
+      gate.redirectLimit = limit
+      gate.hopReplayable = isReplayable(rreq)
+      # Digest is only in play on the original origin, before an Authorization is set
+      # (mirrors maybeDigest's own guard); off any other hop the 401 is surfaced.
+      gate.digestReady = client.config.auth.kind == akDigest and
+        not rreq.headers.contains("authorization") and
+        originKey(rreq.url) == digestOrigin
+    resp = run(client, rreq, BodySink(nil), asyncStream, userSink, gate)
+    maybeDigest(client, rreq, resp, digestOrigin, userSink, gate)
     decodeBody(resp, client.config)
     let location = resp.headers.get("location")
     if shouldFollowRedirect(resp.status, hops, limit, location):
@@ -574,7 +710,8 @@ template followRedirects(client, startReq, resp: typed; asyncStream: typed = nil
       break
 
 template performRequest*(client, req0: typed; cancel: CancelToken = nil;
-                         asyncStream: typed = nil): Response =
+                         asyncStream: typed = nil; userSink: typed = nil;
+                         gate: typed = nil): Response =
   ## Buffered request with the full policy layer: retries with backoff, redirect
   ## following, decompression, size cap, and throw-on-non-2xx. Middleware (which
   ## can wrap, short-circuit, or observe) is composed around this by the entry
@@ -586,12 +723,28 @@ template performRequest*(client, req0: typed; cancel: CancelToken = nil;
   ## The request that carries one flags `hasStreamedBody`, so `isReplayable` treats
   ## it as non-replayable: it is sent once and never retried/redirected/digest-replayed,
   ## exactly like a sync `bodyStream`.
+  ##
+  ## `userSink`/`gate` (when set) stream the FINAL response body to the caller's gated
+  ## sink. The gate is filled once here with the retry/surfacing mirror (and its
+  ## `attempt` updated per iteration); the streaming drain site is a best-effort
+  ## optimization. The delivery RULE is enforced in ONE place: the fallback below.
+  ## After the policy layer has settled on the surfaced response, if the sink was set,
+  ## the body was not already streamed to it (bodyTruncated) and a buffered body
+  ## remains, the whole (already decoded) body is delivered in one sink call and the
+  ## body cleared. So a gate miss (retry-budget-exhausted final, unsupported digest
+  ## algorithm, the h3 leg) still delivers the final body exactly once.
   mixin sleep, BodySink
   block:
     var req = req0
     var resp: Response
     var attempt = 0
     let policy = client.config.retry
+    if gate != nil:
+      gate.retryReplayable = isReplayable(req)
+      gate.retryVerb = req.verb
+      gate.policy = policy
+      gate.wantsThrow = client.config.wantsThrow
+      gate.http = client.config.http
     # `config.timeouts.total` covers the whole request including retries/redirects
     # and their backoff sleeps. The async backends enforce that with an outer `guard`
     # that aborts in-flight IO; the sync/batch paths have no such guard, so they carry
@@ -610,11 +763,21 @@ template performRequest*(client, req0: typed; cancel: CancelToken = nil;
     while true:
       throwIfCancelled(cancel)
       req.deadlineMs = deadline.attemptBudgetMs   # this attempt gets the time that remains
+      if gate != nil: gate.attempt = attempt
       var gotResp = false
       try:
-        followRedirects(client, req, resp, asyncStream)
+        followRedirects(client, req, resp, asyncStream, userSink, gate)
         gotResp = true
       except CatchableError as e:
+        # A half-delivered gated body must never be re-issued (it would double-feed
+        # the sink), so once the sink has been fed, propagate rather than retry.
+        if gate != nil and gate.fed: raise
+        # On the gated-sink path a cap breach is raised mid-drain (inside the retry
+        # loop) rather than after it as on the buffered path; retrying it is pointless
+        # (the response is deterministic) and would double-hit the sink budget, so
+        # surface it straight away. Mirrors the buffered path, where enforceMaxResponse
+        # raises after the loop and is never retried.
+        if gate != nil and (e of ResponseTooLargeError): raise
         # A provably-unprocessed request (h2 REFUSED_STREAM / above GOAWAY) is
         # safe to retry even when non-idempotent.
         if not shouldRetryAfterError(attempt, bodyReplayable, e of UnprocessedError,
@@ -637,5 +800,25 @@ template performRequest*(client, req0: typed; cancel: CancelToken = nil;
     enforceMaxResponse(resp, client.config.maxResponseBytes)
     enforceProtocol(client.config, resp.httpVersion)  # strict: used proto in config.http
     if client.config.wantsThrow and not resp.ok:
-      raiseHttpError(req, resp)
+      raiseHttpError(req, resp)      # HttpError carries the buffered body
+    # Delivery-rule fallback: the surfaced response is settled. If a gated sink was
+    # set, the body was not already streamed to it (bodyTruncated) and a buffered body
+    # remains, deliver the whole (already decodeBody-decoded) body in ONE sink call,
+    # then clear it. This is the single place the delivery rule is enforced; the
+    # streaming drain sites are just an optimization the gate may skip. A `false`
+    # returned on this single call does NOT set bodyTruncated (the body WAS fully
+    # transferred), so the wrapped sink's SinkStopSignal is caught and discarded here.
+    when compiles(await userSink("")):
+      if not userSink.isNil and resp.body.len > 0 and not resp.bodyTruncated:
+        try:
+          # The wrapped sink is a bare closure (portable to js), so it carries no
+          # chronos raises annotation; navi's contract is it raises at most
+          # CatchableError -- discharge chronos's strict gcsafe/raises here, as the
+          # deliverChunk path does.
+          {.cast(gcsafe).}:
+            {.cast(raises: [CatchableError]).}:
+              await userSink(resp.body)
+        except SinkStopSignal:
+          discard
+        resp.body = ""
     resp

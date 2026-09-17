@@ -13,7 +13,7 @@ import navi/private/[entryguard, streamguard]
 import navi/proto/sse
 import navi/core/public
 import navi/core/[engine, pool, session, decompress, redirect, retry, proxy, h2glue]
-import navi/core/[cookies, digest, cancel, url]
+import navi/core/[cookies, digest, cancel, url, sinkgate]
 import navi/proto/h1
 import navi/proto/h2/conn
 import navi/proto/ws
@@ -37,6 +37,9 @@ type
     clientv: Navi            ## the owning client (see `client`)
     cancel: CancelToken      ## caller's cancellation token, or nil
     idx: int                 ## index of the next middleware to run
+    userSink: BodySink       ## wrapped gated response sink (nil for a buffered call);
+                             ## forwarded to the request core once the chain is spent
+    gate: SinkGate           ## the sink's delivery gate (nil for a buffered call)
   NaviMiddleware* = proc(ctx: NaviContext) {.closure.}
     ## A middleware step: read/modify `ctx.req`, call `ctx.next()` to proceed --
     ## or skip it to short-circuit -- then read/modify `ctx.res`. Run in order;
@@ -175,28 +178,39 @@ when defined(naviHttp3):
     finally:
       conn.close()
 
-proc transport(client: Navi, req: Request, sink: BodySink): Response =
+proc transport(client: Navi, req: Request, sink: BodySink,
+               asyncStream: BodyProducer = nil,
+               userSink: BodySink = nil, gate: SinkGate = nil): Response =
   ## Pool-based transport (one request per connection at a time). In a
   ## `-d:naviHttp3` build, a GET to an origin that has advertised h3 (Alt-Svc) is
   ## sent over HTTP/3; any QUIC failure falls back to h2/h1. The h3 endpoint is
   ## learned from the `alt-svc` header captured on prior h2/h1 responses.
+  ##
+  ## `asyncStream` is accepted for signature parity with the async backends' wider
+  ## `run` form but is always nil here (the sync backend has no event loop). `userSink`
+  ## / `gate` (when set) stream the FINAL response body to the caller's gated sink; the
+  ## h3 leg stays buffered (the performRequest fallback delivers its final body).
+  if asyncStream != nil: discard   # accepted for parity; never set on the sync path
   when defined(naviHttp3):
     # Any verb may use h3, whether its body is buffered or streamed (bodyStream is
-    # pulled over the h3 request stream, just like h2).
+    # pulled over the h3 request stream, just like h2). The h3 body is buffered here;
+    # the gated sink is fed by the performRequest fallback, not this leg.
     if client.config.wantsH3 and req.url.isTls:
       let ep = client.altSvc.h3Endpoint("https", req.url.host, req.url.port)
       if ep.isSome:
         try: return h3Transport(client, req, ep.get)
         except QuicError: discard   # fall back to the h2/h1 transport below
-  result = poolTransport(client, req, sink)
+  result = poolTransport(client, req, sink, nil, userSink, gate)
   when defined(naviHttp3):
     let alt = result.headers.get("alt-svc")
     if alt.len > 0:
       client.altSvc.record("https", req.url.host, req.url.port, alt)
 
-proc runCore(client: Navi, req: Request, cancel: CancelToken): Response =
-  ## The innermost `next`: the full policy layer for one buffered request.
-  performRequest(client, req, cancel)
+proc runCore(client: Navi, req: Request, cancel: CancelToken,
+             userSink: BodySink = nil, gate: SinkGate = nil): Response =
+  ## The innermost `next`: the full policy layer for one buffered request. `userSink`
+  ## / `gate` (when set) stream the final response body to the caller's gated sink.
+  performRequest(client, req, cancel, nil, userSink, gate)
 
 proc client*(ctx: NaviContext): Navi = ctx.clientv
   ## The client handling this request (e.g. to read `ctx.client.config`).
@@ -206,22 +220,44 @@ proc next*(ctx: NaviContext) =
   ## exhausted -- the request itself. The outcome lands in `ctx.res`.
   let mws = ctx.clientv.config.middleware
   if ctx.idx >= mws.len:
-    ctx.res = runCore(ctx.clientv, ctx.req, ctx.cancel)
+    ctx.res = runCore(ctx.clientv, ctx.req, ctx.cancel, ctx.userSink, ctx.gate)
   else:
     let m = mws[ctx.idx]
     inc ctx.idx
     m(ctx)
+
+proc wrapSink(s: GatedBodySink, gate: SinkGate): BodySink =
+  ## Adapt a caller's gated sink into the internal `BodySink` the engine drains into:
+  ## mark the gate as fed (so the replay guards bar a retry) before each delivery, and
+  ## turn a `false` return into a `SinkStopSignal` the drain site catches and converts
+  ## to a normal early stop. Nil in -> nil out (no sink).
+  if s.isNil: return nil
+  result = proc(data: string) {.closure, raises: [CatchableError].} =
+    gate.fed = true
+    if not s(data):
+      raise newException(SinkStopSignal, "navi: sink requested early stop")
+
+proc wrapSink(s: BodySink, gate: SinkGate): BodySink =
+  ## Adapt a caller's void sink (always continue) into the internal `BodySink`, marking
+  ## the gate as fed before each delivery. Nil in -> nil out.
+  if s.isNil: return nil
+  result = proc(data: string) {.closure, raises: [CatchableError].} =
+    gate.fed = true
+    s(data)
 
 proc requestResolved(client: Navi, verb: HttpVerb, target: string,
                      headers: Headers, body: ResolvedBody,
                      form: seq[(string, string)],
                      params: seq[(string, string)],
                      cancel: CancelToken,
-                     trailers: Headers): Response =
+                     trailers: Headers,
+                     userSink: BodySink = nil, gate: SinkGate = nil): Response =
   let req = buildRequest(client.config, verb, target, headers, body,
                          form, params, trailers)
-  if client.config.middleware.len == 0: return runCore(client, req, cancel)
-  let ctx = NaviContext(req: req, clientv: client, cancel: cancel)
+  if client.config.middleware.len == 0:
+    return runCore(client, req, cancel, userSink, gate)
+  let ctx = NaviContext(req: req, clientv: client, cancel: cancel,
+                        userSink: userSink, gate: gate)
   ctx.next()
   ctx.res
 
@@ -241,6 +277,38 @@ proc request*[B](client: Navi, verb: HttpVerb, target: string,
   ## the whole call.
   requestResolved(client, verb, target, headers, toBody(body), form, params,
                   cancel, trailers)
+
+proc request*[B](client: Navi, verb: HttpVerb, target: string,
+                 headers: Headers, body: B, sink: GatedBodySink,
+                 form: seq[(string, string)] = @[],
+                 params: seq[(string, string)] = @[],
+                 cancel: CancelToken = nil,
+                 trailers = initHeaders()): Response =
+  ## Like `request`, but streams the FINAL response body to `sink` instead of
+  ## buffering it into `res.body`. The full policy layer still runs (redirects,
+  ## retries, digest, middleware, throw-on-non-2xx): only the body of the response
+  ## actually surfaced to you reaches the sink; redirect/retry/digest/thrown-error
+  ## bodies never do (an `HttpError` still carries its buffered body). `sink` returns
+  ## `bool`: `true` keeps going, `false` stops the download early -- the request then
+  ## returns normally with `res.body == ""` and `res.bodyTruncated == true`. On a full
+  ## drain `res.body` is "" and any trailers are populated; HEAD/204/304 never call it.
+  let gate = newSinkGate()
+  requestResolved(client, verb, target, headers, toBody(body), form, params,
+                  cancel, trailers, wrapSink(sink, gate), gate)
+
+proc request*[B](client: Navi, verb: HttpVerb, target: string,
+                 headers: Headers, body: B, sink: BodySink,
+                 form: seq[(string, string)] = @[],
+                 params: seq[(string, string)] = @[],
+                 cancel: CancelToken = nil,
+                 trailers = initHeaders()): Response =
+  ## Like the gated `request` overload, but `sink` is a void `BodySink` (always
+  ## continue): the FINAL response body streams to it and cannot be stopped early, so
+  ## `res.bodyTruncated` is never set by it. Convenient when you always want the whole
+  ## body pushed to your sink.
+  let gate = newSinkGate()
+  requestResolved(client, verb, target, headers, toBody(body), form, params,
+                  cancel, trailers, wrapSink(sink, gate), gate)
 
 include navi/private/stream_download
 include navi/private/sse_stream

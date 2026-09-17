@@ -158,6 +158,7 @@ Every client shares the same API, and the below table details where they differ.
 | Keep-alive / connection pool | ✓ | ✓ | ✓ | ✗ |
 | Streaming upload | ✓ | ✓ | ✓ | buffered |
 | Streaming download (pull) | ✓ | ✓ | ✓ | ✓ |
+| Sink download (push, `sink =`) | ✓ | ✓ | ✓ | ✓ |
 | Cookie jar | ✓ | ✓ | ✓ | ✓ |
 | Proxy (HTTP + SOCKS5) | ✓ | ✓ | ✓ | ✗ |
 | Unix domain sockets | ✓ | ✓ | ✓ | ✗ |
@@ -331,6 +332,10 @@ discard api.request(POST, "path", body = payload)
 # block on h2/h3). Same shape as headers; a buffered body is sent chunked when set.
 discard api.request(POST, "path", body = payload,
                     trailers = initHeaders({"x-checksum": "abc123"}))
+
+# Push the response body to a sink instead of buffering it (the full policy layer
+# still runs); see the "Sink downloads (push)" subsection under Streaming.
+discard api.get("path", sink = proc(chunk: string): bool = writeChunk(chunk); true)
 ```
 
 ### Responses
@@ -824,6 +829,55 @@ starving the other multiplexed streams or blocking the connection reader) instea
 of the body piling up in memory. Over HTTP/1.1 the awaited consumer pauses the read
 loop, which back-pressures the peer through TCP. The size cap
 (`maxResponseBytes`) is enforced incrementally on the streamed bytes.
+
+#### Sink downloads (push)
+
+`stream()` is the pull model: you drive the body. `request(..., sink = ...)` is the
+push model: you keep the full `request` policy layer (redirects, retries, digest,
+middleware, throw-on-non-2xx) and navi pushes the **final** response's body to your
+sink chunk by chunk instead of buffering it into `res.body`. When the sink consumed
+the body, `res.body` is `""`; the status, headers, and (on a full drain) trailers are
+still populated.
+
+A **bool** sink returns `true` to keep going or `false` to stop the download early.
+On `false` the request returns **normally** with `res.bodyTruncated == true` and
+`res.body == ""` (an early-stopped body has no trailers). Chunks are `string` on the
+native clients and `seq[byte]` on `navi/js`:
+
+```nim
+var file = open("out.bin", fmWrite)
+let res = api.get("https://example.com/large", sink = proc(chunk: string): bool =
+  discard file.writeBuffer(unsafeAddr chunk[0], chunk.len)
+  file.getFilePos() < 10_000_000)          # stop once we've written 10 MB
+file.close()
+if res.bodyTruncated: echo "stopped early"
+```
+
+A **void** sink always continues (it cannot stop early, so `bodyTruncated` stays
+false):
+
+```nim
+let res = api.get("url", sink = proc(chunk: string) = process(chunk))
+```
+
+On the **async** clients the sink is awaited (`proc(chunk): Future[bool]` /
+`Future[void]`), so a slow sink back-pressures the peer exactly like `each` above:
+
+```nim
+let res = await api.get("url", sink = proc(chunk: string): Future[bool] {.async.} =
+  await outFile.write(chunk); return true)
+```
+
+The **delivery rule** is that only the body of the response actually surfaced to you
+reaches the sink. A redirect hop, a digest 401 challenge, a retryable status that is
+retried, and (with `throwHttpErrors` on) a thrown non-2xx body never do; on a thrown
+non-2xx the `HttpError.response.body` still carries the buffered body, and the sink
+is not called. `HEAD`, `204`, and `304` responses have no body, so the sink is never
+called for them. A gzip/deflate/br/zstd body is decoded before it reaches the sink.
+
+On a `-d:naviHttp3` build the HTTP/3 leg buffers the final body internally and then
+hands it to the sink in one call (the h1/h2 legs stream it incrementally); the
+delivery rule and early-stop semantics are the same either way.
 
 The request `body` is dispatched by type. A `string` is the raw body; a `JsonNode`
 is sent as JSON; a `Multipart` as `multipart/form-data`; a `BodyProducer`, a closure

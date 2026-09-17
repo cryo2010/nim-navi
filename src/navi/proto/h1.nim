@@ -118,6 +118,20 @@ proc emitBody(p: var H1Parser, chunk: string) =
   else:
     p.body.add(chunk)
 
+proc setStreaming*(p: var H1Parser, streaming: bool) =
+  ## Flip the streaming flag after the headers are in (the gated-drain path decides
+  ## whether to stream only once status/headers are known). Turning streaming OFF
+  ## migrates any body bytes that arrived alongside the headers from `pending` (where
+  ## the streaming `emitBody` routed them) into `body`, so the buffered drain below
+  ## and `toResponse` see them; from here `emitBody` appends to `body`. Turning it ON
+  ## does the reverse move so a later `takeBody` delivers them.
+  if p.streaming == streaming: return
+  if streaming:
+    p.pending.add(move(p.body))
+  else:
+    p.body.add(move(p.pending))
+  p.streaming = streaming
+
 proc takeBody*(p: var H1Parser): string =
   ## Move the streaming body received so far out of the parser, leaving it empty.
   ## The engine drains this per feed, decodes it, and hands it to the sink, so raw

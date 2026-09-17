@@ -11,7 +11,7 @@ when not defined(js):
 
 import std/[asyncjs, jsffi]
 from std/strutils import cmpIgnoreCase
-import ../core/[headers, url, request, response, cancel]
+import ../core/[headers, url, request, response, cancel, sinkgate]
 
 type
   BodySink* = proc(data: seq[byte]): Future[void] {.closure.}
@@ -26,6 +26,15 @@ type
     ## binary-clean representation here -- a Nim js `string` is a JS (UTF-16) string,
     ## so routing bytes through it risks the same lossiness as the buffered `.text()`
     ## path. Portable sinks targeting both js and native must handle both element types.
+
+  GatedBodySink* = proc(data: seq[byte]): Future[bool] {.closure.}
+    ## A response sink for `request()` that can stop the download early. Like
+    ## `BodySink` it receives decoded body chunks of the FINAL surfaced response
+    ## (`seq[byte]`, from a JS Uint8Array) and is awaited (backpressure), but returns
+    ## `Future[bool]`: `true` keeps the transfer going, `false` stops it cleanly (the
+    ## request returns normally with `res.body == ""` and `res.bodyTruncated == true`,
+    ## the fetch body aborted). Only the final response's body is delivered;
+    ## redirect/retry/thrown-error bodies never reach it.
 
   AsyncBodyProducer* = proc(): Future[string] {.closure.}
     ## Pull-based upload source for the js backend, accepted by `body` for API parity
@@ -136,24 +145,36 @@ proc readOne*(reader: JsObject): Future[seq[byte]] {.async.} =
     return bytes
 
 proc fetchExchange*(req: Request, sink: BodySink, timeout = 0,
-                    cancel: CancelToken = nil, cap = 0): Future[Response] {.async.} =
+                    cancel: CancelToken = nil, cap = 0,
+                    userSink: BodySink = nil, gate: SinkGate = nil): Future[Response] {.async.} =
   ## One request/response through `fetch`. With a `sink`, the body streams to it
   ## and `Response.body` is left empty; otherwise the body is buffered. A nonzero
   ## `timeout` aborts the fetch after that many ms; `cancel` aborts it on demand.
   ## `cap` (when > 0) caps the streamed body size.
+  ##
+  ## `userSink`/`gate` (when set) are the buffered `request()` gated-sink path: after
+  ## the headers arrive the gate decides whether this response is surfaced; if so the
+  ## body streams to `userSink` (a wrapped sink that raises `SinkStopSignal` on an
+  ## early stop, which aborts the fetch body and returns a truncated response); if not
+  ## the body is buffered for the policy layer. To make the early-stop abort possible
+  ## an AbortController is always created when `userSink` is set (folded into the
+  ## signal combination), even without a cancel token or timeout.
   var controller: JsObject
   let wantCancel = cancel != nil
-  if wantCancel:
+  let wantGated = not userSink.isNil and not gate.isNil
+  if wantCancel or wantGated:
     controller = newAbortController()
-    cancel.armHook(proc() {.gcsafe, raises: [].} = controller.abort())
+    if wantCancel:
+      cancel.armHook(proc() {.gcsafe, raises: [].} = controller.abort())
   var signal: JsObject
-  if wantCancel and timeout > 0: signal = anySignal(signalOf(controller), abortAfter(timeout))
-  elif wantCancel:               signal = signalOf(controller)
-  elif timeout > 0:              signal = abortAfter(timeout)
+  let haveController = wantCancel or wantGated
+  if haveController and timeout > 0: signal = anySignal(signalOf(controller), abortAfter(timeout))
+  elif haveController:               signal = signalOf(controller)
+  elif timeout > 0:                  signal = abortAfter(timeout)
   var res: JsObject
   try:
     res = await fetch(cstring(req.url.absoluteTarget),
-                      buildInit(req, signal, wantCancel or timeout > 0))
+                      buildInit(req, signal, haveController or timeout > 0))
   except:  # noqa: bare - a fetch rejection is a native JS error (no Nim m_type),
            # so a typed `except` would re-raise it. Surface it as a Nim exception
            # the retry loop and user `try/except` can handle like any transport error.
@@ -162,7 +183,25 @@ proc fetchExchange*(req: Request, sink: BodySink, timeout = 0,
     raise newException(IOError, "navi: fetch failed: " & getCurrentExceptionMsg())
   finally:
     if wantCancel: cancel.disarmHook()
-  if sink.isNil:
+  if wantGated:
+    # js `fetch` hides the negotiated version, so httpVersion is "" (protocolAllowed
+    # passes on js, http == {}); the redirect/digest mirrors are inert (fetch follows
+    # redirects itself, js has no digest), so the gate reduces to the retry/throw
+    # decisions the js retry mirror fills.
+    let snap = toResponse(res, "")
+    if gate.wantsDelivery("", snap.status, snap.headers):
+      try:
+        await drainToSink(res, userSink, cap)
+      except SinkStopSignal:
+        abort(controller)              # stop the body stream; the request still returns
+        var r = toResponse(res, "")
+        r.bodyTruncated = true
+        return r
+      return toResponse(res, "")
+    # Not surfaced: buffer for the policy layer (the runCore fallback delivers a
+    # surfaced final body via the same userSink).
+    result = toResponse(res, $(await jsText(res)))
+  elif sink.isNil:
     result = toResponse(res, $(await jsText(res)))
   else:
     await drainToSink(res, sink, cap)
