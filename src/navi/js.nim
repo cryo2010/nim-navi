@@ -298,8 +298,12 @@ proc request*[B](client: Navi, verb: HttpVerb, target: string,
   ## `bool`: `false` stops the download early -- the fetch body is aborted and the
   ## request returns normally with `res.body == ""` and `res.bodyTruncated == true`.
   let gate = newSinkGate()
-  requestResolved(client, verb, target, headers, toBody(body), form, params,
-                  cancel, trailers, nil, wrapSink(sink, gate), gate)
+  when B is AsyncBodyProducer:
+    requestResolved(client, verb, target, headers, ResolvedBody(), form, params,
+                    cancel, trailers, body, wrapSink(sink, gate), gate)
+  else:
+    requestResolved(client, verb, target, headers, toBody(body), form, params,
+                    cancel, trailers, nil, wrapSink(sink, gate), gate)
 
 proc request*[B](client: Navi, verb: HttpVerb, target: string,
                  headers: Headers, body: B, sink: BodySink,
@@ -310,8 +314,12 @@ proc request*[B](client: Navi, verb: HttpVerb, target: string,
   ## Like the gated `request` overload, but `sink` is a void `BodySink` (always
   ## continue): the FINAL response body streams to it and cannot be stopped early.
   let gate = newSinkGate()
-  requestResolved(client, verb, target, headers, toBody(body), form, params,
-                  cancel, trailers, nil, wrapSink(sink, gate), gate)
+  when B is AsyncBodyProducer:
+    requestResolved(client, verb, target, headers, ResolvedBody(), form, params,
+                    cancel, trailers, body, wrapSink(sink, gate), gate)
+  else:
+    requestResolved(client, verb, target, headers, toBody(body), form, params,
+                    cancel, trailers, nil, wrapSink(sink, gate), gate)
 
 # --- Streaming downloads (pull-based handle) ---
 
