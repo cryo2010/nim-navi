@@ -27,6 +27,13 @@ type
     ## so routing bytes through it risks the same lossiness as the buffered `.text()`
     ## path. Portable sinks targeting both js and native must handle both element types.
 
+  AsyncBodyProducer* = proc(): Future[string] {.closure.}
+    ## Pull-based upload source for the js backend, accepted by `body` for API parity
+    ## with the native async backends. `fetch` cannot stream a request body, so it is
+    ## drained (awaited chunk by chunk) into a buffered body before sending, exactly
+    ## like the sync `BodyProducer` on js. Its `Future` is `std/asyncjs`'s. Returns
+    ## the next chunk, or "" at end of body.
+
 # --- fetch / DOM bindings ---
 proc fetch(url: cstring, init: JsObject): Future[JsObject] {.importjs: "fetch(#, #)".}
 proc newHeaders(): JsObject {.importjs: "new Headers()".}

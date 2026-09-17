@@ -31,6 +31,16 @@ type
     ## the chunk crosses an `await` so it must be owned, not a borrowed view; being
     ## navi's own body type lets the engine move each chunk in with no copy.
 
+  AsyncBodyProducer* = proc(): Future[string] {.closure.}
+    ## Pull-based upload source for the asyncdispatch backend: returns the next body
+    ## chunk (or "" at end of body). The engine `await`s each call, so producing a
+    ## chunk may itself await -- e.g. reading from a streaming download to pipe it
+    ## into the upload in constant memory. The async analog of the sync
+    ## `BodyProducer` (`core/request.nim`); its Future type is backend-specific, so
+    ## it lives here rather than on `Request`, and is threaded through the send paths
+    ## (mirroring `BodySink`). Not replayable: like `bodyStream`, a request carrying
+    ## one is sent once and never retried/redirected/digest-replayed.
+
 # Disable Nagle on the connection socket: without it the TLS handshake's final
 # flight plus the first request stall ~40ms on the peer's delayed ACK, paid on
 # every fresh (unpooled) connection.

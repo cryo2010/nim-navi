@@ -133,6 +133,15 @@ type
                                 ## request trailers).
     body*: string
     bodyStream*: BodyProducer  ## when set, the body is streamed chunked
+    hasStreamedBody*: bool      ## true when the body is streamed and non-replayable:
+                                ## a `bodyStream` producer, or an async producer
+                                ## threaded outside the request (its type lives at the
+                                ## backend layer, so it cannot be a field; see
+                                ## `AsyncBodyProducer` per async backend). The
+                                ## retry/redirect/digest guards read this instead of
+                                ## `bodyStream` alone, so a non-rewindable async upload
+                                ## is treated as non-replayable too. Set by the request
+                                ## builder / async `requestResolved`.
     absoluteForm*: bool         ## use absolute-URI on the request line (http proxy)
     deadlineMs*: int            ## per-attempt connect/total budget override, in ms; 0
                                 ## means "use config.timeouts.total". The sync and batch
@@ -395,6 +404,8 @@ proc buildRequest*(opts: NaviConfigBase, verb: HttpVerb, target: string,
   let resolved = resolveBody(body, form)
   result.body = resolved.content
   result.bodyStream = resolved.stream
+  if resolved.stream != nil:
+    result.hasStreamedBody = true   # a sync producer is non-replayable (see isReplayable)
   if resolved.contentType.len > 0 and not result.headers.contains("content-type"):
     result.headers.add("content-type", resolved.contentType)
   # Digest can't be precomputed (it needs the server's nonce), so its header is

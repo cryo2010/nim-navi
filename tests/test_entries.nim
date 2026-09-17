@@ -5,6 +5,7 @@ import std/[net, os, strutils, tables, times, monotimes]
 import navi
 import navi/core/pool
 import navi/core/response  # for the `response.TimeoutError` qualifier
+from std/asyncfutures import Future  # only the type, for the async-producer rejection test
 import ./support
 
 var serverReady: bool
@@ -1019,3 +1020,14 @@ suite "streamed request body is not retried":
                           body = producer)
     check res.status == 503        # not retried
     joinThread(th)
+
+  test "the sync backend rejects an async body producer at compile time":
+    # The sync backend has no event loop to await a producer. An async producer
+    # (proc(): Future[string]) matches no `toBody` overload -- it is a proc, so it is
+    # excluded from the catch-all `toBody[T: not proc]`, and its return type is not the
+    # sync `BodyProducer`'s (proc(): string) -- so passing one to the sync
+    # `request`/`put` is a hard compile error, not a silent JSON serialization.
+    let api = newNavi()
+    proc asyncProducer(): Future[string] = discard   # the exact async producer shape
+    check not compiles(api.put("http://127.0.0.1/", body = asyncProducer))
+    check not compiles(api.request(PUT, "http://127.0.0.1/", body = asyncProducer))

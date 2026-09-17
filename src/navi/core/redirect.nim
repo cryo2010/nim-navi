@@ -19,6 +19,7 @@ proc dropBody(r: var Request) =
   ## trailers belong to the dropped body and go with it.
   r.body = ""
   r.bodyStream = nil
+  r.hasStreamedBody = false
   r.trailers = initHeaders()
 
 proc redirectRequest*(req: Request, status: int, location: string): Request =

@@ -826,10 +826,11 @@ loop, which back-pressures the peer through TCP. The size cap
 (`maxResponseBytes`) is enforced incrementally on the streamed bytes.
 
 The request `body` is dispatched by type. A `string` is the raw body; a `JsonNode`
-is sent as JSON; a `Multipart` as `multipart/form-data`; a `BodyProducer` or a
-closure `BodyIterator` streams a chunked upload; and any other value is serialized
-to JSON via `std/jsonutils`. `form` still encodes a urlencoded body and is outranked
-by a typed `body`.
+is sent as JSON; a `Multipart` as `multipart/form-data`; a `BodyProducer`, a closure
+`BodyIterator`, or (on the async backends) an async producer (`proc(): Future[string]`)
+streams a chunked upload; and any other value is serialized to JSON via
+`std/jsonutils`. `form` still encodes a urlencoded body and is outranked by a typed
+`body`.
 
 Stream an upload from a pull-based producer (`BodyProducer`), sent as chunked
 transfer-encoding. The producer returns the next chunk, or `""` at end of body:
@@ -854,6 +855,28 @@ let it = iterator (): string {.closure.} =
   for p in parts: yield p
 discard api.request(POST, "https://example.com/upload", body = it)
 ```
+
+On the **async backends** (`navi/asyncdispatch`, `navi/chronos`) `body` also accepts
+an **async producer** (`proc(): Future[string]`): the engine `await`s each call, so
+producing a chunk can itself await. That lets you pipe a streaming download into a
+streaming upload in constant memory, without a thread or buffering the whole body:
+
+```nim
+proc pipe() {.async.} =
+  let api = newNavi()
+  let src = await api.stream(GET, "https://example.com/big")   # download handle
+  # Each pull reads one chunk from the download and streams it straight up:
+  discard await api.put("https://example.com/upload",
+    body = proc(): Future[string] {.async.} = return await src.readChunk())
+```
+
+Like the synchronous `BodyProducer`, an async producer is **not replayable**: a
+request carrying one is sent once and never auto-retried, redirected (307/308), or
+digest-replayed, since its producer cannot rewind. The sync backend rejects an async
+producer at compile time (it has no event loop to await it). Two paths buffer instead
+of streaming, awaiting each chunk into a full body before sending: HTTP/3 (its C-side
+body pull is synchronous) and `navi/js` (`fetch` cannot stream a request body), so
+the constant-memory property holds on h1 and h2.
 
 Any other value is serialized as JSON (`application/json`) via the catch-all arm, so
 an object, ref, or seq can be posted directly:
