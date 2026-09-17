@@ -873,9 +873,10 @@ proc pipe() {.async.} =
 Like the synchronous `BodyProducer`, an async producer is **not replayable**: a
 request carrying one is sent once and never auto-retried, redirected (307/308), or
 digest-replayed, since its producer cannot rewind. The sync backend rejects an async
-producer at compile time (it has no event loop to await it); `navi/js` accepts it for
-API parity but buffers it (awaiting each chunk into a full body), as `fetch` cannot
-stream a request body.
+producer at compile time (it has no event loop to await it). Two paths buffer instead
+of streaming, awaiting each chunk into a full body before sending: HTTP/3 (its C-side
+body pull is synchronous) and `navi/js` (`fetch` cannot stream a request body), so
+the constant-memory property holds on h1 and h2.
 
 Any other value is serialized as JSON (`application/json`) via the catch-all arm, so
 an object, ref, or seq can be posted directly:

@@ -15,13 +15,14 @@ onward (pre-1.0, minor versions may include breaking changes).
   streaming download into a streaming upload in constant memory
   (`body = proc(): Future[string] {.async.} = return await src.readChunk()`), which
   the synchronous producer could not express (the engine called it inline). The
-  producer streams as chunked transfer-encoding (h1) or DATA frames (h2/h3), with
+  producer streams as chunked transfer-encoding (h1) or DATA frames (h2), with
   trailers, identically to the sync producer, and is **not replayable** (sent once,
-  never retried/redirected/digest-replayed). The sync backend rejects an async
-  producer at compile time (no event loop to await it); `navi/js` accepts it for API
-  parity but buffers it (awaiting each chunk), as `fetch` cannot stream a request
-  body. Its type lives at the backend layer (`AsyncBodyProducer`, like `BodySink`),
-  since the `Future` type differs per backend (#367).
+  never retried/redirected/digest-replayed). Two paths buffer instead of stream:
+  h3 drains the producer before sending (its C-side body pull is synchronous), and
+  `navi/js` does the same as `fetch` cannot stream a request body; both still await
+  each chunk. The sync backend rejects an async producer at compile time (no event
+  loop to await it). Its type lives at the backend layer (`AsyncBodyProducer`, like
+  `BodySink`), since the `Future` type differs per backend (#367).
 
 ### Changed
 - **BREAKING: the request `body` is now type-dispatched, and the `json`,
