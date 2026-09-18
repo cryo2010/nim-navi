@@ -216,7 +216,7 @@ template runAll() =
     # and `each` bakes in the await on asyncdispatch/chronos. Each chunk is an
     # owned string; status/headers are available before the body is drained.
     var total = 0
-    let r = await api().stream(GET, base & "/bytes/2048")
+    let r = await api().stream.get(base & "/bytes/2048")
     r.each(chunk): total += chunk.len
     total == 2048 and r.status == 200
 

@@ -20,7 +20,7 @@ proc main() {.async.} =
   doAssert warm.httpVersion == "HTTP/2", "warm-up should be h2, got " & warm.httpVersion
 
   # Stream /big over h3: Caddy gzips it, so this also exercises the streamed decode.
-  let s = await api.stream(GET, "https://localhost:4433/big")
+  let s = await api.stream.get("https://localhost:4433/big")
   doAssert s.status == 200, "stream status " & $s.status
   doAssert s.httpVersion == "HTTP/3",
     "stream() should ride h3, got " & s.httpVersion
@@ -32,7 +32,7 @@ proc main() {.async.} =
   echo "stream() over ", s.httpVersion, " delivered ", body.len, " decoded bytes intact"
 
   # A short body streamed over h3 (single chunk / bodyless-friendly path).
-  let s2 = await api.stream(GET, "https://localhost:4433/")
+  let s2 = await api.stream.get("https://localhost:4433/")
   doAssert s2.httpVersion == "HTTP/3"
   var b2 = ""
   s2.each(chunk): b2.add chunk

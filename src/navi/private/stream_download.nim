@@ -145,6 +145,10 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
   ## and middleware is not applied. Redirect/digest hops are opened as streams and
   ## their bodies discarded (their connections closed). Consume the returned handle
   ## with `each`/`drain`, or `close` it if you decide not to read the body.
+  ##
+  ## The verb-named sugar `api.stream.get(target)` (and the six other verbs) forwards
+  ## here; this verb-as-argument form is the full-control layer, as `request` is to
+  ## the buffered verb helpers.
   var rreq = buildRequest(client.config, verb, target, headers, params = params)
   let digestOrigin = originKey(rreq.url)   # digest creds only for this origin
   var hops = 0
@@ -303,7 +307,7 @@ proc drain*(sr: StreamResponse, sink: BodySink) =
 template each*(sr: StreamResponse; chunk, body: untyped): untyped =
   ## Drain the streaming body, running `body` for each decoded chunk with `chunk`
   ## bound to it (an owned `string`, moved from navi's read buffer, no copy):
-  ##   let res = api.stream(GET, url)
+  ##   let res = api.stream.get(url)
   ##   res.each(chunk): outFile.write(chunk)
   ## Sugar over `drain`; the connection is returned/closed when the body is done.
   ##

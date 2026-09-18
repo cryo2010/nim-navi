@@ -53,7 +53,7 @@ proc runDownload() =
   let outPath = getTempDir() / "navi-stream-dl.bin"
   var f = open(outPath, fmWrite)
   var written = 0
-  let res = api.stream(GET, base & "/download")
+  let res = api.stream.get(base & "/download")
   res.each(chunk):
     if chunk.len > 0:
       discard f.writeBuffer(unsafeAddr chunk[0], chunk.len)

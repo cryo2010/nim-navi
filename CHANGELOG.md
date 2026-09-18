@@ -8,6 +8,15 @@ onward (pre-1.0, minor versions may include breaking changes).
 ## [Unreleased]
 
 ### Added
+- **A `stream` namespace view: `api.stream.get(url)` opens a streaming download.**
+  Streaming downloads now have the same two-layer shape as the rest of navi: a
+  verb-named sugar over a full-control layer. `api.stream` returns a zero-cost view
+  whose seven verb procs (`get`/`post`/`put`/`patch`/`delete`/`head`/`options`)
+  open a streaming response, `api.stream.get(url)` (and `await api.stream.get(url)`
+  on the async/js backends) mirroring `api.get(url)`. The verb-as-argument
+  `api.stream(GET, url)` remains public as the full-control form, exactly as
+  `request(verb, ...)` remains beside the verb helpers; the view is sugar over it
+  and takes the same `headers`/`params`/`cancel` arguments.
 - **A response `sink` on the buffered `request()` API (and every verb helper).**
   Passing `sink =` to `request`/`get`/`post`/`put`/`patch`/`delete`/`head`/`options`
   streams the response body to a caller callback instead of buffering it into

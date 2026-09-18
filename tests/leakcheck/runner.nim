@@ -68,7 +68,7 @@ template runAll() =
     of "streamdown", "streamdownc":
       let path = if scenario == "streamdownc": "/download-gz" else: "/download"
       let api = newNavi(cfgFor(cert, true, h1only = false))
-      let s = await api.stream(GET, baseTls & path)
+      let s = await api.stream.get(baseTls & path)
       doAssert s.status == 200
       var n = 0
       s.each(chunk): n += chunk.len

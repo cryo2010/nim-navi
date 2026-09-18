@@ -25,7 +25,7 @@ type Progress = ref object
 proc oneDownload(api: Navi, cfg: Config, prog: Progress, url: string) {.async.} =
   var st = newSha1State()
   var got = 0
-  let res = await api.stream(GET, url)
+  let res = await api.stream.get(url)
   if res.status != 200:
     stderr.writeLine cfg.label & " FAIL: /download -> " & $res.status
     quit(1)

@@ -607,6 +607,7 @@ proc request*[B](client: Navi, verb: HttpVerb, target: string,
                     cancel, trailers, nil, wrapSink(sink, gate), gate)
 
 include navi/private/impl_stream
+include navi/private/stream_verbs
 include navi/private/impl_sse
 include navi/private/verbs
 include navi/private/impl_ws

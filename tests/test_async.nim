@@ -104,6 +104,8 @@ suite "asyncdispatch entry end to end":
     startTruncated(th, port, bodyBytes = 10)
     let api = newNavi()
     proc run(): Future[bool] {.async.} =
+      # verb-as-argument full-control form (the `api.stream.get` view is sugar over it):
+      # kept here so the underlying `stream(client, verb, ...)` layer keeps runtime coverage.
       let handle = await api.stream(GET, "http://127.0.0.1:" & $port & "/")
       check handle.status == 200
       try:
@@ -128,7 +130,7 @@ suite "asyncdispatch entry end to end":
       let t0 = getMonoTime()
       var raised = false
       try:
-        discard await api.stream(GET, "http://127.0.0.1:" & $port & "/")
+        discard await api.stream.get("http://127.0.0.1:" & $port & "/")
       except naviresp.TimeoutError:
         raised = true
       return (raised, (getMonoTime() - t0).inMilliseconds.int)
@@ -144,7 +146,7 @@ suite "asyncdispatch entry end to end":
 
     let api = newNavi()
     proc run(): Future[(int, string)] {.async.} =
-      let res = await api.stream(GET, "http://127.0.0.1:" & $port & "/")
+      let res = await api.stream.get("http://127.0.0.1:" & $port & "/")
       var collected = ""
       res.each(chunk): collected.add chunk
       return (res.status, collected)     # status is read before the body was drained
@@ -163,7 +165,7 @@ suite "asyncdispatch entry end to end":
     let key = "http://127.0.0.1:" & $port
     proc run(): Future[(string, int, string)] {.async.} =
       var got = ""
-      let res = await api.stream(GET, key & "/")
+      let res = await api.stream.get(key & "/")
       res.each(chunk): got.add chunk
       let idle = api.pool.idleCount(key)          # returned after a full drain
       let second = await api.get(key & "/")       # ...and reused
@@ -185,7 +187,7 @@ suite "asyncdispatch entry end to end":
     let key = "http://127.0.0.1:" & $port
     proc run(): Future[(string, int, string)] {.async.} =
       var body = ""
-      let res = await api.stream(GET, key & "/")
+      let res = await api.stream.get(key & "/")
       while true:                                 # break-friendly pull loop
         let c = await res.readChunk()
         if c.len == 0: break
@@ -227,7 +229,7 @@ suite "asyncdispatch entry end to end":
     let key = "http://127.0.0.1:" & $port
     proc run(): Future[(bool, int)] {.async.} =
       var raised = false
-      let res = await api.stream(GET, key & "/")
+      let res = await api.stream.get(key & "/")
       try:
         res.each(chunk): raise newException(ValueError, "consumer failed")
       except ValueError: raised = true
@@ -292,7 +294,7 @@ suite "asyncdispatch entry end to end":
     startUploadEcho(dstTh, dstPort)
     proc run(): Future[Response] {.async.} =
       let api = newNavi()
-      let sr = await api.stream(GET, "http://127.0.0.1:" & $srcPort & "/")
+      let sr = await api.stream.get("http://127.0.0.1:" & $srcPort & "/")
       return await api.put("http://127.0.0.1:" & $dstPort & "/",
         body = proc(): Future[string] {.async.} = return await sr.readChunk())
     let res = waitFor run()

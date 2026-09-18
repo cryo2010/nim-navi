@@ -371,6 +371,10 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
   ## handle whose body streams on demand via `each`/`drain`. Does NOT throw on a
   ## non-2xx status (inspect `status`), and middleware is not applied. Redirects,
   ## body decoding, and the cookie store are the runtime's here, as for `request`.
+  ##
+  ## The verb-named sugar `api.stream.get(target)` (and the six other verbs) forwards
+  ## here; this verb-as-argument form is the full-control layer, as `request` is to
+  ## the buffered verb helpers.
   throwIfCancelled(cancel)
   var rq = buildRequest(client.config, verb, target, headers, params = params)
   if not client.jar.isNil: applyCookies(client.jar, rq)
@@ -427,7 +431,7 @@ template each*(sr: StreamResponse; chunk, body: untyped): untyped =
   ## Drain the streaming body, running `body` for each chunk with `chunk` bound to
   ## it. On js `chunk` is a `seq[byte]` (chunks come from a JS `Uint8Array`), unlike
   ## the native backends' `string`. The outer `await` is baked in:
-  ##   let res = await api.stream(GET, url)
+  ##   let res = await api.stream.get(url)
   ##   res.each(chunk): total += chunk.len
   ##
   ## `body` runs as a proc, so `break`/`continue`/`return` cannot escape the loop
@@ -579,4 +583,5 @@ proc websocket*(client: Navi, url: string,
   elif u.startsWith("https://"): u = "wss://" & u["https://".len .. ^1]
   openWebSocket(u, maxMessageBytes)
 
+include navi/private/stream_verbs
 include navi/private/verbs

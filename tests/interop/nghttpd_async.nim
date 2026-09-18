@@ -57,7 +57,7 @@ suite "nghttpd interop (asyncdispatch, http/2 mux)":
       cfg.tls.caFile = cert
       let api = newNavi(cfg)
       var calls, total = 0
-      let res = await api.stream(GET, base & "/large.bin")   # returns after headers
+      let res = await api.stream.get(base & "/large.bin")   # returns after headers
       res.each(chunk):
         inc calls
         total += chunk.len
