@@ -311,6 +311,7 @@ proc request*[B](client: Navi, verb: HttpVerb, target: string,
                   cancel, trailers, wrapSink(sink, gate), gate)
 
 include navi/private/stream_download
+include navi/private/stream_verbs
 include navi/private/sse_stream
 include navi/private/verbs
 include navi/private/batch

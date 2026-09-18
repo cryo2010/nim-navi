@@ -163,6 +163,8 @@ suite "sync entry end to end":
     var th: Thread[ServerCtx]
     startTruncated(th, port, bodyBytes = 10)
     let api = newNavi()
+    # verb-as-argument full-control form (the `api.stream.get` view is sugar over it):
+    # kept here so the underlying `stream(client, verb, ...)` layer keeps runtime coverage.
     let handle = api.stream(GET, "http://127.0.0.1:" & $port & "/")
     check handle.status == 200                   # headers arrived fine
     expect IOError:                              # draining the short body must raise,
@@ -235,7 +237,7 @@ suite "sync entry end to end":
 
     let api = newNavi()
     var collected = ""
-    let res = api.stream(GET, "http://127.0.0.1:" & $port & "/")
+    let res = api.stream.get("http://127.0.0.1:" & $port & "/")
     check res.status == 200         # headers available before the body is drained
     res.each(chunk): collected.add chunk
     check collected == """{"ok":true}"""
@@ -251,7 +253,7 @@ suite "sync entry end to end":
     let key = "http://127.0.0.1:" & $port
     var got = ""
     block:
-      let res = api.stream(GET, key & "/")
+      let res = api.stream.get(key & "/")
       check res.status == 200
       check api.pool.idleCount(key) == 0   # checked out while the handle is live
       res.each(chunk): got.add chunk
@@ -270,7 +272,7 @@ suite "sync entry end to end":
     let api = newNavi()
     let key = "http://127.0.0.1:" & $port
     var raised = false
-    let res = api.stream(GET, key & "/")
+    let res = api.stream.get(key & "/")
     check res.status == 200
     try:
       res.each(chunk): raise newException(ValueError, "consumer failed")
@@ -287,7 +289,7 @@ suite "sync entry end to end":
 
     let api = newNavi()
     let key = "http://127.0.0.1:" & $port
-    let res = api.stream(GET, key & "/")
+    let res = api.stream.get(key & "/")
     check res.status == 200
     var body = ""
     while (let c = res.readChunk(); c.len > 0):   # break-friendly pull loop
@@ -307,7 +309,7 @@ suite "sync entry end to end":
     let api = newNavi()
     let key = "http://127.0.0.1:" & $port
     let pool = block:
-      let res = api.stream(GET, key & "/")
+      let res = api.stream.get(key & "/")
       discard res.readChunk()               # read a chunk but do not reach EOF
       api.pool                              # res dropped here without finishing
     check pool.idleCount(key) == 0          # not pooled: the guard closed it
@@ -825,7 +827,7 @@ suite "sync entry end to end":
     let api = newNavi(cfg)
     var msg = ""
     try:
-      let res = api.stream(GET, "http://127.0.0.1:" & $port & "/")
+      let res = api.stream.get("http://127.0.0.1:" & $port & "/")
       res.each(chunk): discard          # cap is enforced during the drain
     except ResponseTooLargeError as e: msg = e.msg
     check "maxResponseBytes" in msg

@@ -787,14 +787,17 @@ When a host resolves to several addresses (typical of dual-stack IPv4/IPv6 hosts
 
 ### Streaming
 
-`stream()` returns a handle whose status and headers are available immediately,
-while the body is pulled on demand. You inspect the headers, then consume the body
-a chunk at a time with `each`. The connection is returned to the pool once the body
-is fully read (or closed if you `close` the handle first).
+`api.stream.get(url)` returns a handle whose status and headers are available
+immediately, while the body is pulled on demand. You inspect the headers, then
+consume the body a chunk at a time with `each`. The connection is returned to the
+pool once the body is fully read (or closed if you `close` the handle first). The
+verb-named form (`api.stream.get`, `.post`, ... all seven verbs) is sugar over the
+full-control `api.stream(GET, url)`, exactly as `api.get(url)` is sugar over
+`api.request(GET, url)`.
 
 ```nim
 var file = open("out.bin", fmWrite)
-let res = api.stream(GET, "https://example.com/large")
+let res = api.stream.get("https://example.com/large")
 if res.status == 200:
   res.each(chunk):
     discard file.writeBuffer(unsafeAddr chunk[0], chunk.len)
@@ -806,7 +809,7 @@ same code awaits the open, and the `each` body may await (the `await` is baked i
 `each`, so there is none on the `each` line itself):
 
 ```nim
-let res = await api.stream(GET, "https://example.com/large")
+let res = await api.stream.get("https://example.com/large")
 res.each(chunk):
   await sink.write(chunk)
 ```
@@ -918,7 +921,7 @@ streaming upload in constant memory, without a thread or buffering the whole bod
 ```nim
 proc pipe() {.async.} =
   let api = newNavi()
-  let src = await api.stream(GET, "https://example.com/big")   # download handle
+  let src = await api.stream.get("https://example.com/big")   # download handle
   # Each pull reads one chunk from the download and streams it straight up:
   discard await api.put("https://example.com/upload",
     body = proc(): Future[string] {.async.} = return await src.readChunk())

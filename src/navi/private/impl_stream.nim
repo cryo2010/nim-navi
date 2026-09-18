@@ -238,6 +238,10 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
   ## deadline -- continues to bound the body reads: the same total budget is an
   ## absolute wall-clock deadline on the returned handle that `readChunk`/`drain`
   ## enforce, so a wedged peer cannot stall the body forever either.
+  ##
+  ## The verb-named sugar `api.stream.get(target)` (and the six other verbs) forwards
+  ## here; this verb-as-argument form is the full-control layer, as `request` is to
+  ## the buffered verb helpers.
   let totalMs = client.config.totalMs
   # The whole-exchange deadline starts before the open, so the open and the body
   # reads share ONE total budget, just as sync's Conn.deadline (set at connect)
@@ -427,7 +431,7 @@ template each*(sr: StreamResponse; chunk, body: untyped): untyped =
   ## Drain the streaming body, running `body` for each decoded chunk with `chunk`
   ## bound to it (an owned `string`, moved from navi's read buffer). The outer
   ## `await` is baked in, so call it inside an async proc without one:
-  ##   let res = await api.stream(GET, url)
+  ##   let res = await api.stream.get(url)
   ##   res.each(chunk): await outFile.write(chunk)
   ##
   ## `body` runs as a proc, so `break`/`continue`/`return` cannot escape the loop

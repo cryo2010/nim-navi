@@ -26,7 +26,7 @@ proc sampleContent(bytes, seed: int): string =
 
 proc downloadOne(api: Navi, base: string, i: int) {.async.} =
   ## Stream a download and verify its body against the server's x-sha1.
-  let res = await api.stream(GET, base & "/download?size=" & $fileSize)
+  let res = await api.stream.get(base & "/download?size=" & $fileSize)
   doAssert res.status == 200, "download " & $i & " status " & $res.status
   doAssert res.httpVersion == "HTTP/2", "download " & $i & " not h2: " & res.httpVersion
   var body = newStringOfCap(fileSize)

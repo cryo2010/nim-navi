@@ -12,7 +12,7 @@ proc oneDownload(api: Navi, cfg: Config, url: string) =
   var st = newSha1State()
   var got = 0
   var lastReport = epochTime()
-  let res = api.stream(GET, url)
+  let res = api.stream.get(url)
   if res.status != 200:
     stderr.writeLine cfg.label & " FAIL: /download -> " & $res.status
     quit(1)

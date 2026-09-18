@@ -28,7 +28,7 @@ proc main() =
   var written = 0
   # Status and headers land first; the body is pulled on demand. Write each chunk
   # as it arrives, so memory stays flat no matter how large the response is.
-  let res = api.stream(GET, "http://127.0.0.1:" & $port & "/")
+  let res = api.stream.get("http://127.0.0.1:" & $port & "/")
   res.each(chunk):
     if chunk.len > 0:
       discard f.writeBuffer(unsafeAddr chunk[0], chunk.len)

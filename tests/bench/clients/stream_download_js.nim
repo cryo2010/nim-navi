@@ -31,7 +31,7 @@ proc main() {.async.} =
   proc oneDownload(api: Navi, url: string): Future[int] {.async.} =
     let h = createSha1()
     var got = 0
-    let res = await api.stream(GET, url)
+    let res = await api.stream.get(url)
     if res.status != 200:
       echo label, " FAIL: /download -> ", res.status; jsExit(1)
     let expected = res.headers.get("x-sha1")

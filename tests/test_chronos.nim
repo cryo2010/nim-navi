@@ -28,7 +28,7 @@ suite "chronos entry end to end":
     # `api`/`key` are passed as parameters (not captured): chronos's async macro
     # rejects an async proc that closes over a GC'd local as "not GC-safe".
     proc run(api: Navi): Future[(int, string)] {.async.} =
-      let res = await api.stream(GET, "http://127.0.0.1:" & $port & "/")
+      let res = await api.stream.get("http://127.0.0.1:" & $port & "/")
       var collected = ""
       res.each(chunk): collected.add chunk
       return (res.status, collected)     # status is read before the body was drained
@@ -45,7 +45,7 @@ suite "chronos entry end to end":
 
     proc run(api: Navi, key: string): Future[(string, int, string)] {.async.} =
       var got = ""
-      let res = await api.stream(GET, key & "/")
+      let res = await api.stream.get(key & "/")
       res.each(chunk): got.add chunk
       let idle = api.pool.idleCount(key)          # returned after a full drain
       let second = await api.get(key & "/")       # ...and reused
@@ -92,6 +92,8 @@ suite "chronos entry end to end":
     var th: Thread[ServerCtx]
     startTruncated(th, port, bodyBytes = 10)
     proc run(api: Navi): Future[(int, bool)] {.async.} =
+      # verb-as-argument full-control form (the `api.stream.get` view is sugar over it):
+      # kept here so the underlying `stream(client, verb, ...)` layer keeps runtime coverage.
       let handle = await api.stream(GET, "http://127.0.0.1:" & $port & "/")
       let st = handle.status
       var raised = false
@@ -112,7 +114,7 @@ suite "chronos entry end to end":
 
     proc run(api: Navi, key: string): Future[(bool, int)] {.async.} =
       var raised = false
-      let res = await api.stream(GET, key & "/")
+      let res = await api.stream.get(key & "/")
       try:
         res.each(chunk): raise newException(ValueError, "consumer failed")
       except ValueError: raised = true
@@ -212,7 +214,7 @@ suite "chronos entry end to end":
     startUploadEcho(dstTh, dstPort)
     proc run(): Future[Response] {.async.} =
       let api = newNavi()
-      let sr = await api.stream(GET, "http://127.0.0.1:" & $srcPort & "/")
+      let sr = await api.stream.get("http://127.0.0.1:" & $srcPort & "/")
       return await api.put("http://127.0.0.1:" & $dstPort & "/",
         body = proc(): Future[string] {.async.} = return await sr.readChunk())
     let res = waitFor run()

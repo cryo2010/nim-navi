@@ -79,7 +79,7 @@ suite "stream() decompresses the response body":
 
     let api = newNavi()
     var collected = ""
-    let res = api.stream(GET, "http://127.0.0.1:" & $port & "/")
+    let res = api.stream.get("http://127.0.0.1:" & $port & "/")
     check res.status == 200                    # headers available before draining
     res.each(chunk): collected.add chunk
     check collected == """{"ok":true}"""       # decoded on the way to the sink
@@ -97,7 +97,7 @@ suite "stream() decompresses the response body":
     cfg.decompress = false
     let api = newNavi(cfg)
     var collected = ""
-    let res = api.stream(GET, "http://127.0.0.1:" & $port & "/")
+    let res = api.stream.get("http://127.0.0.1:" & $port & "/")
     check res.status == 200
     res.each(chunk): collected.add chunk
     check collected == gz                      # raw compressed bytes

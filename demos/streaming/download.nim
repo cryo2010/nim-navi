@@ -16,7 +16,7 @@ proc main() {.async.} =
 
   var f = open(outPath, fmWrite)
   var written = 0
-  let res = await api.stream(GET, getEnv("BASE") & "/download")
+  let res = await api.stream.get(getEnv("BASE") & "/download")
   res.each(chunk):
     if chunk.len > 0:
       discard f.writeBuffer(unsafeAddr chunk[0], chunk.len)

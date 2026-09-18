@@ -33,7 +33,7 @@ proc dlThread(a: ptr BenchThread) {.thread, nimcall.} =
       var st = newSha1State()
       var got = 0
       try:
-        let res = api.stream(GET, url)
+        let res = api.stream.get(url)
         if res.status != 200:
           stderr.writeLine cfg.label & " FAIL: /download -> " & $res.status; quit(1)
         cfg.checkVersion(res.httpVersion)

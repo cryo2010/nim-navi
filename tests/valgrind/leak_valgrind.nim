@@ -56,14 +56,14 @@ proc exerciseStream(): int =
   cfg.tls.caFile = cert
   let api = newNavi(cfg)
   for _ in 0 ..< iters:
-    let r = api.stream(GET, url)
+    let r = api.stream.get(url)
     doAssert r.status == 200, "unexpected stream status " & $r.status
     var n = 0
     r.each(chunk): n += chunk.len
     doAssert n > 0, "empty streamed body"
     inc result
   for _ in 0 ..< iters:
-    let r = api.stream(GET, url)
+    let r = api.stream.get(url)
     doAssert r.status == 200, "unexpected stream status " & $r.status
     inc result          # r goes out of scope undrained -> the guard closes it
   api.close()
