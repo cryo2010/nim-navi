@@ -141,7 +141,9 @@ proc parallel*(client: Navi, targets: openArray[string]): seq[Response] =
   # honors via `RetryDeadline` (issue #359). Armed once, before the first round.
   var deadline = initRetryDeadline(client.config.totalMs)
   while pending.len > 0:
-    let remaining = deadline.attemptBudgetMs   # this round's connects get what remains
+    # Each round's connects get the remaining whole-batch budget, capped by the
+    # per-attempt limit when set (issue #375); mirrors the single-request loop.
+    let remaining = effectiveAttemptMs(deadline.attemptBudgetMs, client.config.attemptMs)
     for pi in 0 ..< pending.len:
       applyCookies(client.jar, pending[pi].req)
       pending[pi].req.deadlineMs = remaining

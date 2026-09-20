@@ -30,3 +30,16 @@ suite "retry backoff (Retry-After)":
   test "no Retry-After uses exponential backoff":
     check backoffMs(1, respWith(""), policy) == 100
     check backoffMs(2, respWith(""), policy) == 200
+
+suite "per-attempt budget (#375)":
+  test "the smaller of the per-attempt cap and the remaining total wins":
+    check effectiveAttemptMs(1000, 200) == 200   # attempt cap is tighter
+    check effectiveAttemptMs(200, 1000) == 200   # remaining total is tighter
+    check effectiveAttemptMs(300, 300) == 300    # equal
+
+  test "an unset per-attempt cap falls back to the remaining total":
+    check effectiveAttemptMs(500, 0) == 500
+    check effectiveAttemptMs(0, 0) == 0          # both unbounded stays unbounded
+
+  test "an unbounded total lets the per-attempt cap bound each try alone":
+    check effectiveAttemptMs(0, 250) == 250

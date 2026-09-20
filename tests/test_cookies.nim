@@ -1,6 +1,8 @@
 ## Cookie jar expiry unit tests (Max-Age and Expires).
 import unittest
+import std/[options, strutils]
 import navi/core/[headers, url, request, response, cookies]
+import navi   # the sync entry, for the client-level `cookies` accessor
 
 proc setCookieResp(setCookie: string): Response =
   var h = initHeaders()
@@ -165,3 +167,75 @@ suite "cookie name prefixes (RFC 6265bis 5.5)":
   test "the prefix match should be case-insensitive":
     let jar = stored("__HOST-a=1; Path=/", "https://x.test/")   # missing Secure
     check jar.replayed("https://x.test/") == ""
+
+proc snapshot(jar: CookieJar): seq[StoredCookie] =
+  # Explicit-call helpers keep the jar-level API off the `check`-macro's UFCS path
+  # (its expression capture resolves `jar.len` as a field, not the proc).
+  for c in items(jar): result.add c
+
+suite "cookie jar inspection (#374)":
+  test "len and items should reflect every stored cookie":
+    let jar = newCookieJar()
+    storeCookies(jar, parseUrl("http://x.test/"), setCookieResp("a=1; Max-Age=3600"))
+    storeCookies(jar, parseUrl("http://x.test/"),
+                 setCookieResp("b=2; Domain=x.test; Path=/foo; Secure"))
+    let n = len(jar)
+    check n == 2
+    var names: seq[string]
+    for c in items(jar): names.add c.name
+    check names == @["a", "b"]           # insertion order preserved
+
+  test "items should expose the cookie attributes as a read-only snapshot":
+    let snap = snapshot(stored("b=2; Domain=x.test; Path=/foo; Secure", "https://x.test/foo"))
+    check snap.len == 1
+    let c = snap[0]
+    check c.name == "b"
+    check c.value == "2"
+    check c.domain == "x.test"
+    check c.path == "/foo"
+    check c.secure
+    check not c.hostOnly                  # a Domain attribute was present
+    check c.expires.isNone                # a session cookie
+
+  test "a host-only session cookie should report hostOnly with no expiry":
+    let snap = snapshot(stored("a=1", "http://x.test/"))
+    check snap[0].hostOnly
+    check snap[0].expires.isNone
+
+  test "enumeration should NOT prune expired cookies (reports stored state as-is)":
+    # A cookie with a positive Max-Age is stored with an absolute expiry; inspection
+    # must still surface it (staleness is the caller's to detect via `expires`),
+    # unlike `applyCookies`, which drops expired cookies before replay.
+    let snap = snapshot(stored("a=1; Max-Age=3600", "http://x.test/"))
+    check snap.len == 1
+    check snap[0].expires.isSome
+
+  test "$ should dump one cookie per line with key attributes":
+    let jar = newCookieJar()
+    storeCookies(jar, parseUrl("https://x.test/"),
+                 setCookieResp("a=1"))
+    storeCookies(jar, parseUrl("https://x.test/"),
+                 setCookieResp("__Secure-b=2; Secure"))
+    let dump = `$`(jar)
+    let lines = dump.splitLines()
+    check lines.len == 2
+    check lines[0] == "a=1; Domain=x.test; Path=/; HostOnly; session"
+    check "__Secure-b=2" in lines[1]
+    check "; Secure" in lines[1]
+
+  test "client.cookies should snapshot the client's own jar":
+    let api = newNavi()
+    check cookies(api).len == 0
+    storeCookies(api.jar, parseUrl("http://x.test/"), setCookieResp("a=1; Max-Age=3600"))
+    storeCookies(api.jar, parseUrl("http://x.test/"), setCookieResp("b=2; Max-Age=3600"))
+    let snap = cookies(api)
+    check snap.len == 2
+    check snap[0].name == "a"
+    check snap[1].name == "b"
+
+  test "an extended client should have an independent jar view":
+    let api = newNavi()
+    storeCookies(api.jar, parseUrl("http://x.test/"), setCookieResp("a=1; Max-Age=3600"))
+    let derived = api.extend(initNaviConfig())
+    check cookies(api).len == 1
+    check cookies(derived).len == 0       # extend gives a fresh jar

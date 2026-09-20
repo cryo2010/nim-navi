@@ -461,6 +461,25 @@ proc transport(client: Navi, req: Request, sink: BodySink,
   when defined(naviHttp3):
     client.recordAltSvc(rq, result)
 
+template guardedAttempt*(client, startReq, resp, attemptMs, cancel,
+                         asyncStream, userSink, gate: typed) =
+  ## Run one attempt of the retry loop, bounded by the per-attempt budget (issue
+  ## #375). The async backends ignore `deadlineMs` at connect and enforce timeouts
+  ## with a `guard`; here an INNER guard bounds just this attempt (all its redirect
+  ## hops). Because it fires inside the retry loop, a per-attempt timeout surfaces as
+  ## a retryable `TimeoutError`, whereas the OUTER `total` guard (which wraps the
+  ## whole loop) aborts everything and stays terminal. With no per-attempt cap the
+  ## attempt runs inline, exactly as before.
+  mixin guard, followRedirects
+  if attemptMs > 0:
+    proc attemptOnce(): Future[Response] {.async.} =
+      var r: Response
+      followRedirects(client, startReq, r, asyncStream, userSink, gate)
+      return r
+    resp = await guard(attemptMs, attemptOnce(), cancel)
+  else:
+    followRedirects(client, startReq, resp, asyncStream, userSink, gate)
+
 proc doRequest(client: Navi, req: Request,
                asyncStream: AsyncBodyProducer = nil,
                userSink: BodySink = nil, gate: SinkGate = nil): Future[Response] {.async.} =
@@ -468,6 +487,14 @@ proc doRequest(client: Navi, req: Request,
 
 proc client*(ctx: NaviContext): Navi = ctx.clientv
   ## The client handling this request (e.g. to read `ctx.client.config`).
+
+proc cookies*(client: Navi): seq[StoredCookie] =
+  ## A read-only snapshot of the client's cookie jar, for inspection/debugging:
+  ## every cookie currently stored (all origins), across the whole jar rather than
+  ## the URL-scoped view a request sees. Expired-but-not-yet-pruned entries are
+  ## included; `StoredCookie.expires` reveals staleness. See also `items`/`len`/`$`
+  ## on `client.jar`.
+  for c in client.jar: result.add c
 
 proc next*(ctx: NaviContext): Future[void] {.async.} =
   ## Run the rest of the chain: the next middleware, or -- once they are
