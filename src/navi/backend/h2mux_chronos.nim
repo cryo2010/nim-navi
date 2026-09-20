@@ -107,7 +107,9 @@ proc reader(mux: H2Mux) {.async.} =
   # the transport close + readerDone itself, so running the teardown here too would
   # race it. Only self-exit (peer close / GOAWAY / error) runs the teardown here.
   if mux.state == msActive:                # `close` has not taken over (would be msClosing)
-    mux.failAll("navi: http/2 connection closed")
+    # Self-exit (peer close / GOAWAY / error): the connection died unexpectedly, so a
+    # waiter with no response HEADERS yet is the keep-alive race (see failAll).
+    mux.failAll("navi: http/2 connection closed", preHeadersUnprocessed = true)
     if mux.state != msTransportClosed:     # `close` may race us mid-teardown: whoever
       mux.state = msTransportClosed        # reaches this state first owns the be.close, so
       try: await be.close(mux.transport)   # the transport (and its unshared SSL_CTX) is

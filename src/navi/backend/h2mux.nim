@@ -106,7 +106,9 @@ proc reader(mux: H2Mux) {.async.} =
       if mux.h2.goneAway and mux.activeStreams == 0: break
   except CatchableError:
     discard
-  mux.failAll("navi: http/2 connection closed")
+  # The reader exited: the connection died unexpectedly. Waiters with no response
+  # HEADERS yet are the keep-alive race (retryable on a fresh conn); see failAll.
+  mux.failAll("navi: http/2 connection closed", preHeadersUnprocessed = true)
   try: await be.close(mux.transport)   # the reader owns the transport close
   except CatchableError: discard
   if not mux.settingsSeen.finished: mux.settingsSeen.complete()  # unblock a pending

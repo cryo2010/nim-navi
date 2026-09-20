@@ -343,8 +343,17 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
     let unprocessed = h2.streamUnprocessed(sid)
     let connErr = h2.connError
     let done = h2.streamDone(sid)  # END_STREAM seen (else the loop broke on transport EOF)
+    let sawHeaders = h2.headersReady(sid)          # before takeResponse drops the stream
     let lengthBad = h2.streamLengthMismatch(sid)   # capture before takeResponse drops it
     var r = toResponse(h2.takeResponse(sid))
+    # A reused pooled connection dropped before ANY response header, with no connection
+    # error and no proven-unprocessed signal: the keep-alive race. Surface it as
+    # KeepAliveRaceError so `poolTransport` replays it once on a fresh connection (the h1
+    # pooled-conn replay analog); a drop AFTER headers (sawHeaders) falls through to the
+    # truncation cascade below (the peer began responding: not safely replayable).
+    if not sawHeaders and not done and connErr.len == 0 and not unprocessed and
+       not tooLarge:
+      raise newException(KeepAliveRaceError, "navi: http/2 connection closed")
     # `r.status == 0` (gone away before a response) is treated as a reset here; on the
     # buffered path the decoder-complete check only applies when streaming to a sink.
     raiseH2Terminal(H2Terminal(connErr: connErr, tooLarge: tooLarge,
@@ -425,7 +434,11 @@ template h2SendAndReadHeaders*(transport, h2, req: typed): uint32 =
       if connErr.len > 0: raise newException(IOError, "navi: http/2 " & connErr)
       if unprocessed:
         raise newException(UnprocessedError, "navi: http/2 request not processed")
-      raise newException(IOError, "navi: http/2 request did not complete")
+      # No headers, no connection error, no proven-unprocessed signal: a reused pooled
+      # connection dropped before responding -- the keep-alive race. KeepAliveRaceError
+      # lets `poolTransport` replay it once on a fresh connection for any method (the h1
+      # pooled-conn replay analog); on a fresh connection it is not replayed.
+      raise newException(KeepAliveRaceError, "navi: http/2 connection closed")
     sid
 
 template h2DrainBody*(transport, h2, sid, sink, decompress, cap: typed) =
@@ -588,9 +601,13 @@ template poolTransport*(client, req, sink: typed; asyncStream: typed = nil;
         # process it, so only an idempotent method (or a proven-unprocessed peer
         # signal: h2 REFUSED_STREAM / above GOAWAY) may be replayed. A non-replayable
         # streamed body (`bodyStream`) is never retried (its producer cannot rewind).
+        # `KeepAliveRaceError` is the h2 analog of `not gotResponse`: a reused pooled
+        # h2 connection that dropped before any response header (h2 keeps gotResponse
+        # true, since it signals its own unprocessed case), so replay it for any method.
         let replayable = isReplayable(req)
         if not (replayable and
-                (not gotResponse or isIdempotent(req.verb) or (e of UnprocessedError))):
+                (not gotResponse or isIdempotent(req.verb) or
+                 (e of UnprocessedError) or (e of KeepAliveRaceError))):
           raise
 
     if not served:

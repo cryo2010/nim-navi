@@ -287,18 +287,35 @@ proc transportInner(client: Navi, req: Request, sink: BodySink,
   client.pruneDeadMuxes()          # evict muxes that died since the last request (#312)
 
   if wantH2:
-    # 1. A live shared connection, or one currently being established.
+    # 1. A live shared connection, or one currently being established. A reused mux
+    # can be torn down by the peer at any time (idle recycle, a GOAWAY-less close), so
+    # a request dispatched on it that dies BEFORE any response HEADERS is the classic
+    # keep-alive race: the mux surfaces that as `KeepAliveRaceError` (see failAll). It
+    # was not answered, so replay it once on a fresh connection below -- even a
+    # non-idempotent one, mirroring the h1 pooled-connection replay (which the retry
+    # policy will NOT do for a plain IOError). Scoped to the REUSED mux here: a fresh
+    # mux (step 3) failing the same way is not caught, so it surfaces and is not
+    # replayed. A gated body already fed, or a non-rewindable streamed body, must not
+    # be re-issued, so those propagate.
     if client.muxes.hasKey(origin) and client.muxes[origin].canReuse:
       # A reused mux adopts the CURRENT keepalive interval, not the one it was opened
       # with, honoring navi's live-config contract (issue #360).
       client.muxes[origin].applyKeepAlive(client.config.h2KeepAliveMs)
-      return await client.muxRequest(client.muxes[origin], req, sink, asyncStream,
-                                     userSink, gate)
-    if client.pendingMux.hasKey(origin):
+      try:
+        return await client.muxRequest(client.muxes[origin], req, sink, asyncStream,
+                                       userSink, gate)
+      except KeepAliveRaceError:
+        if (gate != nil and gate.fed) or not isReplayable(req): raise
+        # else fall through to a fresh connection below
+    elif client.pendingMux.hasKey(origin):
       let mux = await client.pendingMux[origin]
       if mux != nil and mux.canReuse:
         mux.applyKeepAlive(client.config.h2KeepAliveMs)
-        return await client.muxRequest(mux, req, sink, asyncStream, userSink, gate)
+        try:
+          return await client.muxRequest(mux, req, sink, asyncStream, userSink, gate)
+        except KeepAliveRaceError:
+          if (gate != nil and gate.fed) or not isReplayable(req): raise
+          # else fall through to a fresh connection below
       # else: turned out http/1.1, fall through
 
   # 2. A pooled http/1.1 connection.

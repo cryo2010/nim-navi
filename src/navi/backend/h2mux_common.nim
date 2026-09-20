@@ -279,11 +279,23 @@ proc wakeRecvers(mux: H2Mux) =
     let r = mux.recvReady.getOrDefault(sid, nil)
     if r != nil and not r.finished: r.complete()
 
-proc failAll(mux: H2Mux, msg: string) =
+proc failAll(mux: H2Mux, msg: string, preHeadersUnprocessed = false) =
+  ## Fail every in-flight buffered waiter. `preHeadersUnprocessed` marks the case
+  ## where the connection DIED unexpectedly (the reader exited) rather than being
+  ## closed deliberately by the client: a waiter that had not yet received any
+  ## response HEADERS then got no answer, so -- if this connection was a reused one --
+  ## it is the keep-alive race. Surface it as `KeepAliveRaceError` (an `IOError`
+  ## subtype, same message) so the reused-connection router can replay it once; a
+  ## waiter that already had headers stays a plain `IOError` (the peer began
+  ## responding, so a non-idempotent request must not be silently replayed). A
+  ## deliberate client close leaves everything a plain `IOError`.
   mux.alive = false
   for sid, fut in mux.waiters:
     if not fut.finished:
-      fut.fail(newException(IOError, msg))
+      if preHeadersUnprocessed and not mux.h2.headersReady(sid):
+        fut.fail(newException(KeepAliveRaceError, msg))
+      else:
+        fut.fail(newException(IOError, msg))
   mux.waiters.clear()
   while mux.pendingSlots.len > 0:                 # wake blocked requests; they see
     let s = mux.pendingSlots.popFirst()           # `not alive` and raise
@@ -491,14 +503,16 @@ proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: strin
   ## `connectTunnel` (RFC 8441 Extended CONNECT) sends the header block WITHOUT
   ## END_STREAM and streams no body, so the send side stays open for full-duplex
   ## tunnel DATA (see `tunnelSend`). Used for WebSocket-over-h2.
-  if not mux.alive:
-    raise newException(IOError, "navi: http/2 connection not usable")
+  if not mux.alive:                        # died between the router's canReuse check and
+    raise newException(KeepAliveRaceError,  # here (TOCTOU): never sent -> keep-alive race
+      "navi: http/2 connection closed")
   while mux.alive and mux.activeStreams >= mux.h2.maxConcurrentStreams:
     let slot = newFuture[void]("h2mux.slot")
     mux.pendingSlots.addLast(slot)
     await slot
-  if not mux.alive:
-    raise newException(IOError, "navi: http/2 connection not usable")
+  if not mux.alive:                        # closed while parked on a concurrency slot
+    raise newException(KeepAliveRaceError,
+      "navi: http/2 connection closed")
   if mux.h2.goneAway:       # a GOAWAY landed while we waited: opening a new stream now
     raise newException(UnprocessedError,   # would break RFC 9113 6.8 (peer PROTOCOL_ERRORs
       "navi: http/2 request not processed") # and drops the conn). Retry on a fresh conn.
@@ -528,7 +542,10 @@ proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: strin
   while true:
     if not mux.alive:
       mux.detachSink(sid)
-      raise newException(IOError, "navi: http/2 connection closed")
+      # No response HEADERS arrived before the connection closed: if this was a reused
+      # connection it is the keep-alive race, so surface it as retryable-on-a-fresh-conn
+      # (KeepAliveRaceError, an IOError subtype with the same message).
+      raise newException(KeepAliveRaceError, "navi: http/2 connection closed")
     if mux.h2.streamReset(sid):
       let err = mux.resetError(sid)          # classify before detachSink clears flags
       mux.detachSink(sid)
@@ -627,14 +644,16 @@ proc request*(mux: H2Mux, headers: seq[(string, string)], body: string,
   ## completes (so a burst of concurrent requests is queued, not RST). When
   ## `bodyStream` is set the body is streamed chunk by chunk instead of `body`;
   ## `asyncStream` (awaited per chunk) outranks both when set.
-  if not mux.alive:
-    raise newException(IOError, "navi: http/2 connection not usable")
+  if not mux.alive:                        # the mux died between the router's canReuse
+    raise newException(KeepAliveRaceError,  # check and here (TOCTOU): the request was
+      "navi: http/2 connection closed")     # never sent, so it is the keep-alive race
   while mux.alive and mux.activeStreams >= mux.h2.maxConcurrentStreams:
     let slot = newFuture[void]("h2mux.slot")
     mux.pendingSlots.addLast(slot)
     await slot
-  if not mux.alive:
-    raise newException(IOError, "navi: http/2 connection not usable")
+  if not mux.alive:                        # closed while parked on a concurrency slot:
+    raise newException(KeepAliveRaceError,  # still not sent, still the race
+      "navi: http/2 connection closed")
   if mux.h2.goneAway:       # a GOAWAY landed while we waited: opening a new stream now
     raise newException(UnprocessedError,   # would break RFC 9113 6.8 (peer PROTOCOL_ERRORs
       "navi: http/2 request not processed") # and drops the conn). Retry on a fresh conn.

@@ -55,6 +55,19 @@ type
     ## stream id) that the request was not processed. Safe to retry regardless of
     ## method idempotency; the retry layer does so automatically.
 
+  KeepAliveRaceError* = object of IOError
+    ## Raised when a REUSED keep-alive connection -- a cached HTTP/2 mux (async) or a
+    ## pooled single-connection h2 transport (sync) -- is torn down before this request
+    ## received any response HEADERS: the classic keep-alive race, where a connection
+    ## known-good moments ago is idle-recycled or closed (without a GOAWAY) by the peer
+    ## just as a request is dispatched on it. Unlike `UnprocessedError` this is not a
+    ## peer PROOF of non-processing, only the strong heuristic that no response began;
+    ## so the transport layer replays it ONCE on a fresh connection for any method
+    ## (mirroring the h1 pooled-connection replay), but the retry policy does NOT
+    ## auto-retry it -- a FRESH connection failing this way signals a real fault, not a
+    ## race. An `IOError` subtype, so existing `except IOError` handlers still catch it
+    ## and the surfaced message is unchanged.
+
   ProtocolError* = object of CatchableError
     ## Raised when the HTTP version actually used is not one the request allowed
     ## via `config.http` (strict protocol selection). For example, requesting

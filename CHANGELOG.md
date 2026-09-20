@@ -69,6 +69,24 @@ onward (pre-1.0, minor versions may include breaking changes).
   body); the iterator wrapper only returns `""` at the true end of body, so
   buffering cannot truncate it (#365).
 
+### Fixed
+- **HTTP/2 keep-alive race: a request dropped on a reused connection before any
+  response is now replayed on a fresh connection, even when non-idempotent.** A
+  shared h2 connection can be recycled by the server at any time (an idle timeout, or
+  a GOAWAY-less close). A request dispatched on a REUSED connection that is torn down
+  before its response HEADERS arrive was never processed, so it is now surfaced as a
+  new `KeepAliveRaceError` (an `IOError` subtype) and replayed once on a fresh
+  connection for any method -- the HTTP/2 analog of the existing HTTP/1.1
+  pooled-connection replay. Previously such a drop raised a generic
+  `IOError: navi: http/2 connection closed` that the retry policy would not replay
+  for a non-idempotent verb (POST/PATCH), failing the request un-retryably. The
+  replay is scoped to reused connections: a request that fails the same way on a
+  FRESH connection still surfaces (a fresh-connection drop signals a real fault, not
+  a race), and a drop AFTER the response began stays non-replayable. Covers the async
+  mux (`navi/asyncdispatch`, `navi/chronos`) and the sync pooled-h2 carrier. HTTP/3
+  is unaffected here (its Alt-Svc fallback already re-sends on a QUIC failure; see
+  #378 for a related follow-up to gate that fallback for non-idempotent requests).
+
 ## [0.10.0] - 2026-09-15
 
 ### Added
