@@ -611,9 +611,21 @@ proc startTruncated*(th: var Thread[ServerCtx], port, bodyBytes: int) =
   while not ready: sleep(1)
 
 proc serveChunkedTrailer(ctx: ServerCtx) {.thread.} =
-  ## Send a valid chunked body in several chunks (payload split into `failures`
-  ## pieces), followed by a trailing field `x-checksum: done`. For the response-sink
-  ## tests: proves multi-chunk delivery and that trailers survive a full drain.
+  ## Send a valid 3-chunk body ("Hello, chunked world!") plus a trailing field
+  ## `x-checksum: done`. For the response-sink tests: proves chunked parsing and that
+  ## trailers survive a full drain.
+  ##
+  ## The whole response (status line, chunks, trailer) is written in ONE `send`.
+  ## The response-sink tests make the client stop reading and close the connection
+  ## early (a sink returning false or raising); if the server were still writing
+  ## later chunks at that moment, its blocking `send` to the gone peer can wedge the
+  ## server thread indefinitely (std/net's `send` retries on disconnect rather than
+  ## failing fast), and `joinThread` then hangs the whole test -- a rare flake that a
+  ## slow/instrumented build (ASan, arc) widened enough to fail CI. Sending once,
+  ## before the client has read anything, closes that window: the bytes are buffered
+  ## and the server moves on to `close` before the client can bail. The chunked
+  ## framing (and thus multi-chunk parsing) is unchanged; only the wire is not split
+  ## across writes, which TCP never guaranteed anyway.
   var server = newSocket()
   server.setSockOpt(OptReuseAddr, true)
   server.bindAddr(Port(ctx.port), "127.0.0.1")
@@ -621,14 +633,13 @@ proc serveChunkedTrailer(ctx: ServerCtx) {.thread.} =
   ctx.ready[] = true
   var client = acceptClient(server)
   discard client.recvUntil("\r\n\r\n")
-  client.send("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n" &
-              "Trailer: x-checksum\r\n\r\n")
-  let pieces = ["Hello, ", "chunked ", "world!"]
-  for p in pieces:
-    client.send(toHex(p.len, 1) & "\r\n" & p & "\r\n")
-  client.send("0\r\nx-checksum: done\r\n\r\n")
-  client.close()
-  server.close()
+  var wire = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: x-checksum\r\n\r\n"
+  for p in ["Hello, ", "chunked ", "world!"]:
+    wire.add(toHex(p.len, 1) & "\r\n" & p & "\r\n")
+  wire.add("0\r\nx-checksum: done\r\n\r\n")
+  try: client.send(wire) except CatchableError, Defect: discard
+  try: client.close() except CatchableError, Defect: discard
+  try: server.close() except CatchableError, Defect: discard
 
 proc startChunkedTrailer*(th: var Thread[ServerCtx], port: int) =
   ## Serve one connection: a 3-chunk body ("Hello, chunked world!") plus a trailer.
