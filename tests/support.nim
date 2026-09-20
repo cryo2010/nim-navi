@@ -32,6 +32,16 @@ type ServerCtx* = object
   failures: int
   count: ptr int        ## when set, count the requests the server answered
 
+proc waitFlag*(flag: ptr bool) =
+  ## Poll a cross-thread bool (a server thread's readiness/closed signal), yielding
+  ## the CPU between checks. A bare `while not flag[]: discard` busy-spin pins a core
+  ## and, under the parallel test load `checkmate` creates (one process per file on a
+  ## 2-core CI runner), can starve the very server thread that sets the flag -- which
+  ## surfaced as an intermittent `(timed out)` hang. `sleep(1)` here is `os.sleep`;
+  ## callers in the async suites use this helper instead of a bare `sleep` (which the
+  ## async backends shadow with a `Future`-returning version).
+  while not flag[]: sleep(1)
+
 proc hexToBytes*(hex: string): string =
   for i in countup(0, hex.len - 2, 2):
     result.add char(parseHexInt(hex[i .. i + 1]))
@@ -58,7 +68,7 @@ proc startRaw*(th: var Thread[ServerCtx], port: int, payload: string) =
   ## Serve a single connection that replies with `payload`.
   var ready = false
   createThread(th, serveRaw, ServerCtx(port: port, ready: addr ready, payload: payload))
-  while not ready: discard
+  while not ready: sleep(1)
 
 proc serveEchoLine(ctx: ServerCtx) {.thread.} =
   ## Read one request and reply 200 with the request line (verb target version)
@@ -85,7 +95,7 @@ proc startEchoLine*(th: var Thread[ServerCtx], port: int) =
   ## Serve a single connection that echoes the request line as the body.
   var ready = false
   createThread(th, serveEchoLine, ServerCtx(port: port, ready: addr ready))
-  while not ready: discard
+  while not ready: sleep(1)
 
 proc serveHang(ctx: ServerCtx) {.thread.} =
   ## Accept a connection, read the request, then never reply (for timeout tests).
@@ -145,7 +155,7 @@ proc startHangCount*(th: var Thread[ServerCtx], port: var int, conns: int, count
   var ready = false
   createThread(th, serveHangCount,
     ServerCtx(portOut: addr port, ready: addr ready, failures: conns, count: count))
-  while not ready: discard
+  while not ready: sleep(1)
 
 proc serveAlways503(ctx: ServerCtx) {.thread.} =
   ## Answer every request with 503 on one kept-alive connection, forever, tallying
@@ -178,7 +188,7 @@ proc startAlways503*(th: var Thread[ServerCtx], port: var int, count: ptr int) =
   var ready = false
   createThread(th, serveAlways503,
     ServerCtx(portOut: addr port, ready: addr ready, count: count))
-  while not ready: discard
+  while not ready: sleep(1)
 
 proc startHang*(th: var Thread[ServerCtx], port: var int) =
   ## Serve a single connection that accepts but never responds. Binds an
@@ -186,7 +196,7 @@ proc startHang*(th: var Thread[ServerCtx], port: var int) =
   ## to `port`, which must be a mutable `var`.
   var ready = false
   createThread(th, serveHang, ServerCtx(portOut: addr port, ready: addr ready))
-  while not ready: discard
+  while not ready: sleep(1)
 
 proc headerValue(head, name: string): string =
   for line in head.split("\r\n"):
@@ -228,7 +238,7 @@ proc serveBodyEcho(ctx: ServerCtx) {.thread.} =
 proc startBodyEcho*(th: var Thread[ServerCtx], port: int) =
   var ready = false
   createThread(th, serveBodyEcho, ServerCtx(port: port, ready: addr ready))
-  while not ready: discard
+  while not ready: sleep(1)
 
 proc readChunkedBody(client: Socket): string =
   ## Decode a chunked transfer-encoding request body: repeatedly read a hex length
@@ -305,7 +315,7 @@ proc start503Once*(th: var Thread[ServerCtx], port: var int, count: ptr int) =
   var ready = false
   createThread(th, serve503Once,
     ServerCtx(portOut: addr port, ready: addr ready, count: count))
-  while not ready: discard
+  while not ready: sleep(1)
 
 proc serveProxy(ctx: ServerCtx) {.thread.} =
   ## Minimal HTTP proxy: echoes back the absolute-URI request target so a test
@@ -331,7 +341,7 @@ proc serveProxy(ctx: ServerCtx) {.thread.} =
 proc startProxy*(th: var Thread[ServerCtx], port: int) =
   var ready = false
   createThread(th, serveProxy, ServerCtx(port: port, ready: addr ready))
-  while not ready: discard
+  while not ready: sleep(1)
 
 proc serveCookies(ctx: ServerCtx) {.thread.} =
   ## First request gets a Set-Cookie; the second echoes back whatever Cookie
@@ -364,7 +374,7 @@ proc serveCookies(ctx: ServerCtx) {.thread.} =
 proc startCookies*(th: var Thread[ServerCtx], port: int) =
   var ready = false
   createThread(th, serveCookies, ServerCtx(port: port, ready: addr ready))
-  while not ready: discard
+  while not ready: sleep(1)
 
 proc serveRetry(ctx: ServerCtx) {.thread.} =
   ## Answer `failures` requests with 503, then one with 200, on a single
@@ -400,7 +410,7 @@ proc startRetry*(th: var Thread[ServerCtx], port, failures: int) =
   var ready = false
   createThread(th, serveRetry,
     ServerCtx(port: port, ready: addr ready, failures: failures))
-  while not ready: discard
+  while not ready: sleep(1)
 
 proc serveRedirect(ctx: ServerCtx) {.thread.} =
   ## First request gets a 302 to /final (relative), the second gets 200.
@@ -431,7 +441,7 @@ proc serveRedirect(ctx: ServerCtx) {.thread.} =
 proc startRedirect*(th: var Thread[ServerCtx], port: int) =
   var ready = false
   createThread(th, serveRedirect, ServerCtx(port: port, ready: addr ready))
-  while not ready: discard
+  while not ready: sleep(1)
 
 proc serveOnce(ctx: ServerCtx) {.thread.} =
   var server = newSocket(if ctx.ipv6: AF_INET6 else: AF_INET)
@@ -457,7 +467,7 @@ proc startServer*(th: var Thread[ServerCtx], port: int, ipv6 = false) =
   ## Launch the one-shot server and block until it is listening.
   var ready = false
   createThread(th, serveOnce, ServerCtx(port: port, ready: addr ready, ipv6: ipv6))
-  while not ready: discard
+  while not ready: sleep(1)
 
 type KeepAliveCtx* = object
   portOut: ptr int      ## bind an ephemeral port and report it here
@@ -533,7 +543,7 @@ proc startKeepAliveStall*(th: var Thread[KeepAliveStallCtx], port: var int,
   var ready = false
   createThread(th, serveKeepAliveStall,
     KeepAliveStallCtx(portOut: addr port, ready: addr ready, stallMs: stallMs))
-  while not ready: discard
+  while not ready: sleep(1)
 
 proc recvUntil(c: Socket, terminator: string): string =
   while not result.endsWith(terminator):
@@ -575,7 +585,7 @@ proc serveUploadEcho(ctx: ServerCtx) {.thread.} =
 proc startUploadEcho*(th: var Thread[ServerCtx], port: int) =
   var ready = false
   createThread(th, serveUploadEcho, ServerCtx(port: port, ready: addr ready))
-  while not ready: discard
+  while not ready: sleep(1)
 
 proc serveTruncated(ctx: ServerCtx) {.thread.} =
   ## Send response headers declaring `Content-Length: 100` but only `failures` body
@@ -598,7 +608,7 @@ proc startTruncated*(th: var Thread[ServerCtx], port, bodyBytes: int) =
   var ready = false
   createThread(th, serveTruncated,
     ServerCtx(port: port, ready: addr ready, failures: bodyBytes))
-  while not ready: discard
+  while not ready: sleep(1)
 
 proc serveChunkedTrailer(ctx: ServerCtx) {.thread.} =
   ## Send a valid chunked body in several chunks (payload split into `failures`
@@ -624,7 +634,7 @@ proc startChunkedTrailer*(th: var Thread[ServerCtx], port: int) =
   ## Serve one connection: a 3-chunk body ("Hello, chunked world!") plus a trailer.
   var ready = false
   createThread(th, serveChunkedTrailer, ServerCtx(port: port, ready: addr ready))
-  while not ready: discard
+  while not ready: sleep(1)
 
 proc serveGzipBody(ctx: ServerCtx) {.thread.} =
   ## Send a gzip-encoded body ({"ok":true}) with Content-Encoding: gzip, so a sink
@@ -647,7 +657,7 @@ proc startGzipBody*(th: var Thread[ServerCtx], port: int) =
   ## Serve one gzip-encoded body ({"ok":true}).
   var ready = false
   createThread(th, serveGzipBody, ServerCtx(port: port, ready: addr ready))
-  while not ready: discard
+  while not ready: sleep(1)
 
 proc serveStatusBody(ctx: ServerCtx) {.thread.} =
   ## Answer one request with status `failures` (reused as the status code) and
@@ -669,7 +679,7 @@ proc startStatusBody*(th: var Thread[ServerCtx], port, status: int, body: string
   var ready = false
   createThread(th, serveStatusBody,
     ServerCtx(port: port, ready: addr ready, failures: status, payload: body))
-  while not ready: discard
+  while not ready: sleep(1)
 
 proc serveHeadNoBody(ctx: ServerCtx) {.thread.} =
   ## Answer a HEAD request with 200 + Content-Length but no body (correct HEAD), so a
@@ -688,7 +698,7 @@ proc serveHeadNoBody(ctx: ServerCtx) {.thread.} =
 proc startHeadNoBody*(th: var Thread[ServerCtx], port: int) =
   var ready = false
   createThread(th, serveHeadNoBody, ServerCtx(port: port, ready: addr ready))
-  while not ready: discard
+  while not ready: sleep(1)
 
 proc serve204(ctx: ServerCtx) {.thread.} =
   ## Answer one request with 204 No Content (no body at all).
@@ -706,7 +716,7 @@ proc serve204(ctx: ServerCtx) {.thread.} =
 proc start204*(th: var Thread[ServerCtx], port: int) =
   var ready = false
   createThread(th, serve204, ServerCtx(port: port, ready: addr ready))
-  while not ready: discard
+  while not ready: sleep(1)
 
 proc serveDigestThenBody(ctx: ServerCtx) {.thread.} =
   ## Answer the first request 401 with a Digest challenge (and a body that must NOT
@@ -744,7 +754,7 @@ proc startDigestThenBody*(th: var Thread[ServerCtx], port: int, body: string) =
   var ready = false
   createThread(th, serveDigestThenBody,
     ServerCtx(port: port, ready: addr ready, payload: body))
-  while not ready: discard
+  while not ready: sleep(1)
 
 proc serveTruncatedChunked(ctx: ServerCtx) {.thread.} =
   ## Send a chunked response but close after one chunk, without the terminating
@@ -763,7 +773,7 @@ proc serveTruncatedChunked(ctx: ServerCtx) {.thread.} =
 proc startTruncatedChunked*(th: var Thread[ServerCtx], port: int) =
   var ready = false
   createThread(th, serveTruncatedChunked, ServerCtx(port: port, ready: addr ready))
-  while not ready: discard
+  while not ready: sleep(1)
 
 type StaleCtx* = object
   portOut: ptr int
@@ -814,7 +824,7 @@ proc startStalePooled*(th: var Thread[StaleCtx], port: var int, closed1: ptr boo
   var ready = false
   createThread(th, serveStalePooled,
     StaleCtx(portOut: addr port, ready: addr ready, closed1: closed1, accepts: accepts))
-  while not ready: discard
+  while not ready: sleep(1)
 
 proc startKeepAlive*(th: var Thread[KeepAliveCtx], port: var int, requests: int,
                      accepts: ptr int) =
@@ -824,7 +834,7 @@ proc startKeepAlive*(th: var Thread[KeepAliveCtx], port: var int, requests: int,
   createThread(th, serveKeepAlive,
     KeepAliveCtx(portOut: addr port, requests: requests, ready: addr ready,
                  accepts: accepts))
-  while not ready: discard
+  while not ready: sleep(1)
 
 # --- cache-aware server for the middleware tests ------------------------------
 # Serves `requests` connections (Connection: close each). Replies 200 with
