@@ -465,7 +465,7 @@ api.config.throwHttpErrors = false
 
 ### Retries
 
-Idempotent requests that hit a transient failure (network error or 408/413/429/500/502/503/504) are retried with capped exponential backoff, honoring `Retry-After` (both the seconds and HTTP-date forms).
+Requests that hit a transient failure (network error or 408/413/429/500/502/503/504) are retried with capped exponential backoff, honoring `Retry-After` (both the seconds and HTTP-date forms).
 
 ```nim
 let api = newNavi()
@@ -553,22 +553,25 @@ api.config.maxResponseBytes = 10 * 1024 * 1024   # 10 MiB; 0 (default) is unlimi
 Cookies are stored automatically and replayed on later requests to the same client (matched by domain, path, and Secure). 
 
 ```nim
-TODO
+let api = newNavi()
+
+# Cookies are set automatically upon response
+discard api.get("https://example.com/login")
+
+# Access a read-only snapshot for debugging
+for c in api.cookies:
+  echo c.name, "=", c.value,
+       " domain=", c.domain, 
+       " path=", c.path,
+       (if c.secure: " secure" else: ""),
+       (if c.expires.isSome: " expires=" & $c.expires.get else: " (session)")
+
+# Or output the cookie jar
+echo api.jar
 ```
 
 > [!NOTE]
 > `__Host-` and `__Secure-` name-prefixed cookies are enforced per RFC 6265bis (rejected unless Secure over https, and for `__Host-` also host-only with `Path=/`).
-
-For debugging, inspect what the jar holds with `client.cookies` (a read-only `seq[StoredCookie]` snapshot of every stored cookie, all origins), or dump the jar directly:
-
-```nim
-for c in api.cookies:
-  echo c.name, "=", c.value, " (", c.domain, c.path, ")"
-
-echo api.jar          # one cookie per line: name=value; Domain=...; Path=...; flags
-```
-
-Inspection reflects the stored state as-is and does not prune expired cookies (a request drops them at send time); `StoredCookie.expires` lets you spot stale entries. On `navi/js` this reads navi's jar off a browser (Node/Deno/Bun/Workers) and is empty in a browser, where the runtime owns the cookie store.
 
 ### Middleware
 
