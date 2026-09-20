@@ -49,9 +49,10 @@ discard main()
   - [Requests](#requests)
   - [Responses](#responses)
   - [Headers](#headers)
-  - [TLS](#tls)
+  - [TLS](#transport-layer-security-tls)
   - [Errors](#errors)
-  - [Retries, redirects, and timeouts](#retries-redirects-and-timeouts)
+  - [Retries](#retries)
+  - [Timeouts](#timeouts)
   - [Query parameters](#query-parameters)
   - [Cancellation](#cancellation)
   - [Response size limits](#response-size-limits)
@@ -77,6 +78,7 @@ discard main()
 - **HTTP/2 multiplexing:** concurrent async requests on a single HTTP/2 connection
 - **HTTP/3:** (QUIC), opt-in via `-d:naviHttp3`, automatic `Alt-Svc: h3` upgrades (RFC 9000, 9114, 7838)
 - **Transport Layer Security (TLS)** on all clients with certificate verification
+- **TLS controls:** custom/in-memory CA, mTLS, version and cipher pinning, SPKI certificate pinning
 - **Connection pooling / keep-alive** with automatic retry on a stale pooled connection
 - **Happy Eyeballs:** address racing for fast connections (RFC 8305)
 - **Streaming** uploads (chunked) and downloads (with backpressure)
@@ -84,15 +86,15 @@ discard main()
 - **Retries** with capped exponential backoff, honoring `Retry-After`
 - **Redirects** with method rewrites and cross-origin `Authorization` / `Proxy-Authorization` stripping
 - **Throw-on-non-2xx** by default, opt-out available
-- **Automatic decompression**: gzip, deflate, brotli and zstd; `res.text` charset decoding
+- **Decompression**: automatic gzip, deflate, brotli and zstd response decompression
+- **Charset decoding:** `res.text` decodes UTF-8, US-ASCII, Latin-1, Windows-1252, UTF-16 LE/BE
 - **Timeouts:** per-phase (connect / read / total)
 - **Connection-pool sizing:** per-host and global idle caps, idle-timeout eviction
 - **Middleware:** onion-style functions that modify, observe, or short-circuit requests
 - **Cookies:** automatic and per-client; per-domain with expiration (RFC 6265)
-- **Digest Access Authentication:** Basic/bearer/digest, MD5 and SHA-256 (RFC 7617, 6750, 7616)
+- **Authentication:** Basic, Bearer, and Digest (MD5/SHA-256) (RFC 7617, 6750, 7616)
 - **Proxy:** http absolute-URI, https CONNECT (with Proxy-Authorization), and SOCKS5 (RFC 1928)
 - **Unix domain sockets (UDS):** dial a socket path instead of TCP
-- **TLS controls:** custom/in-memory CA, mTLS, version and cipher pinning, SPKI certificate pinning
 - **WebSockets** with fragmentation reassembly, message streaming, automatic ping/pong and keepalive (RFC 6455)
 
 ## Installation
@@ -338,7 +340,7 @@ for (name, value) in h.pairs:
   echo name & ": " & value
 ```
 
-### TLS
+### Transport Layer Security (TLS)
 
 ```nim
 var config = initNaviConfig()
@@ -391,9 +393,6 @@ a pooled, kept-alive connection already amortizes the handshake. Disable it with
 config.tls.resumeSessions = false
 ```
 
-Supported on all three native clients (sync, asyncdispatch, chronos), which now
-share the same OpenSSL session cache; the sync client sees the largest gain.
-
 #### TLS version pinning
 
 Pin the acceptable TLS protocol range with `minVersion` / `maxVersion` (each a
@@ -405,17 +404,10 @@ config.tls.minVersion = tls12    # refuse anything below TLS 1.2
 config.tls.maxVersion = tls13
 ```
 
-Enforced on all three native clients (sync, asyncdispatch, chronos), which run
-OpenSSL, so `tls13` is honored on chronos too. On `navi/js` the runtime controls
-the TLS version, so these are ignored. A negotiation outside the pinned range
-fails the handshake (`ValueError`). If the loaded OpenSSL/LibreSSL is too old to
-support version pinning (e.g. the LibreSSL some macOS builds link), setting a
-bound raises rather than silently ignoring it.
-
 #### Cipher selection
 
-Restrict the offered ciphers with `ciphers` (TLS ≤1.2) and `cipherSuites` (TLS 1.3)
-— they use OpenSSL's two separate cipher APIs, so set whichever applies to the
+Restrict the offered ciphers with `ciphers` (TLS ≤1.2) and `cipherSuites` (TLS 1.3);
+they use OpenSSL's two separate cipher APIs, so set whichever applies to the
 versions you allow. Both are colon-separated OpenSSL names; "" (default) leaves the
 library's selection.
 
@@ -424,14 +416,11 @@ config.tls.ciphers      = "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SH
 config.tls.cipherSuites = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"
 ```
 
-Enforced on all three native clients (sync, asyncdispatch, chronos), which run
-OpenSSL; a value with no cipher the peer accepts fails the handshake, and an
-all-invalid list raises. On `navi/js` the runtime controls ciphers, so they are
-ignored.
-
 #### Client certificates (mTLS)
 
-On the native OpenSSL clients (sync, asyncdispatch, chronos) navi can present a client certificate for mutual TLS, from several sources. Precedence is `pkcs12File`, then in-memory (`certPem`/`keyPem`), then the `certFile`/`keyFile` pair.
+Navi can present a client certificate for mutual TLS from several sources. You should only configure
+one of these, and the precedence order is `pkcs12File`, in-memory (`certPem`/`keyPem`) and then the 
+`certFile`/`keyFile` pair.
 
 ```nim
 # PEM cert + key files (a single PEM may hold both; leave keyFile empty)
@@ -455,7 +444,7 @@ config.tls.certPem = certString
 config.tls.keyPem  = keyString
 ```
 
-Key algorithms (RSA, ECDSA, Ed25519) work in any of these as long as OpenSSL supports them. In-memory PEM may carry an intermediate chain; a PKCS#12 bundle's extra chain certs are not installed (only its leaf and key), which is all a client needs to present. Supported on all three native clients (sync, asyncdispatch, chronos), which run OpenSSL; `navi/js` does not present client certificates.
+Key algorithms (RSA, ECDSA, Ed25519) work in any of these as long as OpenSSL supports them. In-memory PEM may carry an intermediate chain; a PKCS#12 bundle's extra chain certs are not installed (only its leaf and key), which is all a client needs to present.
 
 ### Errors
 
@@ -473,15 +462,13 @@ let api = newNavi()
 api.config.throwHttpErrors = false
 ```
 
-### Retries, redirects, and timeouts
+### Retries
 
-Idempotent requests that hit a transient failure (network error or 408/413/429/500/502/503/504) are retried with capped exponential backoff, honoring `Retry-After` (both the seconds and HTTP-date forms). Redirects are followed by default.
+Idempotent requests that hit a transient failure (network error or 408/413/429/500/502/503/504) are retried with capped exponential backoff, honoring `Retry-After` (both the seconds and HTTP-date forms).
 
 ```nim
 let api = newNavi()
 api.config.retry.limit = 3        # default 2; 0 disables retries
-api.config.maxRedirects = 5       # default 20; 0 disables
-api.config.timeouts.total = 5000  # 5s; 0 (default) disables. Raises TimeoutError.
 ```
 
 The whole retry policy is configurable via `config.retry` (a `RetryPolicy`):
@@ -494,7 +481,14 @@ api.config.retry.statuses = @[429, 503]           # response statuses that trigg
 api.config.retry.maxDelay = 30_000                # cap the wait between attempts (ms)
 ```
 
-`timeouts.total` bounds the whole request (raising `TimeoutError`): on the async clients (asyncdispatch/chronos/js) it covers all retries; on the sync client it is per attempt.
+### Timeouts
+
+Set `config.timeouts.total` to bound the whole request, including all retries and their backoff (raising `TimeoutError`). The async clients (asyncdispatch/chronos/js) enforce it with an outer guard that aborts in-flight IO; the sync client enforces it cooperatively, at each connect and read boundary.
+
+```nim
+let api = newNavi()
+api.config.timeouts.total = 5000  # 5s; 0 (default) disables. Raises TimeoutError.
+```
 
 #### Per-phase timeouts
 
@@ -522,17 +516,18 @@ let res = api.get("/search", params = @{"q": "http client", "page": "2"})
 # GET /search?q=http+client&page=2
 ```
 
-Pairs preserve order and allow duplicate keys (`@{"tag": "a", "tag": "b"}` gives `?tag=a&tag=b`), which a plain `Table` cannot; use pairs, `@{}`, or an `OrderedTable` when order or repeats matter.
+> [!TIP]
+> Pairs preserve order and allow duplicate keys (`@{"tag": "a", "tag": "b"}` gives `?tag=a&tag=b`), which a plain `Table` cannot; use pairs, `@{}`, or an `OrderedTable` when order or repeats matter.
 
 ### Cancellation
 
 Pass a `CancelToken` to abort a request. On the async clients (asyncdispatch/chronos/js) `cancel()` aborts the in-flight request; on the sync client it is cooperative (checked between attempts, so it cannot interrupt a socket read already blocked in a syscall -- use `timeouts.read` for that). A cancelled request raises `RequestCancelledError`.
 
 ```nim
-let tok = newCancelToken()
-let fut = api.get("https://slow.example", cancel = tok)
+let token = newCancelToken()
+let res = api.get("https://slow.example", cancel=token)
 # ... later, from a timer or another task:
-tok.cancel()
+token.cancel()
 ```
 
 ### Response size limits
@@ -546,7 +541,14 @@ api.config.maxResponseBytes = 10 * 1024 * 1024   # 10 MiB; 0 (default) is unlimi
 
 ### Cookies
 
-Each client keeps a cookie jar automatically: cookies from `Set-Cookie` are stored and replayed on later requests to the same client (matched by domain, path, and Secure). `__Host-` and `__Secure-` name-prefixed cookies are enforced per RFC 6265bis (rejected unless Secure over https, and for `__Host-` also host-only with `Path=/`). There is nothing to configure.
+Cookies are stored automatically and replayed on later requests to the same client (matched by domain, path, and Secure). 
+
+```nim
+TODO
+```
+
+> [!NOTE]
+> `__Host-` and `__Secure-` name-prefixed cookies are enforced per RFC 6265bis (rejected unless Secure over https, and for `__Host-` also host-only with `Path=/`).
 
 ### Middleware
 
