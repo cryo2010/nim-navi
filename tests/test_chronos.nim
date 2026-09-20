@@ -68,7 +68,7 @@ suite "chronos entry end to end":
     let key = "http://127.0.0.1:" & $port
     check (waitFor api.get(key & "/")).status == 200   # conn 1, then pooled
     check api.pool.idleCount(key) == 1
-    while not closed1: discard                          # server closed the pooled conn
+    waitFlag(addr closed1)                              # server closed the pooled conn
 
     let r = waitFor api.request(POST, key & "/submit", body = "data")
     check r.status == 200

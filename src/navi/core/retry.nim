@@ -101,6 +101,19 @@ proc attemptBudgetMs*(d: RetryDeadline): int =
   ## `deadlineMs` that would overflow the monotonic-clock arithmetic at connect.
   if not d.active: 0 else: d.remainingMs
 
+proc effectiveAttemptMs*(remainingTotalMs, attemptMs: int): int =
+  ## The wall-clock budget for one attempt: the smaller of the per-attempt cap
+  ## (`config.timeouts.attempt`, 0 = none) and the remaining whole-request budget
+  ## (`remainingTotalMs`, 0 = unbounded). Returns 0 (unbounded) only when neither
+  ## is set. Composes with the retry deadline: pass `deadline.attemptBudgetMs` as
+  ## `remainingTotalMs` so an attempt never outlives the `total` budget. Because it
+  ## is a plain `min`, a lapse of the per-attempt slice (total still has room) and a
+  ## lapse of `total` itself are distinguished by the retry loop, not here: the
+  ## former is retried like any transport error, the latter stops the loop.
+  if attemptMs <= 0: remainingTotalMs
+  elif remainingTotalMs <= 0: attemptMs
+  else: min(remainingTotalMs, attemptMs)
+
 proc backoffWithinDeadline*(d: RetryDeadline, backoff: int): int =
   ## The backoff sleep to actually perform before the next attempt, or -1 to stop
   ## retrying because the budget is (or would be) exhausted. When unbounded the

@@ -146,7 +146,13 @@ proc runCore(client: Navi, req0: Request, cancel: CancelToken,
     var failed = false
     if not client.jar.isNil: applyCookies(client.jar, req)
     try:
-      resp = await fetchExchange(req, nil, client.config.totalMs, cancel,
+      # `fetch` can only bound a whole try via `AbortSignal.timeout`, so both
+      # `total` and the per-attempt cap (#375) apply per fetch here (the runtime
+      # owns the cross-retry timing); use the smaller of the two. A fetch abort is
+      # caught below and retried under the normal policy, matching the native
+      # backends' retryable per-attempt timeout.
+      let fetchMs = effectiveAttemptMs(client.config.totalMs, client.config.attemptMs)
+      resp = await fetchExchange(req, nil, fetchMs, cancel,
                                  client.config.maxResponseBytes, userSink, gate)
     except CatchableError:
       throwIfCancelled(cancel)   # a cancel is not a retryable failure

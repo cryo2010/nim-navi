@@ -79,7 +79,7 @@ suite "asyncdispatch entry end to end":
     let key = "http://127.0.0.1:" & $port
     check (waitFor api.get(key & "/")).status == 200   # conn 1, then pooled
     check api.pool.idleCount(key) == 1
-    while not closed1: discard                          # server closed the pooled conn
+    waitFlag(addr closed1)                              # server closed the pooled conn
 
     let r = waitFor api.request(POST, key & "/submit", body = "data")
     check r.status == 200
@@ -137,6 +137,33 @@ suite "asyncdispatch entry end to end":
     let (raised, elapsed) = waitFor run()
     check raised                           # bounded, not a forever-hang
     check elapsed < 500                    # fired near the 150ms bound, not the 600ms hold
+    joinThread(th)
+
+  test "a per-attempt timeout is retried while the total budget allows it (#375)":
+    # Exercises the async per-attempt guard: each attempt stalls (server never
+    # replies), the inner guard fires at ~attempt ms, and because total is unbounded
+    # and GET is retryable, the timeout is retried up to the limit -- a fresh
+    # connection each time. The server therefore sees limit+1 attempts, then the
+    # final per-attempt TimeoutError propagates (an attempt timeout is retryable,
+    # unlike the terminal outer `total` guard).
+    var port = 0
+    var count = 0
+    var th: Thread[ServerCtx]
+    startHangCount(th, port, conns = 3, count = addr count)
+
+    var cfg = initNaviConfig()
+    cfg.retry.limit = 2
+    cfg.timeouts.attempt = 150
+    cfg.timeouts.total = 0
+    let api = newNavi(cfg)
+    proc run(): Future[bool] {.async.} =
+      try:
+        discard await api.get("http://127.0.0.1:" & $port & "/")
+      except naviresp.TimeoutError:
+        return true
+      return false
+    check waitFor run()
+    check count == 3                       # retried per attempt: limit(2) + 1
     joinThread(th)
 
   test "stream should expose headers before the body and deliver it via each":

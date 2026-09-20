@@ -461,6 +461,25 @@ proc transport(client: Navi, req: Request, sink: BodySink,
   when defined(naviHttp3):
     client.recordAltSvc(rq, result)
 
+template guardedAttempt*(client, startReq, resp, attemptMs, cancel,
+                         asyncStream, userSink, gate: typed) =
+  ## Run one attempt of the retry loop, bounded by the per-attempt budget (issue
+  ## #375). The async backends ignore `deadlineMs` at connect and enforce timeouts
+  ## with a `guard`; here an INNER guard bounds just this attempt (all its redirect
+  ## hops). Because it fires inside the retry loop, a per-attempt timeout surfaces as
+  ## a retryable `TimeoutError`, whereas the OUTER `total` guard (which wraps the
+  ## whole loop) aborts everything and stays terminal. With no per-attempt cap the
+  ## attempt runs inline, exactly as before.
+  mixin guard, followRedirects
+  if attemptMs > 0:
+    proc attemptOnce(): Future[Response] {.async.} =
+      var r: Response
+      followRedirects(client, startReq, r, asyncStream, userSink, gate)
+      return r
+    resp = await guard(attemptMs, attemptOnce(), cancel)
+  else:
+    followRedirects(client, startReq, resp, asyncStream, userSink, gate)
+
 proc doRequest(client: Navi, req: Request,
                asyncStream: AsyncBodyProducer = nil,
                userSink: BodySink = nil, gate: SinkGate = nil): Future[Response] {.async.} =
