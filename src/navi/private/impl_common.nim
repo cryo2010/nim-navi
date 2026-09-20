@@ -488,6 +488,14 @@ proc doRequest(client: Navi, req: Request,
 proc client*(ctx: NaviContext): Navi = ctx.clientv
   ## The client handling this request (e.g. to read `ctx.client.config`).
 
+proc cookies*(client: Navi): seq[StoredCookie] =
+  ## A read-only snapshot of the client's cookie jar, for inspection/debugging:
+  ## every cookie currently stored (all origins), across the whole jar rather than
+  ## the URL-scoped view a request sees. Expired-but-not-yet-pruned entries are
+  ## included; `StoredCookie.expires` reveals staleness. See also `items`/`len`/`$`
+  ## on `client.jar`.
+  for c in client.jar: result.add c
+
 proc next*(ctx: NaviContext): Future[void] {.async.} =
   ## Run the rest of the chain: the next middleware, or -- once they are
   ## exhausted -- the request itself. The outcome lands in `ctx.res`.

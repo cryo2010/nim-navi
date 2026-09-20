@@ -13,8 +13,15 @@ const url = "http://127.0.0.1:9521/"
 
 proc twoRequests(): Future[(string, string)] {.async.} =
   let api = newNavi()                       # no config: jar is kept off-browser
+  doAssert api.cookies.len == 0, "a fresh jar should be empty"
   let r1 = await api.get(url)               # nothing stored yet
   let r2 = await api.get(url)               # Set-Cookie from r1 is replayed
+  # `client.cookies` must surface the stored cookie off the browser (#374): the
+  # jar-inspection accessor has to compile AND run under nim js, not just check.
+  let snap = api.cookies
+  doAssert snap.len == 1, "the jar should hold one cookie after the exchange"
+  doAssert snap[0].name == "sid" and snap[0].value == "abc123",
+    "client.cookies should expose the stored cookie's name/value"
   return (r1.body, r2.body)
 
 proc middlewareRuns(): Future[bool] {.async.} =
