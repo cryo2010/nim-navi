@@ -94,6 +94,18 @@ template await*(x: untyped): untyped = x
 
 proc sleep*(ms: int) = os.sleep(ms)
 
+template guardedAttempt*(client, startReq, resp, attemptMs, cancel,
+                         asyncStream, userSink, gate: typed) =
+  ## Run one attempt of the retry loop (issue #375). On the sync backend the
+  ## per-attempt budget is enforced cooperatively through `startReq.deadlineMs`
+  ## (already stamped by the caller), which bounds connect and every read of this
+  ## attempt, so there is nothing extra to wrap: just issue the request and follow
+  ## its redirects. `attemptMs`/`cancel` are accepted for signature parity with the
+  ## async backends, which wrap the attempt in an inner `guard`.
+  mixin followRedirects
+  discard attemptMs
+  followRedirects(client, startReq, resp, asyncStream, userSink, gate)
+
 proc tcpConnect(host: string, port: int, connectMs = 0): SocketHandle =
   ## Resolve `host` and connect to the first address that accepts a TCP
   ## connection (IPv4 or IPv6, in the resolver's order). With `connectMs` > 0 the

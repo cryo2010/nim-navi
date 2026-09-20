@@ -667,7 +667,7 @@ template maybeDigest(client, rreq, resp, digestOrigin: typed;
         if gate != nil: gate.digestReady = false  # the replay's response is surfaced
         resp = run(client, rreq, BodySink(nil), nil, userSink, gate)
 
-template followRedirects(client, startReq, resp: typed; asyncStream: typed = nil;
+template followRedirects*(client, startReq, resp: typed; asyncStream: typed = nil;
                          userSink: typed = nil; gate: typed = nil) =
   ## Issue `startReq`, following redirects into `resp`. Expands inline so its
   ## `await`s run in the caller's async proc. `asyncStream` (async only) is the
@@ -733,7 +733,7 @@ template performRequest*(client, req0: typed; cancel: CancelToken = nil;
   ## remains, the whole (already decoded) body is delivered in one sink call and the
   ## body cleared. So a gate miss (retry-budget-exhausted final, unsupported digest
   ## algorithm, the h3 leg) still delivers the final body exactly once.
-  mixin sleep, BodySink
+  mixin sleep, BodySink, guardedAttempt
   block:
     var req = req0
     var resp: Response
@@ -762,11 +762,19 @@ template performRequest*(client, req0: typed; cancel: CancelToken = nil;
     let bodyReplayable = isReplayable(req)
     while true:
       throwIfCancelled(cancel)
-      req.deadlineMs = deadline.attemptBudgetMs   # this attempt gets the time that remains
+      # This attempt's budget: the remaining whole-request time, further capped by
+      # `config.timeouts.attempt` when set (issue #375). On the sync/batch paths
+      # `deadlineMs` bounds connect + reads directly; on the async backends it is
+      # ignored at connect and the per-attempt slice is enforced by `guardedAttempt`
+      # (below), which wraps this attempt in an inner `guard`. Either way, an attempt
+      # timeout surfaces as a retryable error, while `total` exhaustion still stops
+      # the loop via `backoffWithinDeadline`.
+      let attemptMs = effectiveAttemptMs(deadline.attemptBudgetMs, client.config.attemptMs)
+      req.deadlineMs = attemptMs
       if gate != nil: gate.attempt = attempt
       var gotResp = false
       try:
-        followRedirects(client, req, resp, asyncStream, userSink, gate)
+        guardedAttempt(client, req, resp, attemptMs, cancel, asyncStream, userSink, gate)
         gotResp = true
       except CatchableError as e:
         # A half-delivered gated body must never be re-issued (it would double-feed

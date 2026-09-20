@@ -62,11 +62,19 @@ type
   Timeouts* = object
     ## Per-phase deadlines in milliseconds; 0 (default) disables that phase's
     ## limit. `connect` and `read` are enforced on the native backends (sync,
-    ## asyncdispatch, chronos); `total` on all four. On `navi/js` only `total` is
-    ## enforceable (via `AbortSignal.timeout`), as `fetch` hides the phases.
+    ## asyncdispatch, chronos); `total` and `attempt` on all four. On `navi/js`
+    ## only `total` and `attempt` are enforceable (via `AbortSignal.timeout`), as
+    ## `fetch` hides the connect/read phases.
     connect*: int   ## TCP connect + TLS handshake (establishment)
     read*: int      ## stall waiting for a response chunk (per-read idle)
     total*: int     ## whole request, including retries/redirects
+    attempt*: int   ## wall-clock bound on a SINGLE attempt (connect + this try's
+                    ## reads, including its redirect hops), separate from `total`.
+                    ## The effective per-attempt budget is `min(attempt, remaining
+                    ## total)`. Unlike a `total` expiry (terminal), an `attempt`
+                    ## expiry is retryable under the normal policy, so a slow attempt
+                    ## can be abandoned and re-tried against a healthier connection
+                    ## while `total` still caps the whole request. 0 disables.
     h2KeepAlive*: int  ## HTTP/2 PING keepalive interval (ms) for a connection with
                        ## active streams: after this long idle, PING the peer; if a
                        ## second interval passes with no inbound frame at all, treat the
@@ -185,6 +193,8 @@ proc readMs*(opts: NaviConfigBase): int = opts.timeouts.read
   ## Per-read stall deadline while waiting for a response chunk, in ms; 0 disables.
 proc totalMs*(opts: NaviConfigBase): int = opts.timeouts.total
   ## Overall request deadline in ms, including retries/redirects; 0 disables.
+proc attemptMs*(opts: NaviConfigBase): int = opts.timeouts.attempt
+  ## Per-attempt wall-clock deadline in ms (see `Timeouts.attempt`); 0 disables.
 proc totalMsFor*(opts: NaviConfigBase, req: Request): int =
   ## The total/connect budget to use for this attempt: the request's per-attempt
   ## `deadlineMs` override when set (the remaining whole-request budget threaded by

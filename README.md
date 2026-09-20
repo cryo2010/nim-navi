@@ -297,6 +297,7 @@ Every field, and the default `initNaviConfig()` gives it:
 | `timeouts.connect` | `int` | `0` | TCP connect + TLS handshake deadline (ms); `0` disables. |
 | `timeouts.read` | `int` | `0` | Per-read idle deadline (ms); `0` disables. |
 | `timeouts.total` | `int` | `0` | Whole-request deadline including retries/redirects (ms); `0` disables. |
+| `timeouts.attempt` | `int` | `0` | Per-attempt deadline, `min(attempt, remaining total)` (ms); retryable on expiry. `0` disables. |
 | `tls.caBundle` | `string` | `""` | Extra trusted CA certificates as an in-memory PEM string (added alongside `caFile` / the system roots). |
 | `tls.caFile` | `string` | `""` | Custom CA bundle path; `""` uses the system trust store. |
 | `tls.certFile` | `string` | `""` | Client certificate file (PEM or DER) for mTLS. |
@@ -526,6 +527,14 @@ api.config.retry.maxDelay = 30_000                # cap the wait between attempt
 
 `timeouts.total` bounds the whole request (raising `TimeoutError`): on the async clients (asyncdispatch/chronos/js) it covers all retries; on the sync client it is per attempt.
 
+`timeouts.attempt` bounds a **single attempt** instead (connect plus that try's reads and redirect hops). The effective budget for a try is `min(attempt, remaining total)`. Unlike a `total` expiry, which is terminal, an `attempt` expiry is **retryable** under the normal policy, so a slow attempt is abandoned and re-tried against a fresh connection while `total` still caps the whole request:
+
+```nim
+let api = newNavi()
+api.config.timeouts.attempt = 2_000   # give up on one try after 2s and retry
+api.config.timeouts.total   = 10_000  # but never spend more than 10s overall
+```
+
 #### Per-phase timeouts
 
 For finer control, set `config.timeouts` (a `Timeouts`) to bound individual phases instead of just the overall request. Each field is milliseconds; 0 (the default) disables that phase's limit.
@@ -538,8 +547,8 @@ api.config.timeouts.total   = 30_000  # whole request, including retries/redirec
 ```
 
 - **connect** and **read** are enforced on the native clients (sync, asyncdispatch, chronos).
-- **total** is enforced on all four clients.
-- On `navi/js` only **total** applies (via `AbortSignal.timeout` — `fetch` hides the connect/read phases).
+- **total** and **attempt** are enforced on all four clients (an **attempt** timeout is retryable; a **total** timeout is terminal).
+- On `navi/js` only **total** and **attempt** apply (via `AbortSignal.timeout` — `fetch` hides the connect/read phases).
 
 All raise `TimeoutError`. A timed-out phase on the async clients abandons the in-flight operation (asyncdispatch drains it in the background; chronos cancels it).
 

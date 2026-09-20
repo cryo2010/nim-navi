@@ -199,6 +199,59 @@ suite "sync entry end to end":
     api.close()                            # drop the connection so the server loop exits
     joinThread(th)
 
+  test "a per-attempt timeout is retried while the total budget allows it (#375)":
+    # Each attempt stalls (the server never replies), so the per-attempt deadline
+    # fires; with total unbounded and GET retryable, that timeout is retried until
+    # the retry limit, opening a fresh connection each time. So the server sees
+    # limit+1 attempts, then the final per-attempt timeout propagates. This is the
+    # distinguishing #375 behavior: an attempt timeout is retryable, unlike `total`.
+    var port = 0
+    var count = 0
+    var th: Thread[ServerCtx]
+    startHangCount(th, port, conns = 3, count = addr count)   # limit(2)+1 attempts
+
+    var cfg = initNaviConfig()
+    cfg.retry.limit = 2
+    cfg.timeouts.attempt = 150             # each try is abandoned after ~150ms
+    cfg.timeouts.total = 0                 # unbounded: only `attempt` + the limit bound it
+    let api = newNavi(cfg)
+
+    var raised = false
+    let started = epochTime()
+    try:
+      discard api.get("http://127.0.0.1:" & $port & "/")
+    except response.TimeoutError:
+      raised = true
+    let elapsedMs = (epochTime() - started) * 1000
+
+    check raised                           # the final attempt's timeout surfaced
+    check count == 3                       # retried per attempt: limit(2) + 1 attempts
+    check elapsedMs < 2000                 # ~3x150ms + backoff, nowhere near a hang
+    joinThread(th)
+
+  test "attempt=0 leaves the whole request bounded only by total (#375)":
+    # With no per-attempt cap, behavior is unchanged: a wedged server is bounded by
+    # `total` alone, which is terminal (one attempt, no per-attempt retry loop).
+    var port = 0
+    var th: Thread[ServerCtx]
+    startHang(th, port)                    # accepts, reads, never replies (one conn)
+
+    var cfg = initNaviConfig()
+    cfg.timeouts.total = 150               # the only bound; attempt defaults to 0
+    let api = newNavi(cfg)
+
+    var raised = false
+    let started = epochTime()
+    try:
+      discard api.get("http://127.0.0.1:" & $port & "/")
+    except response.TimeoutError:
+      raised = true
+    let elapsedMs = (epochTime() - started) * 1000
+
+    check raised
+    check elapsedMs < 500                  # fired near the 150ms total, not the 600ms hold
+    joinThread(th)
+
   test "close should drain the connection pool":
     var port = 0
     var accepts = 0

@@ -106,6 +106,47 @@ proc serveHang(ctx: ServerCtx) {.thread.} =
   client.close()
   server.close()
 
+proc serveHangCount(ctx: ServerCtx) {.thread.} =
+  ## Accept up to `failures` connections; read each request, tally it into `count`,
+  ## and hold the connection open WITHOUT replying (never reads a second request on
+  ## it). For per-attempt timeout tests: every attempt stalls until the client's
+  ## per-attempt deadline fires, and the client opens a fresh connection to retry,
+  ## so `count` ends up equal to the number of attempts the client made. Accepts are
+  ## not delayed by the holds (held sockets are parked, not serviced), so the count
+  ## is reliable regardless of client backoff timing. Exits once `failures`
+  ## connections have been accepted, so the thread can be joined.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(0), "127.0.0.1")     # ephemeral: no cross-iteration collision
+  server.listen()
+  ctx.portOut[] = server.getLocalAddr()[1].int
+  ctx.ready[] = true
+  var held: seq[Socket]
+  while held.len < ctx.failures:
+    var client = acceptClient(server)
+    var req = ""
+    while true:
+      let c = client.recv(1)
+      if c.len == 0: break
+      req.add c
+      if req.len >= 4 and req[^4 .. ^1] == "\r\n\r\n": break
+    if ctx.count != nil: inc ctx.count[]
+    held.add client                          # park it open; never reply
+  # Keep every connection open a while after the LAST accept, so the client's final
+  # attempt also hits its per-attempt timeout instead of seeing a premature close
+  # (which would surface as an IOError, not the TimeoutError under test).
+  sleep(500)
+  for c in held: c.close()
+  server.close()
+
+proc startHangCount*(th: var Thread[ServerCtx], port: var int, conns: int, count: ptr int) =
+  ## Serve `conns` connections that each accept + read + stall (never reply), on an
+  ## ephemeral port (written to `port`), tallying accepted requests into `count`.
+  var ready = false
+  createThread(th, serveHangCount,
+    ServerCtx(portOut: addr port, ready: addr ready, failures: conns, count: count))
+  while not ready: discard
+
 proc serveAlways503(ctx: ServerCtx) {.thread.} =
   ## Answer every request with 503 on one kept-alive connection, forever, tallying
   ## each answered request into `count`. For total-deadline retry tests: the client
