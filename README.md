@@ -618,6 +618,17 @@ let info = newNavi(cfg).get("/v1.45/info")
 
 Each client keeps a cookie jar automatically: cookies from `Set-Cookie` are stored and replayed on later requests to the same client (matched by domain, path, and Secure). `__Host-` and `__Secure-` name-prefixed cookies are enforced per RFC 6265bis (rejected unless Secure over https, and for `__Host-` also host-only with `Path=/`). There is nothing to configure.
 
+For debugging, inspect what the jar holds with `client.cookies` (a read-only `seq[StoredCookie]` snapshot of every stored cookie, all origins), or dump the jar directly:
+
+```nim
+for c in api.cookies:
+  echo c.name, "=", c.value, " (", c.domain, c.path, ")"
+
+echo api.jar          # one cookie per line: name=value; Domain=...; Path=...; flags
+```
+
+Inspection reflects the stored state as-is and does not prune expired cookies (a request drops them at send time); `StoredCookie.expires` lets you spot stale entries. On `navi/js` this reads navi's jar off a browser (Node/Deno/Bun/Workers) and is empty in a browser, where the runtime owns the cookie store.
+
 ### Middleware
 
 Middleware wraps a request onion-style. Each is a **`proc(ctx: NaviContext)`** that

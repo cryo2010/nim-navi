@@ -184,6 +184,15 @@ proc runCore(client: Navi, req0: Request, cancel: CancelToken,
 proc client*(ctx: NaviContext): Navi = ctx.clientv
   ## The client handling this request (e.g. to read `ctx.client.config`).
 
+proc cookies*(client: Navi): seq[StoredCookie] =
+  ## A read-only snapshot of the client's cookie jar, for inspection/debugging:
+  ## every cookie currently stored (all origins). In a browser the runtime owns
+  ## the cookie store and navi keeps no jar, so this is always empty there; off the
+  ## browser (Node/Deno/Bun/Workers) it reflects navi's jar. Expired-but-not-yet-
+  ## pruned entries are included; `StoredCookie.expires` reveals staleness.
+  if client.jar.isNil: return @[]
+  for c in client.jar: result.add c
+
 proc next*(ctx: NaviContext): Future[void] {.async.} =
   ## Run the rest of the chain: the next middleware, or -- once they are
   ## exhausted -- the request itself. The outcome lands in `ctx.res`.

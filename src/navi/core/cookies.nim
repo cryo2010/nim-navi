@@ -26,7 +26,44 @@ type
   CookieJar* = ref object
     cookies: seq[Cookie]
 
+  StoredCookie* = object
+    ## A read-only snapshot of one stored cookie, for inspection/debugging (see
+    ## `items`, `len`, `$`, and `Navi.cookies`). A value copy of the jar's internal
+    ## state: mutating it does not touch the jar.
+    name*, value*, domain*, path*: string
+    secure*: bool
+    hostOnly*: bool          ## no Domain attribute: matches the exact host only
+    expires*: Option[Time]   ## absolute expiry; `none` means a session cookie
+
 proc newCookieJar*(): CookieJar = CookieJar()
+
+func toStored(c: Cookie): StoredCookie =
+  StoredCookie(name: c.name, value: c.value, domain: c.domain, path: c.path,
+               secure: c.secure, hostOnly: c.hostOnly, expires: c.expires)
+
+iterator items*(jar: CookieJar): StoredCookie =
+  ## Yield a read-only snapshot of every cookie currently stored, in insertion
+  ## order. Enumeration does NOT prune expired cookies: it reflects the stored
+  ## state as-is, and `StoredCookie.expires` lets the caller detect staleness (a
+  ## request via `applyCookies` still drops expired cookies before replaying).
+  for c in jar.cookies:
+    yield toStored(c)
+
+proc len*(jar: CookieJar): int = jar.cookies.len
+  ## The number of cookies currently stored (including any expired-but-not-yet-
+  ## pruned entries; see `items`).
+
+proc `$`*(jar: CookieJar): string =
+  ## A human-readable dump, one cookie per line, for quick debugging. Each line is
+  ## `name=value; Domain=...; Path=...` plus `Secure` / `HostOnly` flags and the
+  ## expiry (`Expires=...` or `session`). Not a wire format.
+  for c in jar.cookies:
+    if result.len > 0: result.add '\n'
+    result.add c.name & "=" & c.value & "; Domain=" & c.domain & "; Path=" & c.path
+    if c.secure: result.add "; Secure"
+    if c.hostOnly: result.add "; HostOnly"
+    if c.expires.isSome: result.add "; Expires=" & $c.expires.get
+    else: result.add "; session"
 
 const dateFormats = [
   "ddd, dd MMM yyyy HH:mm:ss 'GMT'",   # RFC 1123 (the common form)
