@@ -137,6 +137,26 @@ suite "sync entry end to end":
     joinThread(th)
     check accepts == 2                           # a second connection was opened
 
+  test "a streamed non-idempotent request is not replayed on a stale pooled connection (at-most-once)":
+    # The sync streaming path (openStream) must honor the same at-most-once rule as the
+    # buffered path and the async streaming twin: a POST whose reused pooled connection
+    # dropped before any response is NOT replayed. Previously the sync streaming pooled
+    # branch fell through to a fresh connect unconditionally, replaying it.
+    var port = 0
+    var accepts = 0
+    var closed1 = false
+    var th: Thread[StaleCtx]
+    startStaleNoRetry(th, port, addr closed1, addr accepts)
+
+    let api = newNavi()
+    let key = "http://127.0.0.1:" & $port
+    check api.get(key & "/").status == 200       # conn 1, then pooled
+    while not closed1: sleep(1)                   # server closed the pooled conn
+    expect response.KeepAliveRaceError:
+      discard api.stream(POST, key & "/submit")
+    joinThread(th)
+    check accepts == 1                            # sent once, never replayed
+
   test "a buffered request raises on a premature close mid-body (length-delimited)":
     const port = 9260
     var th: Thread[ServerCtx]

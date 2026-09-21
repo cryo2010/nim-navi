@@ -13,16 +13,27 @@
 ##    client saw the response begin, so the same drop must NOT be a race (a plain
 ##    IOError: the peer processed it, a non-idempotent request must not be replayed).
 ##
+##  * pmResetThenClose -- sends RST_STREAM(CANCEL) then closes. A terminal reset the peer
+##    may have processed: NOT a race (a plain reset IOError). Exercises `connDeathError`'s
+##    reset consultation when the close races the reader's dispatch of the RST.
+##
+##  * pmRefusedThenClose -- sends RST_STREAM(REFUSED_STREAM) then closes. The peer proved
+##    it did not process the request, so it is provably unprocessed (UnprocessedError,
+##    retryable for any method). Exercises `connDeathError`'s unprocessed consultation.
+##
 ## The peer owns its whole listener (create/bind/listen/accept/close), binds to
 ## 127.0.0.1 explicitly and unbuffered -- same rationale as support_h2peer.
 import std/net
-from navi/proto/h2/frame import encodeSettings, encodeHeaders
+from navi/proto/h2/frame import encodeSettings, encodeHeaders, encodeRstStream,
+  errCancel, errRefusedStream
 
 type
   PeerMode* = enum
     pmCloseBeforeHeaders
     pmCloseAfterHeaders
     pmInterimThenClose      ## send a 1xx interim response, then close before the final
+    pmResetThenClose        ## send RST_STREAM(CANCEL), then close: a terminal reset
+    pmRefusedThenClose      ## send RST_STREAM(REFUSED_STREAM), then close: unprocessed
   RacePeerArg* = tuple[port: int, mode: PeerMode]
 
 const clientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"   # 24 bytes, precedes the frames
@@ -68,6 +79,10 @@ proc runRacePeer*(arg: RacePeerArg) {.thread.} =
     elif arg.mode == pmInterimThenClose:
       client.send(encodeHeaders(reqStream, status103Block,   # 1xx: response began
                                 endStream = false, endHeaders = true))
+    elif arg.mode == pmResetThenClose:
+      client.send(encodeRstStream(reqStream, errCancel))     # terminal reset (not REFUSED)
+    elif arg.mode == pmRefusedThenClose:
+      client.send(encodeRstStream(reqStream, errRefusedStream))  # provably unprocessed
   client.close()
   listener.close()
 

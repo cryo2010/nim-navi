@@ -13,6 +13,12 @@ import ./asyncdispatch as be     # for Conn / BodySink
 
 include ./h2mux_common
 
+proc isCancellation(e: ref CatchableError): bool {.gcsafe, raises: [].} =
+  ## asyncdispatch has no structured cancellation, so a send-phase error is never a
+  ## cancellation here (the shared classifier treats it as a transport failure).
+  discard e
+  false
+
 proc fireSend(mux: H2Mux, data: string) {.gcsafe, raises: [].} =
   ## asyncdispatch has no untracked spawn, so `asyncCheck` the serialized send and
   ## drop the returned future; `send` already swallows nothing, so guard the call.
@@ -106,9 +112,11 @@ proc reader(mux: H2Mux) {.async.} =
       if mux.h2.goneAway and mux.activeStreams == 0: break
   except CatchableError:
     discard
-  # The reader exited: the connection died unexpectedly. Waiters with no response
-  # HEADERS yet are the keep-alive race (retryable on a fresh conn); see failAll.
-  mux.failAll("navi: http/2 connection closed", preHeadersUnprocessed = true)
+  # The reader exited: the connection died unexpectedly (not a deliberate `close()`,
+  # which sets `deliberateClose` first). Each waiter is classified per-stream by
+  # `failAll` -> `connDeathError`: a written-but-no-response waiter is the keep-alive
+  # race (retryable on a fresh conn), a never-written / REFUSED one is unprocessed.
+  mux.failAll("navi: http/2 connection closed")
   try: await be.close(mux.transport)   # the reader owns the transport close
   except CatchableError: discard
   if not mux.settingsSeen.finished: mux.settingsSeen.complete()  # unblock a pending
@@ -125,6 +133,7 @@ proc newH2Mux*(transport: be.Conn, maxBody = 0, decompress = false,
                   waiters: initTable[uint32, Future[H2Response]](),
                   sendReady: initTable[uint32, seq[Future[void]]](),
                   sinkStreams: initHashSet[uint32](),
+                  sentStreams: initHashSet[uint32](),
                   recvq: initTable[uint32, Deque[string]](),
                   recvReady: initTable[uint32, Future[void]](),
                   decoders: initTable[uint32, CappedDecoder](),

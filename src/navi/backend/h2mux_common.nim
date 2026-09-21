@@ -73,6 +73,13 @@ type
     deliberateClose: bool    ## set by `close()` before it tears the mux down, so an
                              ## in-flight request woken by the close reports a plain
                              ## client-close `IOError`, not a retryable keep-alive race
+    sentStreams: HashSet[uint32]  ## streams whose request frames have finished being
+                             ## written to the wire (marked after the requester's send
+                             ## completes). A waiter still ABSENT here when the connection
+                             ## dies never reached the peer -- its HEADERS were queued
+                             ## behind the serialized send chain and never flushed -- so
+                             ## it is provably unprocessed (`UnprocessedError`), not the
+                             ## ambiguous keep-alive race (see `connDeathError`).
     readerDone: Future[void] ## completed once the reader has exited and the
                              ## transport is closed, so `close` can join it
     settingsSeen: Future[void]  ## completed once the peer's initial SETTINGS is seen
@@ -110,6 +117,12 @@ proc reapStream(mux: H2Mux, sid: uint32) {.gcsafe, raises: [].}
   ## stream off a still-healthy connection -- RST it, drop bookkeeping, release the
   ## slot -- when a request's send/produce phase raises (issue #261) or dispatch finds
   ## its waiter cancelled (issue #262), so a failure never strands a concurrency slot.
+
+proc isCancellation(e: ref CatchableError): bool {.gcsafe, raises: [].}
+  ## Whether `e` is a structured cancellation (a chronos `CancelledError`), so the
+  ## send-phase except blocks re-raise it untouched instead of reclassifying it as a
+  ## keep-alive race. Defined per backend after the include: asyncdispatch has no
+  ## cancellation so it is always false there; chronos checks `e of CancelledError`.
 
 const goAwayGraceMs = 30_000
   ## After a GOAWAY the peer promises (via last-stream-id) to finish the covered
@@ -150,6 +163,7 @@ proc detachSink(mux: H2Mux, sid: uint32) =
   ## bookkeeping and drop the stream via `takeResponse` -- no RST, since it is
   ## already dead or the peer has gone away -- and release its concurrency slot.
   mux.sinkStreams.excl sid
+  mux.sentStreams.excl sid
   mux.recvq.del(sid)
   discard mux.h2.takeResponse(sid)
   mux.releaseSlot()
@@ -174,12 +188,14 @@ proc dispatch(mux: H2Mux) =
       let err = mux.resetError(sid)          # classify before takeResponse clears flags
       discard mux.h2.takeResponse(sid)
       mux.waiters.del(sid)
+      mux.sentStreams.excl sid
       mux.releaseSlot()
       fut.fail(err)
     elif mux.h2.streamEnded(sid):
       let lengthBad = mux.h2.streamLengthMismatch(sid)   # before takeResponse drops it
       let resp = mux.h2.takeResponse(sid)
       mux.waiters.del(sid)
+      mux.sentStreams.excl sid
       mux.releaseSlot()
       if lengthBad: fut.fail(newException(IOError, bodyLengthErr))  # body != Content-Length
       else: fut.complete(resp)
@@ -189,6 +205,7 @@ proc dispatch(mux: H2Mux) =
       # (RFC 9113 6.8: the peer may still deliver it); the reader keeps running until
       # it ends, or `failAll` fails it on the real connection close.
       mux.waiters.del(sid)
+      mux.sentStreams.excl sid
       mux.releaseSlot()
       fut.fail(newException(UnprocessedError, "navi: http/2 request not processed"))
 
@@ -249,6 +266,7 @@ proc reapStream(mux: H2Mux, sid: uint32) {.gcsafe, raises: [].} =
   try:
     mux.waiters.del(sid)
     mux.sinkStreams.excl sid
+    mux.sentStreams.excl sid
     mux.recvq.del(sid)
     mux.clearSendReady(sid)
     mux.wakeRecver(sid)                              # wake a parked reader; it re-checks
@@ -282,27 +300,59 @@ proc wakeRecvers(mux: H2Mux) =
     let r = mux.recvReady.getOrDefault(sid, nil)
     if r != nil and not r.finished: r.complete()
 
-proc failAll(mux: H2Mux, msg: string, preHeadersUnprocessed = false) =
-  ## Fail every in-flight buffered waiter. `preHeadersUnprocessed` marks the case
-  ## where the connection DIED unexpectedly (the reader exited) rather than being
-  ## closed deliberately by the client. A waiter whose request was written but that
-  ## had received no response HEADERS and no connection-level protocol error is the
-  ## ambiguous keep-alive race: surface it as `KeepAliveRaceError` (an `IOError`
-  ## subtype, same message) so the retry layer may replay it (idempotent, or any
-  ## method with an Idempotency-Key). A waiter that already had headers, or one whose
-  ## death is a connection PROTOCOL error (`connError`), stays a plain `IOError` -- the
-  ## peer either began responding or violated framing, neither of which is a safe
-  ## unprocessed-race replay. A deliberate client close leaves everything a plain
-  ## `IOError`. (Provably-unprocessed cases -- REFUSED_STREAM, above GOAWAY, or a mux
-  ## found dead before the request was sent -- are `UnprocessedError`, raised elsewhere.)
+proc connDeathError(mux: H2Mux, sid: uint32, msg: string,
+                    attemptedWrite = false): ref CatchableError {.gcsafe, raises: [].} =
+  ## The one classifier for a connection death observed by an in-flight stream `sid`
+  ## (a buffered `waiter` in `failAll`, the sink/gated header-wait in
+  ## `sendAndReadHeaders`, and the send-phase except blocks). Precedence, highest first:
+  ##   * a DELIBERATE client close (`close()`) -- everything is a plain `IOError`; the
+  ##     client tore the connection down, nothing is retryable on a fresh one.
+  ##   * a connection PROTOCOL error (`connError`) -- a plain `IOError` carrying the
+  ##     connError text: framing was violated, not a safe unprocessed-race replay.
+  ##   * a PROVEN-unprocessed peer signal (`streamUnprocessed` -- RST REFUSED_STREAM or a
+  ##     stream above GOAWAY's last id) -- `UnprocessedError`, retryable for any method.
+  ##   * a terminal RST_STREAM (non-REFUSED) -- `resetError` (a plain reset, oversize, or
+  ##     an unprocessed the line above already caught): the peer may have processed it.
+  ##   * the request was NEVER WRITTEN (`sid notin sentStreams`) -- its HEADERS were still
+  ##     queued behind the serialized send chain and never hit the wire, so it is provably
+  ##     unprocessed (`UnprocessedError`), retryable for any method. Suppressed when
+  ##     `attemptedWrite` is set (the caller's send RAISED mid-write): bytes may have gone
+  ##     out partially, which is ambiguous, so it falls through to the race below rather
+  ##     than claiming a proof of non-processing it does not have.
+  ##   * a response BEGAN (`responseBegan` -- final or a 1xx interim) -- a plain `IOError`:
+  ##     the peer demonstrably started responding, so a replay could double-apply.
+  ##   * else -- the ambiguous keep-alive race: request written (or partially written), no
+  ##     response began. `KeepAliveRaceError` (an `IOError` subtype, same `msg`) so the
+  ##     retry layer may replay it (idempotent, or any method with an Idempotency-Key).
+  if mux.deliberateClose:
+    return newException(IOError, msg)
+  if mux.h2.connError.len > 0:
+    return newException(IOError, "navi: http/2 " & mux.h2.connError)
+  if mux.h2.streamUnprocessed(sid):
+    return newException(UnprocessedError, "navi: http/2 request not processed")
+  if mux.h2.streamReset(sid):
+    return mux.resetError(sid)
+  if not attemptedWrite and sid notin mux.sentStreams:
+    return newException(UnprocessedError, "navi: http/2 request not processed")
+  if mux.h2.responseBegan(sid):
+    return newException(IOError, msg)
+  newException(KeepAliveRaceError, msg)
+
+proc failAll(mux: H2Mux, msg: string) =
+  ## Fail every in-flight buffered waiter, classifying each per-stream via
+  ## `connDeathError`: a deliberate client close or a connection PROTOCOL error is a
+  ## plain `IOError`; a proven-unprocessed / never-written waiter is `UnprocessedError`;
+  ## a terminal reset is the reset error; a waiter that had begun receiving a response is
+  ## a plain `IOError`; and a waiter written but with no response begun is the ambiguous
+  ## keep-alive race (`KeepAliveRaceError`, retryable idempotent / with an Idempotency-
+  ## Key). Raceability is computed inside `connDeathError` from `deliberateClose` +
+  ## `connError`, so a caller no longer passes a `preHeadersUnprocessed` flag: `close()`
+  ## sets `deliberateClose` first (its waiters stay plain IOError), while the reader's
+  ## self-exit leaves it false (its written-but-no-response waiters become the race).
   mux.alive = false
-  let raceable = preHeadersUnprocessed and mux.h2.connError.len == 0
   for sid, fut in mux.waiters:
     if not fut.finished:
-      if raceable and not mux.h2.responseBegan(sid):
-        fut.fail(newException(KeepAliveRaceError, msg))
-      else:
-        fut.fail(newException(IOError, msg))
+      fut.fail(mux.connDeathError(sid, msg))
   mux.waiters.clear()
   while mux.pendingSlots.len > 0:                 # wake blocked requests; they see
     let s = mux.pendingSlots.popFirst()           # `not alive` and raise
@@ -381,6 +431,7 @@ proc endStream(mux: H2Mux, sid: uint32) =
   mux.recvReady.del(sid)
   mux.recvq.del(sid)
   mux.sinkStreams.excl sid
+  mux.sentStreams.excl sid
   mux.decoders.del(sid)
   if wasActive and mux.alive and not mux.h2.streamEnded(sid) and
      not mux.h2.streamReset(sid):
@@ -540,27 +591,38 @@ proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: strin
       await mux.streamBody(sid, bodyStream, trailers)
     else:
       await mux.send(mux.h2.encodeRequest(sid, headers, body, trailers))
-  except CatchableError:
-    mux.reapStream(sid)                   # send/producer raised: RST + free the slot (#261)
-    raise
+    mux.sentStreams.incl sid              # request fully on the wire (see connDeathError)
+  except CatchableError as e:
+    # The send raised at WRITE time (a transport OSError/AsyncStreamError), or the user's
+    # BodyProducer raised. A genuine cancellation (chronos guard timeout / CancelToken) is
+    # NOT a keep-alive race: reap and re-raise it untouched. Otherwise, re-raising the raw
+    # transport error would hand the retry layer something it does not recognize (neither
+    # KeepAliveRaceError nor UnprocessedError) and it would decline the replay. Classify
+    # BEFORE reapStream clears the per-stream flags (`attemptedWrite`: bytes may have gone
+    # out partially, so an unmarked stream is the ambiguous race, not a proof of
+    # non-processing). A producer error surfaces the same way -- nothing on this connection
+    # reached the peer -- the intended behavior for a rewindable body. reapStream RSTs +
+    # frees the slot (#261).
+    if isCancellation(e) or e of KeepAliveRaceError or e of UnprocessedError:
+      mux.reapStream(sid)
+      raise
+    let err = mux.connDeathError(sid, "navi: http/2 connection closed",
+                                 attemptedWrite = true)
+    mux.reapStream(sid)
+    raise err
   # Wait for the response headers. As in drainDownload, there is no yield between the
   # state checks and registering `recvReady`, so the reader (which runs only while we
   # await) cannot slip a wake in between: no lost wakeup.
   while true:
     if not mux.alive:
+      # The connection died while we waited for headers. Classify BEFORE `detachSink`,
+      # which calls `takeResponse` and drops the stream -- that would clear `responseBegan`
+      # / the reset flags and misread a 1xx-then-drop as a race (the same "classify before
+      # detachSink clears flags" the reset path below relies on). `connDeathError` is the
+      # sink/gated twin of `failAll`'s per-waiter classification.
+      let err = mux.connDeathError(sid, "navi: http/2 connection closed")
       mux.detachSink(sid)
-      # The connection died while we waited for headers. Classify it the same way
-      # `failAll` classifies buffered waiters (this is the sink/gated twin of that path):
-      # a deliberate client close or a connection PROTOCOL error is a plain IOError -- NOT
-      # a retryable race -- while a drop with no response begun (no interim 1xx either) on
-      # a reused connection is the ambiguous keep-alive race.
-      if mux.deliberateClose:
-        raise newException(IOError, "navi: http/2 connection closed")
-      if mux.h2.connError.len > 0:
-        raise newException(IOError, "navi: http/2 " & mux.h2.connError)
-      if mux.h2.responseBegan(sid):
-        raise newException(IOError, "navi: http/2 connection closed")
-      raise newException(KeepAliveRaceError, "navi: http/2 connection closed")
+      raise err
     if mux.h2.streamReset(sid):
       let err = mux.resetError(sid)          # classify before detachSink clears flags
       mux.detachSink(sid)
@@ -620,6 +682,7 @@ proc dropStream*(mux: H2Mux, sid: uint32) =
   ## be sent if the connection is already gone.
   if sid notin mux.sinkStreams: return
   mux.sinkStreams.excl sid
+  mux.sentStreams.excl sid
   mux.recvq.del(sid)
   mux.wakeRecver(sid)                          # wake a parked readChunk racing us
   mux.clearSendReady(sid)                     # a tunnel may have a parked send
@@ -637,6 +700,7 @@ proc abandon*(mux: H2Mux, sid: uint32): Future[void] {.async.} =
   ## slot and buffers.
   if sid notin mux.sinkStreams: return
   mux.sinkStreams.excl sid
+  mux.sentStreams.excl sid
   mux.recvq.del(sid)
   mux.wakeRecver(sid)                          # wake a parked readChunk racing us
   mux.clearSendReady(sid)                     # a tunnel may have a parked send
@@ -690,11 +754,33 @@ proc request*(mux: H2Mux, headers: seq[(string, string)], body: string,
       await mux.streamBody(sid, bodyStream, trailers)
     else:
       await mux.send(mux.h2.encodeRequest(sid, headers, body, trailers))
-  except CatchableError:
-    # The send or the user's BodyProducer raised (a file read error, etc.): the
-    # waiter is registered, no END_STREAM/RST is on the wire, and the slot is held.
-    # Left alone the mux stays pooled and reusable, so repeated producer failures
-    # exhaust MAX_CONCURRENT_STREAMS. RST the stream and release the slot (issue #261).
+    mux.sentStreams.incl sid              # request fully on the wire (see connDeathError)
+  except CatchableError as e:
+    # The send raised at WRITE time (transport error), or the user's BodyProducer raised.
+    # A genuine cancellation (chronos guard timeout / CancelToken) is NOT a keep-alive
+    # race: reap and re-raise it untouched. Otherwise the waiter is registered but no
+    # END_STREAM/RST is on the wire and the slot is held; left alone the mux stays pooled
+    # and repeated producer failures exhaust MAX_CONCURRENT_STREAMS. Two orderings can
+    # reach here (issue #261 + the keep-alive race): the send raised first (failAll has not
+    # run), or a concurrent reader close ran `failAll` first and already CLASSIFIED + failed
+    # `fut`. In the latter case consume `fut`'s classified error (so asyncdispatch does not
+    # warn about an unread failed future) and prefer it; otherwise classify the raw
+    # transport error ourselves (`attemptedWrite`: a partial write is the ambiguous race,
+    # not proof of non-processing) so the retry layer sees a KeepAliveRaceError/
+    # UnprocessedError it can act on rather than a raw OSError it declines. reapStream RSTs
+    # + frees the slot.
+    if isCancellation(e):
+      mux.reapStream(sid)
+      raise
+    var chosen: ref CatchableError =
+      if e of KeepAliveRaceError or e of UnprocessedError: e
+      else: mux.connDeathError(sid, "navi: http/2 connection closed",
+                               attemptedWrite = true)
+    if fut.finished and fut.failed:
+      let prior = fut.readError()          # consume failAll's already-classified failure
+                                           # (else asyncdispatch warns on the unread future)
+      if prior of KeepAliveRaceError or prior of UnprocessedError:
+        chosen = (ref CatchableError)(prior)   # prefer the reader's classification
     mux.reapStream(sid)
-    raise
+    raise chosen
   result = await fut

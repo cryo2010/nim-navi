@@ -96,7 +96,15 @@ onward (pre-1.0, minor versions may include breaking changes).
   `navi/asyncdispatch` and `navi/chronos`, and the sync pooled-h2 carrier), on both the
   buffered `request()` and the streaming `stream()`/`sse()` paths. The single replay
   decision lives in one predicate (`retry.replayableAfterError`) shared by every
-  reused/pooled fall-through. HTTP/3 already re-sends on a QUIC failure via its Alt-Svc
+  reused/pooled fall-through. The classification covers the whole exchange, not just
+  the header read: a failure while *writing* the request on a reused connection is the
+  same ambiguous race (previously it surfaced as an unclassified transport error and
+  was never replayed), an HTTP/2 request still queued behind the mux's serialized send
+  chain when the connection died is provably unprocessed, and a `1xx` interim is
+  tracked on HTTP/1.1 too (the parser previously discarded it, making a 103-then-drop
+  look like a "no response" race). Concurrent requests failed by one HTTP/2 connection
+  death now coalesce onto a single fresh connection instead of each opening (and
+  leaking) its own. HTTP/3 already re-sends on a QUIC failure via its Alt-Svc
   fallback; see #378 for a related follow-up to gate that fallback for non-idempotent
   requests.
 

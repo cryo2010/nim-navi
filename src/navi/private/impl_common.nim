@@ -230,6 +230,31 @@ proc pruneDeadMuxes(client: Navi) =
     if not mux.canReuse: dead.add origin
   for origin in dead: client.muxes.del(origin)
 
+proc closeOrphanMux(mux: H2Mux) {.async.} =
+  ## Fire-and-forget close of a mux that was displaced from `client.muxes` while still
+  ## live (its reader + keepalive still running). Swallows errors so it is safe to
+  ## `asyncCheck` off the request path: the request must not block on tearing an orphan
+  ## down, but the orphan must still be reachable for close (else its fd/reader leak
+  ## where `client.close`/`pruneDeadMuxes` can never see it). `asyncCheck` resolves on
+  ## both backends (asyncdispatch's std, chronos's asyncfutures).
+  try: await mux.close()
+  except CatchableError: discard
+
+proc resolveReusableMux(client: Navi, origin: string): Future[H2Mux] {.async.} =
+  ## Resolve a shared h2 connection to reuse for `origin`: a live cached mux, or -- when
+  ## a concurrent connect is in flight -- the mux that coalescing connect yields. Returns
+  ## nil when there is neither (or the pending connect turned out http/1.1), so the caller
+  ## falls through to the pooled-h1 / fresh-connect steps. Awaiting `pendingMux` here (not
+  ## in the caller's try) keeps a coalesced waiter off the fresh-connect path, so a burst
+  ## -- including racers displaced by a keep-alive race -- still lands on ONE connection.
+  if client.muxes.hasKey(origin) and client.muxes[origin].canReuse:
+    return client.muxes[origin]
+  if client.pendingMux.hasKey(origin):
+    let mux = await client.pendingMux[origin]
+    if mux != nil and mux.canReuse: return mux
+    # else: that connect turned out http/1.1, or resolved dead -- fall through
+  return nil
+
 proc openFreshConn(client: Navi, rq: Request, origin: string,
                    wantH2: bool): Future[tuple[conn: Conn, mux: H2Mux]] {.async.} =
   ## Open a fresh connection to `rq`'s origin, coalescing concurrent cold connects
@@ -248,6 +273,16 @@ proc openFreshConn(client: Navi, rq: Request, origin: string,
                              client.config.tls, proxyTarget, alpn,
                              client.config.connectMs, client.config.readMs)
     return (conn, H2Mux(nil))
+  # A concurrent racer may already have a connect in flight (or a live mux) for this
+  # origin -- e.g. N waiters displaced from a reused mux by a keep-alive race in one
+  # tick, each reaching here. Coalesce onto it (no await before this check ran in the
+  # caller's lookup, but the reap/popIdle awaits since then open a window) rather than
+  # opening a second connection and overwriting the pendingMux slot, which would orphan
+  # the racer's connection where `client.close`/`pruneDeadMuxes` can never reach it.
+  if client.pendingMux.hasKey(origin):
+    let existing = await client.pendingMux[origin]
+    if existing != nil and existing.canReuse: return (default(Conn), existing)
+    # else: that connect turned out http/1.1 or resolved dead -- open our own below
   let pending = newFuture[H2Mux]("navi.pendingMux")
   client.pendingMux[origin] = pending
   try:
@@ -258,16 +293,28 @@ proc openFreshConn(client: Navi, rq: Request, origin: string,
       let mux = await newH2Mux(conn, client.config.maxResponseBytes,
                                client.config.wantsDecompress,
                                client.config.h2KeepAliveMs)
+      # Installing into `muxes` must not silently orphan a DIFFERENT live mux another
+      # racer cached in the meantime: its reader + keepalive would run forever, its fd
+      # unreachable for close. Close the displaced one fire-and-forget (off the request
+      # path -- close is async and we must not block here); our own entry, if a racer
+      # replaced it, is left alone. `pending.del` likewise only removes OUR future.
+      let prior = client.muxes.getOrDefault(origin, nil)
+      if prior != nil and prior != mux:   # a racer cached a DIFFERENT live mux here:
+        asyncCheck closeOrphanMux(prior)  # close it (its own dead-guard no-ops if it
+                                          # already exited), never leaving it orphaned
       client.muxes[origin] = mux
-      client.pendingMux.del(origin)
+      if client.pendingMux.getOrDefault(origin, nil) == pending:
+        client.pendingMux.del(origin)
       pending.complete(mux)
       return (conn, mux)
     else:
-      client.pendingMux.del(origin)
+      if client.pendingMux.getOrDefault(origin, nil) == pending:
+        client.pendingMux.del(origin)
       pending.complete(nil)          # this origin is http/1.1
       return (conn, H2Mux(nil))
   except CatchableError as e:
-    client.pendingMux.del(origin)
+    if client.pendingMux.getOrDefault(origin, nil) == pending:
+      client.pendingMux.del(origin)
     # A failure after the branch already completed `pending` (h1 fallback, or a
     # post-handshake error) must not complete the future twice (mirrors chronos).
     if not pending.finished: pending.fail(e)
@@ -290,35 +337,37 @@ proc transportInner(client: Navi, req: Request, sink: BodySink,
     # 1. A live shared connection, or one currently being established. A reused mux
     # can be torn down by the peer at any time (idle recycle, a GOAWAY-less close), so
     # a request dispatched on it that dies BEFORE any response HEADERS is the classic
-    # keep-alive race: the mux surfaces that as `KeepAliveRaceError` (see failAll). It
-    # was not answered, so replay it once on a fresh connection below -- even a
-    # non-idempotent one, mirroring the h1 pooled-connection replay (which the retry
-    # policy will NOT do for a plain IOError). Scoped to the REUSED mux here: a fresh
-    # mux (step 3) failing the same way is not caught, so it surfaces and is not
-    # replayed. A gated body already fed, or a non-rewindable streamed body, must not
-    # be re-issued, so those propagate.
-    if client.muxes.hasKey(origin) and client.muxes[origin].canReuse:
-      # A reused mux adopts the CURRENT keepalive interval, not the one it was opened
-      # with, honoring navi's live-config contract (issue #360).
-      client.muxes[origin].applyKeepAlive(client.config.h2KeepAliveMs)
+    # keep-alive race: the mux surfaces that as `KeepAliveRaceError` (see failAll), or
+    # `UnprocessedError` when the mux was found dead before the request was sent (a
+    # TOCTOU dead mux, or a GOAWAY while parked on a concurrency slot). Neither was
+    # answered, so replay it -- a race for an idempotent/keyed method, an unprocessed
+    # error for any method (the shared `replayableAfterError`). A gated body already
+    # fed, or a non-rewindable streamed body, must not be re-issued, so those propagate.
+    #
+    # The retry does NOT jump straight to a fresh connection: a concurrent racer may
+    # have already opened one (registered in `pendingMux`), so re-enter the lookup once
+    # and coalesce onto it rather than each racer opening -- and orphaning -- its own
+    # connection. `resolveReusableMux` (below) does the muxes/pendingMux lookup; we run
+    # it at most twice (the initial dispatch, then one retry after a replayable race).
+    var attempted = false            # whether we already dispatched on a resolved mux
+    while true:
+      let mux = await client.resolveReusableMux(origin)
+      if mux == nil: break           # no live/pending mux (or it turned out h1): fall through
+      mux.applyKeepAlive(client.config.h2KeepAliveMs)   # adopt the CURRENT keepalive
+                                     # interval, not the one it was opened with (#360)
       try:
-        return await client.muxRequest(client.muxes[origin], req, sink, asyncStream,
-                                       userSink, gate)
-      except KeepAliveRaceError as e:
+        return await client.muxRequest(mux, req, sink, asyncStream, userSink, gate)
+      except CatchableError as e:
+        # Fall through to a fresh connection only when the error class is replayable
+        # AND this request may be replayed; a gated body already fed never is. On the
+        # first replayable race retry the lookup once (to coalesce onto a peer's fresh
+        # connect); a second failure falls through to steps 2/3. Any other error class
+        # (a post-response truncation, a cancellation) is terminal and propagates.
         if (gate != nil and gate.fed) or
-           not (isReplayable(req) and replayableAfterError(req, e)): raise
-        # else fall through to a fresh connection below
-    elif client.pendingMux.hasKey(origin):
-      let mux = await client.pendingMux[origin]
-      if mux != nil and mux.canReuse:
-        mux.applyKeepAlive(client.config.h2KeepAliveMs)
-        try:
-          return await client.muxRequest(mux, req, sink, asyncStream, userSink, gate)
-        except KeepAliveRaceError as e:
-          if (gate != nil and gate.fed) or
-             not (isReplayable(req) and replayableAfterError(req, e)): raise
-          # else fall through to a fresh connection below
-      # else: turned out http/1.1, fall through
+           not (isReplayClassError(e) and isReplayable(req) and
+                replayableAfterError(req, e)): raise
+        if attempted: break          # already retried once: stop coalescing, go fresh
+        attempted = true             # loop once more through resolveReusableMux
 
   # 2. A pooled http/1.1 connection.
   for dead in reapExpired(client.pool):    # close idle connections past idleConnTimeout

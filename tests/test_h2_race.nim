@@ -41,6 +41,7 @@ proc post(mux: H2Mux): Future[ref CatchableError] {.async.} =
     result = e
 
 var beforeThread, afterThread, preThread, interimThread: Thread[RacePeerArg]
+var resetThread, refusedThread: Thread[RacePeerArg]
 
 suite "http/2 keep-alive race":
   test "a drop before response headers surfaces as KeepAliveRaceError":
@@ -97,3 +98,38 @@ suite "http/2 keep-alive race":
       await mux.close()
     waitFor run()
     joinThread(interimThread)
+
+  test "a terminal RST_STREAM(CANCEL) before headers is a plain reset, NOT a race":
+    # The peer reset the stream (not REFUSED), so it may have processed the request:
+    # `connDeathError` must surface a plain reset IOError, not a KeepAliveRaceError that
+    # would replay a non-idempotent request. Exercises the reset-flag consultation.
+    startRacePeer(resetThread, 9344, pmResetThenClose)
+    proc run() {.async.} =
+      let mux = await connectMux(9344)
+      let fut = post(mux)
+      check await withTimeout(fut, 5000)
+      let e = fut.read
+      check e != nil
+      check e of IOError
+      check not (e of KeepAliveRaceError)  # a reset, not the ambiguous race
+      check not (e of UnprocessedError)    # CANCEL is not REFUSED: no proof of non-processing
+      await mux.close()
+    waitFor run()
+    joinThread(resetThread)
+
+  test "an RST_STREAM(REFUSED_STREAM) before headers is UnprocessedError":
+    # REFUSED_STREAM is the peer's proof it did not process the request, so it is
+    # retryable for any method (`UnprocessedError`), NOT the ambiguous race. Exercises
+    # the unprocessed-flag consultation in `connDeathError`.
+    startRacePeer(refusedThread, 9345, pmRefusedThenClose)
+    proc run() {.async.} =
+      let mux = await connectMux(9345)
+      let fut = post(mux)
+      check await withTimeout(fut, 5000)
+      let e = fut.read
+      check e != nil
+      check e of UnprocessedError
+      check not (e of KeepAliveRaceError)
+      await mux.close()
+    waitFor run()
+    joinThread(refusedThread)

@@ -107,34 +107,26 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
   if wantH2:
     # A reused mux can be torn down before headers arrive (keep-alive race /
     # provably-unprocessed). streamOpen has no outer retry loop, so -- like the buffered
-    # transportInner -- fall through to a fresh connection when the error is replayable
-    # for this request; otherwise the caller sees it. Catch only the race/unprocessed
-    # types so a genuine cancellation or post-header error still propagates.
-    if client.muxes.hasKey(origin) and client.muxes[origin].canReuse:
-      let mux = client.muxes[origin]
+    # transportInner -- this in-place fall-through is the ONLY replay: fall through to a
+    # fresh connection when the error class is replayable AND this request may be
+    # replayed; otherwise the caller sees it. Only the race/unprocessed classes fall
+    # through, so a cancellation or a post-header error still propagates. On a replayable
+    # error, re-enter the lookup once (via `resolveReusableMux`) to coalesce onto a
+    # concurrent racer's fresh connect rather than each racer opening its own.
+    var attempted = false
+    while true:
+      let mux = await client.resolveReusableMux(origin)
+      if mux == nil: break           # no live/pending mux (or it turned out h1): fall through
       try:
         let sid = await mux.sendAndReadHeaders(h2HeaderList(req), req.body, req.bodyStream, h2TrailerList(req))
         return StreamResponse(kind: skH2, mux: mux, sid: sid,
           resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
           decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
       except CatchableError as e:
-        # Only the race / provably-unprocessed types fall through to a fresh connection;
-        # anything else (cancellation, a post-header error) re-raises to the caller.
-        if not ((e of KeepAliveRaceError or e of UnprocessedError) and
-                isReplayable(req) and replayableAfterError(req, e)): raise
-        # else fall through to a fresh connection below
-    elif client.pendingMux.hasKey(origin):
-      let mux = await client.pendingMux[origin]
-      if mux != nil and mux.canReuse:
-        try:
-          let sid = await mux.sendAndReadHeaders(h2HeaderList(req), req.body, req.bodyStream, h2TrailerList(req))
-          return StreamResponse(kind: skH2, mux: mux, sid: sid,
-            resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
-            decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
-        except CatchableError as e:
-          if not ((e of KeepAliveRaceError or e of UnprocessedError) and
-                  isReplayable(req) and replayableAfterError(req, e)): raise
-          # else fall through to a fresh connection below
+        if not (isReplayClassError(e) and isReplayable(req) and
+                replayableAfterError(req, e)): raise
+        if attempted: break          # already retried once: stop coalescing, go fresh
+        attempted = true             # loop once more through resolveReusableMux
 
   for dead in reapExpired(client.pool):    # close idle connections past idleConnTimeout
     await close(dead.transport)            # (the buffered path reaps too; issue #313)

@@ -45,6 +45,16 @@ proc replayableAnyMethod*(req: Request, e: ref Exception): bool =
   ## Mirrors Go net/http's post-write replay rule (RFC 9110 9.2.2).
   (e of UnprocessedError) or ((e of KeepAliveRaceError) and hasIdempotencyKey(req))
 
+proc isReplayClassError*(e: ref Exception): bool =
+  ## Whether `e` is one of the two transport error classes a reused/pooled
+  ## fall-through may replay on a fresh connection: `KeepAliveRaceError` (the request
+  ## was written, then the connection dropped before any response began -- ambiguous)
+  ## or `UnprocessedError` (the peer proved it was not processed). Any other error
+  ## (a post-response truncation, a cancellation, a protocol error) is terminal and
+  ## must propagate. The single place the replayable-error TYPE set lives, shared by
+  ## every fall-through so the set cannot diverge (see `replayableAnyMethod`).
+  e of KeepAliveRaceError or e of UnprocessedError
+
 proc replayableAfterError*(req: Request, e: ref Exception): bool =
   ## The single transport-layer replay predicate, shared by every reused/pooled
   ## connection fall-through (h1 + h2, sync + async, streaming + buffered): re-send `req`
