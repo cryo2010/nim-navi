@@ -35,14 +35,32 @@ proc isRetryableStatus*(status: int, policy: RetryPolicy): bool =
   ## Whether `status` should trigger a retry under `policy`.
   status in policy.statuses
 
-proc shouldRetryAfterError*(attempt: int; bodyReplayable, unprocessed: bool;
+proc replayableAnyMethod*(req: Request, e: ref Exception): bool =
+  ## Whether transport error `e` makes `req` safe to replay REGARDLESS of method
+  ## idempotency: the peer proved it was not processed (`UnprocessedError` -- h2
+  ## REFUSED_STREAM / above GOAWAY / a connection found dead before the request was
+  ## written), or the connection dropped before any response began
+  ## (`KeepAliveRaceError`) AND the caller vouched safety with an Idempotency-Key.
+  ## This is NOT proof of non-processing for the keyed-race case; it is caller-vouched.
+  ## Mirrors Go net/http's post-write replay rule (RFC 9110 9.2.2).
+  (e of UnprocessedError) or ((e of KeepAliveRaceError) and hasIdempotencyKey(req))
+
+proc replayableAfterError*(req: Request, e: ref Exception): bool =
+  ## The single transport-layer replay predicate, shared by every reused/pooled
+  ## connection fall-through (h1 + h2, sync + async, streaming + buffered): re-send `req`
+  ## on a fresh connection after `e` when the method is idempotent, or the error makes it
+  ## replayable regardless of method (`replayableAnyMethod`). Orthogonal to `isReplayable`
+  ## (body rewindability), which the caller must also check.
+  isIdempotent(req.verb) or replayableAnyMethod(req, e)
+
+proc shouldRetryAfterError*(attempt: int; bodyReplayable, replayableAnyMethod: bool;
                             verb: HttpVerb; policy: RetryPolicy): bool =
-  ## Whether a raised transport error should be retried: attempts remain, the
-  ## body can be replayed, and either the verb is retryable or the peer proved
-  ## the request was not processed (h2 REFUSED_STREAM / above GOAWAY -- safe to
-  ## replay even when non-idempotent).
+  ## Whether a raised transport error should be retried by the policy loop: attempts
+  ## remain, the body can be replayed, and either the verb is in the retry policy or the
+  ## error is replayable regardless of method (`replayableAnyMethod` -- a proven-
+  ## unprocessed error, or an Idempotency-Key-vouched keep-alive race; see that proc).
   attempt < policy.limit and bodyReplayable and
-    (isRetryableVerb(verb, policy) or unprocessed)
+    (isRetryableVerb(verb, policy) or replayableAnyMethod)
 
 proc shouldRetryAfterResponse*(attempt, status: int; bodyReplayable: bool;
                                verb: HttpVerb; policy: RetryPolicy): bool =

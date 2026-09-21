@@ -33,6 +33,8 @@ type
     hdrBuf: string
     hdrEndStream: bool
     sawFinal: bool        ## the final (non-1xx) response HEADERS block has arrived
+    sawInterim: bool      ## a 1xx interim response (100/103/...) has arrived, so the
+                          ## peer demonstrably began responding even before `sawFinal`
     recvPending: int      ## received bytes not yet acked with a WINDOW_UPDATE
     recvWindow: int       ## receive window still granted to the peer for this stream;
                           ## debited by each DATA payload, credited by each WINDOW_UPDATE.
@@ -327,6 +329,7 @@ proc applyHeaders(c: H2Conn, s: Stream, sid: uint32, outbuf: var string) =
     # END_STREAM is malformed (it would otherwise hang the request, `ended` unset);
     # otherwise discard it and wait for the final response in a later HEADERS block.
     if s.hdrEndStream: malformedResponse(s, sid, outbuf)
+    else: s.sawInterim = true    # the peer began responding: not a "no response" race
     return
   if not statusSeen or status < 100 or status > 599:
     malformedResponse(s, sid, outbuf); return             # missing/invalid :status
@@ -764,6 +767,14 @@ proc headersReady*(c: H2Conn, streamId: uint32): bool =
   ## caller return a handle after the headers and drain the body on demand.
   let s = c.streams.getOrDefault(streamId)
   s != nil and s.sawFinal
+
+proc responseBegan*(c: H2Conn, streamId: uint32): bool =
+  ## True once the peer has sent ANY response HEADERS for the stream -- a 1xx interim
+  ## (100/103/...) or the final block. Used to classify a connection drop: if a
+  ## response began, the request was not "unprocessed", so the drop is a truncation,
+  ## not a safe keep-alive race. (`headersReady` alone misses the 1xx-then-drop case.)
+  let s = c.streams.getOrDefault(streamId)
+  s != nil and (s.sawFinal or s.sawInterim)
 
 proc respSnapshot*(c: H2Conn, streamId: uint32): H2Response =
   ## Status + headers snapshot (empty body) WITHOUT dropping the stream, so a

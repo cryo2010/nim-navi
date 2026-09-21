@@ -347,18 +347,18 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
     let unprocessed = h2.streamUnprocessed(sid)
     let connErr = h2.connError
     let done = h2.streamDone(sid)  # END_STREAM seen (else the loop broke on transport EOF)
-    let sawHeaders = h2.headersReady(sid)          # before takeResponse drops the stream
+    let responseBegan = h2.responseBegan(sid)      # final OR 1xx headers; before takeResponse
     let lengthBad = h2.streamLengthMismatch(sid)   # capture before takeResponse drops it
     var r = toResponse(h2.takeResponse(sid))
-    # The connection dropped before ANY response header, with no stream reset, no
-    # connection error, and no proven-unprocessed signal: the ambiguous keep-alive
-    # race (request written, no response began). Surface it as KeepAliveRaceError so
-    # the retry layer may replay it (idempotent, or any method with an Idempotency-Key).
-    # `not wasReset` matters: a stream RST before headers (e.g. INTERNAL_ERROR after the
-    # peer started handling it) is NOT a race -- it falls through to raiseH2Terminal and
-    # is surfaced as a terminal reset (not replayed for a non-idempotent method). A drop
-    # AFTER headers (sawHeaders) likewise falls through (the peer began responding).
-    if not sawHeaders and not done and not wasReset and connErr.len == 0 and
+    # The connection dropped before ANY response header (not even a 1xx), with no stream
+    # reset, no connection error, no abrupt GOAWAY (`not done`), and no proven-unprocessed
+    # signal: the ambiguous keep-alive race (request written, no response began). Surface
+    # it as KeepAliveRaceError so the retry layer may replay it (idempotent, or any method
+    # with an Idempotency-Key). Every conjunct is load-bearing: `not wasReset` keeps a
+    # pre-header RST terminal; `not done` keeps an abrupt GOAWAY(err) terminal; the rest
+    # defer to the raiseH2Terminal cascade below (which the peer began-responding /
+    # connErr / oversize / unprocessed cases fall through to).
+    if not responseBegan and not done and not wasReset and connErr.len == 0 and
        not unprocessed and not tooLarge:
       raise newException(KeepAliveRaceError, "navi: http/2 connection closed")
     # `r.status == 0` (gone away before a response) is treated as a reset here; on the
@@ -438,6 +438,7 @@ template h2SendAndReadHeaders*(transport, h2, req: typed): uint32 =
       let connErr = h2.connError
       let unprocessed = h2.streamUnprocessed(sid)
       let wasReset = h2.streamReset(sid)     # capture before takeResponse drops the stream
+      let began = h2.responseBegan(sid)      # 1xx or final headers seen (before takeResponse)
       discard h2.takeResponse(sid)
       if connErr.len > 0: raise newException(IOError, "navi: http/2 " & connErr)
       if unprocessed:
@@ -446,6 +447,9 @@ template h2SendAndReadHeaders*(transport, h2, req: typed): uint32 =
       # terminal reset the peer may have processed, NOT a keep-alive race: surface a
       # plain IOError so a non-idempotent request is not replayed.
       if wasReset: raise newException(IOError, "navi: http/2 request did not complete")
+      # A 1xx interim response (100/103) arrived before the drop: the peer demonstrably
+      # began responding, so it is not a "no response" race -- surface a plain IOError.
+      if began: raise newException(IOError, "navi: http/2 request did not complete")
       # No headers, no reset, no connection error, no proven-unprocessed signal: the
       # ambiguous keep-alive race (request written, no response began). KeepAliveRaceError
       # lets the retry layer replay it for an idempotent method, or any method carrying an
@@ -515,7 +519,7 @@ template h1GatedFinish*(transport, parser, sink, gate, keep,
     r.bodyTruncated = truncated
     r
 
-template serveOnce(client, pc, rq, sink, key, gotResponse: typed;
+template serveOnce(client, pc, rq, sink, key: typed;
                    asyncStream: typed = nil; userSink: typed = nil;
                    gate: typed = nil): Response =
   ## Run one request/response over the pooled connection `pc` -- reused or freshly
@@ -523,12 +527,12 @@ template serveOnce(client, pc, rq, sink, key, gotResponse: typed;
   ## `pc.h2` set means an established h2 connection; otherwise HTTP/1.1, unless the
   ## transport just negotiated "h2" on a fresh connection (`pc.h2` still nil), in
   ## which case the h2 connection is initialized and its client preamble sent first.
-  ## `gotResponse` is set false while an h1 request is in flight and true once the
-  ## response headers arrive, so a caller's stale-retry logic can tell a pre- from a
-  ## post-response failure (h2 signals its own unprocessed case via UnprocessedError,
-  ## so it leaves `gotResponse` true). The caller must guard the call so a raised
-  ## exchange closes the transport before re-raising; the pool/close below runs only
-  ## on success, so a pooled connection is never double-closed.
+  ## A pre-response failure is classified by the exception TYPE (`h1SendAndReadHeaders`
+  ## raises `KeepAliveRaceError` before any response; the h2 templates their own
+  ## `UnprocessedError`/`KeepAliveRaceError`), so the caller's replay decision reads the
+  ## error, not a flag. The caller must guard the call so a raised exchange closes the
+  ## transport before re-raising; the pool/close below runs only on success, so a pooled
+  ## connection is never double-closed.
   mixin sendAll, await, BodySink
   block:
     let gated = not userSink.isNil and not gate.isNil
@@ -546,10 +550,8 @@ template serveOnce(client, pc, rq, sink, key, gotResponse: typed;
                      client.config.wantsDecompress, client.config.maxResponseBytes)
       keep = pc.h2.canReuse
     else:
-      gotResponse = false
       var parser = h1SendAndReadHeaders(pc.transport, rq,
                      not sink.isNil or gated, asyncStream)
-      gotResponse = true
       if gated:
         r = h1GatedFinish(pc.transport, parser, userSink, gate, keep,
                           client.config.wantsDecompress, client.config.maxResponseBytes)
@@ -591,14 +593,8 @@ template poolTransport*(client, req, sink: typed; asyncStream: typed = nil;
       # so a connection taken from the idle pool must adopt the CURRENT read timeout
       # and per-attempt total deadline, not the ones it was opened with (issue #360).
       rearm(pc.transport, client.config.readMs, totalMsFor(client.config, rq))
-      # `gotResponse` splits a reused-connection failure into "before any response"
-      # (the request never reached a working server -> unprocessed) vs "after the
-      # response began" (the server processed it). h2 signals its own unprocessed
-      # case via UnprocessedError, so treat its failures as post-response.
-      var gotResponse = true
       try:
-        resp = serveOnce(client, pc, rq, sink, key, gotResponse, asyncStream,
-                         userSink, gate)
+        resp = serveOnce(client, pc, rq, sink, key, asyncStream, userSink, gate)
         served = true
       except CatchableError as e:
         await close(pc.transport)  # pooled connection was stale
@@ -606,20 +602,13 @@ template poolTransport*(client, req, sink: typed; asyncStream: typed = nil;
         # (it would double-feed the sink): once the sink has been fed, propagate.
         if gate != nil and gate.fed: raise
         # Fall through to a fresh connection only when replaying is safe (matching Go
-        # net/http; RFC 9110 9.2.2). A reused keep-alive connection can be dropped at any
-        # time, but "no response byte yet" does NOT prove the request was unprocessed once
-        # its bytes were written. So replay an idempotent method; a proven-unprocessed
-        # peer signal (`UnprocessedError` -- h2 REFUSED_STREAM / above GOAWAY / dead before
-        # send); or the ambiguous written-but-no-response race (`KeepAliveRaceError`) ONLY
-        # when the caller vouched safety with an Idempotency-Key. A non-idempotent method
-        # without such a key is NOT auto-replayed here. A non-replayable streamed body is
-        # never retried (its producer cannot rewind). `gotResponse` still distinguishes a
-        # pre-response send/read failure (KeepAliveRaceError from h1SendAndReadHeaders)
-        # from a post-response truncation; the key gate is applied via the error type.
-        let replayable = isReplayable(req)
-        if not (replayable and
-                (isIdempotent(req.verb) or (e of UnprocessedError) or
-                 ((e of KeepAliveRaceError) and hasIdempotencyKey(req)))):
+        # net/http; RFC 9110 9.2.2). The error type carries the pre/post-response and
+        # proven/ambiguous distinction: `replayableAfterError` replays an idempotent
+        # method, a proven-unprocessed error (`UnprocessedError`), or an Idempotency-Key-
+        # vouched keep-alive race (`KeepAliveRaceError`). A non-idempotent method without
+        # a key, or a post-response truncation, is not replayed. A non-replayable streamed
+        # body (`bodyStream`) is never retried (its producer cannot rewind).
+        if not (isReplayable(req) and replayableAfterError(req, e)):
           raise
 
     if not served:
@@ -628,14 +617,12 @@ template poolTransport*(client, req, sink: typed; asyncStream: typed = nil;
                                     client.config.connectMs, client.config.readMs,
                                     totalMsFor(client.config, rq))
       var npc = PooledConn[typeof(transport)](transport: transport)
-      var gotResponse = true   # unused on the fresh path (nothing to replay onto)
       # Guard the exchange so a failure (h1/h2 send, the h2 preamble/stream, or a
       # truncated body) closes the just-opened transport before re-raising, instead
       # of leaking the fd/TLS handle. serveOnce's pool/close decision runs only on
       # success, so a pooled connection is never double-closed.
       try:
-        resp = serveOnce(client, npc, rq, sink, key, gotResponse, asyncStream,
-                         userSink, gate)
+        resp = serveOnce(client, npc, rq, sink, key, asyncStream, userSink, gate)
       except CatchableError:
         await close(transport)
         raise
@@ -815,19 +802,12 @@ template performRequest*(client, req0: typed; cancel: CancelToken = nil;
         # surface it straight away. Mirrors the buffered path, where enforceMaxResponse
         # raises after the loop and is never retried.
         if gate != nil and (e of ResponseTooLargeError): raise
-        # "Safe to retry even when non-idempotent" holds only when the request was not
-        # processed: a peer PROOF (`UnprocessedError` -- h2 REFUSED_STREAM / above GOAWAY
-        # / a connection found dead before the request was sent), OR the ambiguous
-        # keep-alive race (`KeepAliveRaceError` -- written but no response began) *when
-        # the caller supplied an Idempotency-Key* to vouch that a replay is safe. Without
-        # such a key a `KeepAliveRaceError` is NOT treated as unprocessed here, so a
-        # non-idempotent method is not auto-replayed (it might already have been applied);
-        # an idempotent method still retries via `isRetryableVerb`. This mirrors Go
+        # An idempotent verb retries via the policy (`isRetryableVerb`); a non-idempotent
+        # one only when `replayableAnyMethod` holds -- a proven-unprocessed error, or an
+        # Idempotency-Key-vouched keep-alive race (see retry.nim). This mirrors Go
         # net/http's post-write policy and RFC 9110 9.2.2.
-        let unprocessed = (e of UnprocessedError) or
-                          ((e of KeepAliveRaceError) and hasIdempotencyKey(req))
-        if not shouldRetryAfterError(attempt, bodyReplayable, unprocessed,
-                                     req.verb, policy):
+        if not shouldRetryAfterError(attempt, bodyReplayable,
+                                     replayableAnyMethod(req, e), req.verb, policy):
           raise # not retryable: propagate the transport error
       if gotResp and
          not shouldRetryAfterResponse(attempt, resp.status, bodyReplayable,

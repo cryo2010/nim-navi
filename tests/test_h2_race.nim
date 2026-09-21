@@ -40,7 +40,7 @@ proc post(mux: H2Mux): Future[ref CatchableError] {.async.} =
   except CatchableError as e:
     result = e
 
-var beforeThread, afterThread, preThread: Thread[RacePeerArg]
+var beforeThread, afterThread, preThread, interimThread: Thread[RacePeerArg]
 
 suite "http/2 keep-alive race":
   test "a drop before response headers surfaces as KeepAliveRaceError":
@@ -83,3 +83,17 @@ suite "http/2 keep-alive race":
       check not (e of KeepAliveRaceError)  # not the ambiguous written-but-no-response case
     waitFor run()
     joinThread(preThread)
+
+  test "a 1xx interim response before the drop is NOT a race (the peer began responding)":
+    startRacePeer(interimThread, 9343, pmInterimThenClose)
+    proc run() {.async.} =
+      let mux = await connectMux(9343)
+      let fut = post(mux)
+      check await withTimeout(fut, 5000)
+      let e = fut.read
+      check e != nil
+      check e of IOError                   # a response began (103), so a plain IOError
+      check not (e of KeepAliveRaceError)  # NOT the safe unprocessed race
+      await mux.close()
+    waitFor run()
+    joinThread(interimThread)

@@ -70,6 +70,9 @@ type
     cap: int                           ## max decoded response bytes (maxResponseBytes)
     sendTail: Future[void]   ## tail of the serialized send chain
     alive: bool
+    deliberateClose: bool    ## set by `close()` before it tears the mux down, so an
+                             ## in-flight request woken by the close reports a plain
+                             ## client-close `IOError`, not a retryable keep-alive race
     readerDone: Future[void] ## completed once the reader has exited and the
                              ## transport is closed, so `close` can join it
     settingsSeen: Future[void]  ## completed once the peer's initial SETTINGS is seen
@@ -296,7 +299,7 @@ proc failAll(mux: H2Mux, msg: string, preHeadersUnprocessed = false) =
   let raceable = preHeadersUnprocessed and mux.h2.connError.len == 0
   for sid, fut in mux.waiters:
     if not fut.finished:
-      if raceable and not mux.h2.headersReady(sid):
+      if raceable and not mux.h2.responseBegan(sid):
         fut.fail(newException(KeepAliveRaceError, msg))
       else:
         fut.fail(newException(IOError, msg))
@@ -546,9 +549,17 @@ proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: strin
   while true:
     if not mux.alive:
       mux.detachSink(sid)
-      # No response HEADERS arrived before the connection closed: if this was a reused
-      # connection it is the keep-alive race, so surface it as retryable-on-a-fresh-conn
-      # (KeepAliveRaceError, an IOError subtype with the same message).
+      # The connection died while we waited for headers. Classify it the same way
+      # `failAll` classifies buffered waiters (this is the sink/gated twin of that path):
+      # a deliberate client close or a connection PROTOCOL error is a plain IOError -- NOT
+      # a retryable race -- while a drop with no response begun (no interim 1xx either) on
+      # a reused connection is the ambiguous keep-alive race.
+      if mux.deliberateClose:
+        raise newException(IOError, "navi: http/2 connection closed")
+      if mux.h2.connError.len > 0:
+        raise newException(IOError, "navi: http/2 " & mux.h2.connError)
+      if mux.h2.responseBegan(sid):
+        raise newException(IOError, "navi: http/2 connection closed")
       raise newException(KeepAliveRaceError, "navi: http/2 connection closed")
     if mux.h2.streamReset(sid):
       let err = mux.resetError(sid)          # classify before detachSink clears flags

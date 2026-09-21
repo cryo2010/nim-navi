@@ -159,7 +159,8 @@ proc close*(mux: H2Mux) {.async.} =
                                        # already mid-teardown (it may have set
                                        # msTransportClosed while parked at its own be.close);
                                        # the msTransportClosed guard below then skips (#314)
-  mux.alive = false
+  mux.deliberateClose = true           # so a woken sink/gated request reports a plain
+  mux.alive = false                    # client-close IOError, not a retryable race
   mux.failAll("navi: client closed")
   # A guard timeout / CancelToken can cancel this close() while it is parked on an
   # await below. Capture the cancellation rather than swallowing it, finish the

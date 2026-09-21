@@ -105,19 +105,36 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
             client.h3conns.del(origin)     # drop a dead connection; fall back below
 
   if wantH2:
+    # A reused mux can be torn down before headers arrive (keep-alive race /
+    # provably-unprocessed). streamOpen has no outer retry loop, so -- like the buffered
+    # transportInner -- fall through to a fresh connection when the error is replayable
+    # for this request; otherwise the caller sees it. Catch only the race/unprocessed
+    # types so a genuine cancellation or post-header error still propagates.
     if client.muxes.hasKey(origin) and client.muxes[origin].canReuse:
       let mux = client.muxes[origin]
-      let sid = await mux.sendAndReadHeaders(h2HeaderList(req), req.body, req.bodyStream, h2TrailerList(req))
-      return StreamResponse(kind: skH2, mux: mux, sid: sid,
-        resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
-        decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
-    if client.pendingMux.hasKey(origin):
-      let mux = await client.pendingMux[origin]
-      if mux != nil and mux.canReuse:
+      try:
         let sid = await mux.sendAndReadHeaders(h2HeaderList(req), req.body, req.bodyStream, h2TrailerList(req))
         return StreamResponse(kind: skH2, mux: mux, sid: sid,
           resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
           decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
+      except CatchableError as e:
+        # Only the race / provably-unprocessed types fall through to a fresh connection;
+        # anything else (cancellation, a post-header error) re-raises to the caller.
+        if not ((e of KeepAliveRaceError or e of UnprocessedError) and
+                isReplayable(req) and replayableAfterError(req, e)): raise
+        # else fall through to a fresh connection below
+    elif client.pendingMux.hasKey(origin):
+      let mux = await client.pendingMux[origin]
+      if mux != nil and mux.canReuse:
+        try:
+          let sid = await mux.sendAndReadHeaders(h2HeaderList(req), req.body, req.bodyStream, h2TrailerList(req))
+          return StreamResponse(kind: skH2, mux: mux, sid: sid,
+            resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
+            decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
+        except CatchableError as e:
+          if not ((e of KeepAliveRaceError or e of UnprocessedError) and
+                  isReplayable(req) and replayableAfterError(req, e)): raise
+          # else fall through to a fresh connection below
 
   for dead in reapExpired(client.pool):    # close idle connections past idleConnTimeout
     await close(dead.transport)            # (the buffered path reaps too; issue #313)
@@ -128,14 +145,16 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
       return StreamResponse(kind: skH1, transport: pc.transport, parser: parser,
         resp: parser.toResponse(), client: client, key: origin,
         decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
-    except CatchableError:
+    except CatchableError as e:
       await close(pc.transport)     # pooled connection was stale
-      # Only open a fresh connection when replay is safe (mirrors transportInner):
-      # the header read failed, so the request was not processed (the classic
-      # keep-alive race -- safe to replay any method), but a non-rewindable streamed
-      # body cannot be re-sent. Previously the streaming path replayed here
-      # unconditionally, unlike the buffered path.
-      if not isReplayable(req): raise
+      # Open a fresh connection only when replay is safe (the same predicate as the
+      # buffered path; matching Go net/http / RFC 9110 9.2.2): an idempotent method, a
+      # proven-unprocessed error, or an Idempotency-Key-vouched keep-alive race. A
+      # non-idempotent method without a key -- e.g. api.stream(POST, ...) whose pooled
+      # connection dropped before any response -- is NOT replayed (it may already have
+      # been processed); a non-rewindable streamed body is never re-sent. streamOpen has
+      # no outer retry loop, so this in-place fall-through is the only replay.
+      if not (isReplayable(req) and replayableAfterError(req, e)): raise
 
   var rq = req
   rq.absoluteForm = usesAbsoluteForm(resolveProxy(client.config, rq.url), rq.url.isTls)

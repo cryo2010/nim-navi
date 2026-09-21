@@ -85,15 +85,20 @@ onward (pre-1.0, minor versions may include breaking changes).
       auto-retried: once its bytes are on the wire it may already have been processed,
       and replaying could double-apply a side effect (the exact heuristic RFC 9110 9.2.2
       flags as unsafe, and which Go and undici also decline).
-    - **A drop AFTER the response began** stays a plain `IOError` (truncation) and is
-      never auto-retried.
+    - **A drop AFTER the response began** -- including a `1xx` interim response
+      (100-continue / 103 Early Hints) that arrived before the connection dropped --
+      stays a plain `IOError` and is never auto-retried (the peer demonstrably began
+      responding).
   Previously HTTP/2 had no keep-alive-race handling at all (any close surfaced a generic
   `IOError` the retry policy would not replay even for an idempotent verb on the mux
   path), and the HTTP/1.1 pooled path over-replayed non-idempotent requests on any
   pre-response close. Covers HTTP/1.1 (sync + async) and HTTP/2 (the async mux on
-  `navi/asyncdispatch` and `navi/chronos`, and the sync pooled-h2 carrier). HTTP/3
-  already re-sends on a QUIC failure via its Alt-Svc fallback; see #378 for a related
-  follow-up to gate that fallback for non-idempotent requests.
+  `navi/asyncdispatch` and `navi/chronos`, and the sync pooled-h2 carrier), on both the
+  buffered `request()` and the streaming `stream()`/`sse()` paths. The single replay
+  decision lives in one predicate (`retry.replayableAfterError`) shared by every
+  reused/pooled fall-through. HTTP/3 already re-sends on a QUIC failure via its Alt-Svc
+  fallback; see #378 for a related follow-up to gate that fallback for non-idempotent
+  requests.
 
 ## [0.10.0] - 2026-09-15
 

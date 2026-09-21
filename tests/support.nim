@@ -913,6 +913,33 @@ proc startDropOnce*(th: var Thread[StaleCtx], port: var int, accepts: ptr int) =
     StaleCtx(portOut: addr port, ready: addr ready, closed1: addr closed1, accepts: accepts))
   while not ready: sleep(1)
 
+proc serveStaleNoRetry(ctx: StaleCtx) {.thread.} =
+  ## Serve ONE keep-alive request (so the connection is pooled), then close it and STOP
+  ## listening. For asserting a reused-connection request is NOT replayed: a correct
+  ## client that declines to replay sees the raised race error; a wrongful replay fails
+  ## to connect (the listener is gone) rather than hanging the test on a second accept.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(0), "127.0.0.1")
+  server.listen()
+  ctx.portOut[] = server.getLocalAddr()[1].int
+  ctx.ready[] = true
+  var c = acceptClient(server)
+  discard c.recvUntil("\r\n\r\n")
+  c.send("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: keep-alive\r\n\r\nabc")
+  c.close()                              # pooled, then closed while idle
+  ctx.accepts[] = 1
+  ctx.closed1[] = true
+  server.close()                         # no second accept: a replay would be refused
+
+proc startStaleNoRetry*(th: var Thread[StaleCtx], port: var int, closed1: ptr bool,
+                        accepts: ptr int) =
+  ## Serve one keep-alive request then close + stop listening. Binds an ephemeral port.
+  var ready = false
+  createThread(th, serveStaleNoRetry,
+    StaleCtx(portOut: addr port, ready: addr ready, closed1: closed1, accepts: accepts))
+  while not ready: sleep(1)
+
 proc startKeepAlive*(th: var Thread[KeepAliveCtx], port: var int, requests: int,
                      accepts: ptr int) =
   ## Launch the keep-alive server and block until it is listening. Binds an

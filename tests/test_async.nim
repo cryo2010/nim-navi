@@ -125,6 +125,25 @@ suite "asyncdispatch entry end to end":
     joinThread(th)
     check accepts == 1                                  # sent once, never replayed
 
+  test "a streamed non-idempotent request is not replayed on a stale pooled connection (at-most-once)":
+    # The streaming path (openStreamConn) must honor the same at-most-once rule as the
+    # buffered path: a POST whose reused pooled connection dropped before any response is
+    # NOT replayed. Previously the streaming pooled path replayed any rewindable body.
+    var port = 0
+    var accepts = 0
+    var closed1 = false
+    var th: Thread[StaleCtx]
+    startStaleNoRetry(th, port, addr closed1, addr accepts)
+
+    let api = newNavi()
+    let key = "http://127.0.0.1:" & $port
+    check (waitFor api.get(key & "/")).status == 200    # conn 1, then pooled
+    waitFlag(addr closed1)                              # server closed the pooled conn
+    expect naviresp.KeepAliveRaceError:
+      discard waitFor api.stream(POST, key & "/submit")
+    joinThread(th)
+    check accepts == 1                                  # sent once, never replayed
+
   test "a buffered request raises on a premature close mid-body":
     const port = 9263
     var th: Thread[ServerCtx]

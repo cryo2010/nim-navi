@@ -304,9 +304,9 @@ proc transportInner(client: Navi, req: Request, sink: BodySink,
       try:
         return await client.muxRequest(client.muxes[origin], req, sink, asyncStream,
                                        userSink, gate)
-      except KeepAliveRaceError:
-        if (gate != nil and gate.fed) or not isReplayable(req) or
-           not (isIdempotent(req.verb) or hasIdempotencyKey(req)): raise
+      except KeepAliveRaceError as e:
+        if (gate != nil and gate.fed) or
+           not (isReplayable(req) and replayableAfterError(req, e)): raise
         # else fall through to a fresh connection below
     elif client.pendingMux.hasKey(origin):
       let mux = await client.pendingMux[origin]
@@ -314,9 +314,9 @@ proc transportInner(client: Navi, req: Request, sink: BodySink,
         mux.applyKeepAlive(client.config.h2KeepAliveMs)
         try:
           return await client.muxRequest(mux, req, sink, asyncStream, userSink, gate)
-        except KeepAliveRaceError:
-          if (gate != nil and gate.fed) or not isReplayable(req) or
-             not (isIdempotent(req.verb) or hasIdempotencyKey(req)): raise
+        except KeepAliveRaceError as e:
+          if (gate != nil and gate.fed) or
+             not (isReplayable(req) and replayableAfterError(req, e)): raise
           # else fall through to a fresh connection below
       # else: turned out http/1.1, fall through
 
@@ -348,17 +348,11 @@ proc transportInner(client: Navi, req: Request, sink: BodySink,
       # A half-delivered gated body must never be replayed onto a fresh connection.
       if gate != nil and gate.fed: raise
       # Replay on a fresh connection only when safe (matching Go net/http; RFC 9110
-      # 9.2.2). "No response byte yet" does not prove the request was unprocessed once
-      # its bytes were written -- a pre-response failure is `KeepAliveRaceError`
-      # (h1SendAndReadHeaders raises it when the peer closed before any headers). So
-      # replay an idempotent method; a proven-unprocessed peer signal (`UnprocessedError`);
-      # or the ambiguous race (`KeepAliveRaceError`) ONLY with a caller Idempotency-Key.
-      # A non-idempotent method without a key is not auto-replayed; a non-rewindable
+      # 9.2.2), via the shared predicate: an idempotent method, a proven-unprocessed
+      # error, or an Idempotency-Key-vouched keep-alive race. A non-idempotent method
+      # without a key, or a post-response truncation, is not replayed; a non-rewindable
       # streamed body is never retried.
-      let replayable = isReplayable(req)
-      if not (replayable and
-              (isIdempotent(req.verb) or (e of UnprocessedError) or
-               ((e of KeepAliveRaceError) and hasIdempotencyKey(req)))):
+      if not (isReplayable(req) and replayableAfterError(req, e)):
         raise
       # else fall through to a fresh connection below
 

@@ -22,10 +22,14 @@ type
   PeerMode* = enum
     pmCloseBeforeHeaders
     pmCloseAfterHeaders
+    pmInterimThenClose      ## send a 1xx interim response, then close before the final
   RacePeerArg* = tuple[port: int, mode: PeerMode]
 
 const clientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"   # 24 bytes, precedes the frames
 const status200Block = "\x88"                             # HPACK indexed field, index 8
+const status103Block = "\x08\x03103"                      # HPACK literal :status: 103
+                                                          # (0x08 = literal, name idx 8;
+                                                          #  0x03 = 3-byte value "103")
 
 proc runRacePeer*(arg: RacePeerArg) {.thread.} =
   let listener = newSocket(buffered = false)
@@ -57,9 +61,13 @@ proc runRacePeer*(arg: RacePeerArg) {.thread.} =
         if ftype == 0x1:                           # a HEADERS frame: the request head
           reqStream = uint32(sid)
           break read                               # request seen: act on the mode
-  if arg.mode == pmCloseAfterHeaders and reqStream != 0:
-    client.send(encodeHeaders(reqStream, status200Block,
-                              endStream = false, endHeaders = true))
+  if reqStream != 0:
+    if arg.mode == pmCloseAfterHeaders:
+      client.send(encodeHeaders(reqStream, status200Block,
+                                endStream = false, endHeaders = true))
+    elif arg.mode == pmInterimThenClose:
+      client.send(encodeHeaders(reqStream, status103Block,   # 1xx: response began
+                                endStream = false, endHeaders = true))
   client.close()
   listener.close()
 

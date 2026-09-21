@@ -150,7 +150,8 @@ proc close*(mux: H2Mux) {.async.} =
   ## transport. Joining the reader (rather than closing the transport out from
   ## under it) avoids leaving it suspended on a dead fd, which crashes at teardown.
   if mux.readerDone.finished: return   # reader already exited (e.g. peer closed)
-  mux.alive = false
+  mux.deliberateClose = true           # so a woken sink/gated request reports a plain
+  mux.alive = false                    # client-close IOError, not a retryable race
   mux.failAll("navi: client closed")
   be.shutdownConn(mux.transport)       # unblock the reader's pending read/write
   await mux.readerDone                  # it observes EOF, closes the transport, exits
