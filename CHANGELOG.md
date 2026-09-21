@@ -70,22 +70,24 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
-- **HTTP/2 keep-alive race: a request dropped on a reused connection before any
-  response is now replayed on a fresh connection, even when non-idempotent.** A
-  shared h2 connection can be recycled by the server at any time (an idle timeout, or
-  a GOAWAY-less close). A request dispatched on a REUSED connection that is torn down
-  before its response HEADERS arrive was never processed, so it is now surfaced as a
-  new `KeepAliveRaceError` (an `IOError` subtype) and replayed once on a fresh
-  connection for any method -- the HTTP/2 analog of the existing HTTP/1.1
-  pooled-connection replay. Previously such a drop raised a generic
-  `IOError: navi: http/2 connection closed` that the retry policy would not replay
-  for a non-idempotent verb (POST/PATCH), failing the request un-retryably. The
-  replay is scoped to reused connections: a request that fails the same way on a
-  FRESH connection still surfaces (a fresh-connection drop signals a real fault, not
-  a race), and a drop AFTER the response began stays non-replayable. Covers the async
-  mux (`navi/asyncdispatch`, `navi/chronos`) and the sync pooled-h2 carrier. HTTP/3
-  is unaffected here (its Alt-Svc fallback already re-sends on a QUIC failure; see
-  #378 for a related follow-up to gate that fallback for non-idempotent requests).
+- **Keep-alive race: a request dropped before any response is now retried, even when
+  non-idempotent.** A connection can be torn down by the server at any time -- an idle
+  recycle, a GOAWAY-less close, or a freshly-opened connection dropped under load. A
+  request whose connection closes before its response HEADERS arrive was never
+  processed, so it is now surfaced as a new `KeepAliveRaceError` (an `IOError` subtype)
+  and retried: immediately on a fresh connection when the dropped connection was a
+  reused/pooled one (no backoff, the low-latency common case), and otherwise through
+  the normal retry layer (bounded by the retry limit). This applies to any method,
+  including non-idempotent ones (POST/PATCH) -- a pre-response close proves no response
+  began, matching the long-standing HTTP/1.1 pooled-connection replay and now extended
+  to freshly-opened connections and to HTTP/2. Previously such a drop raised a generic
+  `IOError: ... connection closed` that the retry policy would not replay for a
+  non-idempotent verb, failing the request un-retryably. A drop AFTER the response
+  began stays a plain `IOError` and is NOT retried (the peer processed it, so
+  at-most-once is preserved). Covers HTTP/1.1 (sync + async) and HTTP/2 (the async mux
+  on `navi/asyncdispatch` and `navi/chronos`, and the sync pooled-h2 carrier). HTTP/3
+  already re-sends on a QUIC failure via its Alt-Svc fallback; see #378 for a related
+  follow-up to gate that fallback for non-idempotent requests.
 
 ## [0.10.0] - 2026-09-15
 

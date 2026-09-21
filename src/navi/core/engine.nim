@@ -100,10 +100,14 @@ template h1SendAndReadHeaders*(transport, req, streaming: typed;
       if chunk.len == 0: parser.eof(); break
       parser.feed(chunk)
     if not parser.headersReady and not parser.finished:
-      # The peer closed before any response headers -- typically a pooled keep-alive
-      # connection the server had already closed. Raise (rather than return a status-0
-      # response) so the caller discards it and retries on a fresh connection.
-      raise newException(IOError, "navi: http/1.1 connection closed before response")
+      # The peer closed before any response headers -- the keep-alive race (a pooled
+      # connection the server had already closed, or a freshly-opened one dropped before
+      # responding). No response began, so the request was not processed: raise
+      # KeepAliveRaceError (not a plain IOError) so the reused-connection path replays it
+      # and the retry layer retries it once on a fresh connection for any method, the h1
+      # analog of the h2 mux's pre-header classification.
+      raise newException(KeepAliveRaceError,
+        "navi: http/1.1 connection closed before response")
     parser
 
 template deliverChunk*(cd, sink, rawBody, encoding: typed) =
@@ -803,9 +807,16 @@ template performRequest*(client, req0: typed; cancel: CancelToken = nil;
         # surface it straight away. Mirrors the buffered path, where enforceMaxResponse
         # raises after the loop and is never retried.
         if gate != nil and (e of ResponseTooLargeError): raise
-        # A provably-unprocessed request (h2 REFUSED_STREAM / above GOAWAY) is
-        # safe to retry even when non-idempotent.
-        if not shouldRetryAfterError(attempt, bodyReplayable, e of UnprocessedError,
+        # Safe to retry even when non-idempotent when the request was not processed:
+        # a peer PROOF (UnprocessedError -- h2 REFUSED_STREAM / above GOAWAY), or a
+        # keep-alive race (KeepAliveRaceError -- a connection, reused OR freshly opened,
+        # torn down before ANY response header, so no response began). The immediate
+        # reused-connection replay above handles the common case with no backoff; this
+        # covers a freshly-opened connection dropped the same way, bounded by the retry
+        # limit. A drop AFTER the response began is a plain IOError and is not retried
+        # here (the peer processed it), preserving at-most-once for that case.
+        let unprocessed = (e of UnprocessedError) or (e of KeepAliveRaceError)
+        if not shouldRetryAfterError(attempt, bodyReplayable, unprocessed,
                                      req.verb, policy):
           raise # not retryable: propagate the transport error
       if gotResp and

@@ -87,6 +87,27 @@ suite "asyncdispatch entry end to end":
     joinThread(th)
     check accepts == 2
 
+  test "a non-idempotent request is retried when a FRESH connection is dropped before any response":
+    # The keep-alive race on a freshly-opened connection (not a pooled one): the very
+    # first request opens a new connection, the server drops it before any response
+    # header, and the client must still replay the POST on a second connection. Before
+    # the fresh-connection fix this failed un-retryably (a plain IOError the retry policy
+    # would not replay for a non-idempotent verb); now the pre-header close is a
+    # KeepAliveRaceError the retry layer replays for any method, bounded by the limit.
+    var port = 0
+    var accepts = 0
+    var closed1 = false
+    var th: Thread[StaleCtx]
+    startFreshDrop(th, port, addr closed1, addr accepts)
+
+    let api = newNavi()
+    let key = "http://127.0.0.1:" & $port
+    let r = waitFor api.request(POST, key & "/submit", body = "data")
+    check r.status == 200
+    check r.body == "replayed:data"                    # served on the second connection
+    joinThread(th)
+    check accepts == 2                                  # first (fresh) dropped, retry served
+
   test "a buffered request raises on a premature close mid-body":
     const port = 9263
     var th: Thread[ServerCtx]
