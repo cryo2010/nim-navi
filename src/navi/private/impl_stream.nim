@@ -105,19 +105,28 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
             client.h3conns.del(origin)     # drop a dead connection; fall back below
 
   if wantH2:
-    if client.muxes.hasKey(origin) and client.muxes[origin].canReuse:
-      let mux = client.muxes[origin]
-      let sid = await mux.sendAndReadHeaders(h2HeaderList(req), req.body, req.bodyStream, h2TrailerList(req))
-      return StreamResponse(kind: skH2, mux: mux, sid: sid,
-        resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
-        decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
-    if client.pendingMux.hasKey(origin):
-      let mux = await client.pendingMux[origin]
-      if mux != nil and mux.canReuse:
+    # A reused mux can be torn down before headers arrive (keep-alive race /
+    # provably-unprocessed). streamOpen has no outer retry loop, so -- like the buffered
+    # transportInner -- this in-place fall-through is the ONLY replay: fall through to a
+    # fresh connection when the error class is replayable AND this request may be
+    # replayed; otherwise the caller sees it. Only the race/unprocessed classes fall
+    # through, so a cancellation or a post-header error still propagates. On a replayable
+    # error, re-enter the lookup once (via `resolveReusableMux`) to coalesce onto a
+    # concurrent racer's fresh connect rather than each racer opening its own.
+    var attempted = false
+    while true:
+      let mux = await client.resolveReusableMux(origin)
+      if mux == nil: break           # no live/pending mux (or it turned out h1): fall through
+      try:
         let sid = await mux.sendAndReadHeaders(h2HeaderList(req), req.body, req.bodyStream, h2TrailerList(req))
         return StreamResponse(kind: skH2, mux: mux, sid: sid,
           resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
           decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
+      except CatchableError as e:
+        if not (isReplayClassError(e) and isReplayable(req) and
+                replayableAfterError(req, e)): raise
+        if attempted: break          # already retried once: stop coalescing, go fresh
+        attempted = true             # loop once more through resolveReusableMux
 
   for dead in reapExpired(client.pool):    # close idle connections past idleConnTimeout
     await close(dead.transport)            # (the buffered path reaps too; issue #313)
@@ -128,14 +137,16 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
       return StreamResponse(kind: skH1, transport: pc.transport, parser: parser,
         resp: parser.toResponse(), client: client, key: origin,
         decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
-    except CatchableError:
+    except CatchableError as e:
       await close(pc.transport)     # pooled connection was stale
-      # Only open a fresh connection when replay is safe (mirrors transportInner):
-      # the header read failed, so the request was not processed (the classic
-      # keep-alive race -- safe to replay any method), but a non-rewindable streamed
-      # body cannot be re-sent. Previously the streaming path replayed here
-      # unconditionally, unlike the buffered path.
-      if not isReplayable(req): raise
+      # Open a fresh connection only when replay is safe (the same predicate as the
+      # buffered path; matching Go net/http / RFC 9110 9.2.2): an idempotent method, a
+      # proven-unprocessed error, or an Idempotency-Key-vouched keep-alive race. A
+      # non-idempotent method without a key -- e.g. api.stream(POST, ...) whose pooled
+      # connection dropped before any response -- is NOT replayed (it may already have
+      # been processed); a non-rewindable streamed body is never re-sent. streamOpen has
+      # no outer retry loop, so this in-place fall-through is the only replay.
+      if not (isReplayable(req) and replayableAfterError(req, e)): raise
 
   var rq = req
   rq.absoluteForm = usesAbsoluteForm(resolveProxy(client.config, rq.url), rq.url.isTls)

@@ -105,6 +105,10 @@ type
                             ## the engine to drain and hand to a sink, not `body`
     pending: string         ## streaming body received since the last `takeBody`
     headRequest: bool       ## response is to a HEAD request -> never has a body
+    sawInterim: bool        ## a 1xx interim response (100 Continue / 103 Early Hints)
+                            ## has arrived, so the peer demonstrably began responding even
+                            ## before the final headers -- mirrors h2's `responseBegan`,
+                            ## so a later drop is a truncation, not a keep-alive race
 
 proc initH1Parser*(streaming = false, headRequest = false): H1Parser =
   result.state = stStatusLine
@@ -151,6 +155,14 @@ proc headersReady*(p: H1Parser): bool {.inline.} =
   ## before it starts draining the body.
   p.state notin {stStatusLine, stHeaders}
 
+proc responseBegan*(p: H1Parser): bool {.inline.} =
+  ## True once the peer has sent ANY response -- a 1xx interim (100/103/...) or the
+  ## final headers. Mirrors the h2 `responseBegan`: used to classify a connection drop.
+  ## A close after the final headers is truncation (`headersReady` alone catches that),
+  ## but a close after ONLY a 1xx interim (which the parser discards) must also count as
+  ## "the peer began responding," so it is not misread as a safe keep-alive race.
+  p.sawInterim or p.headersReady
+
 proc takeLine(p: var H1Parser, line: var string): bool =
   ## Pop one CRLF-terminated line from the buffer, if a full line is present.
   ## Scans from the read cursor; consuming only advances `pos` (no memmove).
@@ -179,7 +191,10 @@ proc finishHeaders(p: var H1Parser) =
   if p.status in 100 .. 199:
     # Interim response (100 Continue, 103 Early Hints, ...): it has no body, and
     # its status/headers are not the final response (RFC 9110 15.2). Drop them and
-    # read the final response that follows on the same connection.
+    # read the final response that follows on the same connection. Record that the peer
+    # began responding (`responseBegan`): a subsequent close before the FINAL headers is
+    # then a truncation, not a keep-alive race -- the peer demonstrably started replying.
+    p.sawInterim = true
     p.status = 0
     p.reason = ""
     p.headers = initHeaders()

@@ -68,7 +68,10 @@ suite "asyncdispatch entry end to end":
     check res.headers.get("x-echo-authorization") == "Bearer captured-42"
     joinThread(th)
 
-  test "a non-idempotent request is replayed on a fresh connection when the pooled one was closed before any response":
+  test "an idempotent request is replayed on a fresh connection when the pooled one was closed before any response":
+    # The classic keep-alive race: a pooled connection the server closed while idle is
+    # reused and dropped before any response. An idempotent method (PUT) is safe to
+    # replay, so it is re-sent on a fresh connection (matching Go net/http).
     var port = 0
     var accepts = 0
     var closed1 = false
@@ -81,11 +84,65 @@ suite "asyncdispatch entry end to end":
     check api.pool.idleCount(key) == 1
     waitFlag(addr closed1)                              # server closed the pooled conn
 
-    let r = waitFor api.request(POST, key & "/submit", body = "data")
+    let r = waitFor api.put(key & "/submit", body = "data")
     check r.status == 200
     check r.body == "replayed:data"                    # served on the fresh connection
     joinThread(th)
     check accepts == 2
+
+  test "a non-idempotent request with an Idempotency-Key is replayed on a dropped fresh connection":
+    # A pre-response drop is ambiguous, so a non-idempotent POST is replayed only when
+    # the caller vouches safety with an Idempotency-Key (Go net/http's escape hatch).
+    var port = 0
+    var accepts = 0
+    var closed1 = false
+    var th: Thread[StaleCtx]
+    startFreshDrop(th, port, addr closed1, addr accepts)
+
+    let api = newNavi()
+    let key = "http://127.0.0.1:" & $port
+    var h = initHeaders()
+    h["idempotency-key"] = "req-1"
+    let r = waitFor api.request(POST, key & "/submit", headers = h, body = "data")
+    check r.status == 200
+    check r.body == "replayed:data"                    # served on the second connection
+    joinThread(th)
+    check accepts == 2                                  # first (fresh) dropped, retry served
+
+  test "a non-idempotent request WITHOUT an Idempotency-Key is not replayed (at-most-once)":
+    # The default: a POST whose connection drops before any response is NOT auto-retried
+    # (it may already have been processed). The server serves exactly one connection and
+    # stops listening, so a wrongful replay would fail to connect rather than hang.
+    var port = 0
+    var accepts = 0
+    var th: Thread[StaleCtx]
+    startDropOnce(th, port, addr accepts)
+
+    let api = newNavi()
+    let key = "http://127.0.0.1:" & $port
+    expect naviresp.KeepAliveRaceError:
+      discard waitFor api.request(POST, key & "/submit", body = "data")
+    joinThread(th)
+    check accepts == 1                                  # sent once, never replayed
+
+  test "a streamed non-idempotent request is not replayed on a stale pooled connection (at-most-once)":
+    # The streaming path (openStreamConn) must honor the same at-most-once rule as the
+    # buffered path: a POST whose reused pooled connection dropped before any response is
+    # NOT replayed. Previously the streaming pooled path replayed any rewindable body.
+    var port = 0
+    var accepts = 0
+    var closed1 = false
+    var th: Thread[StaleCtx]
+    startStaleNoRetry(th, port, addr closed1, addr accepts)
+
+    let api = newNavi()
+    let key = "http://127.0.0.1:" & $port
+    check (waitFor api.get(key & "/")).status == 200    # conn 1, then pooled
+    waitFlag(addr closed1)                              # server closed the pooled conn
+    expect naviresp.KeepAliveRaceError:
+      discard waitFor api.stream(POST, key & "/submit")
+    joinThread(th)
+    check accepts == 1                                  # sent once, never replayed
 
   test "a buffered request raises on a premature close mid-body":
     const port = 9263

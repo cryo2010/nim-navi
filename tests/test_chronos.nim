@@ -57,7 +57,7 @@ suite "chronos entry end to end":
     joinThread(th)
     check accepts == 1                            # both requests used the one connection
 
-  test "a non-idempotent request is replayed on a fresh connection when the pooled one was closed before any response":
+  test "an idempotent request is replayed on a fresh connection when the pooled one was closed before any response":
     var port = 0
     var accepts = 0
     var closed1 = false
@@ -70,7 +70,9 @@ suite "chronos entry end to end":
     check api.pool.idleCount(key) == 1
     waitFlag(addr closed1)                              # server closed the pooled conn
 
-    let r = waitFor api.request(POST, key & "/submit", body = "data")
+    # PUT is idempotent, so the pre-response drop is safe to replay (Go net/http line);
+    # a non-idempotent POST would NOT be replayed here without an Idempotency-Key.
+    let r = waitFor api.put(key & "/submit", body = "data")
     check r.status == 200
     check r.body == "replayed:data"                    # served on the fresh connection
     joinThread(th)

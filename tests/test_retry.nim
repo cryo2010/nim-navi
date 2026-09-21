@@ -43,3 +43,20 @@ suite "per-attempt budget (#375)":
 
   test "an unbounded total lets the per-attempt cap bound each try alone":
     check effectiveAttemptMs(0, 250) == 250
+
+suite "idempotency key (keep-alive-race replay opt-in)":
+  proc reqWith(headerName: string): Request =
+    var h = initHeaders()
+    if headerName.len > 0: h[headerName] = "abc-123"
+    Request(verb: POST, headers: h)
+
+  test "no idempotency-key header -> not vouched":
+    check not hasIdempotencyKey(reqWith(""))
+    check not hasIdempotencyKey(reqWith("content-type"))
+
+  test "an Idempotency-Key header vouches (case-insensitive)":
+    check hasIdempotencyKey(reqWith("Idempotency-Key"))
+    check hasIdempotencyKey(reqWith("idempotency-key"))
+
+  test "the X-Idempotency-Key variant is also accepted (matches Go)":
+    check hasIdempotencyKey(reqWith("X-Idempotency-Key"))

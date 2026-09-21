@@ -55,6 +55,23 @@ type
     ## stream id) that the request was not processed. Safe to retry regardless of
     ## method idempotency; the retry layer does so automatically.
 
+  KeepAliveRaceError* = object of IOError
+    ## Raised when a connection is torn down after the request was WRITTEN but before
+    ## any response HEADERS arrived (an idle recycle, a GOAWAY-less close, or a mid-flight
+    ## drop). The request's fate is genuinely ambiguous: it may have been received and
+    ## processed by the peer, or not. Unlike `UnprocessedError` (a peer PROOF of
+    ## non-processing -- REFUSED_STREAM, a GOAWAY above the stream id, or a connection
+    ## found dead BEFORE the request was sent), this is only "no response began," which
+    ## does not imply "not processed" once the bytes are on the wire.
+    ##
+    ## Retry policy (mirrors Go net/http's post-write behavior; see RFC 9110 9.2.2):
+    ## an idempotent method is retried, and any method is retried if the request carries
+    ## an `Idempotency-Key`; a non-idempotent method WITHOUT such a key is NOT
+    ## auto-retried (retrying could double-apply a side effect the peer already
+    ## committed). A drop that happens AFTER response headers begin is a plain `IOError`
+    ## (truncation), never this. An `IOError` subtype, so existing `except IOError`
+    ## handlers still catch it and the surfaced message is unchanged.
+
   ProtocolError* = object of CatchableError
     ## Raised when the HTTP version actually used is not one the request allowed
     ## via `config.http` (strict protocol selection). For example, requesting

@@ -113,9 +113,18 @@ proc openStream(client: Navi, req0: Request): StreamResponse =
         return StreamResponse(kind: skH1, pc: pc, parser: parser,
                               resp: parser.toResponse(), client: client, key: key,
                               decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
-    except CatchableError:
-      try: pc.transport.close()          # pooled connection was stale; open a fresh one
+    except CatchableError as e:
+      try: pc.transport.close()          # pooled connection was stale
       except CatchableError: discard
+      # Open a fresh connection only when replay is safe (the same predicate as the
+      # buffered/async paths; matching Go net/http / RFC 9110 9.2.2): an idempotent
+      # method, a proven-unprocessed error, or an Idempotency-Key-vouched keep-alive
+      # race. A non-idempotent method without a key -- e.g. api.stream(POST, ...) whose
+      # pooled connection dropped before any response -- is NOT replayed (it may already
+      # have been processed); a non-rewindable streamed body is never re-sent. This sync
+      # openStream has no outer retry loop, so this in-place fall-through is the only
+      # replay (previously it replayed unconditionally, unlike the buffered path).
+      if not (isReplayable(req0) and replayableAfterError(req0, e)): raise
 
   let transport = connect(rq.url.host, rq.url.port, rq.url.isTls, client.config.tls,
                           proxy, alpn, client.config.connectMs, client.config.readMs,
