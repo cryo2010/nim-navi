@@ -235,6 +235,56 @@ suite "h2 send-side flow control":
     let out3 = c.feed(encodeWindowUpdate(sid, 200_000) & encodeWindowUpdate(0, 200_000))
     check dataBytes(out1) + dataBytes(out2) + dataBytes(out3) == 200_000
 
+suite "h2 early response closes the send side (RFC 9113 8.1)":
+  # A server may answer completely before consuming the whole request body (413, auth
+  # reject, an /echo that errors early). Once the complete response is in, the client
+  # aborts the remaining body with RST_STREAM(CANCEL) -- like Go net/http -- instead
+  # of pushing windowed-out DATA at a peer that no longer wants it. Beyond the 8.1
+  # SHOULD, late DATA is actively harmful against hypercorn/python-h2: DATA on a
+  # stream the server considers closed is dropped WITHOUT crediting its inbound
+  # connection window (h2 issue #1210), so each late frame permanently shrinks it
+  # and a long-lived mux slowly wedges. The same applies after a server RST_STREAM:
+  # further DATA there is DATA on a closed stream (RFC 9113 5.1).
+  let post = @[(":method", "POST"), (":scheme", "https"),
+               (":path", "/"), (":authority", "x")]
+
+  test "a complete response with body still queued cancels the stream and stops the DATA":
+    let c = newServerConn()
+    let sid = c.openStream()
+    let out1 = c.encodeRequest(sid, post, repeat("x", 200_000))  # > 65535 send window
+    check dataBytes(out1) == 65535               # tail is windowed out, still queued
+    # The server answers completely (headers + END_STREAM) without draining the body.
+    let resp = c.feed(encodeHeaders(sid, (HpackEncoder()).encode(@[(":status", "200")]),
+                                    endStream = true, endHeaders = true))
+    check firstFrameOfType(resp, ftRstStream)    # client aborts the rest (8.1, CANCEL)
+    check dataBytes(resp) == 0
+    # A window grant afterwards must NOT release the dead stream's queued tail.
+    let out2 = c.feed(encodeWindowUpdate(sid, 200_000) & encodeWindowUpdate(0, 200_000))
+    check dataBytes(out2) == 0
+    # The complete response is kept (a client MUST NOT discard it, 8.1).
+    check c.streamDone(sid)
+    check c.takeResponse(sid).status == 200
+
+  test "a server RST with body still queued stops the DATA without an RST echo":
+    let c = newServerConn()
+    let sid = c.openStream()
+    discard c.encodeRequest(sid, post, repeat("x", 200_000))     # 65535 out, tail queued
+    let resp = c.feed(encodeRstStream(sid, errCancel))           # server kills the stream
+    check not firstFrameOfType(resp, ftRstStream)  # no RST at an already-closed stream
+    let out2 = c.feed(encodeWindowUpdate(sid, 200_000) & encodeWindowUpdate(0, 200_000))
+    check dataBytes(out2) == 0                   # no DATA on a closed stream (5.1)
+
+  test "a complete response to a bodiless request does not get a spurious RST":
+    let c = newServerConn()
+    let sid = c.openStream()
+    discard c.encodeRequest(sid, @[(":method", "GET"), (":scheme", "https"),
+                                   (":path", "/"), (":authority", "x")], "")
+    let resp = c.feed(encodeHeaders(sid, (HpackEncoder()).encode(@[(":status", "200")]),
+                                    endStream = true, endHeaders = true))
+    check not firstFrameOfType(resp, ftRstStream)  # END_STREAM rode the HEADERS: closed
+    check c.streamDone(sid)
+    check c.takeResponse(sid).status == 200
+
 suite "h2 max concurrent streams":
   test "the h2 client should read the peer's MAX_CONCURRENT_STREAMS from SETTINGS":
     let c = newServerConn()
@@ -398,6 +448,110 @@ suite "h2 flow control on reset streams":
     for _ in 0 ..< 270: more.add encodeData(id, repeat("x", 16000), endStream = false)
     let toSend = c.feed(more)                       # 270 x 16000 = 4.32 MB > connReplenish
     check hasConnWindowUpdate(toSend)               # connection window given back
+
+  test "the connection window should count DATA that overruns the STREAM window (no leak)":
+    # A frame that overruns the per-stream receive window RSTs the stream
+    # (FLOW_CONTROL_ERROR), but its payload was already debited from the CONNECTION
+    # window (RFC 9113 6.9.1). That debit must be credited back, or every stream
+    # overrun leaks its overrunning frame's bytes from the connection window and a
+    # long-lived mux slowly stalls at conn-window 0 (the h2 soak signature).
+    #
+    # A stream is put in sinkMode so its window is HELD (no eager stream WINDOW_UPDATE);
+    # an eager stream would replenish its window as DATA arrives and never overrun.
+    # Drive its receive window to exactly 0 with a DATA total that is an exact multiple
+    # of connReplenish (so the batched connection-pending counter lands back at 0, no
+    # pending residual), then send one more DATA frame -- the overrun. Post-fix its
+    # 16384 bytes are credited to the connection pending; a fresh (eager) stream then
+    # only needs connReplenish-16384 more bytes to trip the connection WINDOW_UPDATE
+    # threshold. Pre-fix (the leak) the overrun bytes vanish, so that same feed stays
+    # 16384 short of the threshold and emits nothing.
+    const frameSz = 16384                             # defaultMaxFrameSize
+    const streamWin = 8 * 1024 * 1024                 # recvWindowSize we advertise
+    const connReplenish = 4 * 1024 * 1024
+    let c = newServerConn()
+    let a = c.openStream()
+    c.setSinkMode(a)                                  # hold the stream window so it can overrun
+    var srv = headForStream(a)
+    for _ in 0 ..< (streamWin div frameSz):           # 512 frames = 8 MiB = exactly streamWin
+      srv.add encodeData(a, repeat("x", frameSz), endStream = false)  # recvWindow -> exactly 0
+    discard c.feed(srv)                               # connPending back to 0 (8 MiB is 2x conn)
+    check not c.streamReset(a)                        # window at 0, not yet overrun
+    let overrun = c.feed(encodeData(a, repeat("x", frameSz), endStream = false))
+    check c.streamReset(a)                            # this frame overran the stream window
+    check not hasConnWindowUpdate(overrun)            # 16384 < connReplenish: no flush yet
+    # A fresh eager stream carries connReplenish-frameSz more bytes. WITH the overrun
+    # credited (fix) this reaches the threshold and emits a connection WINDOW_UPDATE;
+    # WITHOUT it (leak) it stops one frame short and emits nothing.
+    let b = c.openStream()
+    var srv2 = headForStream(b)
+    for _ in 0 ..< (connReplenish div frameSz - 1):   # connReplenish - frameSz, in whole frames
+      srv2.add encodeData(b, repeat("y", frameSz), endStream = false)
+    let toSend2 = c.feed(srv2)
+    check hasConnWindowUpdate(toSend2)                # fails pre-fix: the overrun leaked
+
+  test "the connection window credits should exactly match debits across mixed drop paths":
+    # End-to-end accounting: over exchanges that hit the stray-after-END, reset-stream,
+    # and stream-overrun DROP paths, the connection WINDOW_UPDATE credits the client
+    # emits must sum to EXACTLY the DATA bytes it debited. A per-path leak shows up as
+    # credited < debited. The plan lands the WITH-fix total on an exact connReplenish
+    # boundary so no credit is stranded below the batch threshold and the comparison is
+    # exact; the leaked overrun frame (pre-fix) then leaves the final batch one frame
+    # short of the boundary, so it never flushes and credited falls a whole connReplenish
+    # behind. NO body cap here: a cap would RST the sink stream on its first DATA frame
+    # (the capped path, which credits and is covered above) before it could ever overrun.
+    const frameSz = 16384
+    const connReplenish = 4 * 1024 * 1024
+    let c = newServerConn()
+    var debited = 0
+    var allOut = ""                                   # every connection WINDOW_UPDATE ends up here
+    # 1) stray DATA after END_STREAM (drop-after-END path): open, end cleanly, then DATA.
+    block:
+      let id = c.openStream()
+      allOut.add c.feed(headForStream(id) & encodeData(id, "", endStream = true))  # ends stream
+      allOut.add c.feed(encodeData(id, repeat("x", frameSz), endStream = false))   # stray -> dropped
+      debited += frameSz
+    # 2) reset-stream path: the server RSTs a live stream, then keeps sending DATA on it.
+    block:
+      let id = c.openStream()
+      allOut.add c.feed(headForStream(id) & encodeRstStream(id, errCancel))        # server reset
+      allOut.add c.feed(encodeData(id, repeat("x", frameSz), endStream = false))   # reset-stream path
+      debited += frameSz
+    # 3) stream-overrun path: a sinkMode stream (window held, so it CAN overrun; an eager
+    #    stream replenishes as DATA arrives and never does) driven to window 0, then one
+    #    overrun frame. The 8 MiB fill flushes through the batcher and leaves the pending
+    #    counter back where the two blocks above left it (2*frameSz), so the overrun
+    #    frame's OWN credit is isolated as what tips the final batch below.
+    let ov = c.openStream()
+    c.setSinkMode(ov)
+    var srv = headForStream(ov)
+    for _ in 0 ..< (8 * 1024 * 1024 div frameSz):     # exactly the 8 MiB stream window
+      srv.add encodeData(ov, repeat("x", frameSz), endStream = false)
+      debited += frameSz
+    allOut.add c.feed(srv)
+    check not c.streamReset(ov)                       # window at exactly 0, not yet overrun
+    allOut.add c.feed(encodeData(ov, repeat("x", frameSz), endStream = false))     # overrun -> RST
+    debited += frameSz
+    check c.streamReset(ov)                           # the overrun path was actually taken
+    # Feed exactly enough DATA on the now-reset ov stream (the crediting reset path) to
+    # land the WITH-fix debit total on a connReplenish boundary: with the fix the final
+    # batch flushes and credited == debited; without it the batch stays frameSz short
+    # and never flushes.
+    let fill = (connReplenish - (debited mod connReplenish)) mod connReplenish
+    var fillLeft = fill
+    while fillLeft > 0:
+      let n = min(frameSz, fillLeft)
+      allOut.add c.feed(encodeData(ov, repeat("x", n), endStream = false))
+      debited += n; fillLeft -= n
+    check debited mod connReplenish == 0              # the WITH-fix plan lands on a boundary
+    # Sum every connection WINDOW_UPDATE the client emitted across the whole exchange.
+    var credited = 0
+    var d: FrameDecoder
+    d.feed(allOut)
+    var f: Frame
+    while d.next(f):
+      if f.typ == uint8(ftWindowUpdate) and f.streamId == 0'u32:
+        credited += int(readU32(f.payload, 0) and 0x7fffffff'u32)
+    check credited == debited                         # no leak on any drop path
 
 proc allFrames(s: string): seq[Frame] =
   var d: FrameDecoder

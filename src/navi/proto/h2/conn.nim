@@ -165,7 +165,12 @@ proc flushSend(c: H2Conn, streamId: uint32, s: Stream, outbuf: var string) =
   ## END_STREAM rides the final DATA frame, or -- when the request carries trailers
   ## -- a trailing HEADERS block after the body (RFC 9113 8.1). A body that closes
   ## with nothing pending gets an empty END_STREAM DATA frame (or the trailers).
-  if s.endSent: return
+  ## A stream the peer already finished (`ended`: complete response, or RST) must not
+  ## get more DATA: on a reset stream that is DATA on a closed stream (RFC 9113 5.1),
+  ## and after a clean early response the client aborts the rest (8.1, `closeSendSide`).
+  ## This guard keeps a window-released tail from slipping out anyway -- the conn-level
+  ## WINDOW_UPDATE path flushes EVERY stream, finished ones included.
+  if s.endSent or s.ended: return
   while s.sendOff < s.sendBuf.len:
     let avail = min(s.sendWindow, c.connSendWindow)
     if avail <= 0: return                      # windowed out; wait for a WINDOW_UPDATE
@@ -186,6 +191,28 @@ proc flushSend(c: H2Conn, streamId: uint32, s: Stream, outbuf: var string) =
       outbuf.add encodeData(streamId, "", endStream = true)
     s.endSent = true
 
+proc closeSendSide(streamId: uint32, s: Stream, outbuf: var string) =
+  ## The peer finished the stream (complete response via END_STREAM, or RST_STREAM)
+  ## while our send side may still be open. RFC 9113 8.1: a client that has the
+  ## complete response SHOULD abort the rest of the request body -- so cancel the
+  ## stream (RST_STREAM(CANCEL), like Go net/http) instead of pushing the remaining
+  ## windowed-out DATA at a peer that no longer wants it. Beyond the SHOULD, this
+  ## matters for real servers: hypercorn/python-h2 silently drop DATA on a stream
+  ## they consider closed WITHOUT crediting their inbound connection window (h2
+  ## issue #1210), so every late DATA frame permanently shrinks it -- late DATA on
+  ## a long-lived mux slowly wedges the whole connection. The queued body is dropped
+  ## (so `sendDrained` frees a parked streaming upload) and `endSent` blocks any
+  ## further DATA. A fully-sent request (endSent) needs nothing; a peer-reset stream
+  ## is already closed, so only the queue is dropped (no RST at a dead stream).
+  if s.endSent: return
+  if not s.reset:
+    outbuf.add encodeRstStream(streamId, errCancel)
+  s.sendBuf.setLen(0)
+  s.sendOff = 0
+  s.trailers.setLen(0)
+  s.sendClosed = true
+  s.endSent = true
+
 proc encodeRequest*(c: H2Conn, streamId: uint32, headers: openArray[HeaderPair],
                     body: string, trailers: openArray[HeaderPair] = []): string =
   ## `headers` must start with the pseudo-headers (:method, :scheme, :path,
@@ -198,12 +225,19 @@ proc encodeRequest*(c: H2Conn, streamId: uint32, headers: openArray[HeaderPair],
   let hasTrailers = trailers.len > 0
   result = c.encodeHeaderFrames(streamId, headers,
                                 endStream = not hasBody and not hasTrailers)
+  let s = c.streams.getOrDefault(streamId)
+  if s == nil: return
   if hasBody or hasTrailers:
-    let s = c.streams[streamId]
     s.sendBuf = body
     s.sendClosed = true                        # whole body known: END_STREAM on last DATA
     if hasTrailers: s.trailers = @trailers      # ... or on the trailing HEADERS block
     c.flushSend(streamId, s, result)
+  else:
+    # END_STREAM rode the HEADERS: the send side is closed on the wire. Record it, so
+    # `closeSendSide` can tell this fully-sent request from one with body still owed
+    # (only the latter is cancelled when the peer finishes the stream early).
+    s.sendClosed = true
+    s.endSent = true
 
 proc encodeRequestHead*(c: H2Conn, streamId: uint32,
                         headers: openArray[HeaderPair]): string =
@@ -220,9 +254,11 @@ proc sendDrained*(c: H2Conn, streamId: uint32): bool =
 proc queueSend*(c: H2Conn, streamId: uint32, data: string): string =
   ## Append a streamed request-body chunk and emit as much as the send window
   ## allows now; the remainder is released by `feed` on WINDOW_UPDATE. Compacts
-  ## the already-sent prefix so buffered memory stays bounded.
+  ## the already-sent prefix so buffered memory stays bounded. A stream whose send
+  ## side is already closed (END_STREAM out, or `closeSendSide` aborted it) takes
+  ## nothing: buffering into it would just pin dead memory until the stream drops.
   let s = c.streams.getOrDefault(streamId)
-  if s == nil or data.len == 0: return
+  if s == nil or data.len == 0 or s.endSent: return
   if s.sendOff > 0:                            # drop the sent prefix
     s.sendBuf = s.sendBuf[s.sendOff .. ^1]
     s.sendOff = 0
@@ -277,6 +313,7 @@ proc malformedResponse(s: Stream, sid: uint32, outbuf: var string) =
   outbuf.add encodeRstStream(sid, errProtocolError)
   s.reset = true
   s.ended = true
+  closeSendSide(sid, s, outbuf)                # drop any queued body; no DATA after RST
 
 proc applyHeaders(c: H2Conn, s: Stream, sid: uint32, outbuf: var string) =
   # HPACK is stateful, so every block must be decoded even when its fields are
@@ -320,7 +357,9 @@ proc applyHeaders(c: H2Conn, s: Stream, sid: uint32, outbuf: var string) =
     # non-pseudo fields so the caller can read them off the response. Trailers MUST
     # carry END_STREAM; without it the response can never complete -- malformed.
     for h in headers: s.resp.trailers.add(h)
-    if s.hdrEndStream: s.ended = true
+    if s.hdrEndStream:
+      s.ended = true
+      closeSendSide(sid, s, outbuf)  # complete response: abort an unsent body (8.1)
     else: malformedResponse(s, sid, outbuf)
     return
   if status in 100 .. 199:
@@ -336,7 +375,9 @@ proc applyHeaders(c: H2Conn, s: Stream, sid: uint32, outbuf: var string) =
   s.sawFinal = true
   s.resp.status = status
   for h in headers: s.resp.headers.add(h)
-  if s.hdrEndStream: s.ended = true
+  if s.hdrEndStream:
+    s.ended = true
+    closeSendSide(sid, s, outbuf)    # complete response: abort an unsent body (8.1)
 
 proc connFail(c: H2Conn, code: uint32, reason: string, outbuf: var string) =
   ## Fatal connection error: send GOAWAY and mark the connection unusable. Every
@@ -436,9 +477,15 @@ proc handleData(c: H2Conn, f: Frame, outbuf: var string) =
     if s.recvWindow < 0:
       # Peer sent more than the per-stream receive window we advertised: a stream
       # FLOW_CONTROL_ERROR (RFC 9113 6.9.1). RST it; the connection survives (its
-      # window was already debited and validated above).
+      # window was already debited and validated above). Those debited bytes are
+      # dropped (never delivered, never acked via replenishRecv), so credit the
+      # connection window back here -- otherwise this frame's payload leaks from the
+      # connection window and a long-lived mux slowly stalls at conn-window 0. The
+      # STREAM window is not replenished: the stream is dead, so its window is moot.
       outbuf.add encodeRstStream(f.streamId, errFlowControlError)
       s.reset = true; s.ended = true
+      closeSendSide(f.streamId, s, outbuf)     # drop any queued body; no DATA after RST
+      if f.payload.len > 0: c.replenishConn(f.payload.len, outbuf)
     else:
       # Unpadded is the common case: append the frame payload straight into the body
       # with no intermediate copy. Only a padded frame needs a stripped buffer (via
@@ -457,6 +504,7 @@ proc handleData(c: H2Conn, f: Frame, outbuf: var string) =
       if c.maxBodyBytes > 0 and s.bodyTotal > c.maxBodyBytes:  # over the size cap: RST
         outbuf.add encodeRstStream(f.streamId, errCancel)
         s.reset = true; s.ended = true; s.tooLarge = true
+        closeSendSide(f.streamId, s, outbuf)   # drop any queued body; no DATA after RST
         c.replenishConn(f.payload.len, outbuf)   # still owe the connection window
       else:
         if f.payload.len > 0:
@@ -473,7 +521,9 @@ proc handleData(c: H2Conn, f: Frame, outbuf: var string) =
             c.replenishConn(f.payload.len, outbuf)
           else:
             c.replenishRecv(f.streamId, s, f.payload.len, outbuf)
-        if (f.flags and flagEndStream) != 0: s.ended = true
+        if (f.flags and flagEndStream) != 0:
+          s.ended = true
+          closeSendSide(f.streamId, s, outbuf) # complete response: abort an unsent body (8.1)
   elif f.payload.len > 0:
     c.replenishConn(f.payload.len, outbuf)     # reset/unknown stream: keep the conn window in sync
 
@@ -493,6 +543,7 @@ proc handleWindowUpdate(c: H2Conn, f: Frame, outbuf: var string) =
       if s != nil:
         outbuf.add encodeRstStream(f.streamId, errProtocolError)   # live stream: RST it
         s.reset = true; s.ended = true
+        closeSendSide(f.streamId, s, outbuf)   # drop any queued body; no DATA after RST
       elif f.streamId mod 2 == 0'u32 or f.streamId >= c.nextId:
         # Idle stream: RFC 9113 5.1/6.4 forbid RST_STREAM on an idle stream, so a bad
         # WINDOW_UPDATE here is a connection PROTOCOL_ERROR, not a stream RST.
@@ -514,6 +565,7 @@ proc handleWindowUpdate(c: H2Conn, f: Frame, outbuf: var string) =
       if s.sendWindow.int64 + inc.int64 > 0x7fffffff'i64:  # stream error: RST it
         outbuf.add encodeRstStream(f.streamId, errFlowControlError)
         s.reset = true; s.ended = true
+        closeSendSide(f.streamId, s, outbuf)   # drop any queued body; no DATA after RST
       else:
         s.sendWindow += inc
         c.flushSend(f.streamId, s, outbuf)
@@ -631,6 +683,7 @@ proc handleRstStream(c: H2Conn, f: Frame, outbuf: var string) =
       s.refused = true                       # not processed -> safe to retry
     s.reset = true
     s.ended = true
+    closeSendSide(f.streamId, s, outbuf)     # drop any queued body; no DATA after RST
 
 proc handle(c: H2Conn, f: Frame, outbuf: var string) =
   if c.fatal.len > 0: return

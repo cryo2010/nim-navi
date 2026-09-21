@@ -110,8 +110,11 @@ proc reader(mux: H2Mux) {.async.} =
       mux.wakeSenders()                           # a WINDOW_UPDATE may have drained a send
       if mux.h2.connError.len > 0: break          # fatal: fail all in-flight below
       if mux.h2.goneAway and mux.activeStreams == 0: break
-  except CatchableError:
-    discard
+  except CatchableError as e:
+    mux.readerError = e.msg   # capture WHY the reader exited (a transport read error, a
+                              # runtime fault) before swallowing it, so `connDeathError`
+                              # can surface it -- otherwise a soak can't tell an internal
+                              # client fault from a clean peer EOF (a bare `break` above).
   # The reader exited: the connection died unexpectedly (not a deliberate `close()`,
   # which sets `deliberateClose` first). Each waiter is classified per-stream by
   # `failAll` -> `connDeathError`: a written-but-no-response waiter is the keep-alive

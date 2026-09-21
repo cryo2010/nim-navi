@@ -106,6 +106,13 @@ type
     sawFrameSinceTick: bool     ## the reader saw an inbound frame since the last
                                 ## keepalive tick (any frame proves liveness)
     pingOutstanding: bool       ## a keepalive PING is awaiting any inbound frame
+    readerError: string         ## the reader's terminal exception message, captured
+                                ## before its `except CatchableError` swallows the
+                                ## reason it exited. Empty for a clean peer EOF; set
+                                ## for an internal client exception (a transport read
+                                ## error, a runtime fault). Appended to the connection-
+                                ## closed failure so a soak can tell peer EOF from a
+                                ## client-side fault (otherwise indistinguishable).
 
 proc fireSend(mux: H2Mux, data: string) {.gcsafe, raises: [].}
   ## Fire-and-forget a control-frame send (RST_STREAM from the destructor path).
@@ -300,6 +307,16 @@ proc wakeRecvers(mux: H2Mux) =
     let r = mux.recvReady.getOrDefault(sid, nil)
     if r != nil and not r.finished: r.complete()
 
+proc withReaderReason(mux: H2Mux, msg: string): string {.gcsafe, raises: [].} =
+  ## Append the reader's captured terminal exception message, if any, so a connection
+  ## death that came from an internal client fault (a transport read error, a runtime
+  ## fault) is distinguishable from a clean peer EOF in the surfaced error -- the
+  ## reader's terminal `except CatchableError` otherwise swallows the reason entirely.
+  ## A clean EOF leaves `readerError` empty, so the message is returned unchanged
+  ## (tests matching the bare text keep passing).
+  if mux.readerError.len > 0: msg & " (reader: " & mux.readerError & ")"
+  else: msg
+
 proc connDeathError(mux: H2Mux, sid: uint32, msg: string,
                     attemptedWrite = false): ref CatchableError {.gcsafe, raises: [].} =
   ## The one classifier for a connection death observed by an in-flight stream `sid`
@@ -335,8 +352,8 @@ proc connDeathError(mux: H2Mux, sid: uint32, msg: string,
   if not attemptedWrite and sid notin mux.sentStreams:
     return newException(UnprocessedError, "navi: http/2 request not processed")
   if mux.h2.responseBegan(sid):
-    return newException(IOError, msg)
-  newException(KeepAliveRaceError, msg)
+    return newException(IOError, mux.withReaderReason(msg))
+  newException(KeepAliveRaceError, mux.withReaderReason(msg))
 
 proc failAll(mux: H2Mux, msg: string) =
   ## Fail every in-flight buffered waiter, classifying each per-stream via
