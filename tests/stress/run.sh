@@ -24,7 +24,15 @@ command -v hypercorn >/dev/null || { echo "hypercorn required (pip install -r se
 work="$(mktemp -d)"
 cert="$work/cert.pem"; key="$work/key.pem"
 pids=()
-cleanup() { for p in "${pids[@]:-}"; do kill -- -"$p" 2>/dev/null || true; done; rm -rf "$work"; }
+cleanup() {
+  for p in "${pids[@]:-}"; do kill -- -"$p" 2>/dev/null || true; done
+  # Preserve the server logs outside the mktemp dir before it is removed: on a
+  # workload failure the servers' view (a GOAWAY reason, a worker crash, a timeout
+  # fired) is the only post-mortem evidence, and the EXIT trap otherwise destroys
+  # it with the container still running -- copy, then remove.
+  mkdir -p /navi/stress-srv-logs 2>/dev/null && cp "$work"/srv-*.log /navi/stress-srv-logs/ 2>/dev/null
+  rm -rf "$work"
+}
 trap cleanup EXIT
 
 # Self-signed cert. DNS:127.0.0.1 (not just the IP SAN) so chronos's TLS, which
@@ -50,7 +58,12 @@ start_servers() {
   #    the recycle then fails un-retryably.
   #  - keep_alive_timeout (default 5s): closes a connection idle for 5s; a >5s stream
   #    (a 1 GiB transfer) or an idle pooled connection between transfers is dropped
-  #    mid-flight, which without a client retry crashes the transfer.
+  #    mid-flight, which without a client retry crashes the transfer. Measured on
+  #    hypercorn 0.18 h2: this timer fires at ~the configured value even on a BUSY
+  #    connection (a soak at 13k req/s died in the (t-300, t] window at ka_to=3600
+  #    twice, and at ka_to=120 within 120s), so a fixed value silently caps every
+  #    connection's lifetime. Default it past the whole soak (NAVI_SECONDS + 1h
+  #    headroom) so the steady-state soak never hits it.
   # Raise both (override with NAVI_KEEPALIVE_MAX / NAVI_KEEPALIVE_TIMEOUT).
   #
   # Recycling variant: NAVI_RECYCLE=1 instead LOWERS the limits so the server sends
@@ -59,7 +72,7 @@ start_servers() {
   # already retry transient recycles; a soak with `NAVI_RECYCLE=1 nimble stress...`
   # points it at every workload. Both knobs still override the recycling defaults.
   local ka_max="${NAVI_KEEPALIVE_MAX:-1000000000}"
-  local ka_to="${NAVI_KEEPALIVE_TIMEOUT:-3600}"
+  local ka_to="${NAVI_KEEPALIVE_TIMEOUT:-$(( ${NAVI_SECONDS:-600} + 3600 ))}"
   if [ "${NAVI_RECYCLE:-0}" != "0" ]; then
     ka_max="${NAVI_KEEPALIVE_MAX:-200}"      # recycle each connection after ~200 requests
     ka_to="${NAVI_KEEPALIVE_TIMEOUT:-2}"     # and idle-close after 2s
