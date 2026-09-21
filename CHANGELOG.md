@@ -70,22 +70,28 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
-- **Keep-alive race: a request dropped before any response is now retried, even when
-  non-idempotent.** A connection can be torn down by the server at any time -- an idle
-  recycle, a GOAWAY-less close, or a freshly-opened connection dropped under load. A
-  request whose connection closes before its response HEADERS arrive was never
-  processed, so it is now surfaced as a new `KeepAliveRaceError` (an `IOError` subtype)
-  and retried: immediately on a fresh connection when the dropped connection was a
-  reused/pooled one (no backoff, the low-latency common case), and otherwise through
-  the normal retry layer (bounded by the retry limit). This applies to any method,
-  including non-idempotent ones (POST/PATCH) -- a pre-response close proves no response
-  began, matching the long-standing HTTP/1.1 pooled-connection replay and now extended
-  to freshly-opened connections and to HTTP/2. Previously such a drop raised a generic
-  `IOError: ... connection closed` that the retry policy would not replay for a
-  non-idempotent verb, failing the request un-retryably. A drop AFTER the response
-  began stays a plain `IOError` and is NOT retried (the peer processed it, so
-  at-most-once is preserved). Covers HTTP/1.1 (sync + async) and HTTP/2 (the async mux
-  on `navi/asyncdispatch` and `navi/chronos`, and the sync pooled-h2 carrier). HTTP/3
+- **Keep-alive race: a request dropped before any response is now retried, following
+  the same rule as Go `net/http` (RFC 9110 9.2.2).** A connection can be torn down by
+  the server at any time -- an idle recycle, a GOAWAY-less close, or a freshly-opened
+  connection dropped under load. navi now classifies such a failure precisely:
+    - **Provably unprocessed** -- an HTTP/2 REFUSED_STREAM / above-GOAWAY signal, or a
+      connection found dead *before the request was written* -- surfaces as
+      `UnprocessedError` and is retried for **any** method (it definitely never ran).
+    - **Ambiguous** -- the request was written but the connection closed before any
+      response HEADERS -- surfaces as a new `KeepAliveRaceError` (an `IOError` subtype).
+      This is retried for **idempotent** methods, or for **any** method when the request
+      carries an `Idempotency-Key` (or `X-Idempotency-Key`) header vouching that a replay
+      is safe. A non-idempotent request (POST/PATCH) *without* such a key is NOT
+      auto-retried: once its bytes are on the wire it may already have been processed,
+      and replaying could double-apply a side effect (the exact heuristic RFC 9110 9.2.2
+      flags as unsafe, and which Go and undici also decline).
+    - **A drop AFTER the response began** stays a plain `IOError` (truncation) and is
+      never auto-retried.
+  Previously HTTP/2 had no keep-alive-race handling at all (any close surfaced a generic
+  `IOError` the retry policy would not replay even for an idempotent verb on the mux
+  path), and the HTTP/1.1 pooled path over-replayed non-idempotent requests on any
+  pre-response close. Covers HTTP/1.1 (sync + async) and HTTP/2 (the async mux on
+  `navi/asyncdispatch` and `navi/chronos`, and the sync pooled-h2 carrier). HTTP/3
   already re-sends on a QUIC failure via its Alt-Svc fallback; see #378 for a related
   follow-up to gate that fallback for non-idempotent requests.
 

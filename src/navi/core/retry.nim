@@ -13,6 +13,13 @@ proc isIdempotent*(verb: HttpVerb): bool =
   ## PATCH are excluded, so they are never silently replayed.
   verb in {GET, HEAD, PUT, DELETE, OPTIONS}
 
+proc hasIdempotencyKey*(req: Request): bool =
+  ## Whether the request carries a caller-supplied idempotency guarantee, letting the
+  ## client safely auto-replay it even when the method is non-idempotent and the
+  ## request may already have been transmitted. Mirrors Go net/http, which treats an
+  ## `Idempotency-Key` (or `X-Idempotency-Key`) header as making any method replayable.
+  req.headers.contains("idempotency-key") or req.headers.contains("x-idempotency-key")
+
 proc isReplayable*(req: Request): bool =
   ## Whether a request may be re-sent on a fresh connection (stale-connection
   ## retry), a redirect hop, or a digest one-shot. A pull-based body producer

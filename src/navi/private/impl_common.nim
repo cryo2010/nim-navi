@@ -305,7 +305,8 @@ proc transportInner(client: Navi, req: Request, sink: BodySink,
         return await client.muxRequest(client.muxes[origin], req, sink, asyncStream,
                                        userSink, gate)
       except KeepAliveRaceError:
-        if (gate != nil and gate.fed) or not isReplayable(req): raise
+        if (gate != nil and gate.fed) or not isReplayable(req) or
+           not (isIdempotent(req.verb) or hasIdempotencyKey(req)): raise
         # else fall through to a fresh connection below
     elif client.pendingMux.hasKey(origin):
       let mux = await client.pendingMux[origin]
@@ -314,7 +315,8 @@ proc transportInner(client: Navi, req: Request, sink: BodySink,
         try:
           return await client.muxRequest(mux, req, sink, asyncStream, userSink, gate)
         except KeepAliveRaceError:
-          if (gate != nil and gate.fed) or not isReplayable(req): raise
+          if (gate != nil and gate.fed) or not isReplayable(req) or
+             not (isIdempotent(req.verb) or hasIdempotencyKey(req)): raise
           # else fall through to a fresh connection below
       # else: turned out http/1.1, fall through
 
@@ -327,16 +329,11 @@ proc transportInner(client: Navi, req: Request, sink: BodySink,
     # opened with, honoring navi's live-config contract (issue #360). The whole-request
     # deadline is enforced by the async entry's `guard`, so only `readMs` is re-armed.
     rearm(pc.transport, client.config.readMs)
-    # `gotResponse` distinguishes a reused-connection failure BEFORE any response
-    # byte (unprocessed: safe to replay any method) from one AFTER the response began
-    # (processed: only an idempotent method may be replayed).
-    var gotResponse = false
     let gated = not userSink.isNil and not gate.isNil
     try:
       var keep = false
       var parser = h1SendAndReadHeaders(pc.transport, req, not sink.isNil or gated,
                                         asyncStream)
-      gotResponse = true
       if gated:
         result = h1GatedFinish(pc.transport, parser, userSink, gate, keep,
                                client.config.wantsDecompress, client.config.maxResponseBytes)
@@ -350,12 +347,18 @@ proc transportInner(client: Navi, req: Request, sink: BodySink,
       await close(pc.transport)  # stale
       # A half-delivered gated body must never be replayed onto a fresh connection.
       if gate != nil and gate.fed: raise
-      # Safe to replay on a fresh connection when the request was not processed (a
-      # reused connection dropped before any response) or the method is idempotent /
-      # provably unprocessed; never replay a non-rewindable streamed body.
+      # Replay on a fresh connection only when safe (matching Go net/http; RFC 9110
+      # 9.2.2). "No response byte yet" does not prove the request was unprocessed once
+      # its bytes were written -- a pre-response failure is `KeepAliveRaceError`
+      # (h1SendAndReadHeaders raises it when the peer closed before any headers). So
+      # replay an idempotent method; a proven-unprocessed peer signal (`UnprocessedError`);
+      # or the ambiguous race (`KeepAliveRaceError`) ONLY with a caller Idempotency-Key.
+      # A non-idempotent method without a key is not auto-replayed; a non-rewindable
+      # streamed body is never retried.
       let replayable = isReplayable(req)
       if not (replayable and
-              (not gotResponse or isIdempotent(req.verb) or (e of UnprocessedError))):
+              (isIdempotent(req.verb) or (e of UnprocessedError) or
+               ((e of KeepAliveRaceError) and hasIdempotencyKey(req)))):
         raise
       # else fall through to a fresh connection below
 

@@ -56,17 +56,21 @@ type
     ## method idempotency; the retry layer does so automatically.
 
   KeepAliveRaceError* = object of IOError
-    ## Raised when a REUSED keep-alive connection -- a cached HTTP/2 mux (async) or a
-    ## pooled single-connection h2 transport (sync) -- is torn down before this request
-    ## received any response HEADERS: the classic keep-alive race, where a connection
-    ## known-good moments ago is idle-recycled or closed (without a GOAWAY) by the peer
-    ## just as a request is dispatched on it. Unlike `UnprocessedError` this is not a
-    ## peer PROOF of non-processing, only the strong heuristic that no response began;
-    ## so the transport layer replays it ONCE on a fresh connection for any method
-    ## (mirroring the h1 pooled-connection replay), but the retry policy does NOT
-    ## auto-retry it -- a FRESH connection failing this way signals a real fault, not a
-    ## race. An `IOError` subtype, so existing `except IOError` handlers still catch it
-    ## and the surfaced message is unchanged.
+    ## Raised when a connection is torn down after the request was WRITTEN but before
+    ## any response HEADERS arrived (an idle recycle, a GOAWAY-less close, or a mid-flight
+    ## drop). The request's fate is genuinely ambiguous: it may have been received and
+    ## processed by the peer, or not. Unlike `UnprocessedError` (a peer PROOF of
+    ## non-processing -- REFUSED_STREAM, a GOAWAY above the stream id, or a connection
+    ## found dead BEFORE the request was sent), this is only "no response began," which
+    ## does not imply "not processed" once the bytes are on the wire.
+    ##
+    ## Retry policy (mirrors Go net/http's post-write behavior; see RFC 9110 9.2.2):
+    ## an idempotent method is retried, and any method is retried if the request carries
+    ## an `Idempotency-Key`; a non-idempotent method WITHOUT such a key is NOT
+    ## auto-retried (retrying could double-apply a side effect the peer already
+    ## committed). A drop that happens AFTER response headers begin is a plain `IOError`
+    ## (truncation), never this. An `IOError` subtype, so existing `except IOError`
+    ## handlers still catch it and the surfaced message is unchanged.
 
   ProtocolError* = object of CatchableError
     ## Raised when the HTTP version actually used is not one the request allowed

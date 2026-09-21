@@ -113,11 +113,12 @@ suite "sync entry end to end":
     check elapsed < 4000                            # near the 400ms bound, not the 8s stall
     joinThread(th)
 
-  test "a non-idempotent request is replayed on a fresh connection when the pooled one was closed before any response":
+  test "an idempotent request is replayed on a fresh connection when the pooled one was closed before any response":
     # The keep-alive race: the server silently closes a pooled connection, then the
-    # client reuses it for a POST. The failure comes before any response byte, so the
-    # request was not processed and is safe to replay even though POST is not
-    # idempotent -- it must land on a fresh connection, not error out.
+    # client reuses it. The failure comes before any response byte -- ambiguous, since
+    # the bytes were written. An idempotent method (PUT) is safe to replay, so it lands
+    # on a fresh connection; a non-idempotent POST would NOT be replayed here without an
+    # Idempotency-Key (Go net/http line; RFC 9110 9.2.2).
     var port = 0
     var accepts = 0
     var closed1 = false
@@ -130,7 +131,7 @@ suite "sync entry end to end":
     check api.pool.idleCount(key) == 1
     while not closed1: sleep(1)                  # server has closed the pooled conn
 
-    let r = api.request(POST, key & "/submit", body = "data")
+    let r = api.put(key & "/submit", body = "data")
     check r.status == 200
     check r.body == "replayed:data"             # served on the fresh connection
     joinThread(th)

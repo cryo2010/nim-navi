@@ -68,7 +68,10 @@ suite "asyncdispatch entry end to end":
     check res.headers.get("x-echo-authorization") == "Bearer captured-42"
     joinThread(th)
 
-  test "a non-idempotent request is replayed on a fresh connection when the pooled one was closed before any response":
+  test "an idempotent request is replayed on a fresh connection when the pooled one was closed before any response":
+    # The classic keep-alive race: a pooled connection the server closed while idle is
+    # reused and dropped before any response. An idempotent method (PUT) is safe to
+    # replay, so it is re-sent on a fresh connection (matching Go net/http).
     var port = 0
     var accepts = 0
     var closed1 = false
@@ -81,19 +84,15 @@ suite "asyncdispatch entry end to end":
     check api.pool.idleCount(key) == 1
     waitFlag(addr closed1)                              # server closed the pooled conn
 
-    let r = waitFor api.request(POST, key & "/submit", body = "data")
+    let r = waitFor api.put(key & "/submit", body = "data")
     check r.status == 200
     check r.body == "replayed:data"                    # served on the fresh connection
     joinThread(th)
     check accepts == 2
 
-  test "a non-idempotent request is retried when a FRESH connection is dropped before any response":
-    # The keep-alive race on a freshly-opened connection (not a pooled one): the very
-    # first request opens a new connection, the server drops it before any response
-    # header, and the client must still replay the POST on a second connection. Before
-    # the fresh-connection fix this failed un-retryably (a plain IOError the retry policy
-    # would not replay for a non-idempotent verb); now the pre-header close is a
-    # KeepAliveRaceError the retry layer replays for any method, bounded by the limit.
+  test "a non-idempotent request with an Idempotency-Key is replayed on a dropped fresh connection":
+    # A pre-response drop is ambiguous, so a non-idempotent POST is replayed only when
+    # the caller vouches safety with an Idempotency-Key (Go net/http's escape hatch).
     var port = 0
     var accepts = 0
     var closed1 = false
@@ -102,11 +101,29 @@ suite "asyncdispatch entry end to end":
 
     let api = newNavi()
     let key = "http://127.0.0.1:" & $port
-    let r = waitFor api.request(POST, key & "/submit", body = "data")
+    var h = initHeaders()
+    h["idempotency-key"] = "req-1"
+    let r = waitFor api.request(POST, key & "/submit", headers = h, body = "data")
     check r.status == 200
     check r.body == "replayed:data"                    # served on the second connection
     joinThread(th)
     check accepts == 2                                  # first (fresh) dropped, retry served
+
+  test "a non-idempotent request WITHOUT an Idempotency-Key is not replayed (at-most-once)":
+    # The default: a POST whose connection drops before any response is NOT auto-retried
+    # (it may already have been processed). The server serves exactly one connection and
+    # stops listening, so a wrongful replay would fail to connect rather than hang.
+    var port = 0
+    var accepts = 0
+    var th: Thread[StaleCtx]
+    startDropOnce(th, port, addr accepts)
+
+    let api = newNavi()
+    let key = "http://127.0.0.1:" & $port
+    expect naviresp.KeepAliveRaceError:
+      discard waitFor api.request(POST, key & "/submit", body = "data")
+    joinThread(th)
+    check accepts == 1                                  # sent once, never replayed
 
   test "a buffered request raises on a premature close mid-body":
     const port = 9263

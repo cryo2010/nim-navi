@@ -880,6 +880,39 @@ proc startFreshDrop*(th: var Thread[StaleCtx], port: var int, closed1: ptr bool,
     StaleCtx(portOut: addr port, ready: addr ready, closed1: closed1, accepts: accepts))
   while not ready: sleep(1)
 
+proc serveDropOnce(ctx: StaleCtx) {.thread.} =
+  ## Accept exactly ONE connection, read its full request, drop it before any response
+  ## header, then EXIT without accepting a second connection. For asserting that a
+  ## request is NOT replayed (at-most-once): if the client wrongly retried, the retry
+  ## would fail to connect (the listener is gone), surfacing the misbehavior instead of
+  ## hanging the test thread waiting for a second accept that a correct client never makes.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(0), "127.0.0.1")
+  server.listen()
+  ctx.portOut[] = server.getLocalAddr()[1].int
+  ctx.ready[] = true
+  var c = acceptClient(server)
+  let head = c.recvUntil("\r\n\r\n")
+  let cl = headerValue(head, "content-length")
+  let n = if cl.len > 0: parseInt(cl) else: 0
+  var body = ""
+  while body.len < n:
+    let part = c.recv(n - body.len)
+    if part.len == 0: break
+    body.add part
+  ctx.accepts[] = 1
+  c.close()                              # dropped before any response header
+  server.close()                         # and no second accept: a replay would be refused
+
+proc startDropOnce*(th: var Thread[StaleCtx], port: var int, accepts: ptr int) =
+  ## Serve (drop) exactly one connection, then stop listening. Binds an ephemeral port.
+  var ready = false
+  var closed1 = false
+  createThread(th, serveDropOnce,
+    StaleCtx(portOut: addr port, ready: addr ready, closed1: addr closed1, accepts: accepts))
+  while not ready: sleep(1)
+
 proc startKeepAlive*(th: var Thread[KeepAliveCtx], port: var int, requests: int,
                      accepts: ptr int) =
   ## Launch the keep-alive server and block until it is listening. Binds an
