@@ -232,11 +232,11 @@ proc pruneDeadMuxes(client: Navi) =
 
 proc closeOrphanMux(mux: H2Mux) {.async.} =
   ## Fire-and-forget close of a mux that was displaced from `client.muxes` while still
-  ## live (its reader + keepalive still running). Swallows errors so it is safe to
-  ## `asyncCheck` off the request path: the request must not block on tearing an orphan
-  ## down, but the orphan must still be reachable for close (else its fd/reader leak
-  ## where `client.close`/`pruneDeadMuxes` can never see it). `asyncCheck` resolves on
-  ## both backends (asyncdispatch's std, chronos's asyncfutures).
+  ## live (its reader + keepalive still running). Swallows every error, so its future
+  ## never fails: safe to detach off the request path (the request must not block on
+  ## tearing an orphan down, but the orphan must still be reachable for close, else its
+  ## fd/reader leak where `client.close`/`pruneDeadMuxes` can never see it), and it
+  ## satisfies chronos's `asyncSpawn` no-failure contract at the spawn site.
   try: await mux.close()
   except CatchableError: discard
 
@@ -299,9 +299,11 @@ proc openFreshConn(client: Navi, rq: Request, origin: string,
       # path -- close is async and we must not block here); our own entry, if a racer
       # replaced it, is left alone. `pending.del` likewise only removes OUR future.
       let prior = client.muxes.getOrDefault(origin, nil)
-      if prior != nil and prior != mux:   # a racer cached a DIFFERENT live mux here:
-        asyncCheck closeOrphanMux(prior)  # close it (its own dead-guard no-ops if it
-                                          # already exited), never leaving it orphaned
+      if prior != nil and prior != mux:      # a racer cached a DIFFERENT live mux here:
+        when declared(asyncSpawn):           # close it (its own dead-guard no-ops if it
+          asyncSpawn closeOrphanMux(prior)   # already exited), never leaving it orphaned.
+        else:                                # chronos deprecated asyncCheck in favor of
+          asyncCheck closeOrphanMux(prior)   # asyncSpawn, which asyncdispatch lacks
       client.muxes[origin] = mux
       if client.pendingMux.getOrDefault(origin, nil) == pending:
         client.pendingMux.del(origin)
