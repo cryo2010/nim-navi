@@ -15,7 +15,9 @@ the route it needs. Endpoints:
 import base64
 import gzip
 import hashlib
+import json
 import os
+import urllib.parse
 import zlib
 
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
@@ -66,13 +68,32 @@ async def echo(request: Request) -> Response:
         "x-echo-method": request.method,
         "x-echo-stress": request.headers.get("x-stress", ""),
     }
+    # Content-type-aware canonicalization, between the request decode and the
+    # response encode. JSON/form are parsed and canonically re-serialized (sorted
+    # keys, compact separators) so the echo is provably NOT the bytes navi sent for
+    # the unsorted-key documents: a green run proves each side parsed the other's
+    # serialization. Everything else keeps today's byte-echo.
+    media = request.headers.get("content-type", "application/octet-stream")
+    base = media.split(";", 1)[0].strip().lower()
+    if base == "application/json" and body:
+        try:
+            doc = json.loads(body)
+        except ValueError as e:
+            # A navi encoder bug becomes an immediate hard client failure (status
+            # != 200) with a diagnostic body, not a confusing byte mismatch.
+            return Response(status_code=400, content=str(e).encode(),
+                            headers={**headers, "x-echo-error": "bad-json"})
+        body = json.dumps(doc, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False).encode()
+    elif base == "application/x-www-form-urlencoded" and body:
+        pairs = sorted(urllib.parse.parse_qsl(body.decode(), keep_blank_values=True))
+        body = urllib.parse.urlencode(pairs).encode()
     if request.method == "HEAD":
         return Response(status_code=200, headers=headers)
     want = request.headers.get("x-want-encoding", "")
     out = encode(body, want) if want else body
     if want and out is not body:
         headers["content-encoding"] = want
-    media = request.headers.get("content-type", "application/octet-stream")
     return Response(content=out, media_type=media, headers=headers)
 
 

@@ -4,14 +4,14 @@
 ## per-report cadence as the async client, minus the fan-out (documented: sync has
 ## no concurrency).
 
-import std/[times, strutils]
+import std/[times, strutils, json]
 import ../zlibcodec
-import ../common/[config, reporter, servers]
+import ../common/[config, reporter, servers, payloads]
 import navi
 include ../common/httpset
 
 const verbs = [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS]
-const bodies = stressBodies()
+const allPayloads = stressPayloads()
 
 proc stampMw(): NaviMiddleware =
   result = proc(ctx: NaviContext) =
@@ -21,6 +21,35 @@ proc stampMw(): NaviMiddleware =
 proc failHard(cfg: Config, msg: string) =
   stderr.writeLine cfg.label & " FAIL: " & msg
   quit(1)
+
+proc baseType(ct: string): string =
+  ## The media type before any `;` parameter, lowercased/trimmed, for the mirror check.
+  ct.split(';', 1)[0].strip().toLowerAscii()
+
+proc verifyEcho(cfg: Config, p: Payload, v: HttpVerb, res: Response) =
+  ## Per-kind verification: json by parsed-tree equality, form by decoded pairs,
+  ## text/binary byte-exact. Every failure names p.name.
+  if baseType(res.headers.get("content-type")) != p.contentType:
+    cfg.failHard(p.name & ": echoed content-type '" &
+      res.headers.get("content-type") & "' (want base " & p.contentType & ")")
+  case p.kind
+  of pkJson:
+    var got, want: JsonNode
+    try: got = parseJson(res.body)
+    except CatchableError as e:
+      cfg.failHard(p.name & ": echoed body is not JSON (" & e.msg & ")"); return
+    want = parseJson(p.jsonSrc)
+    if got != want:
+      cfg.failHard(p.name & ": JSON tree mismatch")
+    if p.reserialized and res.body == $want:
+      cfg.failHard(p.name & ": server byte-echoed (canonical echo == sent bytes)")
+  of pkForm:
+    if not checkFormEcho(res.body, p.form):
+      cfg.failHard(p.name & ": form pairs mismatch (echoed '" & res.body & "')")
+  of pkText, pkBinary:
+    if res.body != p.text:
+      cfg.failHard(p.name & ": body mismatch (expected " & $p.text.len &
+        " bytes, got " & $res.body.len & ")")
 
 proc featureChecks(cfg: Config, base: string) =
   ## Once-per-cell checks of paths the /echo soak never hits: redirect following,
@@ -59,6 +88,7 @@ proc main() =
   let reason = cfg.skipReason
   if reason.len > 0: echo cfg.label, " ", reason; return
   var pool = initServerPool(cfg)
+  let payloads = filterPayloads(allPayloads, cfg.contentTypes, jsSafe = false)
   let counter = newStatusCounter()
   var apis: seq[Navi]
   for _ in 0 ..< cfg.clients: apis.add mkClient(cfg)
@@ -82,38 +112,52 @@ proc main() =
   var n = 0
   while epochTime() < deadline:
     for api in apis:
+      # Two-index rotation: every payload crosses every bodied verb (the old
+      # phase-locked pairing shipped body k only with verb k, so big bodies always
+      # landed on bodiless verbs and never went on the wire).
       let v = verbs[n mod verbs.len]
-      let plain = bodies[n mod bodies.len]
+      let p = payloads[(n div verbs.len) mod payloads.len]
       let bodied = v in {POST, PUT, PATCH}
       inc n
       let url = pool.pick() & "/echo"
       var h = initHeaders()
-      var wire = ""
-      if bodied:
-        wire = plain
-        h["content-type"] = "application/octet-stream"
-        if cfg.reqCompression != "none" and plain.len > 0:
-          wire = zcompress(plain, cfg.reqCompression)
-          h["content-encoding"] = cfg.reqCompression
-        if cfg.respCompression != "none":
-          h["x-want-encoding"] = cfg.respCompression
       if n mod 11 == 0: h["x-big"] = repeat("H", 8192)   # exercise the HPACK path
       try:
-        let res = api.request(v, url, headers = h, body = wire)
+        var res: Response
+        if not bodied:
+          res = api.request(v, url, headers = h)
+        else:
+          if cfg.respCompression != "none":
+            h["x-want-encoding"] = cfg.respCompression
+          case p.kind
+          of pkJson:
+            # Typed JsonNode -> application/json, uncompressed (a content-encoding
+            # would misdescribe the plain bytes). Parse per request from the source.
+            res = api.request(v, url, headers = h, body = parseJson(p.jsonSrc))
+          of pkForm:
+            res = api.request(v, url, headers = h, form = p.form)
+          of pkText, pkBinary:
+            var wire = p.text
+            h["content-type"] = p.contentType
+            if cfg.reqCompression != "none" and p.text.len > 0:
+              wire = zcompress(p.text, cfg.reqCompression)
+              h["content-encoding"] = cfg.reqCompression
+            res = api.request(v, url, headers = h, body = wire)
         cfg.checkVersion(res.httpVersion)   # hard-fail on a silent protocol downgrade
-        if res.status != 200: cfg.failHard($v & " " & url & " -> status " & $res.status)
+        if res.status != 200:
+          cfg.failHard(p.name & " " & $v & " " & url & " -> status " & $res.status)
         if res.headers.get("x-echo-method") != $v:
-          cfg.failHard($v & ": echoed method '" & res.headers.get("x-echo-method") & "'")
+          cfg.failHard(p.name & " " & $v & ": echoed method '" &
+            res.headers.get("x-echo-method") & "'")
         if res.headers.get("x-echo-stress") != "1":
-          cfg.failHard($v & ": middleware header not echoed")
-        let expectBody = if bodied and v != HEAD: plain else: ""
-        if res.body != expectBody:
-          cfg.failHard($v & ": body mismatch (expected " & $expectBody.len &
-            " bytes, got " & $res.body.len & ")")
+          cfg.failHard(p.name & " " & $v & ": middleware header not echoed")
+        if bodied: cfg.verifyEcho(p, v, res)
+        elif res.body.len != 0:
+          cfg.failHard(p.name & " " & $v & ": bodiless verb returned a body")
         counter.tally(res.status)
       except CatchableError as e:
         counter.fail()
-        cfg.failHard($v & " " & url & " -> " & $e.name & ": " & e.msg)
+        cfg.failHard(p.name & " " & $v & " " & url & " -> " & $e.name & ": " & e.msg)
     if epochTime() - lastReport >= cfg.reportSeconds.float:
       lastReport = epochTime()
       report(cfg.label, counter, epochTime() - start)

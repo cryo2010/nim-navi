@@ -8,6 +8,7 @@
 ## `nim js` can share it.
 
 import std/[os, strutils]
+import payloads
 
 type
   Config* = object
@@ -20,8 +21,9 @@ type
     seconds*: float          ## soak duration
     clients*: int            ## navi clients per backend
     concurrency*: int        ## in-flight requests per client (async fan-out width)
-    reqCompression*: string  ## none|gzip|deflate (request body; native only)
+    reqCompression*: string  ## none|gzip|deflate (request body; native only, octet/text only)
     respCompression*: string ## none|gzip|deflate|br|zstd (asked via x-want-encoding)
+    contentTypes*: string    ## csv of {octet,text,json,form}; restricts the /echo rotation
     reportSeconds*: int      ## per-report cadence
     streamBytes*: int        ## stream transfer size (bytes)
     cert*: string            ## CA/cert path for TLS verification
@@ -48,9 +50,18 @@ proc loadConfig*(backend: string): Config =
     concurrency: max(1, getInt("NAVI_CONCURRENCY", 8)),
     reqCompression: getEnv("NAVI_REQ_COMPRESSION", "gzip"),
     respCompression: getEnv("NAVI_RESP_COMPRESSION", "gzip"),
+    contentTypes: getEnv("NAVI_CONTENT_TYPES", "octet,text,json,form"),
     reportSeconds: max(1, getInt("NAVI_REPORT_SECONDS", 60)),
     streamBytes: getInt("NAVI_STREAM_BYTES", 1073741824),
     cert: getEnv("NAVI_CERT", ""))
+  # A typo in NAVI_CONTENT_TYPES must not silently narrow (or empty) the rotation:
+  # hard-fail at startup, naming the bad token, so the soak never runs miscoverage.
+  let (ok, bad) = validContentTypes(result.contentTypes)
+  if not ok:
+    stderr.writeLine "[" & result.workload & " " & result.proto & " " &
+      result.backend & "] FAIL: invalid NAVI_CONTENT_TYPES token '" & bad &
+      "' (allowed: octet,text,json,form)"
+    quit(1)
 
 proc label*(c: Config): string =
   ## The tag prefixed to every report line, e.g. "[requests h2 chronos]".
