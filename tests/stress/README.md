@@ -28,10 +28,19 @@ checksum and fails hard on any mismatch.
 | `SECONDS` | `60` | runtime per (backend × protocol) cell |
 | `CLIENTS` | `3` | navi clients per backend |
 | `CONCURRENCY` | `8` | in-flight requests per client (async fan-out) |
-| `REQ_COMPRESSION` | `gzip` | request body: `none` \| `gzip` \| `deflate` (native) |
+| `REQ_COMPRESSION` | `gzip` | request body: `none` \| `gzip` \| `deflate` (native; **octet/text only**) |
 | `RESP_COMPRESSION` | `gzip` | response via `x-want-encoding`: `none` \| `gzip` \| `deflate` \| `br` \| `zstd` |
+| `CONTENT_TYPES` | `octet,text,json,form` | csv restricting the `requests` /echo rotation; unknown tokens hard-fail at startup |
 | `REPORT_SECONDS` | `60` | report cadence |
 | `STREAM_BYTES` | `1073741824` | stream size (1 GiB); lower for a smoke |
+
+The `requests` workload rotates four body kinds through `/echo`:
+
+- **octet** (`application/octet-stream`) and **text** (`text/plain`): raw-string bodies, byte-verified. These are the only kinds `REQ_COMPRESSION` applies to -- the client zlib-compresses the body and sets `content-encoding`; the server decodes it first.
+- **json** (`application/json`): sent as a navi `JsonNode` so the typed encoder is on the wire, **never request-compressed** (a `content-encoding` on a typed body would misdescribe the plain bytes and is the realistic shape for apps sending JSON through navi). The server parses and canonically re-serializes (sorted keys, compact separators); the client compares parsed trees, so a byte-echo cannot make it pass.
+- **form** (`application/x-www-form-urlencoded`): sent as `form = @[(k, v)]`, also never request-compressed. The server parses with `parse_qsl` and re-serializes sorted; the client compares decoded pairs.
+
+`RESP_COMPRESSION` (response via `x-want-encoding`) still applies to every native kind: the server compresses the canonical json/form echo and navi's response auto-decompression decodes it before the parse. `NAVI_CONTENT_TYPES=octet` reproduces the pre-catalog native behavior for bisecting.
 
 Example:
 

@@ -4,6 +4,7 @@
 ## the native reporter's shape.
 
 import std/[strutils, tables]
+import payloads
 
 proc envJs*(name, dflt: cstring): cstring {.importjs: "(process.env[#] ?? #)".}
 proc nowMs*(): float {.importjs: "Date.now()".}
@@ -17,13 +18,14 @@ type JsCfg* = object
   host*, proto*: string
   basePort*, servers*, clients*, concurrency*, reportSeconds*, streamBytes*: int
   seconds*: float
+  contentTypes*: string    ## csv of {octet,text,json,form}; restricts the /echo rotation
 
 proc envInt(name: string, def: int): int =
   let v = $envJs(name.cstring, "".cstring)
   if v.len == 0: def else: parseInt(v)
 
 proc loadJsCfg*(): JsCfg =
-  JsCfg(
+  result = JsCfg(
     host: $envJs("NAVI_HOST", "127.0.0.1"),
     proto: $envJs("NAVI_PROTO", "h2"),
     basePort: envInt("NAVI_BASE_PORT", 9443),
@@ -32,7 +34,14 @@ proc loadJsCfg*(): JsCfg =
     concurrency: max(1, envInt("NAVI_CONCURRENCY", 8)),
     reportSeconds: max(1, envInt("NAVI_REPORT_SECONDS", 60)),
     streamBytes: envInt("NAVI_STREAM_BYTES", 1073741824),
-    seconds: parseFloat($envJs("NAVI_SECONDS", "60")))
+    seconds: parseFloat($envJs("NAVI_SECONDS", "60")),
+    contentTypes: $envJs("NAVI_CONTENT_TYPES", "octet,text,json,form"))
+  # Hard-fail at startup on a NAVI_CONTENT_TYPES typo, matching the native config.
+  let (ok, bad) = validContentTypes(result.contentTypes)
+  if not ok:
+    echo "[requests ", result.proto, " js] FAIL: invalid NAVI_CONTENT_TYPES token '",
+      bad, "' (allowed: octet,text,json,form)"
+    jsExit(1)
 
 type JsPool* = object
   bases: seq[string]

@@ -1,18 +1,16 @@
-## stressRequests, navi/js backend (Node). `clients` x `concurrency` workers fire
-## GET/POST/PUT at /echo across the server pool, tally status codes, and discard
-## responses. Request-body compression is skipped (the js runtime owns its codec).
-## The runner trusts the self-signed cert via NODE_EXTRA_CA_CERTS.
+## stressRequests, navi/js backend (Node). `clients` x `concurrency` workers rotate
+## every verb x payload against /echo across the server pool, tally status codes,
+## and verify each echo per content-type kind (json by parsed-tree equality, form by
+## decoded pairs, text byte-exact). The js cell is the js-safe subset of the shared
+## catalog: binary payloads are excluded (TextEncoder mangles raw bytes) and there is
+## no request-body compression (the js runtime owns its codec). The runner trusts the
+## self-signed cert via NODE_EXTRA_CA_CERTS.
 
-import std/strutils
+import std/[strutils, json]
 import navi/js
-import ../common/harness_js
+import ../common/[harness_js, payloads]
 
 const verbs = [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS]
-# Text-only body shapes (js sends the body as a string via TextEncoder, so a raw
-# binary body would be mangled): empty, tiny, either side of the 16 KiB frame
-# boundary, past the 64 KiB window, and highly compressible.
-let jsBodies = @["", "payload", repeat("a", 16383), repeat("b", 16385),
-                 repeat("c", 65536), repeat("z", 262144)]
 
 proc stampMw(): NaviMiddleware =
   result = proc(ctx: NaviContext) {.async.} =
@@ -22,6 +20,13 @@ proc stampMw(): NaviMiddleware =
 proc main() {.async.} =
   let cfg = loadJsCfg()
   var pool = initJsPool(cfg)
+  let payloads = filterPayloads(stressPayloads(), cfg.contentTypes, jsSafe = true)
+  if payloads.len == 0:
+    # NAVI_CONTENT_TYPES=octet leaves nothing js-safe (binary is excluded on js), so
+    # skip cleanly like a native gap cell instead of `mod 0`-crashing in the worker.
+    echo "[requests ", cfg.proto, " js] skipped: no js-safe payloads in NAVI_CONTENT_TYPES=",
+      cfg.contentTypes
+    return
   let counter = newJsCounter()
   var apis: seq[Navi]
   for _ in 0 ..< cfg.clients:
@@ -35,33 +40,72 @@ proc main() {.async.} =
   let timer = setIntervalJs(proc () = counter.report(label, start),
                             cfg.reportSeconds * 1000)
 
+  proc fail(msg: string) =
+    echo label, " FAIL: ", msg
+    jsExit(1)
+
+  proc verifyEcho(p: Payload, v: HttpVerb, res: Response) =
+    ## Per-kind verification (no checkVersion: js can't pin/read the negotiated version).
+    let base = res.headers.get("content-type").split(';', 1)[0].strip().toLowerAscii()
+    if base != p.contentType:
+      fail(p.name & " " & $v & ": echoed content-type '" &
+        res.headers.get("content-type") & "' (want base " & p.contentType & ")")
+    case p.kind
+    of pkJson:
+      var got, want: JsonNode
+      try: got = parseJson(res.body)
+      except CatchableError as e:
+        fail(p.name & ": echoed body is not JSON (" & e.msg & ")"); return
+      want = parseJson(p.jsonSrc)
+      if got != want: fail(p.name & ": JSON tree mismatch")
+      if p.reserialized and res.body == $want:
+        fail(p.name & ": server byte-echoed (canonical echo == sent bytes)")
+    of pkForm:
+      if not checkFormEcho(res.body, p.form):
+        fail(p.name & ": form pairs mismatch (echoed '" & res.body & "')")
+    of pkText, pkBinary:
+      if res.body != p.text:
+        fail(p.name & ": body mismatch (expected " & $p.text.len &
+          " got " & $res.body.len & ")")
+
   proc worker(api: Navi, i: int) {.async.} =
     var n = i
     while nowMs() < deadline:
       let v = verbs[n mod verbs.len]
-      let plain = jsBodies[n mod jsBodies.len]
+      let p = payloads[(n div verbs.len) mod payloads.len]
       let bodied = v in {POST, PUT, PATCH}
       inc n
       var h = initHeaders()
-      if bodied: h["content-type"] = "text/plain"
+      # No x-want-encoding: the js cell leaves response compression to the runtime's
+      # own codec (unchanged from the pre-catalog js client), so it never asks the
+      # server to br/zstd-encode a body undici might not decode.
       try:
-        let res = await api.request(v, pool.pick() & "/echo", headers = h,
-                                    body = (if bodied: plain else: ""))
+        var res: Response
+        if not bodied:
+          res = await api.request(v, pool.pick() & "/echo", headers = h)
+        else:
+          case p.kind
+          of pkJson:
+            res = await api.request(v, pool.pick() & "/echo", headers = h,
+                                    body = parseJson(p.jsonSrc))
+          of pkForm:
+            res = await api.request(v, pool.pick() & "/echo", headers = h, form = p.form)
+          of pkText, pkBinary:
+            h["content-type"] = p.contentType
+            res = await api.request(v, pool.pick() & "/echo", headers = h, body = p.text)
         if res.status != 200:
-          echo label, " FAIL: ", $v, " -> status ", res.status; jsExit(1)
+          fail(p.name & " " & $v & " -> status " & $res.status)
         if res.headers.get("x-echo-method") != $v:
-          echo label, " FAIL: ", $v, " echoed method '", res.headers.get("x-echo-method"), "'"; jsExit(1)
+          fail(p.name & " " & $v & " echoed method '" & res.headers.get("x-echo-method") & "'")
         if res.headers.get("x-echo-stress") != "1":
-          echo label, " FAIL: ", $v, " middleware header not echoed"; jsExit(1)
-        let expectBody = if bodied and v != HEAD: plain else: ""
-        if res.body != expectBody:
-          echo label, " FAIL: ", $v, " body mismatch (expected ", expectBody.len,
-               " got ", res.body.len, ")"; jsExit(1)
+          fail(p.name & " " & $v & " middleware header not echoed")
+        if bodied: verifyEcho(p, v, res)
+        elif res.body.len != 0:
+          fail(p.name & " " & $v & " bodiless verb returned a body")
         counter.tally(res.status)
       except CatchableError as e:
         counter.note()
-        echo label, " FAIL: ", $v, " -> ", e.name, ": ", e.msg
-        jsExit(1)
+        fail(p.name & " " & $v & " -> " & $e.name & ": " & e.msg)
 
   var futs: seq[Future[void]]
   for api in apis:
