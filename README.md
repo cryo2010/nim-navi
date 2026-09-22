@@ -41,72 +41,69 @@ discard main()
 ## Contents
 
 - [Features](#features)
-- [Install](#install)
-- [Requirements](#requirements)
+- [Installation](#installation)
 - [Choosing a client](#choosing-a-client)
-  - [Capability matrix](#capability-matrix)
-  - [The browser client (`navi/js`)](#the-browser-client-navijs)
 - [Usage](#usage)
-  - [Creating a client](#creating-a-client)
+  - [Quick Start](#quick-start)
   - [Configuration](#configuration)
   - [Requests](#requests)
   - [Responses](#responses)
   - [Headers](#headers)
-  - [TLS](#tls)
+  - [TLS](#transport-layer-security-tls)
   - [Errors](#errors)
-  - [Retries, redirects, and timeouts](#retries-redirects-and-timeouts)
+  - [Retries](#retries)
+  - [Timeouts](#timeouts)
   - [Query parameters](#query-parameters)
   - [Cancellation](#cancellation)
   - [Response size limits](#response-size-limits)
-  - [Auth and proxy](#auth-and-proxy)
-  - [Unix domain sockets](#unix-domain-sockets)
   - [Cookies](#cookies)
   - [Middleware](#middleware)
-    - [Batteries-included middleware](#batteries-included-middleware)
   - [Decompression](#decompression)
-  - [HTTP/2](#http2)
   - [Keep-alive](#keep-alive)
-  - [Happy Eyeballs](#happy-eyeballs)
   - [Streaming](#streaming)
+  - [Server-Sent Events](#server-sent-events)
   - [WebSocket](#websocket)
+- [Advanced](#advanced)
+  - [Auth and proxy](#auth-and-proxy)
+  - [Unix domain sockets](#unix-domain-sockets)
+  - [HTTP/2](#http2)
+  - [Happy Eyeballs](#happy-eyeballs)
 - [Security](#security)
 - [Thanks](#thanks)
 - [License](#license)
 
 ## Features
 
-- **HTTP/1.1 and HTTP/2:** IPv4 and IPv6 and ALPN-negotiated with h1 fallback.
+- **HTTP/1.1 and HTTP/2:** IPv4 and IPv6 and ALPN-negotiated with h1 fallback (RFC 9110, 9112, 9113).
 - **HTTP/2 multiplexing:** concurrent async requests on a single HTTP/2 connection
-- **HTTP/3:** (QUIC), opt-in via `-d:naviHttp3`, automatic `Alt-Svc: h3` upgrades
-- **Sync and async** from a common API
-- **Browser and Node** via a JavaScript client
-- **TLS** on all clients with certificate verification
+- **HTTP/3:** (QUIC), opt-in via `-d:naviHttp3`, automatic `Alt-Svc: h3` upgrades (RFC 9000, 9114, 7838)
+- **Transport Layer Security (TLS)** on all clients with certificate verification
+- **TLS controls:** custom/in-memory CA, mTLS, version and cipher pinning, SPKI certificate pinning
 - **Connection pooling / keep-alive** with automatic retry on a stale pooled connection
-- **Happy Eyeballs:** (RFC 8305) address racing for fast connections
+- **Happy Eyeballs:** address racing for fast connections (RFC 8305)
 - **Streaming** uploads (chunked) and downloads (with backpressure)
-- **Server-Sent Events** with transparent reconnection
+- **Server-Sent Events (SSE)** with transparent reconnection (WHATWG `EventSource`)
 - **Retries** with capped exponential backoff, honoring `Retry-After`
-- **Redirect following** with method rewrites and cross-origin `Authorization` / `Proxy-Authorization` stripping
+- **Redirects** with method rewrites and cross-origin `Authorization` / `Proxy-Authorization` stripping
 - **Throw-on-non-2xx** by default, opt-out available
-- **Automatic decompression**: gzip, deflate, brotli and zstd; `res.text` charset decoding
-- **Trailers**: request trailers sent (`req.trailers`) and response trailers surfaced (`res.trailers`) on HTTP/1.1, HTTP/2, and HTTP/3
-- **Request timeouts** per-phase (connect / read / total)
+- **Decompression**: automatic gzip, deflate, brotli and zstd response decompression
+- **Charset decoding:** `res.text` decodes UTF-8, US-ASCII, Latin-1, Windows-1252, UTF-16 LE/BE
+- **Timeouts:** per-phase (connect / read / total)
 - **Connection-pool sizing:** per-host and global idle caps, idle-timeout eviction
-- **Middleware**: onion-style functions that modify, observe, or short-circuit requests
-- **Cookie jar:** (RFC 6265) automatic and per-client; per-domain with expiration and `__Host-`/`__Secure-` prefixes
-- **Basic/bearer/digest auth:** digest: MD5 and SHA-256, RFC 7616
-- **Proxy:** http absolute-URI, https CONNECT (with Proxy-Authorization), and SOCKS5
-- **Unix domain sockets** (native backends, POSIX): dial a socket path instead of TCP
-- **TLS controls:** custom/in-memory CA, mTLS, version and cipher pinning, SPKI certificate pinning, and a custom verify callback
-- **WebSockets** (RFC 6455) text and binary messages, fragmentation reassembly, per-message streaming, automatic ping/pong, a message-size cap, and optional keepalive
+- **Middleware:** onion-style functions that modify, observe, or short-circuit requests
+- **Cookies:** automatic and per-client; per-domain with expiration (RFC 6265)
+- **Authentication:** Basic, Bearer, and Digest (MD5/SHA-256) (RFC 7617, 6750, 7616)
+- **Proxy:** http absolute-URI, https CONNECT (with Proxy-Authorization), and SOCKS5 (RFC 1928)
+- **Unix domain sockets (UDS):** dial a socket path instead of TCP
+- **WebSockets** with fragmentation reassembly, message streaming, automatic ping/pong and keepalive (RFC 6455)
 
-## Install
+## Installation
 
 ```shell
 nimble add navi
 ```
 
-## Requirements
+### System Requirements
 
 - Nim >= 2.2.10
 - OpenSSL, for https. Compile your program with `-d:ssl`:
@@ -209,70 +206,45 @@ discard main()   # a browser or Node runs the returned Promise
 
 ## Usage
 
-### Creating a client
+### Quick Start
 
-`newNavi()` creates a client with the default config, then you configure it in
-place through `api.config`:
+Below is a basic example that demonstrates how to create a client, configure it
+and start sending requests.
 
 ```nim
+# Create the client
 let api = newNavi()
+
+# Configure the client
 api.config.prefixUrl = "https://api.example.com"
-api.config.headers["authorization"] = "Bearer ..."
-api.config.retry.limit = 5
 
-# Relative targets resolve against prefixUrl.
-let user = api.get("users/42").data
-```
-
-`api.config` is the client's **live** configuration: mutate it any time and the
-change takes effect from the next request on (auth, headers, timeouts, retries,
-redirects, decompression, middleware, and so on). This is the simplest way to
-adjust a running client, e.g. refresh a token with
-`api.config.headers["authorization"] = "Bearer " & newToken`.
-
-Three fields are the exception: `tls`, `http`, and `proxy` are bound when
-connections are opened, so changing them on a live client does not affect its
-existing pooled connections. Set those before the first request, or build a new
-client (or `extend`).
-
-To start from a prepared config instead of mutating after construction, pass one
-to `newNavi`:
-
-```nim
-var config = initNaviConfig()
-config.timeouts.total = 30_000
-let custom = newNavi(config)
-```
-
-Derive a client that layers new defaults over an existing one with `extend`. It
-layers the override's identity fields (prefixUrl, headers, http, auth, proxy) over
-the parent and inherits the rest:
-
-```nim
-var config = initNaviConfig()
-config.headers["x-api-key"] = "..."
-let authed = api.extend(config)
+# Send requests
+let res = await api.get("users/42")
+let user = res.data
 ```
 
 ### Configuration
 
-The fastest path is to mutate `api.config` on a live client (above). To build a
-config up front, use `initNaviConfig()`, which sets the safe defaults
-(verification on, decompression on, 2 retries, 20 redirects); then set the fields
-you want and pass it to `newNavi`. `NaviConfig` has `{.requiresInit.}`, so a bare
-or partial `NaviConfig(...)` literal is a compile error; `initNaviConfig()` is the
-only way to build one, which keeps the defaults from being silently zeroed.
+Navi's config object is available on each client instance via `Navi.config`. 
 
 ```nim
+# Edit the client's config directly
 let api = newNavi()
 api.config.prefixUrl = "https://api.example.com"
-api.config.headers["authorization"] = "Bearer ..."
-
-# Relative targets resolve against prefixUrl.
-let user = api.get("users/42").data
 ```
 
-Every field, and the default `initNaviConfig()` gives it:
+> [!IMPORTANT]
+> The `api.config` fields `tls`, `http` and `proxy` are bound once a connection is
+> opened. Changing them afterwards will have no effect.
+
+You can alternatively construct a config instance using `initNaviConfig()`, which sets safe defaults. 
+
+```nim
+let config = initNaviConfig()
+let api = newNavi(config)
+config.prefixUrl = "https://api.example.com"
+let api = newNavi(config)
+```
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -317,59 +289,59 @@ Every field, and the default `initNaviConfig()` gives it:
 
 ### Requests
 
+Send HTTP requests using the corresponding client member function. Navi will automatically
+set the `Content-Type` based on the provided `body` type if it has not been set.
+
 ```nim
-discard api.get("path", headers = initHeaders({"accept": "application/json"}))
-discard api.post("path", body = """{"name":"navi"}""")
-discard api.post("path", body = %*{"name": "navi"})          # JsonNode -> application/json
-discard api.post("path", form = @[("a", "1"), ("b", "2")])   # url-encoded
-discard api.put("path", body = payload)
-discard api.delete("path")
-discard api.head("path")
+let headers = initHeaders({"accept": "application/json"})
 
-# Any verb, explicitly:
-discard api.request(POST, "path", body = payload)
-
-# Request trailers: fields sent after the body (chunked on h1, a trailing HEADERS
-# block on h2/h3). Same shape as headers; a buffered body is sent chunked when set.
-discard api.request(POST, "path", body = payload,
-                    trailers = initHeaders({"x-checksum": "abc123"}))
-
-# Push the response body to a sink instead of buffering it (the full policy layer
-# still runs); see the "Sink downloads (push)" subsection under Streaming.
-discard api.get("path", sink = proc(chunk: string): bool = writeChunk(chunk); true)
+discard api.get(url, headers = headers)
+discard api.post(url, body = "Hi.")                       # string -> application/text
+discard api.post(url, body = %*{"name": "navi"})          # JsonNode -> application/json
+discard api.post(url, form = @[("a", "1"), ("b", "2")])   # url-encoded
+discard api.put(url, body = payload)
+discard api.patch(url, body = payload)
+discard api.delete(url)
+discard api.head(url)
+discard api.options(url)
 ```
 
 ### Responses
 
+The `Response` object provides the HTTP response data and helpful functions for common
+parsing needs like JSON and UTF-8 strings.
+
 ```nim
 let res = api.get("https://example.com")
 res.status            # int, e.g. 200
-res.ok                # true for 2xx
-res.headers.get("content-type")
-res.body              # body as a string; a Nim string is a byte buffer, so this
-                      # is also your bytes (res.body.toOpenArrayByte(...) for a view)
+res.ok                # true for 2xx statuses
+res.headers           # the response headers
+res.body              # body as a string; view bytes using res.body.toOpenArrayByte(...)
 res.text              # body decoded to UTF-8 from its Content-Type charset (or BOM)
-res.data              # body parsed as JsonNode (cached; raises on invalid)
-res.trailers          # trailing header fields, if the response carried any
+res.data              # body parsed as JsonNode
+res.trailers          # trailing header fields (if any)
 ```
-
-`std/json` is re-exported, so `res.data["field"].getBool()` works without importing it yourself. `data` parses the body regardless of Content-Type, caches it, and raises `JsonParsingError` on invalid JSON.
-
-`res.body` is the raw bytes; `res.text` decodes them to UTF-8 using the `Content-Type` charset (or a leading BOM, else UTF-8), covering UTF-8, ISO-8859-1, Windows-1252, and UTF-16, so a non-UTF-8 response reads correctly. An unrecognized charset falls back to the raw bytes. `res.trailers` is a `Headers` holding the fields after the body (chunked HTTP/1.1, or an HTTP/2 / HTTP/3 trailing HEADERS block, e.g. `grpc-status`); it is empty when there are none. To *send* trailers, set `req.trailers` (the `trailers` argument to `request`), which uses the same `Headers` shape.
 
 ### Headers
 
-`Headers` is case-insensitive and order-preserving.
+`Headers` are case-insensitive, order-preserving and provide two options for access:
+
+1. `Headers.get(name, default)` - Returns the header or a default value
+2. `Headers[name]` - Returns the header or raises an exception, if missing
 
 ```nim
 var h = initHeaders({"accept": "application/json"})
-h.add("x-trace", "abc")     # append (keeps duplicates)
-h["accept"] = "text/plain"  # replace
-h.get("ACCEPT")             # case-insensitive lookup
-for (name, value) in h.pairs: discard
+
+h.add("x-trace", "abc")     # appends headers (keeps duplicates)
+h["accept"] = "text/plain"  # replaces headers
+h.get("ACCEPT", "*/*")      # case-insensitive lookup with a default value
+
+# You can also iterate headers
+for (name, value) in h.pairs:
+  echo name & ": " & value
 ```
 
-### TLS
+### Transport Layer Security (TLS)
 
 ```nim
 var config = initNaviConfig()
@@ -422,9 +394,6 @@ a pooled, kept-alive connection already amortizes the handshake. Disable it with
 config.tls.resumeSessions = false
 ```
 
-Supported on all three native clients (sync, asyncdispatch, chronos), which now
-share the same OpenSSL session cache; the sync client sees the largest gain.
-
 #### TLS version pinning
 
 Pin the acceptable TLS protocol range with `minVersion` / `maxVersion` (each a
@@ -436,17 +405,10 @@ config.tls.minVersion = tls12    # refuse anything below TLS 1.2
 config.tls.maxVersion = tls13
 ```
 
-Enforced on all three native clients (sync, asyncdispatch, chronos), which run
-OpenSSL, so `tls13` is honored on chronos too. On `navi/js` the runtime controls
-the TLS version, so these are ignored. A negotiation outside the pinned range
-fails the handshake (`ValueError`). If the loaded OpenSSL/LibreSSL is too old to
-support version pinning (e.g. the LibreSSL some macOS builds link), setting a
-bound raises rather than silently ignoring it.
-
 #### Cipher selection
 
-Restrict the offered ciphers with `ciphers` (TLS ≤1.2) and `cipherSuites` (TLS 1.3)
-— they use OpenSSL's two separate cipher APIs, so set whichever applies to the
+Restrict the offered ciphers with `ciphers` (TLS ≤1.2) and `cipherSuites` (TLS 1.3);
+they use OpenSSL's two separate cipher APIs, so set whichever applies to the
 versions you allow. Both are colon-separated OpenSSL names; "" (default) leaves the
 library's selection.
 
@@ -455,14 +417,11 @@ config.tls.ciphers      = "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SH
 config.tls.cipherSuites = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"
 ```
 
-Enforced on all three native clients (sync, asyncdispatch, chronos), which run
-OpenSSL; a value with no cipher the peer accepts fails the handshake, and an
-all-invalid list raises. On `navi/js` the runtime controls ciphers, so they are
-ignored.
-
 #### Client certificates (mTLS)
 
-On the native OpenSSL clients (sync, asyncdispatch, chronos) navi can present a client certificate for mutual TLS, from several sources. Precedence is `pkcs12File`, then in-memory (`certPem`/`keyPem`), then the `certFile`/`keyFile` pair.
+Navi can present a client certificate for mutual TLS from several sources. You should only configure
+one of these, and the precedence order is `pkcs12File`, in-memory (`certPem`/`keyPem`) and then the 
+`certFile`/`keyFile` pair.
 
 ```nim
 # PEM cert + key files (a single PEM may hold both; leave keyFile empty)
@@ -486,7 +445,7 @@ config.tls.certPem = certString
 config.tls.keyPem  = keyString
 ```
 
-Key algorithms (RSA, ECDSA, Ed25519) work in any of these as long as OpenSSL supports them. In-memory PEM may carry an intermediate chain; a PKCS#12 bundle's extra chain certs are not installed (only its leaf and key), which is all a client needs to present. Supported on all three native clients (sync, asyncdispatch, chronos), which run OpenSSL; `navi/js` does not present client certificates.
+Key algorithms (RSA, ECDSA, Ed25519) work in any of these as long as OpenSSL supports them. In-memory PEM may carry an intermediate chain; a PKCS#12 bundle's extra chain certs are not installed (only its leaf and key), which is all a client needs to present.
 
 ### Errors
 
@@ -504,15 +463,13 @@ let api = newNavi()
 api.config.throwHttpErrors = false
 ```
 
-### Retries, redirects, and timeouts
+### Retries
 
-Idempotent requests that hit a transient failure (network error or 408/413/429/500/502/503/504) are retried with capped exponential backoff, honoring `Retry-After` (both the seconds and HTTP-date forms). Redirects are followed by default.
+Requests that hit a transient failure (network error or 408/413/429/500/502/503/504) are retried with capped exponential backoff, honoring `Retry-After` (both the seconds and HTTP-date forms).
 
 ```nim
 let api = newNavi()
 api.config.retry.limit = 3        # default 2; 0 disables retries
-api.config.maxRedirects = 5       # default 20; 0 disables
-api.config.timeouts.total = 5000  # 5s; 0 (default) disables. Raises TimeoutError.
 ```
 
 The whole retry policy is configurable via `config.retry` (a `RetryPolicy`):
@@ -525,7 +482,14 @@ api.config.retry.statuses = @[429, 503]           # response statuses that trigg
 api.config.retry.maxDelay = 30_000                # cap the wait between attempts (ms)
 ```
 
-`timeouts.total` bounds the whole request (raising `TimeoutError`): on the async clients (asyncdispatch/chronos/js) it covers all retries; on the sync client it is per attempt.
+### Timeouts
+
+Set `config.timeouts.total` to bound the whole request, including all retries and their backoff (raising `TimeoutError`). The async clients (asyncdispatch/chronos/js) enforce it with an outer guard that aborts in-flight IO; the sync client enforces it cooperatively, at each connect and read boundary.
+
+```nim
+let api = newNavi()
+api.config.timeouts.total = 5000  # 5s; 0 (default) disables. Raises TimeoutError.
+```
 
 `timeouts.attempt` bounds a **single attempt** instead (connect plus that try's reads and redirect hops). The effective budget for a try is `min(attempt, remaining total)`. Unlike a `total` expiry, which is terminal, an `attempt` expiry is **retryable** under the normal policy, so a slow attempt is abandoned and re-tried against a fresh connection while `total` still caps the whole request:
 
@@ -561,17 +525,18 @@ let res = api.get("/search", params = @{"q": "http client", "page": "2"})
 # GET /search?q=http+client&page=2
 ```
 
-Pairs preserve order and allow duplicate keys (`@{"tag": "a", "tag": "b"}` gives `?tag=a&tag=b`), which a plain `Table` cannot; use pairs, `@{}`, or an `OrderedTable` when order or repeats matter.
+> [!TIP]
+> Pairs preserve order and allow duplicate keys (`@{"tag": "a", "tag": "b"}` gives `?tag=a&tag=b`), which a plain `Table` cannot; use pairs, `@{}`, or an `OrderedTable` when order or repeats matter.
 
 ### Cancellation
 
 Pass a `CancelToken` to abort a request. On the async clients (asyncdispatch/chronos/js) `cancel()` aborts the in-flight request; on the sync client it is cooperative (checked between attempts, so it cannot interrupt a socket read already blocked in a syscall -- use `timeouts.read` for that). A cancelled request raises `RequestCancelledError`.
 
 ```nim
-let tok = newCancelToken()
-let fut = api.get("https://slow.example", cancel = tok)
+let token = newCancelToken()
+let res = api.get("https://slow.example", cancel=token)
 # ... later, from a timer or another task:
-tok.cancel()
+token.cancel()
 ```
 
 ### Response size limits
@@ -583,60 +548,30 @@ let api = newNavi()
 api.config.maxResponseBytes = 10 * 1024 * 1024   # 10 MiB; 0 (default) is unlimited
 ```
 
-### Auth and proxy
-
-`auth` can be changed on a live client (it applies per request); `proxy` is bound
-when connections open, so set it before the first request or build a new client.
-
-```nim
-var config = initNaviConfig()
-config.proxy = "http://proxy:8080"     # else HTTP(S)_PROXY / ALL_PROXY / NO_PROXY env
-let api = newNavi(config)
-
-api.config.auth = bearerAuth("token")  # or basicAuth("user", "pass"); safe any time
-```
-
-The proxy URL scheme selects the kind: `http://` / `https://` for an HTTP proxy
-(a `CONNECT` tunnel for https targets, absolute-URI for http), or `socks5://` /
-`socks5h://` for a SOCKS5 proxy (a raw TCP tunnel for every target). A `user:pass@`
-userinfo authenticates to the proxy: `Proxy-Authorization` on an HTTP `CONNECT`,
-or the RFC 1929 username/password method on SOCKS5. Proxies are supported on the
-three native clients (`navi/js` delegates connection setup to `fetch`).
-
-```nim
-config.proxy = "socks5://user:pass@127.0.0.1:1080"   # SOCKS5 with auth
-```
-
-### Unix domain sockets
-
-Set `unixSocket` to dial a Unix socket path instead of TCP, for services that
-listen on a socket file (the Docker daemon, systemd-activated services, local
-sidecars). The URL still carries the host (used for the `Host` header and, over
-https, the TLS SNI/verification name) and the path; only where the bytes go
-changes. Proxies are bypassed. Supported on the native clients on POSIX
-(`navi/js` and Windows raise a clear error).
-
-```nim
-var cfg = initNaviConfig()
-cfg.unixSocket = "/var/run/docker.sock"
-cfg.prefixUrl = "http://localhost"       # host is only for the Host header
-let info = newNavi(cfg).get("/v1.45/info")
-```
-
 ### Cookies
 
-Each client keeps a cookie jar automatically: cookies from `Set-Cookie` are stored and replayed on later requests to the same client (matched by domain, path, and Secure). `__Host-` and `__Secure-` name-prefixed cookies are enforced per RFC 6265bis (rejected unless Secure over https, and for `__Host-` also host-only with `Path=/`). There is nothing to configure.
-
-For debugging, inspect what the jar holds with `client.cookies` (a read-only `seq[StoredCookie]` snapshot of every stored cookie, all origins), or dump the jar directly:
+Cookies are stored automatically and replayed on later requests to the same client (matched by domain, path, and Secure). 
 
 ```nim
-for c in api.cookies:
-  echo c.name, "=", c.value, " (", c.domain, c.path, ")"
+let api = newNavi()
 
-echo api.jar          # one cookie per line: name=value; Domain=...; Path=...; flags
+# Cookies are set automatically upon response
+discard api.get("https://example.com/login")
+
+# Access a read-only snapshot for debugging
+for c in api.cookies:
+  echo c.name, "=", c.value,
+       " domain=", c.domain, 
+       " path=", c.path,
+       (if c.secure: " secure" else: ""),
+       (if c.expires.isSome: " expires=" & $c.expires.get else: " (session)")
+
+# Or output the cookie jar
+echo api.jar
 ```
 
-Inspection reflects the stored state as-is and does not prune expired cookies (a request drops them at send time); `StoredCookie.expires` lets you spot stale entries. On `navi/js` this reads navi's jar off a browser (Node/Deno/Bun/Workers) and is empty in a browser, where the runtime owns the cookie store.
+> [!NOTE]
+> `__Host-` and `__Secure-` name-prefixed cookies are enforced per RFC 6265bis (rejected unless Secure over https, and for `__Host-` also host-only with `Path=/`).
 
 ### Middleware
 
@@ -694,7 +629,7 @@ returning `Future[void]`. navi handles the per-client details itself (chronos's
 strict-raises obligation is discharged inside navi, not stamped into the public
 type), so the same middleware source compiles on all of them.
 
-#### Batteries-included middleware
+#### Included middleware
 
 Ready-made middleware ships under `mw`, imported to **mirror your client import**
 (the middleware type is per-backend, so there is no single universal import):
@@ -740,55 +675,6 @@ counted against the budget.
 
 Responses are decoded transparently: clients send `Accept-Encoding: gzip, deflate, br, zstd` and decode the body per `Content-Encoding`. gzip/deflate use the system zlib (present everywhere); `br` and `zstd` use `libbrotlidec` and `libzstd`, loaded lazily, so they are only required if a server actually sends those encodings. Disable all of it with `decompress: false`.
 
-### HTTP/2
-
-HTTP/2 is transparent: over https navi offers `h2` via ALPN and, if the server
-agrees, speaks h2; otherwise it falls back to HTTP/1.1. Your code is unchanged;
-check `res.httpVersion` if you care which was used.
-
-```nim
-let res = api.get("https://nghttp2.org/")
-echo res.httpVersion   # "HTTP/2" or "HTTP/1.1"
-```
-
-Concurrent async requests to the same origin **multiplex over one connection**.
-Just start them and await together (like `Promise.all`):
-
-```nim
-import navi/asyncdispatch
-
-proc main() {.async.} =
-  let api = newNavi()
-  let results = await all(@[
-    api.get("https://nghttp2.org/httpbin/get"),
-    api.get("https://nghttp2.org/httpbin/ip"),
-    api.get("https://nghttp2.org/httpbin/user-agent"),
-  ])                       # three streams, one connection
-  for r in results: echo r.status
-
-waitFor main()
-```
-
-On the sync client (which can't have requests in flight at once), the same
-multiplexing is available through a batch call:
-
-```nim
-import navi
-
-let api = newNavi()
-let results = api.parallel(@[
-  "https://nghttp2.org/httpbin/get",
-  "https://nghttp2.org/httpbin/ip",
-])   # multiplexed over one h2 connection; each result still goes through the
-     # policy layer (redirects, retries, decompression, cookies)
-```
-
-`parallel` collects every response (it does not raise on non-2xx); inspect
-`.ok` per result.
-
-HTTP/2 runs on all three native clients (sync, asyncdispatch, chronos). To
-disable it and force HTTP/1.1, set `http: {H1}` in `NaviConfig`.
-
 ### Keep-alive
 
 Connection reuse is automatic. Each client keeps an idle-connection pool keyed by origin; responses that are self-delimited (content-length or chunked) and not marked `Connection: close` return their connection to the pool. A pooled connection that the server has since closed is transparently retried on a fresh connection.
@@ -801,11 +687,28 @@ config.maxIdleConns = 100
 config.idleConnTimeout = 90_000   # ms
 ```
 
-### Happy Eyeballs
-
-When a host resolves to several addresses (typical of dual-stack IPv4/IPv6 hosts and CDN pools), navi follows [RFC 8305](https://www.rfc-editor.org/rfc/rfc8305): it interleaves the address families and **races** the connection attempts, staggered by ~250ms, using whichever completes first. A slow or blackholed address no longer stalls the whole connect for the full timeout before the next is tried. If the TLS handshake then fails on the winning address, the remaining addresses are re-raced (handshake-aware fallback). This is automatic and needs no configuration, and works the same on all connecting backends (sync, asyncdispatch, chronos); `navi/js` delegates connection setup to the host runtime's `fetch`.
-
 ### Streaming
+
+Download exmaple:
+```nim
+let api = newNavi()
+
+proc saveChunk(chunk: string) =
+  # INSERT file write
+
+let res = await api.get(url, sink = saveChunk)
+```
+
+Alternatively:
+
+```nim
+let api = newNavi()
+
+let res = await api.stream.get(url)
+
+res.each(chunk):
+  await saveChunk(chunk)
+```
 
 `api.stream.get(url)` returns a handle whose status and headers are available
 immediately, while the body is pulled on demand. You inspect the headers, then
@@ -1096,12 +999,104 @@ On `navi/js` the WebSocket wraps the runtime's native one, so custom handshake
 `headers` are ignored and the runtime handles ping/pong; the send/receive/close
 surface is otherwise the same.
 
+## Advanced
+
+### Auth and proxy
+
+`auth` can be changed on a live client (it applies per request); `proxy` is bound
+when connections open, so set it before the first request or build a new client.
+
+```nim
+var config = initNaviConfig()
+config.proxy = "http://proxy:8080"     # else HTTP(S)_PROXY / ALL_PROXY / NO_PROXY env
+let api = newNavi(config)
+
+api.config.auth = bearerAuth("token")  # or basicAuth("user", "pass"); safe any time
+```
+
+The proxy URL scheme selects the kind: `http://` / `https://` for an HTTP proxy
+(a `CONNECT` tunnel for https targets, absolute-URI for http), or `socks5://` /
+`socks5h://` for a SOCKS5 proxy (a raw TCP tunnel for every target). A `user:pass@`
+userinfo authenticates to the proxy: `Proxy-Authorization` on an HTTP `CONNECT`,
+or the RFC 1929 username/password method on SOCKS5. Proxies are supported on the
+three native clients (`navi/js` delegates connection setup to `fetch`).
+
+```nim
+config.proxy = "socks5://user:pass@127.0.0.1:1080"   # SOCKS5 with auth
+```
+
+### Unix domain sockets
+
+Set `unixSocket` to dial a Unix socket path instead of TCP, for services that
+listen on a socket file (the Docker daemon, systemd-activated services, local
+sidecars). The URL still carries the host (used for the `Host` header and, over
+https, the TLS SNI/verification name) and the path; only where the bytes go
+changes. Proxies are bypassed. Supported on the native clients on POSIX
+(`navi/js` and Windows raise a clear error).
+
+```nim
+var cfg = initNaviConfig()
+cfg.unixSocket = "/var/run/docker.sock"
+cfg.prefixUrl = "http://localhost"       # host is only for the Host header
+let info = newNavi(cfg).get("/v1.45/info")
+```
+
+### HTTP/2
+
+HTTP/2 is transparent: over https navi offers `h2` via ALPN and, if the server
+agrees, speaks h2; otherwise it falls back to HTTP/1.1. Your code is unchanged;
+check `res.httpVersion` if you care which was used.
+
+```nim
+let res = api.get("https://nghttp2.org/")
+echo res.httpVersion   # "HTTP/2" or "HTTP/1.1"
+```
+
+Concurrent async requests to the same origin **multiplex over one connection**.
+Just start them and await together (like `Promise.all`):
+
+```nim
+import navi/asyncdispatch
+
+proc main() {.async.} =
+  let api = newNavi()
+  let results = await all(@[
+    api.get("https://nghttp2.org/httpbin/get"),
+    api.get("https://nghttp2.org/httpbin/ip"),
+    api.get("https://nghttp2.org/httpbin/user-agent"),
+  ])                       # three streams, one connection
+  for r in results: echo r.status
+
+waitFor main()
+```
+
+On the sync client (which can't have requests in flight at once), the same
+multiplexing is available through a batch call:
+
+```nim
+import navi
+
+let api = newNavi()
+let results = api.parallel(@[
+  "https://nghttp2.org/httpbin/get",
+  "https://nghttp2.org/httpbin/ip",
+])   # multiplexed over one h2 connection; each result still goes through the
+     # policy layer (redirects, retries, decompression, cookies)
+```
+
+> [!WARNING]
+> `Navi.parallel` collects every response and does not raise on non-2xx.
+
+### Happy Eyeballs
+
+When a host resolves to several addresses (typical of dual-stack IPv4/IPv6 hosts and CDN pools), navi follows [RFC 8305](https://www.rfc-editor.org/rfc/rfc8305): it interleaves the address families and **races** the connection attempts, staggered by ~250ms, using whichever completes first. A slow or blackholed address no longer stalls the whole connect for the full timeout before the next is tried. If the TLS handshake then fails on the winning address, the remaining addresses are re-raced (handshake-aware fallback).
+
+> [!NOTE]
+> `navi/js` delegates connection setup to the host runtime's `fetch`.
+
 ## Security
 
-navi is secure by default: certificate and hostname verification are on,
-credentials never follow a request across an origin boundary, cookies are
-re-scoped per host, and everything a hostile server can make the client do
-(allocate, wait, retry) is bounded. See the below files for more.
+Navi strives to be secure by default. See the files below for guidance and how to report vulnerabilities.
 
 - [SECURITY.md](SECURITY.md) - how to report a vulnerability.
 - [THREAT_MODEL.md](THREAT_MODEL.md) - what navi defends against and how it is verified.
