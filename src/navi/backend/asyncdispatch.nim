@@ -16,7 +16,8 @@ import ../core/socks
 when defined(ssl):
   import std/openssl
 when defined(posix):
-  from std/posix import Sockaddr_un, TSa_Family, EINPROGRESS, errno
+  from std/posix import Sockaddr_un, TSa_Family, EINPROGRESS, EAGAIN,
+    EWOULDBLOCK, errno
   proc cConnect(fd: SocketHandle, sa: ptr SockAddr, sl: SockLen): cint
     {.importc: "connect", header: "<sys/socket.h>".}
 
@@ -157,7 +158,31 @@ when defined(ssl):
       case SSL_get_error(c.ssl, n.cint)
       of SSL_ERROR_WANT_READ: await waitRead(c.fd)
       of SSL_ERROR_WANT_WRITE: await waitWrite(c.fd)
-      else: result.setLen(0); return   # ZERO_RETURN / reset -> EOF
+      of SSL_ERROR_ZERO_RETURN:
+        result.setLen(0); return       # peer sent close_notify: clean EOF
+      of SSL_ERROR_SYSCALL:
+        # OpenSSL read the fd directly (SSL_set_fd), so a non-blocking socket that
+        # would block surfaces here as SSL_ERROR_SYSCALL with errno EAGAIN/EWOULDBLOCK
+        # -- NOT a close. This races under load: the readable event that woke
+        # waitRead can be drained by another connection's callback before this
+        # SSL_read runs. Treating it as EOF truncates a mid-body response (the
+        # `response truncated` failure the chaos soak surfaced). It is recoverable:
+        # wait for readability and retry, exactly like WANT_READ. Only a genuine
+        # transport EOF (n == 0, or any other errno) is a real close. Chronos never
+        # hits this because it drives OpenSSL over memory BIOs (no fd for OpenSSL to
+        # EAGAIN on), which is why only the asyncdispatch backend was affected.
+        when defined(posix):
+          if n < 0 and (errno == EAGAIN or errno == EWOULDBLOCK):
+            await waitRead(c.fd)
+          else:
+            result.setLen(0); return
+        else:
+          result.setLen(0); return
+      of SSL_ERROR_SSL:
+        # A real protocol/decrypt error: surface it rather than masking a corrupt
+        # stream as a silent truncation.
+        raise newException(IOError, "navi: TLS read failed")
+      else: result.setLen(0); return   # any other code -> treat as EOF
 
 # Byte-I/O primitives the shared tunnel drivers (backend/tunnel) mix in.
 proc sockWrite(fd: AsyncFD, s: string): Future[void] = send(fd, s)

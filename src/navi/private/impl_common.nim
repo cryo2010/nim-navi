@@ -204,14 +204,24 @@ proc h1OnConn(client: Navi, conn: Conn, origin: string, req: Request,
               asyncStream: AsyncBodyProducer = nil,
               userSink: BodySink = nil, gate: SinkGate = nil): Future[Response] {.async.} =
   var keep = false
-  if not userSink.isNil and not gate.isNil:
-    var parser = h1SendAndReadHeaders(conn, req, true, asyncStream)
-    result = h1GatedFinish(conn, parser, userSink, gate, keep,
-                           client.config.wantsDecompress, client.config.maxResponseBytes)
-  else:
-    result = h1Exchange(conn, req, sink, keep,
-                        client.config.wantsDecompress, client.config.maxResponseBytes,
-                        asyncStream)
+  # The exchange can raise (timeout, RST/close mid-body, malformed response, a
+  # cancelled `total` guard). On any raise the success-path pool/close below is
+  # skipped, so close `conn` here or its fd/socket leaks -- a hostile or slow peer
+  # that makes every request time out would otherwise leak one connection each
+  # (surfaced by the chaos stress harness's FD assertion). A clean exchange still
+  # takes the pool-or-close path unchanged.
+  try:
+    if not userSink.isNil and not gate.isNil:
+      var parser = h1SendAndReadHeaders(conn, req, true, asyncStream)
+      result = h1GatedFinish(conn, parser, userSink, gate, keep,
+                             client.config.wantsDecompress, client.config.maxResponseBytes)
+    else:
+      result = h1Exchange(conn, req, sink, keep,
+                          client.config.wantsDecompress, client.config.maxResponseBytes,
+                          asyncStream)
+  except CatchableError:
+    await close(conn)
+    raise
   let pc = PooledConn[Conn](transport: conn)
   if not (keep and pushIdle(client.pool, origin, pc)):
     await close(conn)
