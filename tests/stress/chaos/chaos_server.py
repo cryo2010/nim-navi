@@ -56,7 +56,19 @@ def _load_proto(name, filename):
 
 h1 = _load_proto("chaos_proto_h1", "h1.py")
 h2 = _load_proto("chaos_proto_h2", "h2.py")
-h3 = _load_proto("chaos_proto_h3", "h3.py")
+
+# h3.py imports aioquic at module load. aioquic is installed only in the heavy h3
+# image (Dockerfile.h3), not the h1/h2 image, so importing it there would raise
+# ImportError and take the WHOLE sidecar down on an h1/h2 cell. Load it defensively:
+# a failed import means the h3 module simply registers no modes (mode_names("h3")
+# stays empty), so h1/h2 cells are unaffected and selecting --proto h3 without
+# aioquic hard-errors cleanly via the empty-modes guard in run(), same as a stub.
+try:
+    h3 = _load_proto("chaos_proto_h3", "h3.py")
+    _h3_import_error = None
+except Exception as exc:   # ImportError (no aioquic) or any load-time failure
+    h3 = None
+    _h3_import_error = exc
 
 
 _PROTO_MODULES = {"h1": h1, "h2": h2, "h3": h3}
@@ -110,13 +122,18 @@ async def run(args):
     proto = args.proto
     mod = _PROTO_MODULES[proto]
 
-    # h2/h3 are stubs: they register no modes. Refuse to start rather than come
-    # up as an empty server that would make the client's chaos phase no-op
-    # silently (the control port is not even needed in this branch).
-    if not modes.mode_names(proto):
+    # A proto whose module registered no modes cannot serve: refuse to start rather
+    # than come up as an empty server that would make the client's chaos phase no-op
+    # silently. In practice this now only fires for h3 in the h1/h2 image, where
+    # aioquic is absent and h3.py failed to import (_h3_import_error is set); the
+    # message names that cause so a misconfigured image is obvious.
+    if mod is None or not modes.mode_names(proto):
+        detail = ""
+        if proto == "h3" and _h3_import_error is not None:
+            detail = " (h3.py failed to import: %r -- aioquic is only in the h3 " \
+                     "image)" % (_h3_import_error,)
         sys.stderr.write(
-            "chaos_server: %s chaos not implemented yet "
-            "(only --proto h1 is supported in this phase)\n" % proto)
+            "chaos_server: %s chaos has no registered modes%s\n" % (proto, detail))
         return 2
 
     servers = await mod.start(
