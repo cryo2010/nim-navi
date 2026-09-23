@@ -19,12 +19,23 @@ proc isCancellation(e: ref CatchableError): bool {.gcsafe, raises: [].} =
   discard e
   false
 
+proc trySend(mux: H2Mux, data: string) {.async.} =
+  ## Fire-and-forget send that swallows errors, so it is safe to `asyncCheck`.
+  ## asyncdispatch's `asyncCheck` re-raises a failed future's exception in the
+  ## global loop callback (an uncaught crash), so the raw `send` -- which fails
+  ## whenever the peer has gone away, e.g. a chaos server that RST the connection
+  ## mid-stream -- must be wrapped here rather than guarded at the (synchronous)
+  ## spawn site, where the try/except never sees the later async failure.
+  try: await mux.send(data)
+  except CatchableError: discard
+
 proc fireSend(mux: H2Mux, data: string) {.gcsafe, raises: [].} =
   ## asyncdispatch has no untracked spawn, so `asyncCheck` the serialized send and
-  ## drop the returned future; `send` already swallows nothing, so guard the call.
-  ## Fully non-raising (catches Exception): the stream-teardown paths that fire a
-  ## best-effort RST cannot handle a scheduler failure here.
-  try: asyncCheck mux.send(data)
+  ## drop the returned future. We `asyncCheck` the error-swallowing `trySend` (not
+  ## `send` directly): a bare failed `send` future would surface as an unhandled
+  ## exception in asyncCheck's global callback. The stream-teardown paths that fire
+  ## a best-effort RST cannot handle a scheduler failure, so stay fully non-raising.
+  try: asyncCheck mux.trySend(data)
   except Exception: discard
 
 proc keepAlive(mux: H2Mux) {.async.} =

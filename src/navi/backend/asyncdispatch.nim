@@ -326,6 +326,9 @@ proc happyConnect*(ips: seq[string], port: int):
     raise
   raise newException(IOError, "navi: could not connect: " & lastErr)
 
+proc closeSync*(c: Conn)      # forward decls: connect's timeout cleanup wakes + reclaims
+proc shutdownConn*(c: Conn)   # an abandoned establish via these (both defined below).
+
 proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
               proxy: ProxyTarget, alpn: seq[string] = @[],
               connectMs = 0, readMs = 0, totalMs = 0): Future[Conn] {.async.} =
@@ -403,10 +406,28 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     raise lastErr
 
   # On a connect timeout the establish future is abandoned (asyncdispatch has no
-  # cancellation): it drains in the background and its socket is reclaimed later,
-  # the same contract as the whole-request guard.
+  # cancellation): it keeps running in the background. If it later SUCCEEDS, conn.fd
+  # is a live socket (and conn.ssl a live TLS session) with no owner -- the caller
+  # is unwinding on the TimeoutError, and a value-type Conn has no destructor, so
+  # nothing else will ever close it and the fd leaks. This bites hard when a chaos
+  # flood (h2 headerbomb) starves the event loop enough to push otherwise-fast
+  # loopback connects past connectMs: every such connect leaks a socket, which the
+  # chaos FD assertion catches. Reclaim the conn when the abandoned establish
+  # settles; a failed establish already closed its own fd, so closeSync then no-ops.
   let estFut = establish()
   if connectMs > 0 and not await withTimeout(estFut, connectMs):
+    # The establish future is abandoned here (asyncdispatch has no cancellation). It
+    # is typically parked in the TLS handshake against a peer too busy to answer -- an
+    # h2 headerbomb flood can starve even loopback handshakes past connectMs -- and if
+    # left alone it never completes, pinning its socket for the whole process: a
+    # value-type Conn has no destructor to reclaim it, so the fd leaks (the chaos FD
+    # assertion catches exactly this). Shut the socket down so the parked handshake
+    # errors out and runs establish's own teardown (which closes the fd); the callback
+    # is the backstop for the race where establish instead SUCCEEDS right at the
+    # deadline, leaving a fully-built conn with no owner.
+    shutdownConn(conn)
+    estFut.addCallback(proc() {.gcsafe.} =
+      {.cast(gcsafe).}: closeSync(conn))
     raise newException(response.TimeoutError, connectTimeoutMsg(connectMs))
   await estFut
   return conn
@@ -415,6 +436,12 @@ proc sendAll*(c: Conn, data: string): Future[void] {.async.} =
   when defined(ssl):
     if not c.ssl.isNil:
       await sslWrite(c, data); return
+  # A conn with no TLS session and no valid fd is closed/half-established (e.g. a
+  # connection whose ALPN never resolved under event-loop starvation, mis-routed
+  # onto the h1 path). Raise a typed transport error instead of writing to a dead
+  # fd, so the h1 write-time classifier tears it down and retries on a fresh conn.
+  if c.fd == invalidFd:
+    raise newException(IOError, "navi: send on a closed connection")
   await send(c.fd, data)
 
 proc rearm*(c: var Conn, readMs = 0, totalMs = 0) =
