@@ -1,0 +1,5 @@
+# Chaos sidecar Python deps. Installed into both stress images so the sidecar is
+# ready for every protocol. `h2` (hyper-h2) is the inbound HTTP/2 decoder + HPACK
+# encoder used by phase 2's frame-level chaos; it is a no-op for the h1 slice but
+# lands here now so the images do not need rebuilding when h2 chaos ships.
+h2

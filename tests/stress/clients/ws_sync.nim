@@ -3,9 +3,10 @@
 ## (concurrency does not apply to the sync client). Reports inline every interval.
 
 import std/times
-import ../common/[config, reporter, servers]
+import ../common/[config, reporter, servers, leakcheck]
 import navi
 include ../common/httpset
+include ../common/chaos
 
 proc wsUrl(base: string): string =
   "wss://" & base["https://".len .. ^1] & "/ws"
@@ -14,6 +15,9 @@ proc main() =
   let cfg = loadConfig("sync")
   let reason = cfg.skipReason
   if reason.len > 0: echo cfg.label, " ", reason; return
+  let notice = cfg.chaosSkipNotice
+  if notice.len > 0: echo cfg.label, " ", notice
+  var leakBase = sampleBaseline(cfg.chaos)   # before ANY Navi is constructed
   var pool = initServerPool(cfg)
   let counter = newStatusCounter()
 
@@ -25,6 +29,9 @@ proc main() =
 
   let start = epochTime()
   let deadline = start + cfg.seconds
+  var sc = syncChaosStart(cfg, leakBase)     # no-op when chaos is off
+  let chaosEvery = max(1, cfg.chaos.conc)
+  var nrt = 0
   var lastReport = start
   while epochTime() < deadline:
     try:
@@ -37,15 +44,19 @@ proc main() =
       counter.tally(200)
     except CatchableError:
       counter.fail(); break
+    inc nrt
+    if sc.active and nrt mod chaosEvery == 0: syncChaosStep(sc)   # interleave chaos
     if epochTime() - lastReport >= cfg.reportSeconds.float:
       lastReport = epochTime()
       report(cfg.label, counter, epochTime() - start)
+      syncChaosReport(sc)
   ws.close()
 
   if counter.ops == 0:
     stderr.writeLine cfg.label & " FAIL: no WebSocket round-trip completed"
     quit(1)
   report(cfg.label & " final", counter, epochTime() - start)
+  syncChaosFinish(sc, @[api])
   echo "== ws sync ", cfg.proto, " passed (", counter.ops, " round-trips) =="
 
 main()

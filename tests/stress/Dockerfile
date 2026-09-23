@@ -20,8 +20,11 @@ WORKDIR /navi
 COPY . .
 # checksums: proto/ws SHA-1 + Digest auth. chronos: the chronos backend.
 RUN nimble install -y checksums "chronos@>= 4.0.0"
-# FastAPI + hypercorn (h1/h2 TLS) + optional br/zstd codecs.
+# FastAPI + hypercorn (h1/h2 TLS) + optional br/zstd codecs, plus the chaos
+# sidecar deps (hyper-h2 for the frame-level h2 chaos; a no-op for the h1 slice
+# but installed now so the image is ready for the later phases).
 RUN pip3 install --no-cache-dir --break-system-packages \
-      -r tests/stress/server/requirements.txt
+      -r tests/stress/server/requirements.txt \
+      -r tests/stress/chaos/requirements.txt
 
 ENTRYPOINT ["bash", "tests/stress/run.sh"]

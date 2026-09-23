@@ -12,7 +12,7 @@
 ## registered"). Reporter prints every interval.
 
 import std/[times, strutils]
-import ../common/[config, reporter, servers]
+import ../common/[config, reporter, servers, leakcheck]
 when defined(useChronos):
   import navi/chronos
   const backend = "chronos"
@@ -20,6 +20,7 @@ else:
   import navi/asyncdispatch
   const backend = "asyncdispatch"
 include ../common/httpset
+include ../common/chaos
 
 proc failHard(cfg: Config, msg: string) =
   {.cast(gcsafe).}:
@@ -63,6 +64,9 @@ proc main() {.async.} =
   let cfg = loadConfig(backend)
   let reason = cfg.skipReason
   if reason.len > 0: echo cfg.label, " ", reason; return
+  let notice = cfg.chaosSkipNotice
+  if notice.len > 0: echo cfg.label, " ", notice
+  var leakBase = sampleBaseline(cfg.chaos)   # before ANY Navi is constructed
   var pool = initServerPool(cfg)
   let counter = newStatusCounter()
 
@@ -79,15 +83,18 @@ proc main() {.async.} =
 
   let start = epochTime()
   let deadline = start + cfg.seconds
+  let chaos = chaosMaybeStart(cfg, deadline, cfg.reportSeconds)  # no-op when off
   var gate = initVersionGate(cfg)
   var futs: seq[Future[void]]
   for s in streams: futs.add worker(cfg, s, counter, addr gate, deadline)
   futs.add reporterLoop(cfg, counter, start, deadline)
   for f in futs: await f
+  await chaosAwait(chaos)
   gate.finish()   # hard-fail if the pinned protocol (h2/h3) was never negotiated
 
   if counter.ops == 0: cfg.failHard("no SSE event consumed")
   report(cfg.label & " final", counter, epochTime() - start)
+  await chaosFinish(chaos, leakBase, cfg, @[api])
   echo "== sse ", backend, " ", cfg.proto, " passed (", counter.ops, " events) =="
 
 waitFor main()

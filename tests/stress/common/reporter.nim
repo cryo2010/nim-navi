@@ -61,3 +61,58 @@ proc report*(label: string, c: StatusCounter, elapsed: float) =
   echo label, " ", c.render, " | RSS ", rssStr,
        " | heap ", fmtBytes(getOccupiedMem()),
        " | t=", elapsed.int, "s"
+
+# --- chaos tallies ----------------------------------------------------------
+
+type ChaosCounter* = ref object
+  ## Per-mode outcome tallies for the chaos phase, rendered as a second per-
+  ## interval line next to the canary's StatusCounter (which is untouched). Each
+  ## mode counts ok (a valid Response), expectedErr (the mode's expected typed
+  ## navi error) and otherErr (a different catchable typed error -- tolerated for
+  ## tolerant modes, tallied but not enforced). A strict-mode miss or an
+  ## invariant violation never lands here: it hard-fails via a CHAOS-FAIL(...)
+  ## quit in chaos.nim before it could be tallied.
+  ok*: Table[string, int]
+  expectedErr*: Table[string, int]
+  otherErr*: Table[string, int]
+  ops*: int                    ## total chaos interactions (any outcome)
+
+proc newChaosCounter*(): ChaosCounter =
+  ChaosCounter(ok: initTable[string, int](),
+               expectedErr: initTable[string, int](),
+               otherErr: initTable[string, int]())
+
+proc tallyOk*(c: ChaosCounter, mode: string) =
+  c.ok.mgetOrPut(mode, 0).inc; c.ops.inc
+
+proc tallyExpected*(c: ChaosCounter, mode: string) =
+  c.expectedErr.mgetOrPut(mode, 0).inc; c.ops.inc
+
+proc tallyOther*(c: ChaosCounter, mode: string) =
+  c.otherErr.mgetOrPut(mode, 0).inc; c.ops.inc
+
+proc renderChaos*(c: ChaosCounter): string =
+  ## "<mode> ok/exp/other ..." sorted by mode for stable, diffable output (seed
+  ## reproducibility compares these tallies across runs).
+  var modes: seq[string]
+  for k in c.ok.keys: modes.add k
+  for k in c.expectedErr.keys:
+    if k notin c.ok: modes.add k
+  for k in c.otherErr.keys:
+    if k notin c.ok and k notin c.expectedErr: modes.add k
+  modes.sort()
+  var parts: seq[string]
+  for m in modes:
+    parts.add m & " " & $c.ok.getOrDefault(m, 0) & "/" &
+      $c.expectedErr.getOrDefault(m, 0) & "/" & $c.otherErr.getOrDefault(m, 0)
+  if parts.len == 0: "(no chaos ops yet)" else: parts.join(" ")
+
+proc reportChaos*(label: string, c: ChaosCounter, fd: int) =
+  ## The chaos interval line: per-mode ok/exp/other + live memory + fd. `label`
+  ## already carries the " chaos" suffix (e.g. "[requests h1 chronos chaos]").
+  ## fd < 0 (non-Linux) renders as "n/a".
+  let rss = rssBytes()
+  let rssStr = if rss > 0: fmtBytes(rss) else: "n/a"
+  let fdStr = if fd >= 0: $fd else: "n/a"
+  echo label, " ", c.renderChaos, " | RSS ", rssStr,
+       " | heap ", fmtBytes(getOccupiedMem()), " | fd ", fdStr

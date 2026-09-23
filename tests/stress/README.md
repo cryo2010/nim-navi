@@ -49,11 +49,86 @@ NAVI_SECONDS=600 NAVI_PROTO=all NAVI_BACKEND=chronos \
   nimble stressRequests
 ```
 
+## Chaos: the misbehaving-server sidecar (`NAVI_CHAOS`)
+
+Opt-in hardening against hostile or broken servers. When `NAVI_CHAOS` is on,
+`run.sh` launches a Python asyncio *chaos sidecar* per cell (offering only the
+cell's pinned protocol) and the client attacks it with a seeded schedule of fault
+modes **alongside** the normal verified soak, which keeps running as a canary. A
+client bug that corrupts the shared event loop or allocator takes the canary down
+too -- that is signal. Chaos traffic uses **separate `Navi` instances** (tight
+timeouts, same proto pin + CA), so the canary's pools never contain a chaos
+connection. Default `none` is byte-identical to a pre-chaos run: no sidecar, no
+extra ports, no leak sampling, no chaos report lines.
+
+The client asserts four invariants per cell: no crash/hang (every interaction is a
+typed error or a valid `Response` within a watchdog), the protocol pin is never
+violated, no FD leak, no memory leak. Violations use greppable prefixes
+`CHAOS-FAIL(hang|pin|mode|fd|mem)` and route to the FAILURES banner.
+
+**Modes** (h1 implemented; h2/h3 are follow-up phases). Strict modes assert an
+exact outcome; tolerant modes accept any catchable typed error:
+
+| Mode | Server behavior | Expected |
+| --- | --- | --- |
+| `stall` | reads the request, then silence | strict: clean timeout/abort |
+| `slowbody` | 200 + big length, then drips slower than the read timeout | strict: `TimeoutError`/truncation |
+| `truncate` | short body vs `Content-Length`, or a cut chunk (`?case=`) | tolerant; never a successful short body |
+| `garbage` | malformed status line / colon-less header / `Content-Length: abc` / NULs / doubled (`?case=`) | tolerant; a later request still succeeds |
+| `vanish` | `SO_LINGER=0` RST mid-body; `?prefix=slow`, `?at=pre-headers` | tolerant, within total incl. retries |
+| `headerbomb` | thousands of 8 KiB header lines | tolerant; bounded memory (the heap assertion is the teeth) |
+| `redirectloop` | valid `302` self-loop (`?n` increments) | strict: bounded 3xx once `maxRedirects` is spent |
+| *(port-selected)* `vanish-on-accept` / `stall-on-accept` | RST / never-progress right after accept | tolerant / timeout |
+
+The sidecar is a pure function of the request: the client's seeded schedule picks
+the mode + coins and encodes them in the path/query, so both sides' logs name the
+same mode and reruns with the same seed are identical. Ports derive from
+`NAVI_BASE_PORT + NAVI_CHAOS_PORTBAND` (`+0` data, `+1` vanish-on-accept, `+2`
+stall-on-accept, `+99` a plain-HTTP `/health` control port), loopback only.
+
+**Backends:** asyncdispatch and chronos run the full async driver
+(`NAVI_CHAOS_CONC` workers + an in-process hang watchdog); sync interleaves one
+chaos request per `NAVI_CHAOS_CONC` verified requests (its hang backstop is navi's
+timeouts plus a coreutils `timeout` wrapper). **js is excluded** (hostile-input
+handling there is undici's, not navi's; js cells can't pin the protocol or measure
+navi's FD/heap). The two pure never-respond modes (`stall`, `stall-on-accept`) are
+skipped on **sync** only (a sync read-timeout gap on a zero-byte-response TLS
+connection; async runs them).
+
+**Leak checks** (Linux/Docker): FD is bracketed process-wide (`/proc/self/fd`
+before any `Navi` vs after close+drain, `<= baseline + NAVI_CHAOS_FD_SLACK`). Nim
+heap is checked against the pre-`Navi` baseline after a full GC (so only genuine
+retention counts, not the soak's transient working set). RSS is baselined at the
+pre-teardown peak and must not grow further through close+drain (pages are rarely
+returned). Green runs print the margins.
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `CHAOS` | `none` | `none` \| `all` \| csv of mode names; unknown tokens hard-fail at startup |
+| `CHAOS_CONC` | `8` | chaos workers per cell (async) / interleave basis (sync) |
+| `CHAOS_SEED` | `1` | schedule PRNG seed, mixed with the cell id; printed as a digest |
+| `CHAOS_PORTBAND` | `2000` | chaos ports = `NAVI_BASE_PORT + band {+0,+1,+2,+99}` |
+| `CHAOS_WATCHDOG` | `60` | seconds a chaos worker may go without progress |
+| `CHAOS_FD_SLACK` | `8` | FD leak bound |
+| `CHAOS_HEAP_SLACK_MB` | `32` | Nim heap leak bound |
+| `CHAOS_RSS_SLACK_MB` | `128` | RSS leak bound |
+| `CHAOS_SELFTEST` | *(unset)* | `fd` \| `mem` \| `hang`: plant a deliberate leak/hang to prove the assertions fire (expects FAILURES) |
+
+```
+NAVI_CHAOS=all NAVI_PROTO=h1 NAVI_BACKEND=all nimble stressRequests
+```
+
 ## Layout
 
 - `common/` — shared native harness: `config` (env + gap policy), `reporter`
   (status counter + RSS from `/proc/self/statm`), `servers` (round-robin),
-  `streamcontent` (fixed-block + incremental SHA-1), `httpset` (proto → version set).
+  `streamcontent` (fixed-block + incremental SHA-1), `httpset` (proto → version set),
+  `chaos` (client-side chaos driver: seeded schedule, workers/watchdog, outcome
+  classification; split into `chaos_async`/`chaos_sync` for the two backend models),
+  `leakcheck` (FD/heap/RSS sampling + assertions).
+- `chaos/` — the Python asyncio misbehaving-server sidecar: `chaos_server.py`
+  (entrypoint + control port), `modes.py` (registry + wire helpers), `h1.py` (h1
+  fault handlers), `h2.py`/`h3.py` (phase-2/3 stubs), `requirements.txt` (`h2`).
 - `clients/` — one client per workload. The async source (`*.nim`) is built for
   both asyncdispatch and (`-d:useChronos`) chronos; `*_sync.nim` is the sync
   backend; `*_js.nim` runs under Node. run.sh skips any backend whose client

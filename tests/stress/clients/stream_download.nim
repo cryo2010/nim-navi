@@ -8,7 +8,7 @@
 ## cumulative progress + RSS on the interval regardless of per-transfer duration.
 
 import std/[times, strutils]
-import ../common/[config, reporter, servers, streamcontent]
+import ../common/[config, reporter, servers, streamcontent, leakcheck]
 when defined(useChronos):
   import navi/chronos
   const backend = "chronos"
@@ -16,6 +16,7 @@ else:
   import navi/asyncdispatch
   const backend = "asyncdispatch"
 include ../common/httpset
+include ../common/chaos
 
 type Progress = ref object
   bytes: int          ## cumulative bytes received across all transfers
@@ -57,6 +58,9 @@ proc main() {.async.} =
   let cfg = loadConfig(backend)
   let reason = cfg.skipReason
   if reason.len > 0: echo cfg.label, " ", reason; return
+  let notice = cfg.chaosSkipNotice
+  if notice.len > 0: echo cfg.label, " ", notice
+  var leakBase = sampleBaseline(cfg.chaos)   # before ANY Navi is constructed
   var pool = initServerPool(cfg)
 
   var c = initNaviConfig()
@@ -75,6 +79,7 @@ proc main() {.async.} =
 
   let start = epochTime()
   let deadline = start + cfg.seconds
+  let chaos = chaosMaybeStart(cfg, deadline, cfg.reportSeconds)  # no-op when off
   let prog = Progress()
   let rep = reporterLoop(cfg, prog, start, deadline)
   while epochTime() < deadline:
@@ -85,10 +90,12 @@ proc main() {.async.} =
       inc prog.errors
       stderr.writeLine cfg.label & " transfer retried: " & e.msg
   await rep
+  await chaosAwait(chaos)
 
   if prog.transfers == 0:
     stderr.writeLine cfg.label & " FAIL: no transfer completed (" & $prog.errors & " errors)"
     quit(1)
+  await chaosFinish(chaos, leakBase, cfg, @[api])
   echo "== streamDownload ", backend, " passed (", prog.transfers, " x ",
        cfg.streamBytes, " bytes, ", prog.errors, " retried) =="
 

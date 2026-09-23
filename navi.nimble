@@ -93,7 +93,10 @@ proc runStress(workload: string) =
        " -e NAVI_SECONDS -e NAVI_CLIENTS -e NAVI_CONCURRENCY" &
        " -e NAVI_REQ_COMPRESSION -e NAVI_RESP_COMPRESSION -e NAVI_CONTENT_TYPES" &
        " -e NAVI_STREAM_BYTES -e NAVI_REPORT_SECONDS -e NAVI_LOG_ERRORS" &
-       " -e NAVI_RECYCLE -e NAVI_KEEPALIVE_MAX -e NAVI_KEEPALIVE_TIMEOUT " & image
+       " -e NAVI_RECYCLE -e NAVI_KEEPALIVE_MAX -e NAVI_KEEPALIVE_TIMEOUT" &
+       " -e NAVI_CHAOS -e NAVI_CHAOS_CONC -e NAVI_CHAOS_SEED -e NAVI_CHAOS_PORTBAND" &
+       " -e NAVI_CHAOS_WATCHDOG -e NAVI_CHAOS_FD_SLACK -e NAVI_CHAOS_HEAP_SLACK_MB" &
+       " -e NAVI_CHAOS_RSS_SLACK_MB -e NAVI_CHAOS_SELFTEST " & image
 
 task stressRequests, "Stress: buffered request/response soak (verbs, compression, auth, mw, pool/mux)":
   runStress("requests")
