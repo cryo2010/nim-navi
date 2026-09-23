@@ -1,0 +1,66 @@
+name: stress-chaos
+
+# Nightly chaos rotation for the misbehaving-server sidecar (issue #384). The
+# stress soak is Dockerized and long, so like the live interop it runs nightly
+# and on demand, never as a PR gate. Two jobs:
+#
+#   rotation  -- the full NAVI_CHAOS=all matrix (all protos x all backends). It
+#                must end with `all cells passed`; the driver hard-fails (exit 1
+#                via run.sh) on any CHAOS-FAIL. Run through `docker run` directly,
+#                not nimble, so the container's exit code propagates (nimble does
+#                not, nim-lang/nimble#1802).
+#   selftest  -- NAVI_CHAOS_SELFTEST=fd plants a deliberate FD leak so the leak
+#                assertion MUST fire. Here a green run is a bug: the job passes
+#                only when the container FAILS (`! docker run ...`), proving the
+#                assertion still has teeth.
+on:
+  schedule:
+    - cron: "30 6 * * *"     # 06:30 UTC nightly (after live at 06:00)
+  workflow_dispatch:
+
+jobs:
+  rotation:
+    runs-on: ubuntu-latest
+    name: chaos rotation (all protos x all backends)
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # The h3 image is a superset (ngtcp2/nghttp3/OpenSSL 3.5 + Caddy) and serves
+      # h1/h2 too, so NAVI_PROTO=all builds and runs from it. run.sh iterates the
+      # backend x protocol matrix inside the container and exits 1 on any failure.
+      - name: Build the h3 stress image and run the chaos rotation
+        run: |
+          docker build -f tests/stress/Dockerfile.h3 -t navi-stress-h3 .
+          docker run --rm \
+            -e NAVI_WORKLOAD=requests \
+            -e NAVI_CHAOS=all -e NAVI_PROTO=all -e NAVI_BACKEND=all \
+            -e NAVI_SECONDS=120 -e NAVI_REPORT_SECONDS=30 \
+            navi-stress-h3
+
+  selftest:
+    runs-on: ubuntu-latest
+    name: chaos self-test has teeth (fd leak expects FAILURES)
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # The fd self-test leaks a real, never-closed file descriptor every
+      # interaction, so the FD leak assertion must fire (CHAOS-FAIL(fd), exit 1).
+      # A passing container here would mean the assertion has gone blind, so we
+      # invert: the job passes only if `docker run` FAILS. `!` flips the exit code;
+      # a clean run (exit 0) fails the job with the message below.
+      - name: Build the stress image and assert the fd self-test fails the run
+        run: |
+          docker build -f tests/stress/Dockerfile -t navi-stress .
+          if docker run --rm \
+              -e NAVI_WORKLOAD=requests \
+              -e NAVI_CHAOS=all -e NAVI_PROTO=h1 -e NAVI_BACKEND=chronos \
+              -e NAVI_SECONDS=30 -e NAVI_REPORT_SECONDS=10 \
+              -e NAVI_CHAOS_SELFTEST=fd \
+              navi-stress; then
+            echo "self-test regression: NAVI_CHAOS_SELFTEST=fd did NOT trip the FD leak assertion"
+            exit 1
+          else
+            echo "expected failure: the fd self-test tripped CHAOS-FAIL(fd) as designed"
+          fi
