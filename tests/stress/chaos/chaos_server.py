@@ -25,14 +25,38 @@ early with a clear message rather than starting a half-server.
 
 import argparse
 import asyncio
+import importlib.util
 import json
+import os
 import sys
 import time
 
 import modes
-import h1
-import h2
-import h3
+
+
+def _load_proto(name, filename):
+    """Load a per-protocol module (h1.py/h2.py/h3.py) from this directory under a
+    NON-colliding module name. This matters for h2.py specifically: its file is
+    named `h2.py`, which would otherwise shadow the installed hyper-h2 package the
+    moment it were imported as bare `h2` -- hyper-h2's own internal `import
+    h2.<submodule>` statements would then resolve back to our file instead of the
+    real library and blow up. Loading by path under `chaos_proto_h2` keeps
+    `sys.modules['h2']` reserved for the real package, so `h2.py` can `import
+    h2.connection` normally. The proto modules `import modes` / `register` at load
+    time, which still resolves (modes is not shadowed and the dir is on the path).
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location(
+        name, os.path.join(here, filename))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+h1 = _load_proto("chaos_proto_h1", "h1.py")
+h2 = _load_proto("chaos_proto_h2", "h2.py")
+h3 = _load_proto("chaos_proto_h3", "h3.py")
 
 
 _PROTO_MODULES = {"h1": h1, "h2": h2, "h3": h3}
