@@ -16,7 +16,7 @@
 
 import std/[times, strutils, json]
 import ../zlibcodec
-import ../common/[config, reporter, servers, payloads]
+import ../common/[config, reporter, servers, payloads, leakcheck]
 
 when defined(useChronos):
   import navi/chronos
@@ -25,6 +25,7 @@ else:
   import navi/asyncdispatch
   const backend = "asyncdispatch"
 include ../common/httpset
+include ../common/chaos
 
 const verbs = [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS]
 const allPayloads = stressPayloads()   # compile-time: gcsafe const for the chronos build
@@ -94,6 +95,16 @@ proc worker(api: Navi, cfg: Config, pool: ptr ServerPool, payloads: seq[Payload]
     var h = initHeaders()
     if n mod 11 == 0:                    # occasionally a big header value -> HPACK path
       h["x-big"] = repeat("H", 8192)
+    # Under chaos the shared event loop runs adversarial stall/slow traffic, which
+    # widens the keep-alive race window on this soak's pooled connections. A
+    # non-idempotent verb hitting that race is (correctly, RFC 9110 9.2.2) NOT
+    # auto-replayed by navi without a caller idempotency guarantee, so it would
+    # surface here and hard-fail the canary on what is really load-induced churn.
+    # /echo is idempotent server-side, so tag bodied requests with an
+    # Idempotency-Key when chaos is on: navi then safely replays the race on a
+    # fresh connection. No-op (byte-identical) when chaos is off.
+    if bodied and cfg.chaos.enabled:
+      h["idempotency-key"] = "stress-" & $n
     try:
       var res: Response
       if not bodied:
@@ -175,6 +186,9 @@ proc main() {.async.} =
   let cfg = loadConfig(backend)
   let reason = cfg.skipReason
   if reason.len > 0: echo cfg.label, " ", reason; return
+  let notice = cfg.chaosSkipNotice        # js chaos-skip notice, if any
+  if notice.len > 0: echo cfg.label, " ", notice
+  var leakBase = sampleBaseline(cfg.chaos)   # before ANY Navi is constructed
   var pool = initServerPool(cfg)
   let payloads = filterPayloads(allPayloads, cfg.contentTypes, jsSafe = false)
   let counter = newStatusCounter()
@@ -198,15 +212,18 @@ proc main() {.async.} =
 
   let start = epochTime()
   let deadline = start + cfg.seconds
+  let chaos = chaosMaybeStart(cfg, deadline, cfg.reportSeconds)  # no-op when off
   var futs: seq[Future[void]]
   for api in apis:
     for i in 0 ..< cfg.concurrency:
       futs.add worker(api, cfg, addr pool, payloads, counter, deadline, i)
   futs.add reporterLoop(cfg, counter, start, deadline)
   for f in futs: await f
+  await chaosAwait(chaos)                  # drain the chaos workers/watchdog
 
   if counter.ops == 0: cfg.failHard("no request completed")   # a cell must do work
   report(cfg.label & " final", counter, epochTime() - start)
+  await chaosFinish(chaos, leakBase, cfg, apis)  # close all clients, drain, leak assert
   echo "== requests ", backend, " ", cfg.proto, " passed (", counter.ops, " ops) =="
 
 waitFor main()

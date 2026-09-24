@@ -4,9 +4,10 @@
 ## time remains.
 
 import std/[times, strutils]
-import ../common/[config, reporter, servers, streamcontent]
+import ../common/[config, reporter, servers, streamcontent, leakcheck]
 import navi
 include ../common/httpset
+include ../common/chaos
 
 proc oneDownload(api: Navi, cfg: Config, url: string) =
   var st = newSha1State()
@@ -40,6 +41,9 @@ proc main() =
   let cfg = loadConfig("sync")
   let reason = cfg.skipReason
   if reason.len > 0: echo cfg.label, " ", reason; return
+  let notice = cfg.chaosSkipNotice
+  if notice.len > 0: echo cfg.label, " ", notice
+  var leakBase = sampleBaseline(cfg.chaos)   # before ANY Navi is constructed
   var pool = initServerPool(cfg)
   var c = initNaviConfig()
   c.http = httpVersions(cfg.proto)     # honor NAVI_PROTO (h3 was previously ignored here)
@@ -56,11 +60,14 @@ proc main() =
         except CatchableError: break
 
   let deadline = epochTime() + cfg.seconds
+  var sc = syncChaosStart(cfg, leakBase)     # no-op when chaos is off
   var transfers = 0
   while true:
     oneDownload(api, cfg, pool.pick() & "/download?size=" & $cfg.streamBytes)
     inc transfers
+    if sc.active: syncChaosStep(sc)          # interleave one chaos interaction per transfer
     if epochTime() >= deadline: break
+  syncChaosFinish(sc, @[api])
   echo "== streamDownload sync passed (", transfers, " x ", cfg.streamBytes, " bytes) =="
 
 main()

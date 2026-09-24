@@ -18,6 +18,13 @@ servers="${NAVI_SERVERS:-5}"
 host="${NAVI_HOST:-127.0.0.1}"
 base_port="${NAVI_BASE_PORT:-9443}"
 
+# Opt-in misbehaving-server (chaos) sidecar. `none` (default) => byte-identical
+# to a pre-chaos run: no sidecar, no extra ports, no timeout wrapper. When on,
+# per cell a Python asyncio sidecar (tests/stress/chaos/) offers the pinned
+# protocol's fault modes and the client attacks it alongside the verified soak.
+chaos="${NAVI_CHAOS:-none}"
+chaos_band="${NAVI_CHAOS_PORTBAND:-2000}"
+
 command -v openssl >/dev/null || { echo "openssl required"; exit 127; }
 command -v hypercorn >/dev/null || { echo "hypercorn required (pip install -r server/requirements.txt)"; exit 127; }
 
@@ -160,20 +167,53 @@ start_servers() {
   done
 }
 
+# --- launch the chaos sidecar for a cell -------------------------------------
+# Canary-first ordering (mirroring vortex): only after start_servers succeeds do
+# we bring up the misbehaving sidecar, so the verified soak is never racing it.
+# The sidecar offers only the pinned protocol ($pr); its control port is a plain
+# well-behaved HTTP /health we poll for readiness (the healthcheck for a server
+# whose job is to fail healthchecks). On a start/readiness failure the caller
+# dumps the log, stops the servers, and fails the cell. Returns non-zero on
+# failure. A no-op (returns 0) when chaos is off.
+start_chaos() {
+  [ "$chaos" = none ] && return 0
+  local pr="$1"
+  setsid python3 "$here/chaos/chaos_server.py" --proto "$pr" --host "$host" \
+    --base-port "$base_port" --band "$chaos_band" --cert "$cert" --key "$key" \
+    >"$work/srv-chaos.log" 2>&1 &
+  pids+=($!)
+  local hport=$((base_port + chaos_band + 99))
+  local ok=""
+  for _ in $(seq 1 150); do
+    # The control port is plain HTTP (no TLS): curl for the readiness flag.
+    if curl -s --max-time 2 "http://$host:$hport/health" 2>/dev/null \
+         | grep -q '"ready": true'; then ok=1; break; fi
+    sleep 0.2
+  done
+  [ -n "$ok" ] || { echo "chaos sidecar ($pr) did not become ready"; cat "$work/srv-chaos.log" 2>/dev/null; return 1; }
+}
+
 # True once every port a cell uses (public base_port+i, and the h3 backend
 # base_port+1000+i) can be bound again -- i.e. no live listener is left. Uses
 # SO_REUSEADDR like the servers do, so a port merely in TIME_WAIT counts as free.
+# When chaos is on, also check the band's TCP ports (data/vanish/stall/control)
+# so the next cell does not race a lingering sidecar listener.
 ports_free() {
-  python3 - "$host" "$base_port" "$servers" <<'PY' 2>/dev/null
+  python3 - "$host" "$base_port" "$servers" "$chaos" "$chaos_band" <<'PY' 2>/dev/null
 import socket, sys
 host, base, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+chaos, band = sys.argv[4], int(sys.argv[5])
+ports = []
 for i in range(n):
-    for p in (base + i, base + 1000 + i):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try: s.bind((host, p))
-        except OSError: sys.exit(1)
-        finally: s.close()
+    ports += [base + i, base + 1000 + i]
+if chaos != "none":
+    ports += [base + band, base + band + 1, base + band + 2, base + band + 99]
+for p in ports:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try: s.bind((host, p))
+    except OSError: sys.exit(1)
+    finally: s.close()
 PY
 }
 
@@ -191,6 +231,7 @@ stop_servers() {
   pids=()
   pkill -9 -f hypercorn 2>/dev/null || true      # belt-and-suspenders for any stray
   pkill -9 -f 'caddy run' 2>/dev/null || true
+  pkill -9 -f chaos_server.py 2>/dev/null || true   # reap any stray chaos sidecar
   for _ in $(seq 1 100); do ports_free && break; sleep 0.1; done
 }
 
@@ -224,7 +265,7 @@ for be in "${backends[@]}"; do
   # locate & build this backend's client binary
   bin=""
   case "$be" in
-    sync)          [ -f "$here/clients/${src}_sync.nim" ] && { bin="$work/${src}_sync"; nim c $common -o:"$bin" "$here/clients/${src}_sync.nim" || fail=1; } ;;
+    sync)          [ -f "$here/clients/${src}_sync.nim" ] && { bin="$work/${src}_sync"; nim c $common -d:naviStressSync -o:"$bin" "$here/clients/${src}_sync.nim" || fail=1; } ;;
     asyncdispatch) bin="$work/${src}_ad"; nim c $common -o:"$bin" "$here/clients/${src}.nim" || fail=1 ;;
     chronos)       bin="$work/${src}_ch"; nim c $common -d:useChronos -o:"$bin" "$here/clients/${src}.nim" || fail=1 ;;
     js)            [ -n "$js_src" ] && [ -f "$here/clients/${js_src}.nim" ] && { bin="$work/${js_src}.js"; nim js --path:"$root/src" -d:release --hints:off -o:"$bin" "$here/clients/${js_src}.nim" || fail=1; } ;;
@@ -247,10 +288,25 @@ for be in "${backends[@]}"; do
     # On a failed start, stop_servers first so a partially-started cell does not leak
     # its listeners into the next cell's ports.
     start_servers "$pr" || { stop_servers; fail=1; continue; }
+    # Then the chaos sidecar (canary-first). A start/readiness failure is a cell
+    # failure: dump the log, stop everything, move on.
+    start_chaos "$pr" || { stop_servers; fail=1; continue; }
     export NAVI_BACKEND="$be" NAVI_PROTO="$pr"
-    echo "== stress: $workload | $be | $pr | ${servers} servers =="
-    if [[ "$bin" == *.js ]]; then NODE_EXTRA_CA_CERTS="$cert" node "$bin" || fail=1
-    else "$bin" || fail=1; fi
+    chaos_tag=""; [ "$chaos" != none ] && chaos_tag=" | chaos=$chaos"
+    echo "== stress: $workload | $be | $pr | ${servers} servers${chaos_tag} =="
+    # When chaos is on, wrap the cell in coreutils `timeout` as the outermost hang
+    # backstop (belt-and-suspenders behind navi's own timeouts and the in-process
+    # watchdog, and the sync backend's only watchdog): NAVI_SECONDS + 180s slack,
+    # SIGKILL 10s after SIGTERM. A timeout expiry is a failure like any other.
+    run_cell() {
+      if [ "$chaos" != none ]; then
+        timeout -k 10 "$(( ${NAVI_SECONDS:-600} + 180 ))" "$@"
+      else
+        "$@"
+      fi
+    }
+    if [[ "$bin" == *.js ]]; then NODE_EXTRA_CA_CERTS="$cert" run_cell node "$bin" || fail=1
+    else run_cell "$bin" || fail=1; fi
     stop_servers
   done
 done

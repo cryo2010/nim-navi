@@ -3,14 +3,18 @@
 ## drops mid-stream) until the deadline. Reports inline between events.
 
 import std/[times, strutils]
-import ../common/[config, reporter, servers]
+import ../common/[config, reporter, servers, leakcheck]
 import navi
 include ../common/httpset
+include ../common/chaos
 
 proc main() =
   let cfg = loadConfig("sync")
   let reason = cfg.skipReason
   if reason.len > 0: echo cfg.label, " ", reason; return
+  let notice = cfg.chaosSkipNotice
+  if notice.len > 0: echo cfg.label, " ", notice
+  var leakBase = sampleBaseline(cfg.chaos)   # before ANY Navi is constructed
   var pool = initServerPool(cfg)
   let counter = newStatusCounter()
 
@@ -21,6 +25,7 @@ proc main() =
 
   let start = epochTime()
   let deadline = start + cfg.seconds
+  var sc = syncChaosStart(cfg, leakBase)     # no-op when chaos is off
   var lastReport = start
   var gate = initVersionGate(cfg)
   var lastId = 0
@@ -39,6 +44,10 @@ proc main() =
       if epochTime() - lastReport >= cfg.reportSeconds.float:
         lastReport = epochTime()
         report(cfg.label, counter, epochTime() - start)
+        # one interleaved chaos interaction per report interval (events flow
+        # continuously here, so pinning it to the report cadence bounds the ratio).
+        if sc.active: syncChaosStep(sc)
+        syncChaosReport(sc)
       if epochTime() >= deadline: break
     s.close()
   except CatchableError:
@@ -48,6 +57,7 @@ proc main() =
   if counter.ops == 0:
     stderr.writeLine cfg.label & " FAIL: no SSE event consumed"; quit(1)
   report(cfg.label & " final", counter, epochTime() - start)
+  syncChaosFinish(sc, @[api])
   echo "== sse sync ", cfg.proto, " passed (", counter.ops, " events) =="
 
 main()

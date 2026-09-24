@@ -156,7 +156,11 @@ when defined(naviHttp3):
     ## Send `req` (any verb with a buffered body) over HTTP/3 to a discovered
     ## endpoint and build a navi Response, so the caller's policy layer (cookies,
     ## redirects, retries, throw-on-non-2xx) is reused unchanged. Raises
-    ## `QuicError` on failure, which `transport` catches to fall back to h2/h1.
+    ## `QuicError` on transport failure, which `transport` catches to fall back to
+    ## h2/h1 -- or `TimeoutError` when the client's own budget (attempt/read/total)
+    ## expires mid-request, which propagates like any other navi timeout (no
+    ## fallback: a timed-out request must not silently burn a second budget
+    ## re-running over TCP).
     var fwd: seq[(string, string)]
     for k, v in req.headers:
       let lk = k.toLowerAscii
@@ -170,9 +174,19 @@ when defined(naviHttp3):
                       caFile = client.config.tls.caFile,
                       verify = client.config.tls.wantsVerify,
                       maxBody = uint64(max(0, client.config.maxResponseBytes)))
+    # Bound the blocking drive loop with the client's own budget: attempt (the
+    # per-attempt wall clock) when set, else read, else total. Without a cap the
+    # sync h3 leg has NO timeout at all -- pump waits on the ngtcp2 timer/socket,
+    # so a stalling or drip-feeding h3 server wedges the calling thread forever,
+    # beyond the reach of every configured timeout (the h1/h2 sync path at least
+    # has socket-level read timeouts). 0 (no timeouts configured) preserves the
+    # historical unbounded behavior.
+    let capMs = if client.config.attemptMs > 0: client.config.attemptMs
+                elif client.config.readMs > 0: client.config.readMs
+                else: client.config.totalMs
     try:
       let r = conn.request($req.verb, req.url.requestTarget, fwd, req.body,
-                           req.bodyStream, fwdTrl)
+                           req.bodyStream, fwdTrl, deadlineMs = capMs)
       result = initResponse(r.status, "", "HTTP/3", initHeaders(r.headers), r.body)
       result.trailers = initHeaders(r.trailers)
     finally:

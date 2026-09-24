@@ -16,7 +16,8 @@ import ../core/socks
 when defined(ssl):
   import std/openssl
 when defined(posix):
-  from std/posix import Sockaddr_un, TSa_Family, EINPROGRESS, errno
+  from std/posix import Sockaddr_un, TSa_Family, EINPROGRESS, EAGAIN,
+    EWOULDBLOCK, errno
   proc cConnect(fd: SocketHandle, sa: ptr SockAddr, sl: SockLen): cint
     {.importc: "connect", header: "<sys/socket.h>".}
 
@@ -65,14 +66,19 @@ const invalidFd = AsyncFD(-1)
 
 type
   ConnectionState = enum
-    ## Explicit teardown state for a `Conn`. Only two states are ever observed:
-    ## a connection is either open or torn down. `close`/`closeSync` transition
-    ## `csOpen -> csClosed` exactly once (idempotent: a second call is a no-op),
-    ## and a parked `sslRead` reads it to detect a concurrent teardown. There is
-    ## no distinct "closing" phase to observe: the flag flips atomically and the
-    ## fd is freed within the same close call, so a mid-teardown state would never
-    ## be seen by any reader.
+    ## Teardown state for a `Conn`, checked by a parked `sslRead` to tell an error
+    ## caused by our OWN teardown apart from a genuine peer/protocol fault.
+    ## `shutdownConn` flips `csOpen -> csShutdown` before shutting the socket down to
+    ## wake a parked read (h2 mux close, keepalive death, GOAWAY grace, connect
+    ## timeout); `close`/`closeSync` then set `csClosed` and free the fd. A read that
+    ## wakes to a decrypt error (SSL_ERROR_SSL on the truncated record our SHUT_RDWR
+    ## leaves) after we initiated teardown must NOT raise: a failed asyncdispatch
+    ## future orphans its injected stack trace at process exit (a valgrind leak), and
+    ## the error is expected teardown noise, not peer corruption. So sslRead returns a
+    ## clean EOF once state is past csOpen, and only raises a genuine decrypt error
+    ## seen while the connection is still fully open.
     csOpen
+    csShutdown
     csClosed
   Conn* = object
     fd: AsyncFD
@@ -157,7 +163,39 @@ when defined(ssl):
       case SSL_get_error(c.ssl, n.cint)
       of SSL_ERROR_WANT_READ: await waitRead(c.fd)
       of SSL_ERROR_WANT_WRITE: await waitWrite(c.fd)
-      else: result.setLen(0); return   # ZERO_RETURN / reset -> EOF
+      of SSL_ERROR_ZERO_RETURN:
+        result.setLen(0); return       # peer sent close_notify: clean EOF
+      of SSL_ERROR_SYSCALL:
+        # OpenSSL read the fd directly (SSL_set_fd), so a non-blocking socket that
+        # would block surfaces here as SSL_ERROR_SYSCALL with errno EAGAIN/EWOULDBLOCK
+        # -- NOT a close. This races under load: the readable event that woke
+        # waitRead can be drained by another connection's callback before this
+        # SSL_read runs. Treating it as EOF truncates a mid-body response (the
+        # `response truncated` failure the chaos soak surfaced). It is recoverable:
+        # wait for readability and retry, exactly like WANT_READ. Only a genuine
+        # transport EOF (n == 0, or any other errno) is a real close. Chronos never
+        # hits this because it drives OpenSSL over memory BIOs (no fd for OpenSSL to
+        # EAGAIN on), which is why only the asyncdispatch backend was affected.
+        when defined(posix):
+          if n < 0 and (errno == EAGAIN or errno == EWOULDBLOCK):
+            await waitRead(c.fd)
+          else:
+            result.setLen(0); return
+        else:
+          result.setLen(0); return
+      of SSL_ERROR_SSL:
+        # A decrypt/protocol error. When WE initiated teardown (shutdownConn flipped
+        # the state past csOpen and SHUT_RDWR the socket under this parked read), the
+        # next SSL_read decrypts the truncated final record and reports SSL_ERROR_SSL:
+        # expected teardown noise, not peer corruption. Return a clean EOF -- raising
+        # here fails the read future with an injected stack trace that the h2 reader's
+        # teardown path then leaves orphaned at process exit (a definite valgrind leak,
+        # 21 blocks in the streamdown/up/sse cells). A genuine mid-stream decrypt error
+        # on a still-open connection (state == csOpen) is still surfaced as before.
+        if not c.state.isNil and c.state[] != csOpen:
+          result.setLen(0); return
+        raise newException(IOError, "navi: TLS read failed")
+      else: result.setLen(0); return   # any other code -> treat as EOF
 
 # Byte-I/O primitives the shared tunnel drivers (backend/tunnel) mix in.
 proc sockWrite(fd: AsyncFD, s: string): Future[void] = send(fd, s)
@@ -301,6 +339,9 @@ proc happyConnect*(ips: seq[string], port: int):
     raise
   raise newException(IOError, "navi: could not connect: " & lastErr)
 
+proc closeSync*(c: Conn)      # forward decls: connect's timeout cleanup wakes + reclaims
+proc shutdownConn*(c: Conn)   # an abandoned establish via these (both defined below).
+
 proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
               proxy: ProxyTarget, alpn: seq[string] = @[],
               connectMs = 0, readMs = 0, totalMs = 0): Future[Conn] {.async.} =
@@ -378,10 +419,28 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     raise lastErr
 
   # On a connect timeout the establish future is abandoned (asyncdispatch has no
-  # cancellation): it drains in the background and its socket is reclaimed later,
-  # the same contract as the whole-request guard.
+  # cancellation): it keeps running in the background. If it later SUCCEEDS, conn.fd
+  # is a live socket (and conn.ssl a live TLS session) with no owner -- the caller
+  # is unwinding on the TimeoutError, and a value-type Conn has no destructor, so
+  # nothing else will ever close it and the fd leaks. This bites hard when a chaos
+  # flood (h2 headerbomb) starves the event loop enough to push otherwise-fast
+  # loopback connects past connectMs: every such connect leaks a socket, which the
+  # chaos FD assertion catches. Reclaim the conn when the abandoned establish
+  # settles; a failed establish already closed its own fd, so closeSync then no-ops.
   let estFut = establish()
   if connectMs > 0 and not await withTimeout(estFut, connectMs):
+    # The establish future is abandoned here (asyncdispatch has no cancellation). It
+    # is typically parked in the TLS handshake against a peer too busy to answer -- an
+    # h2 headerbomb flood can starve even loopback handshakes past connectMs -- and if
+    # left alone it never completes, pinning its socket for the whole process: a
+    # value-type Conn has no destructor to reclaim it, so the fd leaks (the chaos FD
+    # assertion catches exactly this). Shut the socket down so the parked handshake
+    # errors out and runs establish's own teardown (which closes the fd); the callback
+    # is the backstop for the race where establish instead SUCCEEDS right at the
+    # deadline, leaving a fully-built conn with no owner.
+    shutdownConn(conn)
+    estFut.addCallback(proc() {.gcsafe.} =
+      {.cast(gcsafe).}: closeSync(conn))
     raise newException(response.TimeoutError, connectTimeoutMsg(connectMs))
   await estFut
   return conn
@@ -390,6 +449,12 @@ proc sendAll*(c: Conn, data: string): Future[void] {.async.} =
   when defined(ssl):
     if not c.ssl.isNil:
       await sslWrite(c, data); return
+  # A conn with no TLS session and no valid fd is closed/half-established (e.g. a
+  # connection whose ALPN never resolved under event-loop starvation, mis-routed
+  # onto the h1 path). Raise a typed transport error instead of writing to a dead
+  # fd, so the h1 write-time classifier tears it down and retries on a fresh conn.
+  if c.fd == invalidFd:
+    raise newException(IOError, "navi: send on a closed connection")
   await send(c.fd, data)
 
 proc rearm*(c: var Conn, readMs = 0, totalMs = 0) =
@@ -419,8 +484,12 @@ proc shutdownConn*(c: Conn) =
   ## with EOF/error. Used to wake the h2 mux's background reader on client close so
   ## it exits its loop (and does the real close itself) instead of being left
   ## suspended on a closed fd, which would crash at process teardown. Does not free
-  ## anything; `close`/`closeSync` still run afterward.
+  ## anything; `close`/`closeSync` still run afterward. Flags `csShutdown` first so a
+  ## parked sslRead woken by the shutdown treats the decrypt error on our truncated
+  ## final record as clean EOF (teardown noise) rather than raising a failed future
+  ## whose stack trace would be orphaned at exit; the SSL itself is still valid here.
   if c.fd == invalidFd: return
+  if not c.state.isNil and c.state[] == csOpen: c.state[] = csShutdown
   when defined(windows):
     discard winlean.shutdown(c.fd.SocketHandle, 2)          # SD_BOTH
   else:

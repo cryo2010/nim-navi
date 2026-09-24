@@ -46,6 +46,11 @@ type
     jar*: CookieJar
     muxes: TableRef[string, H2Mux]              ## live shared h2 connections
     pendingMux: TableRef[string, Future[H2Mux]] ## in-flight connects (coalescing)
+    orphanCloses: seq[Future[void]]             ## detached teardowns of displaced/evicted
+                                                ## shared connections (h2 muxes, h3 conns);
+                                                ## close() awaits them so their fds are
+                                                ## reaped deterministically, not left to
+                                                ## background draining (see trackOrphan).
     when defined(naviHttp3):
       altSvc: AltSvcCache                       ## per-origin h3 discovery cache
       h3conns: TableRef[string, QuicConn]  ## live multiplexed h3 connections
@@ -114,34 +119,76 @@ proc close*(client: Navi): Future[void] {.async.} =
   ## Optional but recommended when done with the client.
   for pc in client.pool.drain():
     await close(pc.transport)
-  # Await any in-flight coalesced connects before closing the live tables: a connect
-  # that resolves after we clear `muxes` would otherwise cache its mux into the
-  # cleared table and never be closed, orphaning the connection and its reader
-  # (issue #315). Snapshot the futures first -- a resolving connect `del`s its own
-  # pending entry, so iterating the table directly would mutate it mid-iteration.
-  var pendingMuxes: seq[Future[H2Mux]]
-  for f in client.pendingMux.values: pendingMuxes.add f
-  for f in pendingMuxes:
-    try:
-      let mux = await f
-      if mux != nil: await mux.close()
-    except CatchableError: discard   # a failed connect has nothing to close
-  client.pendingMux.clear()
-  for mux in client.muxes.values:
-    await mux.close()
-  client.muxes.clear()
-  when defined(naviHttp3):
-    var pendingConns: seq[Future[QuicConn]]
-    for f in client.pendingH3.values: pendingConns.add f
-    for f in pendingConns:
+  # Teardown of the shared-connection tables runs as a STABILIZING loop, not a single
+  # pass, because a connect can resolve and cache its connection AFTER we drain the
+  # tables. Two ways that happens: an in-flight coalesced connect resolving late
+  # (issue #315), and -- the harder one the h3 chaos exposed -- under asyncdispatch a
+  # request whose per-attempt timeout fired leaves its `getH3Conn`/resolveOrConnect
+  # frame ABANDONED but still running in the background (asyncdispatch has no true
+  # cancellation -- see guard); that frame finishes its `openQuicConn`/`connect` and
+  # caches the fresh connection into `h3conns`/`muxes` after a single-pass close()
+  # already drained them, orphaning the connection with its reader + fds where nothing
+  # can ever reach it (the never-closed H3Conns the h3 chaos slowbody/stall timeouts
+  # accreted, one leaked UDP socket + wake-pipe pair each). So we drain, yield the loop
+  # a tick to let any such straggler land, and repeat until a full pass finds every
+  # table stable-empty. Each pass snapshots-then-clears before awaiting a close, so an
+  # in-flight request's error path deleting its own entry mid-await cannot trip the
+  # tables' "length changed while iterating" defect. The `sweeps >= 64` cap bounds the
+  # loop so a pathologically self-refilling table can never spin forever; in practice
+  # one or two passes suffice (a straggler lands, gets reaped the next pass).
+  var sweeps = 0
+  while true:
+    inc sweeps
+    var pendingMuxes: seq[Future[H2Mux]]
+    for f in client.pendingMux.values: pendingMuxes.add f
+    client.pendingMux.clear()
+    for f in pendingMuxes:
       try:
-        let qc = await f
-        if qc != nil: await qc.closeConn()
-      except CatchableError: discard
-    client.pendingH3.clear()
-    for qc in client.h3conns.values:
-      await qc.closeConn()
-    client.h3conns.clear()
+        let mux = await f
+        if mux != nil: await mux.close()
+      except CatchableError: discard   # a failed connect has nothing to close
+    var muxList: seq[H2Mux]
+    for mux in client.muxes.values: muxList.add mux
+    client.muxes.clear()
+    for mux in muxList:
+      await mux.close()
+    when defined(naviHttp3):
+      var pendingConns: seq[Future[QuicConn]]
+      for f in client.pendingH3.values: pendingConns.add f
+      client.pendingH3.clear()
+      for f in pendingConns:
+        try:
+          let qc = await f
+          if qc != nil: await qc.closeConn()
+        except CatchableError: discard
+      var connList: seq[QuicConn]
+      for qc in client.h3conns.values: connList.add qc
+      client.h3conns.clear()
+      for qc in connList:
+        await qc.closeConn()
+    # Reap every displaced/evicted shared connection whose teardown was detached off
+    # the request path (trackOrphan): a QuicError-evicted h3 conn or a race-displaced
+    # h2 mux. Under asyncdispatch these detached futures are NOT reliably driven to
+    # completion by background draining before the process samples its fds, so awaiting
+    # them here makes close() deterministic instead of leaving one un-closed connection
+    # per eviction.
+    while client.orphanCloses.len > 0:
+      let batch = client.orphanCloses
+      client.orphanCloses.setLen(0)
+      for f in batch:
+        try: await f
+        except CatchableError: discard
+    # This pass drained every table. Yield one tick so any abandoned background connect
+    # (asyncdispatch has no true cancellation, so a timed-out request's
+    # `getH3Conn`/connect frame finishes and caches its fresh connection LATER) can
+    # land in a table before we re-check. Loop again only if a straggler materialised;
+    # a stable-empty pass, or the sweep cap, ends the loop.
+    await sleepAsync(msOf(0))   # msOf: 0 for asyncdispatch, 0.milliseconds for chronos
+    var refilled = client.pendingMux.len > 0 or client.muxes.len > 0 or
+                   client.orphanCloses.len > 0
+    when defined(naviHttp3):
+      refilled = refilled or client.pendingH3.len > 0 or client.h3conns.len > 0
+    if not refilled or sweeps >= 64: break
   closeTlsStore(client.config.tls.sessionCache)
   closeTlsCtxStore(client.config.tls.contextStore)
 
@@ -204,14 +251,24 @@ proc h1OnConn(client: Navi, conn: Conn, origin: string, req: Request,
               asyncStream: AsyncBodyProducer = nil,
               userSink: BodySink = nil, gate: SinkGate = nil): Future[Response] {.async.} =
   var keep = false
-  if not userSink.isNil and not gate.isNil:
-    var parser = h1SendAndReadHeaders(conn, req, true, asyncStream)
-    result = h1GatedFinish(conn, parser, userSink, gate, keep,
-                           client.config.wantsDecompress, client.config.maxResponseBytes)
-  else:
-    result = h1Exchange(conn, req, sink, keep,
-                        client.config.wantsDecompress, client.config.maxResponseBytes,
-                        asyncStream)
+  # The exchange can raise (timeout, RST/close mid-body, malformed response, a
+  # cancelled `total` guard). On any raise the success-path pool/close below is
+  # skipped, so close `conn` here or its fd/socket leaks -- a hostile or slow peer
+  # that makes every request time out would otherwise leak one connection each
+  # (surfaced by the chaos stress harness's FD assertion). A clean exchange still
+  # takes the pool-or-close path unchanged.
+  try:
+    if not userSink.isNil and not gate.isNil:
+      var parser = h1SendAndReadHeaders(conn, req, true, asyncStream)
+      result = h1GatedFinish(conn, parser, userSink, gate, keep,
+                             client.config.wantsDecompress, client.config.maxResponseBytes)
+    else:
+      result = h1Exchange(conn, req, sink, keep,
+                          client.config.wantsDecompress, client.config.maxResponseBytes,
+                          asyncStream)
+  except CatchableError:
+    await close(conn)
+    raise
   let pc = PooledConn[Conn](transport: conn)
   if not (keep and pushIdle(client.pool, origin, pc)):
     await close(conn)
@@ -239,6 +296,18 @@ proc closeOrphanMux(mux: H2Mux) {.async.} =
   ## satisfies chronos's `asyncSpawn` no-failure contract at the spawn site.
   try: await mux.close()
   except CatchableError: discard
+
+proc trackOrphan(client: Navi, fut: Future[void]) =
+  ## Retain a detached teardown future (an orphan mux/h3-conn close) so `close()`
+  ## can await it, instead of firing it fully-and-forget. The request path still
+  ## does not block on it -- it just stays reachable. We prune already-finished
+  ## entries opportunistically so a long-lived client under heavy eviction churn
+  ## does not accumulate the seq unboundedly between closes.
+  var live: seq[Future[void]]
+  for f in client.orphanCloses:
+    if not f.finished: live.add f
+  live.add fut
+  client.orphanCloses = live
 
 proc resolveReusableMux(client: Navi, origin: string): Future[H2Mux] {.async.} =
   ## Resolve a shared h2 connection to reuse for `origin`: a live cached mux, or -- when
@@ -300,10 +369,9 @@ proc openFreshConn(client: Navi, rq: Request, origin: string,
       # replaced it, is left alone. `pending.del` likewise only removes OUR future.
       let prior = client.muxes.getOrDefault(origin, nil)
       if prior != nil and prior != mux:      # a racer cached a DIFFERENT live mux here:
-        when declared(asyncSpawn):           # close it (its own dead-guard no-ops if it
-          asyncSpawn closeOrphanMux(prior)   # already exited), never leaving it orphaned.
-        else:                                # chronos deprecated asyncCheck in favor of
-          asyncCheck closeOrphanMux(prior)   # asyncSpawn, which asyncdispatch lacks
+        client.trackOrphan(closeOrphanMux(prior))  # close it off the request path but keep
+                                             # the future reachable so close() reaps it; its
+                                             # own dead-guard no-ops if it already exited.
       client.muxes[origin] = mux
       if client.pendingMux.getOrDefault(origin, nil) == pending:
         client.pendingMux.del(origin)
@@ -423,6 +491,17 @@ when defined(naviHttp3):
     if alt.len > 0:
       client.altSvc.record("https", req.url.host, req.url.port, alt)
 
+  proc closeOrphanQuic(qc: QuicConn) {.async.} =
+    ## Fire-and-forget close of a QUIC connection displaced from `client.h3conns`
+    ## (a stale slot getH3Conn overwrites) or evicted by a stream-scoped QuicError,
+    ## while its reader may still be running. Swallows every error so its future
+    ## never fails -- safe to detach off the request path and satisfies chronos's
+    ## `asyncSpawn` no-failure contract, mirroring closeOrphanMux. Defined before
+    ## getH3Conn/h3Transport so both spawn sites see it (Nim #head instantiates the
+    ## async templates at the call site and will not resolve a later definition).
+    try: await qc.closeConn()
+    except CatchableError: discard
+
   proc getH3Conn(client: Navi, origin: string, ep: AltSvcEndpoint,
                  req: Request): Future[QuicConn] {.async.} =
     ## Reuse the origin's live h3 connection, or open one and cache it. Concurrent
@@ -446,6 +525,18 @@ when defined(naviHttp3):
                                      client.config.tls.caFile,
                                      client.config.tls.wantsVerify,
                                      uint64(max(0, client.config.maxResponseBytes)))
+        # A dead-but-uncleaned prior conn can occupy this slot: the loop above only
+        # returns a cached entry when it is `alive`, so a `not alive` one falls
+        # through to here and would be silently overwritten. Its background reader may
+        # still be parked (a stream-scoped failure that never tore the whole
+        # connection down), holding its UDP socket + wake-pipe fds where neither the
+        # next request nor client.close can ever reach them again -- the exact 9
+        # never-closed H3Conns the asyncdispatch h3 chaos leak accretes. Close the
+        # displaced conn off the request path (trackOrphan keeps it reachable for
+        # close()), before replacing the slot.
+        let prior = client.h3conns.getOrDefault(origin, nil)
+        if prior != nil and prior != qc:
+          client.trackOrphan(closeOrphanQuic(prior))
         client.h3conns[origin] = qc
         client.pendingH3.del(origin)
         pending.complete(qc)
@@ -479,6 +570,21 @@ when defined(naviHttp3):
     except QuicError:
       if client.h3conns.getOrDefault(origin, nil) == qc:
         client.h3conns.del(origin)       # drop a dead connection
+        # A QuicError can be stream-scoped (e.g. the server RESET_STREAMed one
+        # response) with the connection object still alive: its background reader
+        # keeps the UDP fd registered until closeConn. Evicting such a conn from the
+        # table without closing it orphans that fd + reader where neither the next
+        # request nor client.close can ever reach them -- under a hostile server
+        # (stress chaos: truncate/garbage/vanish) evictions are constant and the
+        # process accretes one leaked fd per eviction. Close it off the request path,
+        # exactly like closeOrphanMux for displaced h2 muxes; a conn whose reader
+        # already died self-cleaned (closeConn no-ops), so this only acts on the
+        # live-orphan case. Retain the future via trackOrphan so close() awaits it:
+        # under asyncdispatch a detached (asyncSpawn) close is NOT reliably driven to
+        # completion by background draining before the process samples its fds, so a
+        # hostile server that forces constant evictions leaked one UDP socket +
+        # wake-pipe pair per eviction (the CHAOS-FAIL(fd) the h3 chaos surfaced).
+        client.trackOrphan(closeOrphanQuic(qc))
       raise
 
 proc transport(client: Navi, req: Request, sink: BodySink,

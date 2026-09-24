@@ -321,6 +321,14 @@ proc sendAll*(c: Conn, data: string): Future[void] {.async.} =
     if not c.tls.isNil:
       await c.tls.write(data)
       return
+  # A conn with neither a live TLS session nor a plaintext writer is closed/half-
+  # established (e.g. a connection whose ALPN never resolved under event-loop
+  # starvation, mis-routed onto the h1 path): writing would deref a nil
+  # AsyncStreamWriter and SIGSEGV. Raise a typed transport error instead, so the
+  # h1 write-time classifier tears the conn down and retries on a fresh one rather
+  # than crashing the whole loop (surfaced by the h2 headerbomb chaos mode).
+  if c.writer.isNil:
+    raise newException(IOError, "navi: send on a closed connection")
   await c.writer.write(data)
 
 proc plaintextRead(c: Conn): Future[string] {.async.} =

@@ -11,7 +11,7 @@
 
 import std/[times, strutils]
 from std/os import getEnv
-import ../common/[config, reporter, servers]
+import ../common/[config, reporter, servers, leakcheck]
 
 let logErrors = getEnv("NAVI_LOG_ERRORS").len > 0
 when defined(useChronos):
@@ -21,6 +21,7 @@ else:
   import navi/asyncdispatch
   const backend = "asyncdispatch"
 include ../common/httpset
+include ../common/chaos
 
 proc wsUrl(base: string): string =
   "wss://" & base["https://".len .. ^1] & "/ws"
@@ -63,6 +64,9 @@ proc main() {.async.} =
   let cfg = loadConfig(backend)
   let reason = cfg.skipReason
   if reason.len > 0: echo cfg.label, " ", reason; return
+  let notice = cfg.chaosSkipNotice
+  if notice.len > 0: echo cfg.label, " ", notice
+  var leakBase = sampleBaseline(cfg.chaos)   # before ANY Navi is constructed
   var pool = initServerPool(cfg)
   let counter = newStatusCounter()
 
@@ -79,15 +83,18 @@ proc main() {.async.} =
 
   let start = epochTime()
   let deadline = start + cfg.seconds
+  let chaos = chaosMaybeStart(cfg, deadline, cfg.reportSeconds)  # no-op when off
   var futs: seq[Future[void]]
   for ws in socks: futs.add worker(ws, counter, deadline)
   futs.add reporterLoop(cfg, counter, start, deadline)
   for f in futs: await f
+  await chaosAwait(chaos)
 
   if counter.ops == 0:                 # a cell that did no round-trips is not a pass
     stderr.writeLine cfg.label & " FAIL: no WebSocket round-trip completed"
     quit(1)
   report(cfg.label & " final", counter, epochTime() - start)
+  await chaosFinish(chaos, leakBase, cfg, @[api])
   echo "== ws ", backend, " ", cfg.proto, " passed (", counter.ops, " round-trips) =="
 
 waitFor main()

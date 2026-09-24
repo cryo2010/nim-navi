@@ -204,7 +204,8 @@ proc parseH3Fields*(buf: string): seq[(string, string)] =
 proc request*(c: QuicConn, verb: string, path = "/",
               headers: openArray[(string, string)] = [], body = "",
               producer: proc(): string {.closure, raises: [CatchableError].} = nil,
-              trailers: openArray[(string, string)] = []):
+              trailers: openArray[(string, string)] = [],
+              deadlineMs = 0):
               Http3Response =
   ## Issue an HTTP/3 request on an open connection and return status, body, and
   ## response headers and trailers. `verb` is the method (GET/POST/PUT/...), `headers`
@@ -213,6 +214,20 @@ proc request*(c: QuicConn, verb: string, path = "/",
   ## from `producer` (navi's `bodyStream`, pulled chunk by chunk); `trailers` are sent
   ## after the body as a trailing HEADERS section. Raises `QuicError` on transport
   ## failure.
+  ##
+  ## `deadlineMs` (0 = unbounded, the historical behavior) caps the whole blocking
+  ## drive loop. Without it the sync backend had NO timeout at all on the buffered
+  ## h3 leg -- `navi_h3_pump` waits on the ngtcp2 timer/socket, so a server that
+  ## keeps a stream open forever (or drips a body glacially) wedged the calling
+  ## thread indefinitely, unreachable by any of navi's timeout knobs (exposed by the
+  ## stress chaos slowbody mode, which froze the single-threaded sync cell until the
+  ## harness's external watchdog killed it). The streaming h3 paths already enforce
+  ## deadlines (awaitHeaders/readStreamBody); this closes the same gap for the
+  ## buffered path. On expiry the stream is freed and navi's `TimeoutError` raised,
+  ## matching the timeout taxonomy of the h1/h2 backends. Enforcement granularity is
+  ## one pump cycle: the check runs between pumps, and a pump wakes on every inbound
+  ## packet or ngtcp2 timer, so any server still transmitting is bounded tightly and
+  ## only a fully-silent peer coasts to the next protocol timer first.
   if c.handle == nil:
     raise newException(QuicError, "navi HTTP/3: connection is closed")
   let reqHdr = encodeH3Fields(headers)
@@ -227,8 +242,14 @@ proc request*(c: QuicConn, verb: string, path = "/",
                            reqTrl.cstring, 1)   # buffered: enforce maxResponseBytes
   if sid < 0:
     raise newException(QuicError, "navi HTTP/3 submit failed")
+  let deadline = if deadlineMs > 0: epochTime() + deadlineMs.float / 1000.0
+                 else: 0.0
   while navi_h3_stream_done(c.handle, sid) == 0:   # drive until this stream completes
     if navi_h3_draining(c.handle) != 0: break      # peer closed gracefully (#278)
+    if deadline > 0 and epochTime() > deadline:
+      navi_h3_stream_free(c.handle, sid)
+      raise newException(TimeoutError,
+        "navi: HTTP/3 request timed out after " & $deadlineMs & " ms")
     if navi_h3_pump(c.handle) != 0:
       navi_h3_stream_free(c.handle, sid)
       raise newException(QuicError, "navi HTTP/3 pump failed")

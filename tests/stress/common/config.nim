@@ -27,6 +27,35 @@ type
     reportSeconds*: int      ## per-report cadence
     streamBytes*: int        ## stream transfer size (bytes)
     cert*: string            ## CA/cert path for TLS verification
+    chaos*: ChaosConfig      ## opt-in misbehaving-server attack config (NAVI_CHAOS*)
+
+  ChaosConfig* = object
+    ## Parsed NAVI_CHAOS* knobs for one cell. `enabled` mirrors NAVI_CHAOS != none;
+    ## when off everything downstream returns before allocating so an off run is
+    ## byte-identical. `modes` is the requested set ("all" -> empty means "every
+    ## applicable mode"; a csv narrows it), validated at parse time so a typo
+    ## hard-fails naming the bad token (same discipline as NAVI_CONTENT_TYPES).
+    enabled*: bool
+    raw*: string             ## the NAVI_CHAOS value as given (for skip notices)
+    modesAll*: bool          ## NAVI_CHAOS=all: run every mode applicable to the proto
+    modes*: seq[string]      ## explicit csv of mode names (empty when modesAll)
+    conc*: int               ## NAVI_CHAOS_CONC: chaos workers (async) / interleave basis (sync)
+    seed*: uint64            ## NAVI_CHAOS_SEED: schedule PRNG seed, mixed with the cell id
+    portBand*: int           ## NAVI_CHAOS_PORTBAND: chaos ports = base + band {+0,+1,+2,+99}
+    watchdog*: int           ## NAVI_CHAOS_WATCHDOG: seconds a worker may go without progress
+    fdSlack*: int            ## NAVI_CHAOS_FD_SLACK: FD leak bound
+    heapSlackMb*: int        ## NAVI_CHAOS_HEAP_SLACK_MB: Nim heap leak bound
+    rssSlackMb*: int         ## NAVI_CHAOS_RSS_SLACK_MB: RSS leak bound
+    selfTest*: string        ## NAVI_CHAOS_SELFTEST: ""|fd|mem|hang (deliberate leak/hang)
+
+## Every mode name the chaos catalog knows, across all protocols. Used both to
+## validate a NAVI_CHAOS csv and (by chaos.nim) to build the schedule. Applicability
+## to a given protocol is filtered separately in the schedule.
+const chaosModeNames* = [
+  "stall", "slowbody", "truncate", "garbage", "vanish", "badframes",
+  "zerowindow", "headerbomb", "redirectloop",
+  # port-selected accept-time modes: named so a csv can request them directly.
+  "vanish-on-accept", "stall-on-accept"]
 
 proc getInt(name: string, def: int): int =
   let v = getEnv(name, "")
@@ -35,6 +64,37 @@ proc getInt(name: string, def: int): int =
 proc getFloat(name: string, def: float): float =
   let v = getEnv(name, "")
   if v.len == 0: def else: parseFloat(v)
+
+proc loadChaos(workload, proto, backend: string): ChaosConfig =
+  ## Parse the NAVI_CHAOS* knobs. NAVI_CHAOS defaults to "none" -> a disabled,
+  ## zero-allocation config. "all" runs every applicable mode; a csv narrows it,
+  ## hard-failing at startup on an unknown token naming it (mirroring the
+  ## NAVI_CONTENT_TYPES validation) so a typo never silently narrows coverage.
+  let raw = getEnv("NAVI_CHAOS", "none").strip()
+  if raw.len == 0 or raw == "none":
+    return ChaosConfig(enabled: false)
+  result.enabled = true
+  result.raw = raw
+  if raw == "all":
+    result.modesAll = true
+  else:
+    for tok in raw.split(','):
+      let m = tok.strip()
+      if m.len == 0: continue
+      if m notin chaosModeNames:
+        stderr.writeLine "[" & workload & " " & proto & " " & backend &
+          "] FAIL: invalid NAVI_CHAOS token '" & m & "' (allowed: " &
+          chaosModeNames.join(",") & " or none|all)"
+        quit(1)
+      result.modes.add m
+  result.conc = max(1, getInt("NAVI_CHAOS_CONC", 8))
+  result.seed = uint64(getInt("NAVI_CHAOS_SEED", 1))
+  result.portBand = getInt("NAVI_CHAOS_PORTBAND", 2000)
+  result.watchdog = max(1, getInt("NAVI_CHAOS_WATCHDOG", 60))
+  result.fdSlack = getInt("NAVI_CHAOS_FD_SLACK", 8)
+  result.heapSlackMb = getInt("NAVI_CHAOS_HEAP_SLACK_MB", 32)
+  result.rssSlackMb = getInt("NAVI_CHAOS_RSS_SLACK_MB", 128)
+  result.selfTest = getEnv("NAVI_CHAOS_SELFTEST", "").strip()
 
 proc loadConfig*(backend: string): Config =
   ## Read one cell's config. `backend` is the label for this binary.
@@ -53,7 +113,15 @@ proc loadConfig*(backend: string): Config =
     contentTypes: getEnv("NAVI_CONTENT_TYPES", "octet,text,json,form"),
     reportSeconds: max(1, getInt("NAVI_REPORT_SECONDS", 60)),
     streamBytes: getInt("NAVI_STREAM_BYTES", 1073741824),
-    cert: getEnv("NAVI_CERT", ""))
+    cert: getEnv("NAVI_CERT", ""),
+    chaos: loadChaos(getEnv("NAVI_WORKLOAD", "requests"),
+                     getEnv("NAVI_PROTO", "h2"), backend))
+  # js is excluded from chaos entirely: hostile-input handling there is undici's,
+  # not navi's; js cells can't enforce the protocol pin; and node FD/heap metrics
+  # measure libuv/V8, not this library. Disable it here so every js client is a
+  # byte-identical off run and only needs a skipReason-style notice (below).
+  if result.backend == "js":
+    result.chaos = ChaosConfig(enabled: false)
   # A typo in NAVI_CONTENT_TYPES must not silently narrow (or empty) the rotation:
   # hard-fail at startup, naming the bad token, so the soak never runs miscoverage.
   let (ok, bad) = validContentTypes(result.contentTypes)
@@ -142,6 +210,19 @@ proc finish*(g: VersionGate) =
     stderr.writeLine g.cfg.label & " FAIL: never negotiated " & g.want &
       " over the whole run (NAVI_PROTO=" & g.cfg.proto & ")"
     quit(1)
+
+proc chaosSkipNotice*(c: Config): string =
+  ## Non-empty when NAVI_CHAOS was requested but this cell will not run the chaos
+  ## phase, so the client prints it (not a failure). Only js is excluded outright
+  ## here; the proto-has-no-applicable-modes skip is decided in chaos.nim where
+  ## the schedule is built. Reads the raw env because config.chaos is already
+  ## force-disabled for js.
+  let raw = getEnv("NAVI_CHAOS", "none").strip()
+  if raw.len == 0 or raw == "none": return ""
+  if c.backend == "js":
+    return "chaos skip: js is excluded (hostile-input handling is undici's, and " &
+      "js cells can't pin the protocol or measure navi's FD/heap)"
+  ""
 
 proc skipReason*(c: Config): string =
   ## Non-empty when this cell cannot run on this build/backend, so the client

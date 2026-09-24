@@ -6,9 +6,10 @@
 
 import std/[times, strutils, json]
 import ../zlibcodec
-import ../common/[config, reporter, servers, payloads]
+import ../common/[config, reporter, servers, payloads, leakcheck]
 import navi
 include ../common/httpset
+include ../common/chaos
 
 const verbs = [GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS]
 const allPayloads = stressPayloads()
@@ -87,6 +88,9 @@ proc main() =
   let cfg = loadConfig("sync")
   let reason = cfg.skipReason
   if reason.len > 0: echo cfg.label, " ", reason; return
+  let notice = cfg.chaosSkipNotice
+  if notice.len > 0: echo cfg.label, " ", notice
+  var leakBase = sampleBaseline(cfg.chaos)   # before ANY Navi is constructed
   var pool = initServerPool(cfg)
   let payloads = filterPayloads(allPayloads, cfg.contentTypes, jsSafe = false)
   let counter = newStatusCounter()
@@ -108,6 +112,10 @@ proc main() =
 
   let start = epochTime()
   let deadline = start + cfg.seconds
+  # sync interleaves one chaos request per M verified requests (no fan-out). M ~=
+  # NAVI_CHAOS_CONC so the chaos:verified ratio roughly matches the async cells.
+  var sc = syncChaosStart(cfg, leakBase)   # no-op when chaos is off
+  let chaosEvery = max(1, cfg.chaos.conc)
   var lastReport = start
   var n = 0
   while epochTime() < deadline:
@@ -122,6 +130,11 @@ proc main() =
       let url = pool.pick() & "/echo"
       var h = initHeaders()
       if n mod 11 == 0: h["x-big"] = repeat("H", 8192)   # exercise the HPACK path
+      # Under chaos, tag bodied requests with an Idempotency-Key so navi replays a
+      # load-induced keep-alive race (see the async client for the rationale).
+      # Byte-identical no-op when chaos is off.
+      if bodied and cfg.chaos.enabled:
+        h["idempotency-key"] = "stress-" & $n
       try:
         var res: Response
         if not bodied:
@@ -158,12 +171,15 @@ proc main() =
       except CatchableError as e:
         counter.fail()
         cfg.failHard(p.name & " " & $v & " " & url & " -> " & $e.name & ": " & e.msg)
+      if sc.active and n mod chaosEvery == 0: syncChaosStep(sc)   # interleave chaos
     if epochTime() - lastReport >= cfg.reportSeconds.float:
       lastReport = epochTime()
       report(cfg.label, counter, epochTime() - start)
+      syncChaosReport(sc)
 
   if counter.ops == 0: cfg.failHard("no request completed")
   report(cfg.label & " final", counter, epochTime() - start)
+  syncChaosFinish(sc, apis)
   echo "== requests sync ", cfg.proto, " passed (", counter.ops, " ops) =="
 
 main()

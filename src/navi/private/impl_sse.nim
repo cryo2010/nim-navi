@@ -158,7 +158,19 @@ proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
       # is caught here and driven back through reconnect+backoff, instead of hanging
       # forever. Any byte, incl. a keep-alive comment, completes readFut and resets
       # the bound, so a live-but-quiet stream is untouched.
-      if s.idleTimeoutMs > 0 and not await withTimeout(readFut, msOf(s.idleTimeoutMs)):
+      #
+      # Only arm the bound when the read did NOT complete synchronously. Under a server
+      # that floods events, readChunk resolves immediately every time; wrapping each such
+      # read in withTimeout would push a fresh idle-deadline timer onto asyncdispatch's
+      # global timer heap, and asyncdispatch's withTimeout does not evict the losing
+      # sleepAsync timer when the read wins -- it only clears its callback -- so one live
+      # idleTimeoutMs-long (default 45s) timer future accretes per read and the heap
+      # floods into the hundreds of MiB over a soak (GC_fullCollect cannot reclaim them:
+      # they are reachable through the dispatcher). A ready read needs no bound anyway, so
+      # skip the wrap; the bound still arms the moment a read actually parks. chronos
+      # evicts the timer on completion and is unaffected either way.
+      if s.idleTimeoutMs > 0 and not readFut.finished and
+         not await withTimeout(readFut, msOf(s.idleTimeoutMs)):
         # Idle bound elapsed with the read still parked. Dispose the handle so its h2
         # stream is RST and its concurrency slot freed -- abandoning it with just
         # `s.handle = nil` left the sid in the mux's sinkStreams, the orphaned read

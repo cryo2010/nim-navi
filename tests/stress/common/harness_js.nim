@@ -42,6 +42,14 @@ proc loadJsCfg*(): JsCfg =
     echo "[requests ", result.proto, " js] FAIL: invalid NAVI_CONTENT_TYPES token '",
       bad, "' (allowed: octet,text,json,form)"
     jsExit(1)
+  # js is excluded from chaos entirely (hostile-input handling there is undici's, not
+  # navi's; a js cell can't pin the protocol or measure navi's FD/heap), so when chaos
+  # was requested every js cell prints the skip notice its native peers print -- not a
+  # failure, just the documented gap. Mirrors config.chaosSkipNotice on the native side.
+  let chaos = $envJs("NAVI_CHAOS", "none")
+  if chaos.len > 0 and chaos != "none":
+    echo "[", result.proto, " js] chaos skip: js is excluded (hostile-input handling ",
+      "is undici's, and js cells can't pin the protocol or measure navi's FD/heap)"
 
 type JsPool* = object
   bases: seq[string]
