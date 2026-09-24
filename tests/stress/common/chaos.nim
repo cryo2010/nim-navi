@@ -205,21 +205,9 @@ proc buildPlan(cfg: Config): ChaosPlan =
   if not cfg.chaos.enabled: return
   let pi = protoIdx(cfg.proto)
   if pi < 0: return
-  # The sync backend is single-threaded and blocking: a chaos request occupies the
-  # whole thread until it resolves. The pure never-respond modes (`stall`,
-  # `stall-on-accept`) rely on a per-read stall timeout to unblock, but the sync
-  # backend's read timeout does not fire on a TLS connection that completes the
-  # handshake and then sends ZERO application bytes forever -- the request wedges
-  # until the run.sh `timeout` wrapper kills the cell (a sync-backend timeout gap
-  # worth a follow-up; the async backends handle these fine via their guards). Until
-  # that is fixed, skip the two zero-byte-response modes on sync only; every other
-  # mode (which sends at least some bytes, so the read timeout engages) runs. The
-  # async backends run the full catalog.
-  let syncSkip = ["stall", "stall-on-accept"]
   for e in allEntries:
     if pi notin e.protos: continue
     if not cfg.chaos.modesAll and e.mode notin cfg.chaos.modes: continue
-    if cfg.backend == "sync" and e.mode in syncSkip: continue
     result.entries.add e
   if result.entries.len == 0: return
   result.counter = newChaosCounter()

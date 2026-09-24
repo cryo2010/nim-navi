@@ -27,6 +27,14 @@ proc main() =
   let deadline = start + cfg.seconds
   var sc = syncChaosStart(cfg, leakBase)     # no-op when chaos is off
   var lastReport = start
+  # Interleave a chaos interaction on its OWN cadence, NOT the report cadence:
+  # NAVI_REPORT_SECONDS defaults to 60 while a smoke cell runs 20s, so pinning chaos
+  # to the report interval means the report branch (and thus every chaos step) never
+  # fires in a short cell -- syncChaosFinish then hard-fails "no chaos interaction
+  # completed". Events flow continuously here, so a fixed few-second cadence, capped
+  # to the cell length, guarantees several interactions regardless of the report knob.
+  let chaosEvery = min(2.0, max(0.5, cfg.seconds / 4.0))
+  var lastChaos = start
   var gate = initVersionGate(cfg)
   var lastId = 0
   try:
@@ -44,10 +52,10 @@ proc main() =
       if epochTime() - lastReport >= cfg.reportSeconds.float:
         lastReport = epochTime()
         report(cfg.label, counter, epochTime() - start)
-        # one interleaved chaos interaction per report interval (events flow
-        # continuously here, so pinning it to the report cadence bounds the ratio).
-        if sc.active: syncChaosStep(sc)
         syncChaosReport(sc)
+      if sc.active and epochTime() - lastChaos >= chaosEvery:
+        lastChaos = epochTime()
+        syncChaosStep(sc)                # one interleaved chaos interaction per cadence
       if epochTime() >= deadline: break
     s.close()
   except CatchableError:
