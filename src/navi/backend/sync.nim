@@ -452,30 +452,96 @@ proc dataWaiting*(c: Conn, ms: int): bool =
   ## bytes already buffered inside OpenSSL, which a raw `select` would miss.
   c.waitReadable(ms)
 
-proc recvSome*(c: Conn): string =
-  ## One chunk of up to 4096 bytes; "" means the peer closed. Waits up to the read
-  ## stall limit -- capped by the time left to the overall deadline -- then reads
-  ## what is available in a single read (no fill-the-buffer loop). Raises navi's
-  ## TimeoutError on a per-read stall or an expired total deadline.
-  result = newStringUninit(naviReadBufSize)   # overwritten by the read then setLen(n): no zero-fill
-  var waitMs = c.readMs
+proc readBudgetMs(c: Conn): int =
+  ## The wait budget for one read: the per-read stall limit capped by the time left
+  ## to the overall deadline. Raises navi's TimeoutError up front when the total
+  ## deadline has already lapsed. A result of 0 means "block indefinitely" (no read
+  ## timeout and no total deadline armed).
+  result = c.readMs
   if c.bounded:
     let remaining = remainingMs(c.deadline)
     if remaining <= 0:
       raise newException(response.TimeoutError, "navi: request timed out")
-    waitMs = if waitMs <= 0: remaining else: min(waitMs, remaining)
-  if waitMs > 0 and not c.waitReadable(waitMs):
-    if c.bounded and remainingMs(c.deadline) <= 0:
-      raise newException(response.TimeoutError, "navi: request timed out")
-    raise newException(response.TimeoutError, "navi: read timed out")
+    result = if result <= 0: remaining else: min(result, remaining)
+
+proc readTimedOut(c: Conn) {.noreturn.} =
+  ## The read budget lapsed. Prefer the total-deadline wording when it is the one
+  ## that expired, else the per-read stall wording -- matching the pre-fix messages.
+  if c.bounded and remainingMs(c.deadline) <= 0:
+    raise newException(response.TimeoutError, "navi: request timed out")
+  raise newException(response.TimeoutError, "navi: read timed out")
+
+when defined(ssl):
+  proc sslReadSome(c: Conn, buf: var string): int =
+    ## One SSL_read of up to `buf.len` bytes, bounded by the read budget. Returns the
+    ## byte count (>0), or 0 for a clean peer EOF; raises navi's TimeoutError when the
+    ## budget lapses and IOError on a genuine transport/protocol error.
+    ##
+    ## Why this is not a single `waitReadable` + `SSL_read`: `select` sees the raw fd,
+    ## so it reports "readable" as soon as ANY bytes land -- including a TLS 1.3
+    ## NewSessionTicket or a partial record that carries no application data. SSL_read
+    ## then consumes those non-application bytes and issues a fresh blocking `recv` on
+    ## the fd for the rest; on a post-handshake-silent server that recv parks the whole
+    ## thread forever (the sync stall-timeout gap, issue #386). We arm SO_RCVTIMEO to
+    ## the current budget around each SSL_read so that inner recv cannot block past the
+    ## deadline: an expired receive timeout on a blocking socket surfaces as
+    ## SSL_ERROR_WANT_READ or SSL_ERROR_SYSCALL+EAGAIN, which we treat as "the read
+    ## timed out" once the budget is spent (NOT as a transient to spin on, and NOT as
+    ## an EOF). While budget remains we re-select and retry, so a genuine trickle of
+    ## non-application records does not falsely time out.
+    while true:
+      let waitMs = c.readBudgetMs()   # raises if the total deadline already lapsed
+      if waitMs > 0 and not c.waitReadable(waitMs):
+        c.readTimedOut()
+      # Bound the blocking recv OpenSSL runs under SSL_read: without this a readable
+      # fd carrying only ticket/partial-record bytes wedges the thread here forever.
+      if waitMs > 0: setIoTimeout(c.fd, waitMs)
+      let n = SSL_read(c.ssl, addr buf[0], buf.len).int
+      if waitMs > 0: setIoTimeout(c.fd, 0)   # clear; the next read re-arms its own budget
+      if n > 0: return n
+      case SSL_get_error(c.ssl, n.cint)
+      of SSL_ERROR_ZERO_RETURN: return 0     # peer sent close_notify: clean EOF
+      of SSL_ERROR_WANT_READ, SSL_ERROR_WANT_WRITE:
+        # Would block. With no budget armed (waitMs == 0) the recv OpenSSL ran blocked
+        # indefinitely, so a would-block here can only be a mid-record boundary: loop
+        # to re-select and read the rest. With a budget armed the recv already waited
+        # the full budget (SO_RCVTIMEO) before returning would-block -- that is exactly
+        # the post-handshake-silent stall, so it is the read timeout, not a transient.
+        if waitMs > 0: c.readTimedOut()
+        continue
+      of SSL_ERROR_SYSCALL:
+        # OpenSSL read the fd directly, so a would-block (our expired SO_RCVTIMEO, or a
+        # transient under a receive timeout) surfaces here as SSL_ERROR_SYSCALL with
+        # errno EAGAIN/EWOULDBLOCK -- NOT a close. Distinguish it from a genuine
+        # transport EOF/error: treat would-block as the read timeout (mirroring
+        # WANT_READ), and only a real syscall failure/EOF as the end of the stream.
+        when defined(posix):
+          if n < 0 and (errno == EAGAIN or errno == EWOULDBLOCK):
+            c.readTimedOut()
+        else:
+          if n < 0 and osLastError().int32 == WSAEWOULDBLOCK:
+            c.readTimedOut()
+        return 0   # n == 0 (unexpected EOF) or a real errno: treat as a close
+      of SSL_ERROR_SSL:
+        raise newException(IOError, "navi: TLS read failed")
+      else: return 0   # any other code -> treat as EOF
+
+proc recvSome*(c: Conn): string =
+  ## One chunk of up to `naviReadBufSize` bytes; "" means the peer closed. Waits up to
+  ## the read stall limit -- capped by the time left to the overall deadline -- then
+  ## reads what is available in a single read (no fill-the-buffer loop). Raises navi's
+  ## TimeoutError on a per-read stall or an expired total deadline.
+  result = newStringUninit(naviReadBufSize)   # overwritten by the read then setLen(n): no zero-fill
   var n: int
   when defined(ssl):
     if not c.ssl.isNil:
-      n = SSL_read(c.ssl, addr result[0], result.len).int
-    else:
-      n = sysRecv(c.fd, addr result[0], result.len)
-  else:
-    n = sysRecv(c.fd, addr result[0], result.len)
+      n = sslReadSome(c, result)
+      if n <= 0: result.setLen(0) else: result.setLen(n)
+      return
+  let waitMs = c.readBudgetMs()   # raises if the total deadline already lapsed
+  if waitMs > 0 and not c.waitReadable(waitMs):
+    c.readTimedOut()
+  n = sysRecv(c.fd, addr result[0], result.len)
   if n <= 0:
     result.setLen(0)
   else:
