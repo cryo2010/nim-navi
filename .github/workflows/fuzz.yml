@@ -2,6 +2,9 @@ name: fuzz
 
 on:
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - '.claude/**'
   schedule:
     - cron: "0 6 * * *"   # nightly
   workflow_dispatch:

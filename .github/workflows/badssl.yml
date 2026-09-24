@@ -2,6 +2,9 @@ name: badssl
 
 on:
   pull_request:            # PR check (badssl.com is external; move to nightly if flaky)
+    paths-ignore:
+      - '**.md'
+      - '.claude/**'
   workflow_dispatch:
 
 jobs:

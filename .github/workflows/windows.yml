@@ -16,7 +16,13 @@ name: windows
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - '.claude/**'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - '.claude/**'
 
 jobs:
   # The suite is plain-TCP, so this is what catches the socket-layer branches
