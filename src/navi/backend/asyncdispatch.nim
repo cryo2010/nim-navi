@@ -66,14 +66,19 @@ const invalidFd = AsyncFD(-1)
 
 type
   ConnectionState = enum
-    ## Explicit teardown state for a `Conn`. Only two states are ever observed:
-    ## a connection is either open or torn down. `close`/`closeSync` transition
-    ## `csOpen -> csClosed` exactly once (idempotent: a second call is a no-op),
-    ## and a parked `sslRead` reads it to detect a concurrent teardown. There is
-    ## no distinct "closing" phase to observe: the flag flips atomically and the
-    ## fd is freed within the same close call, so a mid-teardown state would never
-    ## be seen by any reader.
+    ## Teardown state for a `Conn`, checked by a parked `sslRead` to tell an error
+    ## caused by our OWN teardown apart from a genuine peer/protocol fault.
+    ## `shutdownConn` flips `csOpen -> csShutdown` before shutting the socket down to
+    ## wake a parked read (h2 mux close, keepalive death, GOAWAY grace, connect
+    ## timeout); `close`/`closeSync` then set `csClosed` and free the fd. A read that
+    ## wakes to a decrypt error (SSL_ERROR_SSL on the truncated record our SHUT_RDWR
+    ## leaves) after we initiated teardown must NOT raise: a failed asyncdispatch
+    ## future orphans its injected stack trace at process exit (a valgrind leak), and
+    ## the error is expected teardown noise, not peer corruption. So sslRead returns a
+    ## clean EOF once state is past csOpen, and only raises a genuine decrypt error
+    ## seen while the connection is still fully open.
     csOpen
+    csShutdown
     csClosed
   Conn* = object
     fd: AsyncFD
@@ -179,8 +184,16 @@ when defined(ssl):
         else:
           result.setLen(0); return
       of SSL_ERROR_SSL:
-        # A real protocol/decrypt error: surface it rather than masking a corrupt
-        # stream as a silent truncation.
+        # A decrypt/protocol error. When WE initiated teardown (shutdownConn flipped
+        # the state past csOpen and SHUT_RDWR the socket under this parked read), the
+        # next SSL_read decrypts the truncated final record and reports SSL_ERROR_SSL:
+        # expected teardown noise, not peer corruption. Return a clean EOF -- raising
+        # here fails the read future with an injected stack trace that the h2 reader's
+        # teardown path then leaves orphaned at process exit (a definite valgrind leak,
+        # 21 blocks in the streamdown/up/sse cells). A genuine mid-stream decrypt error
+        # on a still-open connection (state == csOpen) is still surfaced as before.
+        if not c.state.isNil and c.state[] != csOpen:
+          result.setLen(0); return
         raise newException(IOError, "navi: TLS read failed")
       else: result.setLen(0); return   # any other code -> treat as EOF
 
@@ -471,8 +484,12 @@ proc shutdownConn*(c: Conn) =
   ## with EOF/error. Used to wake the h2 mux's background reader on client close so
   ## it exits its loop (and does the real close itself) instead of being left
   ## suspended on a closed fd, which would crash at process teardown. Does not free
-  ## anything; `close`/`closeSync` still run afterward.
+  ## anything; `close`/`closeSync` still run afterward. Flags `csShutdown` first so a
+  ## parked sslRead woken by the shutdown treats the decrypt error on our truncated
+  ## final record as clean EOF (teardown noise) rather than raising a failed future
+  ## whose stack trace would be orphaned at exit; the SSL itself is still valid here.
   if c.fd == invalidFd: return
+  if not c.state.isNil and c.state[] == csOpen: c.state[] = csShutdown
   when defined(windows):
     discard winlean.shutdown(c.fd.SocketHandle, 2)          # SD_BOTH
   else:
