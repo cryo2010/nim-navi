@@ -192,7 +192,23 @@ proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
       s.handle = nil
       if not s.reconnect: return none(SseEvent)
       continue
-    s.parser.feed(chunk)
+    # A maxSseEventBytes breach raises straight out of `next`. Dispose the handle
+    # first: the parse state is unusable and the caller is left holding a stream it
+    # cannot resume, so leaving the connection open leaks a socket (and, on h2, a
+    # mux slot). The error is carried out of the `except` rather than awaited inside
+    # it, since `await` in an exception handler is not portable across the two async
+    # backends.
+    var feedErr: ref CatchableError = nil
+    try:
+      s.parser.feed(chunk)
+    except CatchableError as e:
+      feedErr = e
+    if feedErr != nil:
+      if s.handle != nil:
+        try: await s.handle.close()
+        except CatchableError: discard
+        s.handle = nil
+      raise feedErr
 
 template each*(s: SseStream; ev, body: untyped): untyped =
   ## Consume events until the stream ends, binding `ev` to each `SseEvent`. A real

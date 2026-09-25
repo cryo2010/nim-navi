@@ -568,7 +568,16 @@ proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
       s.haveConn = false
       if not s.reconnect: return none(SseEvent)
       continue
-    s.parser.feed(chunk)
+    try:
+      s.parser.feed(chunk)
+    except CatchableError:
+      # A maxSseEventBytes breach raises straight out of `next`. Abort the body
+      # first: the parse state is unusable and the caller cannot resume the stream,
+      # so leaving it live just holds the runtime's connection open.
+      if s.haveConn:
+        abortBody(s.controller)
+        s.haveConn = false
+      raise
 
 template each*(s: SseStream; ev, body: untyped): untyped =
   ## Consume events until the stream ends, binding `ev` to each `SseEvent`. A real
