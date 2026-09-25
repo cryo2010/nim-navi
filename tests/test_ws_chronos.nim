@@ -144,6 +144,27 @@ suite "chronos websocket lifecycle guards (#289)":
     joinThread(th)
     check rejected == 3
 
+  test "receive should report a codeless close as 1005 and echo no code (#244)":
+    # RFC 6455 7.1.5: an absent status code surfaces as 1005, not 1000. 7.4.1: 1005 is
+    # reserved for local use, so the close echo must go out with an empty body.
+    var th: Thread[WsSrv]
+    var port: int
+    var echoed = "<unset>"
+    startWsCodelessClose(th, port, echoed)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("go")                      # triggers the server's codeless close
+      let m = await ws.receive()
+      await ws.close(m.closeCode)              # mirroring it back stays a no-op
+      result = $m.kind & ":" & $m.closeCode & ":" & m.data
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == $wmClose & ":" & $closeNoStatus & ":"
+    check echoed == ""                         # empty body on the wire: no 1005 sent
+
   test "close should accept a reserved code once the socket is already closed":
     # `receive` reports 1006 on an abrupt EOF and 1005 for a codeless close, so a
     # caller mirroring `m.closeCode` back on teardown must not blow up: the codes

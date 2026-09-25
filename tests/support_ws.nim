@@ -23,6 +23,7 @@ type WsSrv* = object
   ready: ptr bool
   portOut: ptr int
   sawEof: ptr bool     ## optional: set to whether the client tore the transport down
+  echoBody: ptr string ## optional: set to the body of the client's close echo
   closeBody: ptr string  ## optional: the payload of the close frame the client sent back
 
 proc wsBind(ctx: WsSrv): Socket =
@@ -246,6 +247,36 @@ proc serveWsMisbehave(ctx: WsSrv) {.thread.} =
                 if ctx.closeBody != nil: ctx.closeBody[] = rf.payload
         except CatchableError: discard             # timeout: the client kept it open
 
+proc serveWsCodelessClose(ctx: WsSrv) {.thread.} =
+  ## Handshake, then answer the client's first frame with a close frame carrying NO
+  ## status code (an empty body, explicitly legal per RFC 6455 5.5.1), and record the
+  ## body of the client's close echo in `echoBody`. The echo must be empty too: the
+  ## client reports the close as 1005, but 1005 is reserved for local use and must
+  ## never go on the wire (7.4.1), so it may not be written into the reply.
+  wsAcceptOne(ctx, server, c):
+    if wsHandshake(c):
+      var dec: WsDecoder
+      var f: Frame
+      var alive = true
+      while alive and not dec.next(f):
+        let chunk = c.recv(4096)
+        if chunk.len == 0: alive = false
+        else: dec.feed(chunk)
+      if alive:
+        c.send(encodeFrame(opClose, "", masked = false))   # no status code at all
+        var echoed = "<no close echo>"
+        try:
+          var g: Frame
+          var got = false
+          while true:
+            if dec.next(g): got = true; break
+            let chunk = c.recv(4096, timeout = 1500)       # bounded: never hang the suite
+            if chunk.len == 0: break
+            dec.feed(chunk)
+          if got and g.opcode == opClose: echoed = g.payload
+        except CatchableError: discard                     # timeout: treat as no echo
+        if ctx.echoBody != nil: ctx.echoBody[] = echoed
+
 proc startWs(th: var Thread[WsSrv], run: proc(ctx: WsSrv) {.thread.}, port: var int) =
   ## Launch a WS server on an ephemeral port, write it to `port` (a mutable `var`),
   ## and block until it is listening.
@@ -258,6 +289,14 @@ proc startWsSilent*(th: var Thread[WsSrv], port: var int) = startWs(th, serveWsS
 proc startWsStall*(th: var Thread[WsSrv], port: var int) = startWs(th, serveWsStall, port)
 proc startWsPingCounter*(th: var Thread[WsSrv], port: var int) = startWs(th, serveWsPingCounter, port)
 proc startWsStreamEcho*(th: var Thread[WsSrv], port: var int) = startWs(th, serveWsStreamEcho, port)
+
+proc startWsCodelessClose*(th: var Thread[WsSrv], port: var int, echoBody: var string) =
+  ## The codeless-close server, plus the string it records the client's close echo
+  ## into (see serveWsCodelessClose).
+  var ready = false
+  createThread(th, serveWsCodelessClose,
+               WsSrv(ready: addr ready, portOut: addr port, echoBody: addr echoBody))
+  while not ready: sleep(1)
 
 proc startWsMisbehave*(th: var Thread[WsSrv], port: var int, sawEof: var bool) =
   ## The misbehaving server, plus the teardown flag it reports (see serveWsMisbehave).

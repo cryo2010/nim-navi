@@ -508,6 +508,27 @@ suite "websocket lifecycle guards (#289)":
     ws.close()                                 # a valid code still works
     joinThread(th)
 
+  test "receive should report a codeless close as 1005 and echo no code (#244)":
+    # RFC 6455 7.1.5: a close frame with no status code must surface as 1005 ("no
+    # status received"), never as an explicit 1000, or an application cannot tell a
+    # codeless close from a normal one. 7.4.1: 1005 is reserved for local use, so the
+    # close echo the client sends back must carry an empty body, not the code 1005.
+    var th: Thread[WsSrv]
+    var port: int
+    var echoed = "<unset>"
+    startWsCodelessClose(th, port, echoed)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("go")                              # triggers the server's codeless close
+    let m = ws.receive()
+    check m.kind == wmClose
+    check m.closeCode == closeNoStatus         # 1005, not closeNormal
+    check m.data == ""
+    ws.close(m.closeCode)                      # mirroring it back stays a no-op
+    joinThread(th)
+    check echoed == ""                         # empty body on the wire: no 1005 sent
+
   test "close should accept a reserved code once the socket is already closed":
     # `receive` reports 1006 on an abrupt EOF and 1005 for a codeless close, so a
     # caller mirroring `m.closeCode` back on teardown must not blow up: the codes

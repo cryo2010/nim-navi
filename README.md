@@ -934,6 +934,22 @@ is the payload (or the reason on a close); `closeCode` is set on `wmClose`. navi
 answers pings automatically and reassembles fragmented messages, so `receive` always
 yields a whole message. Middleware does not apply to `websocket()`.
 
+`closeCode` reports what the peer actually sent, following RFC 6455 7.1.5, and two of
+its values never appear on the wire:
+
+| `closeCode` | meaning |
+| --- | --- |
+| the peer's code | the close frame carried a status code (`closeNormal` = 1000, `closeGoingAway` = 1001, ...) |
+| `closeNoStatus` (1005) | the close frame carried **no** status code, which is legal and distinct from an explicit 1000 |
+| `closeAbnormal` (1006) | the transport ended with no close frame at all |
+
+The same codes surface on the streaming path (`WsReader.closeCode`) and on `navi/js`.
+Because 1005 and 1006 are reserved for local use they are never written into a close
+frame: navi's echo of a codeless close is itself a close frame with an empty body, and
+`close(code)` rejects 1005/1006/1015 while a frame would still go out. Mirroring a
+received code back on teardown (`ws.close(msg.closeCode)`) is a safe no-op: the socket
+is already closed by then, so nothing is sent.
+
 Pass `maxMessageBytes` to bound a reassembled message; a peer can otherwise grow a
 single message without limit via continuation frames. When a message exceeds the cap,
 `receive` closes the connection with code 1009 (Message Too Big) and raises
