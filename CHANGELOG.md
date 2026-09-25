@@ -68,6 +68,20 @@ onward (pre-1.0, minor versions may include breaking changes).
   trailers ride the last write, so a chatty producer no longer costs one write and
   one TLS record per chunk. Chunks at or above the threshold are written directly
   (#299).
+- **The HTTP/1.1 response parser holds at most one read of body bytes, and shifts
+  its parse buffer less.** Chunk data is emitted as it arrives instead of being
+  buffered whole, so a server that declares one multi-megabyte chunk no longer parks
+  that chunk in the parser and the response size cap can fire mid-chunk; the
+  consumed prefix is reclaimed in place (and only once the shift pays for itself)
+  rather than by rebuilding the buffer on every read; and body bytes are appended
+  straight out of the parse buffer with no slice temporary. A chunk whose data is not
+  followed by CRLF is still rejected before the response can complete, so the
+  connection is never pooled (#244).
+- **A small buffered upload leaves with the request head in one write.** A body up
+  to 16 KiB (one TLS record) is packed with the head, so the common small request
+  costs one write and one TLS record instead of two; a larger body is still written
+  separately and never copied to prepend the head. Streamed chunk sizes are written
+  into the output buffer directly, without a formatted temporary per chunk (#244).
 - **BREAKING: the request `body` is now type-dispatched, and the `json`,
   `multipart`, and `bodyStream` parameters are removed (no deprecation).** The
   `body` argument of `request`/`post`/`put`/`patch` dispatches on its type: a
