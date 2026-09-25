@@ -68,6 +68,8 @@ const
     ## Reject a single incoming frame larger than this (64 MiB). A 64-bit length
     ## with its high bit set (RFC 6455 5.2 forbids it) would otherwise become a
     ## negative `int` that slips past the bounds check and crashes `newString`.
+  frameLenError = "navi: WebSocket frame length is invalid or exceeds the " &
+    $maxFramePayload & "-byte limit"
 
 # --- opening handshake ---
 
@@ -178,15 +180,22 @@ proc next*(d: var WsDecoder, f: var Frame): bool =
     pos = 4
   elif length == 127:
     if d.buf.len < 10: return false
-    length = 0
-    for i in 2 ..< 10: length = (length shl 8) or ord(d.buf[i])
+    # Accumulate the 64-bit length into an explicit uint64 and cap it before
+    # narrowing. `int` is only 32 bits on some targets (32-bit natives, and the
+    # js backend), where shifting the eight bytes into an `int` silently drops
+    # the high word: 0x0000_0001_0000_0005 would arrive as 5 and let the peer
+    # under-declare a frame. uint64 also keeps a high-bit-set length (RFC 6455
+    # 5.2 forbids it) from turning into a negative `int`.
+    var len64 = 0'u64
+    for i in 2 ..< 10: len64 = (len64 shl 8) or uint64(ord(d.buf[i]))
+    if len64 > uint64(maxFramePayload):
+      raise newException(ValueError, frameLenError)
+    length = int(len64)
     pos = 10
-  # A negative length (64-bit high bit set) or an oversized one must fail the
-  # connection, not reach `newString(length)` (a RangeDefect / huge allocation).
+  # An oversized length must fail the connection, not reach `newString(length)`
+  # (a RangeDefect / huge allocation).
   if length < 0 or length > maxFramePayload:
-    raise newException(ValueError,
-      "navi: WebSocket frame length is invalid or exceeds the " &
-      $maxFramePayload & "-byte limit")
+    raise newException(ValueError, frameLenError)
   var key: array[4, byte]
   if masked:
     if d.buf.len < pos + 4: return false

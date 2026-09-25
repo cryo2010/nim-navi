@@ -89,6 +89,20 @@ suite "websocket frame codec":
     except ValueError as e: msg = e.msg
     check "invalid or exceeds" in msg
 
+  test "the frame codec should reject a 64-bit length whose high word is set (#285)":
+    # 0x0000_0001_0000_0005: well under the 63-bit limit, so the high-bit guard
+    # never sees it, but the low 32 bits are a plausible 5. Accumulating into a
+    # 32-bit `int` truncated it to 5 and let a 4 GiB frame through as a 5-byte
+    # one; the length must be carried in a uint64 and rejected against the cap.
+    var d: WsDecoder
+    d.feed("\x82\x7f\x00\x00\x00\x01\x00\x00\x00\x05" & "hello")
+    var f: Frame
+    var msg = ""
+    try:
+      discard d.next(f)
+    except ValueError as e: msg = e.msg
+    check "invalid or exceeds" in msg
+
 suite "websocket close":
   test "the close payload should carry the big-endian code then the reason":
     let p = closePayload(closeNormal, "bye")
