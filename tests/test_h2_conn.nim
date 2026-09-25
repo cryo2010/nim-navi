@@ -666,6 +666,94 @@ suite "h2 streamed upload framing":
     check c.sendDrained(sid)
     check endStreamCount(out1 & out3) == 1
 
+  test "a chunk over the peer max frame size should split into max-size DATA frames":
+    let c = newServerConn()
+    let sid = c.openStream()
+    discard c.encodeRequestHead(sid, head)
+    let chunk = repeat("z", 40_000)                  # fits the window, not one frame
+    let wire = c.queueSend(sid, chunk)
+    check wire == dataFrames(sid, chunk)             # 16384 + 16384 + 7232
+    check allFrames(wire).len == 3
+    check c.sendDrained(sid)
+
+  test "a peer-announced max frame size should split streamed chunks at that size":
+    let c = initH2Conn()
+    discard c.feed(encodeSettings([(settingsMaxFrameSize, 20_000'u32)]))
+    let sid = c.openStream()
+    discard c.encodeRequestHead(sid, head)
+    let chunk = repeat("m", 45_000)                  # fits the window, not one frame
+    check c.queueSend(sid, chunk) == dataFrames(sid, chunk, mfs = 20_000)
+
+  test "a chunk that outruns the window should send the window now and the rest on credit":
+    let c = newServerConn()
+    let sid = c.openStream()
+    discard c.encodeRequestHead(sid, head)
+    let chunk = repeat("w", 200_000)                 # 3x the 65535 default window
+    let out1 = c.queueSend(sid, chunk)
+    check out1 == dataFrames(sid, chunk[0 ..< 65535])
+    check not c.sendDrained(sid)
+    let out2 = c.feed(encodeWindowUpdate(sid, 50_000) & encodeWindowUpdate(0, 50_000))
+    check out2 == dataFrames(sid, chunk[65535 ..< 115_535])
+    check c.finishSend(sid) == ""                    # still windowed out
+    let out3 = c.feed(encodeWindowUpdate(sid, 200_000) & encodeWindowUpdate(0, 200_000))
+    check out3 == dataFrames(sid, chunk[115_535 .. ^1], endStream = true)
+    check c.sendDrained(sid)
+    check endStreamCount(out1 & out2 & out3) == 1    # END_STREAM on the final frame only
+
+  test "a final chunk that fits should carry END_STREAM on its own last DATA frame":
+    let c = newServerConn()
+    let sid = c.openStream()
+    discard c.encodeRequestHead(sid, head)
+    # Park the body behind an exhausted window, close it, then release: END_STREAM
+    # has to ride the last DATA frame of the tail, not a separate empty frame.
+    let body = repeat("f", 70_000)
+    let out1 = c.queueSend(sid, body)
+    discard c.finishSend(sid)
+    let out2 = c.feed(encodeWindowUpdate(sid, 100_000) & encodeWindowUpdate(0, 100_000))
+    check out2 == dataFrames(sid, body[65535 .. ^1], endStream = true)
+    check dataBytes(out1 & out2) == body.len         # no empty trailing DATA frame
+    check lastFrameEndsStream(out2)
+
+  test "a streamed body with trailers should end on the trailing HEADERS, not on DATA":
+    let c = newServerConn()
+    let sid = c.openStream()
+    var wire = c.encodeRequestHead(sid, head)
+    let body = repeat("t", 20_000)
+    wire.add c.queueSend(sid, body)
+    wire.add c.finishSend(sid, @[("x-checksum", "abc")])
+    let fs = allFrames(wire)
+    check fs.len >= 3
+    check fs[0].typ == uint8(ftHeaders)
+    var sent = ""
+    for f in fs[1 ..< fs.len - 1]:
+      check f.typ == uint8(ftData)
+      check (f.flags and flagEndStream) == 0         # END_STREAM belongs to the trailers
+      sent.add f.payload
+    check sent == body
+    check fs[^1].typ == uint8(ftHeaders)
+    check (fs[^1].flags and flagEndStream) != 0
+    check endStreamCount(wire) == 1
+
+  test "trailers should follow a window-blocked tail once the window reopens":
+    let c = newServerConn()
+    let sid = c.openStream()
+    let sid2 = c.openStream()                        # a second stream must not confuse it
+    discard c.encodeRequestHead(sid, head)
+    let body = repeat("u", 70_000)
+    let out1 = c.queueSend(sid, body)
+    check dataBytes(out1) == 65535
+    discard c.finishSend(sid, @[("x-checksum", "def")])
+    let out2 = c.feed(encodeWindowUpdate(sid, 100_000) & encodeWindowUpdate(0, 100_000))
+    let fs = allFrames(out2)
+    check fs[0].typ == uint8(ftData)
+    check (fs[0].flags and flagEndStream) == 0
+    check fs[0].payload == body[65535 .. ^1]
+    check fs[^1].typ == uint8(ftHeaders)
+    check fs[^1].streamId == sid
+    check (fs[^1].flags and flagEndStream) != 0
+    check endStreamCount(out1 & out2) == 1
+    check c.sendDrained(sid2)                        # untouched by the flush
+
 suite "h2 incremental response body":
   # The engine drains the body per feed via takeBody (bounded memory) instead of
   # buffering the whole response, decoding content-encoding as chunks arrive.
