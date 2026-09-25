@@ -133,6 +133,25 @@ suite "sse parser":
     p.feed("data\ndata: y\n\n")       # "data" alone -> empty string in the buffer
     check p.drain()[0].data == "\ny"
 
+  test "an id promoted by dispatch should survive a reconnect (#290)":
+    # `id:` only fills a buffer; the persistent resume id moves at dispatch. A
+    # partial event still being received when the connection drops must not
+    # advance it, or the reconnect resumes past events that were never delivered.
+    var p = initSseParser()
+    p.feed("data: 1\nid: 7\n\n")
+    discard p.drain()
+    p.feed("id: 9\ndata: partial")        # no blank line: never dispatched
+    p.reset()                             # the drop
+    check p.lastEventId() == "7"          # not the un-dispatched 9
+
+  test "an id line with no data should still move the resume id (#290)":
+    # Promotion happens before the empty-data early return, so a server can
+    # checkpoint with a bare `id:` event that dispatches nothing.
+    var p = initSseParser()
+    p.feed("id: 5\n\n")
+    check p.drain().len == 0              # nothing dispatched: no data
+    check p.lastEventId() == "5"
+
   test "reset should drop a partial event but keep the resume id":
     var p = initSseParser()
     p.feed("data: 1\nid: 7\n\n")

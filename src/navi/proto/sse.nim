@@ -8,8 +8,11 @@
 ##
 ## The `id` on an event is the persistent "last event id" (it survives across
 ## dispatches until a new `id:` changes it), which is what a reconnect resends as
-## `Last-Event-ID`. `reset` clears the per-connection parse state but keeps that id
-## and the retry, for use across a reconnect.
+## `Last-Event-ID`. Per the spec an `id:` line only fills a buffer; that buffer is
+## promoted to the persistent id when the event is dispatched (the blank line), so a
+## partial event cut off before its blank line never advances the resume point.
+## `reset` clears the per-connection parse state but keeps that id and the retry,
+## for use across a reconnect.
 
 import std/[deques, strutils, options]
 
@@ -36,6 +39,8 @@ type
     data: string             ## current event's data, `data:` lines joined with "\n"
     hasData: bool            ## whether any `data:` line was seen (fires even if empty)
     dataBytes: int           ## running size of `data`, to bound one event
+    idBuf: string            ## last event id buffer: what `id:` fills, promoted to
+                             ## `lastId` only at dispatch
     lastId: string           ## persistent last event id (survives dispatch)
     retry: int               ## last `retry:` value seen, or -1
     atStart: bool            ## until the first byte, to strip a leading BOM
@@ -43,11 +48,18 @@ type
 proc initSseParser*(lastEventId = ""): SseParser =
   ## A fresh parser. `lastEventId` seeds the resume id (for a stream opened with a
   ## caller-supplied Last-Event-ID).
-  SseParser(retry: -1, atStart: true, lastId: lastEventId)
+  SseParser(retry: -1, atStart: true, idBuf: lastEventId, lastId: lastEventId)
 
 proc dispatch(p: var SseParser) =
   ## End of an event (a blank line). Fire it only if it accumulated data; either
   ## way reset the per-event buffers. The last-id buffer persists across events.
+  ##
+  ## Promoting the id buffer is the first step, ahead of the no-data early return:
+  ## an `id:` line with no `data:` still moves the resume point (so a server can
+  ## checkpoint without sending a payload), while an event still being received when
+  ## the connection drops never reaches here and so cannot advance it -- which is
+  ## what keeps a reconnect from skipping the events it never saw.
+  p.lastId = p.idBuf
   if not p.hasData:
     p.evType.setLen(0)
     return
@@ -79,7 +91,7 @@ proc processLine(p: var SseParser, line: string) =
       raise newException(ValueError,
         "navi: SSE event exceeds the " & $maxSseEventBytes & "-byte limit")
   of "id":
-    if '\0' notin val: p.lastId = val        # an id containing NUL is ignored
+    if '\0' notin val: p.idBuf = val         # an id containing NUL is ignored
   of "retry":
     # All-digit but possibly out of int range; ignore an unparseable value rather
     # than crash the stream.
@@ -146,5 +158,6 @@ proc reset*(p: var SseParser) =
   p.data.setLen(0)
   p.hasData = false
   p.dataBytes = 0
+  p.idBuf = p.lastId        # roll back an id from the discarded partial event
   p.ready.clear()
   p.atStart = true
