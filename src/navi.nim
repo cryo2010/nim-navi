@@ -220,6 +220,9 @@ proc transport(client: Navi, req: Request, sink: BodySink,
           # `QuicError` is provably pre-submit (nothing reached the server) and may
           # fall back for any method, while a `QuicSubmittedError` (the request was
           # already on the wire) may only be re-sent when the method is idempotent.
+          # A streamed body (`bodyStream`) narrows the submitted case further (#293):
+          # its producer may already have been pulled, so only a replayable (buffered)
+          # body may be handed to h2/h1.
           if not mayFallBackFromH3(req, e of QuicSubmittedError): raise
           # fall through to the h2/h1 transport below
   result = poolTransport(client, req, sink, nil, userSink, gate)

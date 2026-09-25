@@ -78,3 +78,27 @@ suite "HTTP/3 fall-back discipline (#378)":
     check mayFallBackFromH3(plain(DELETE), submitted = true)
     check not mayFallBackFromH3(plain(POST), submitted = true)
     check not mayFallBackFromH3(plain(PATCH), submitted = true)
+
+suite "HTTP/3 fall-back with a streamed upload (#293)":
+  proc streamed(verb: HttpVerb): Request =
+    var r = Request(verb: verb, headers: initHeaders())
+    r.bodyStream = proc(): string = ""
+    r.hasStreamedBody = true
+    r
+
+  test "a pre-submit failure may still fall back: the producer was never pulled":
+    check mayFallBackFromH3(streamed(PUT), submitted = false)
+    check mayFallBackFromH3(streamed(POST), submitted = false)
+
+  test "a submitted streamed upload never falls back, even when idempotent":
+    # The h3 data reader pulls `bodyStream` as soon as the stream is submitted, so
+    # the producer may be spent; replaying it over h2/h1 would upload a truncated
+    # body. Matches the retry loop / digest / redirect guards.
+    check not mayFallBackFromH3(streamed(PUT), submitted = true)
+    check not mayFallBackFromH3(streamed(GET), submitted = true)
+
+  test "an async producer (hasStreamedBody, no bodyStream) is guarded too":
+    var r = Request(verb: PUT, headers: initHeaders())
+    r.hasStreamedBody = true
+    check not mayFallBackFromH3(r, submitted = true)
+    check mayFallBackFromH3(r, submitted = false)

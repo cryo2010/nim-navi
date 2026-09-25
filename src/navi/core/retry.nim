@@ -72,8 +72,15 @@ proc mayFallBackFromH3*(req: Request, submitted: bool): bool =
   ## server may have processed the request before the stream or connection died -- so
   ## only an idempotent method may be re-sent, the same discipline the h1/h2
   ## fall-through applies via `replayableAfterError` (RFC 9110 9.2.2, issue #378).
+  ##
+  ## A streamed body is bound to the same split (issue #293): the h3 leg pulls
+  ## `bodyStream` from the C data reader as soon as the stream is submitted, so a
+  ## submitted-then-failed attempt may have spent the producer and replaying it over
+  ## h2/h1 would upload a truncated body. `isReplayable` therefore gates the submitted
+  ## case, exactly as it does in the retry loop, `maybeDigest` and `followRedirects`;
+  ## a pre-submit failure never invoked the producer, so it still falls back freely.
   if not submitted: return true
-  isIdempotent(req.verb)
+  isReplayable(req) and isIdempotent(req.verb)
 
 proc shouldRetryAfterError*(attempt: int; bodyReplayable, replayableAnyMethod: bool;
                             verb: HttpVerb; policy: RetryPolicy): bool =

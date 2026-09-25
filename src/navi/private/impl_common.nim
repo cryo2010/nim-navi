@@ -634,7 +634,9 @@ proc transport(client: Navi, req: Request, sink: BodySink,
           # (never connected / stream never opened), so nothing reached the server and
           # any method may fall back; a `QuicSubmittedError` means the request was on
           # the wire when it failed, so the server may have processed it and only an
-          # idempotent method may be re-sent. Anything else propagates.
+          # idempotent method may be re-sent. A streamed body narrows that further
+          # (#293): once the stream is submitted the producer may have been pulled, so
+          # only a replayable (buffered) body may go to h2/h1. Anything else propagates.
           if not mayFallBackFromH3(rq, e of QuicSubmittedError): raise
           # fall through to h2/h1 below (rq is buffered by now)
   result = await transportInner(client, rq, sink, producer, userSink, gate)
