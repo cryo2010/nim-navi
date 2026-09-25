@@ -116,11 +116,27 @@ template sendRequest(conn, req: typed; asyncStream: typed = nil) =
     framed.add(finalChunk(req))
     await sendAll(conn, framed)
   else:
-    # Send the head and body separately rather than `serializeHead(req) & req.body`,
-    # which would allocate a whole (head + body)-sized buffer and copy the entire
-    # upload just to prepend a ~200-byte head (repeated on every retry/redirect).
-    await sendAll(conn, serializeHead(req))
-    if req.body.len > 0:
+    # Buffered body. Two competing costs: `serializeHead(req) & req.body` copies the
+    # entire upload just to prepend a ~200-byte head (again on every retry and
+    # redirect hop), while sending head and body as two writes costs an extra syscall
+    # and, under TLS, an extra record with its own header and MAC -- and an extra TCP
+    # segment, since every backend sets TCP_NODELAY (sync/asyncdispatch set the socket
+    # option, chronos connects with SocketFlags.TcpNoDelay), so nothing coalesces the
+    # two writes for us. Neither stalls (NODELAY means no Nagle wait for the peer's
+    # ACK), but the small-request case is the common one, so pick per body size:
+    # bodies up to one write buffer are packed with the head into a single write (a
+    # bounded, cheap copy, the same trade the streamed-upload path makes in
+    # `coalesceChunk`), larger ones go out as two writes and are never copied.
+    let head = serializeHead(req)
+    if req.body.len == 0:
+      await sendAll(conn, head)
+    elif req.body.len <= h1CoalesceSize:
+      var whole = newStringOfCap(head.len + req.body.len)
+      whole.add head
+      whole.add req.body
+      await sendAll(conn, whole)
+    else:
+      await sendAll(conn, head)
       await sendAll(conn, req.body)
 
 template h1SendAndReadHeaders*(transport, req, streaming: typed;
