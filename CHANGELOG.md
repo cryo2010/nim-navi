@@ -171,8 +171,12 @@ onward (pre-1.0, minor versions may include breaking changes).
   1000-1014/3000-4999), or a non-UTF-8 reason surfaced as a clean `wmClose` and was
   echoed back to the peer verbatim. They now run the same checks `receive` does --
   one shared `ws.parseClose` -- and fail the connection with 1002 before raising.
-  A synthetic EOF (no close frame at all) is still reported as 1006, never
-  validated or echoed.
+  A masked server frame (RFC 6455 5.1) is rejected on the streaming path too, as
+  `receive` already did through `offer(rejectMasked = true)`, so a masked close can
+  no longer be echoed back either; and a `WsReader` whose message was cut short by a
+  rejected close reports `closeCode == closeProtocolError`, the code the connection
+  was failed with. A synthetic EOF (no close frame at all) is still reported as
+  1006, never validated or echoed (#283).
 - **WebSocket driver hygiene:** `send`/`ping` on a closed socket raise a clear
   `IOError` instead of poking a torn-down transport; `close(code)` rejects the
   reserved codes 1005/1006/1015; the keepalive-death path drops its stale pending

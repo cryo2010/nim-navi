@@ -307,7 +307,8 @@ type
     kind*: WsMessageKind
     closeCode*: uint16       ## set when `kind` is wmClose, or when a close ends the
                              ## stream early: the peer's code, 1005 when it sent none,
-                             ## 1006 when the transport just ended (as `receive`)
+                             ## 1006 when the transport just ended (as `receive`), and
+                             ## 1002 when a protocol error failed the connection
     first: string
     hasFirst: bool
     done: bool
@@ -343,6 +344,12 @@ proc readDataFrame(ws: WebSocket): Future[tuple[f: Frame, eof: bool]] {.async.} 
         # close handlers only send while `open`, which EOF just cleared).
         return (Frame(fin: true, opcode: opClose, payload: closePayload(closeAbnormal)), true)
       ws.dec.feed(chunk)
+    # RFC 6455 5.1: a server-to-client frame must never be masked. `receive` rejects
+    # one through `offer(rejectMasked = true)`; the streaming path checks it here so
+    # a masked frame cannot slip past (a masked close would otherwise be echoed back).
+    if f.masked:
+      await ws.failClose(closeProtocolError)
+      raise newException(ValueError, "navi: masked WebSocket frame received from server")
     case f.opcode
     of opPing: await ws.sendRaw(encodeFrame(opPong, f.payload)); continue
     of opPong: continue
@@ -402,6 +409,16 @@ proc checkTextUtf8(r: WsReader, chunk: string): Future[void] {.async.} =
     await r.ws.failClose(closeProtocolError)
     raise newException(ValueError, "navi: invalid UTF-8 in a WebSocket text message")
 
+proc protocolFailed(r: WsReader) =
+  ## Record that a protocol error ended this stream. Every rejection on the reading
+  ## path fails the connection with 1002, so the reader is left done and reporting
+  ## that code whichever check rejected the peer: a close with a bad body or code
+  ## and a masked close (rejected a step earlier, in `readDataFrame`, before the
+  ## frame ever reaches the close handling) read identically to a caller that
+  ## inspects the reader after catching.
+  r.done = true
+  r.closeCode = closeProtocolError
+
 proc readChunk*(r: WsReader): Future[string] {.async.} =
   ## The next chunk of the streamed message (one frame's payload), or "" at its end.
   if r.hasFirst:
@@ -409,7 +426,13 @@ proc readChunk*(r: WsReader): Future[string] {.async.} =
     await r.checkTextUtf8(r.first)
     return r.first
   if r.done: return ""
-  let (f, eof) = await r.ws.readDataFrame()
+  var nxt: tuple[f: Frame, eof: bool]
+  try:
+    nxt = await r.ws.readDataFrame()
+  except ValueError:         # a masked or otherwise malformed frame: failed with 1002
+    r.protocolFailed()
+    raise
+  let (f, eof) = nxt
   case f.opcode
   of opContinuation:
     r.done = f.fin
@@ -417,7 +440,11 @@ proc readChunk*(r: WsReader): Future[string] {.async.} =
     return f.payload
   of opClose:                # a close interrupted the message: truncate and drop
     r.done = true
-    r.closeCode = await r.ws.closeFromPeer(f, eof)  # validated, 1005/1006 as in `receive`
+    try:
+      r.closeCode = await r.ws.closeFromPeer(f, eof)  # validated, as in `receive`
+    except ValueError:
+      r.protocolFailed()
+      raise
     return ""
   else:
     await r.ws.failClose(closeProtocolError)   # tear down, don't just raise (#284)

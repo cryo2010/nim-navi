@@ -349,17 +349,21 @@ suite "async websocket streaming desync teardown (#284)":
 suite "async websocket streaming close validation (RFC 6455 5.5.1 / 7.4)":
   # The streaming reader used to take the peer's close frame on trust: an invalid
   # body surfaced as a clean `wmClose` and was echoed back verbatim. It now runs
-  # the same checks `receive` does, and a bad frame fails the connection (1002).
-  test "stream() should fail the connection on a close code that may not be sent":
+  # the same checks `receive` does, and a bad frame fails the connection with a
+  # 1002 close of its own instead of mirroring the malformed one back (#283).
+  template badCloseAtOpen(trigger: string) =
+    ## Drive `stream()` straight onto the bad close `trigger` produces, and assert
+    ## the client answered 1002 and tore the transport down.
     var th: Thread[WsSrv]
     var port: int
     var sawEof = false
-    startWsMisbehave(th, port, sawEof)
+    var reply = ""
+    startWsMisbehaveClose(th, port, sawEof, reply)
 
     proc run(): Future[string] {.async.} =
       let api = newNavi()
       let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
-      await ws.send("closebad")                # close frame carrying 1006
+      await ws.send(trigger)
       try:
         discard await ws.stream()
         result = "no error"
@@ -369,51 +373,58 @@ suite "async websocket streaming close validation (RFC 6455 5.5.1 / 7.4)":
     let outcome = waitFor run()
     joinThread(th)
     check outcome == "raised:ValueError"
-    check sawEof                               # torn down, not leaked
+    check reply == closePayload(closeProtocolError)   # 1002, not the frame echoed
+    check sawEof                                      # torn down, not leaked
 
-  test "stream() should fail the connection on a 1-byte close payload":
+  template badCloseMidMessage(trigger: string) =
+    ## The same, for a bad close that interrupts a message already being streamed.
     var th: Thread[WsSrv]
     var port: int
     var sawEof = false
-    startWsMisbehave(th, port, sawEof)
+    var reply = ""
+    startWsMisbehaveClose(th, port, sawEof, reply)
 
     proc run(): Future[string] {.async.} =
       let api = newNavi()
       let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
-      await ws.send("closeshort")
-      try:
-        discard await ws.stream()
-        result = "no error"
-      except ValueError as e:
-        result = "raised:" & $e.name
-
-    let outcome = waitFor run()
-    joinThread(th)
-    check outcome == "raised:ValueError"
-    check sawEof
-
-  test "readChunk should fail the connection on an invalid close mid-message":
-    var th: Thread[WsSrv]
-    var port: int
-    var sawEof = false
-    startWsMisbehave(th, port, sawEof)
-
-    proc run(): Future[string] {.async.} =
-      let api = newNavi()
-      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
-      await ws.send("midclosebad")
+      await ws.send(trigger)
       let r = await ws.stream()
       result = await r.readChunk()             # the opening fragment
       try:
-        discard await r.readChunk()            # close with a reserved code
+        discard await r.readChunk()            # the bad close
         result.add "|no error"
       except ValueError as e:
         result.add "|raised:" & $e.name
+      result.add "|" & $r.closeCode            # what `receive` would report too
 
     let outcome = waitFor run()
     joinThread(th)
-    check outcome == "aa|raised:ValueError"
+    check outcome == "aa|raised:ValueError|" & $closeProtocolError
+    check reply == closePayload(closeProtocolError)
     check sawEof
+
+  test "stream() should answer a close code that may not be sent with 1002":
+    badCloseAtOpen("closebad")                 # close frame carrying 1006
+
+  test "stream() should answer a 1-byte close payload with 1002":
+    badCloseAtOpen("closeshort")
+
+  test "stream() should answer a close with an invalid-UTF-8 reason with 1002":
+    badCloseAtOpen("closeutf8")
+
+  test "stream() should answer a masked close frame with 1002":
+    badCloseAtOpen("closemasked")              # RFC 6455 5.1: never masked
+
+  test "readChunk should answer an invalid close code mid-message with 1002":
+    badCloseMidMessage("midclosebad")
+
+  test "readChunk should answer an invalid-UTF-8 close reason mid-message with 1002":
+    badCloseMidMessage("midcloseutf8")
+
+  test "readChunk should answer a masked close mid-message with 1002":
+    # Rejected a step earlier than the others (in `readDataFrame`, before the close
+    # handling), so this pins that the reader still reports 1002 like the rest.
+    badCloseMidMessage("midclosemasked")
 
   test "a valid close mid-message should still end the stream with its code":
     var th: Thread[WsSrv]

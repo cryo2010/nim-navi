@@ -23,6 +23,7 @@ type WsSrv* = object
   ready: ptr bool
   portOut: ptr int
   sawEof: ptr bool     ## optional: set to whether the client tore the transport down
+  closeBody: ptr string  ## optional: the payload of the close frame the client sent back
 
 proc wsBind(ctx: WsSrv): Socket =
   ## Ephemeral loopback listener; report the bound port, then mark ready.
@@ -212,17 +213,37 @@ proc serveWsMisbehave(ctx: WsSrv) {.thread.} =
       of "midcloseok":    # a valid close interrupts a streamed message
         c.send(encodeFrame(opText, "aa", masked = false, fin = false))
         c.send(encodeFrame(opClose, closePayload(closeGoingAway, "later"), masked = false))
+      of "closeutf8":     # RFC 6455 8.1: a close reason must be valid UTF-8
+        c.send(encodeFrame(opClose, closePayload(closeNormal, "\xff"), masked = false))
+      of "midcloseutf8":  # the same bad reason, interrupting a streamed message
+        c.send(encodeFrame(opText, "aa", masked = false, fin = false))
+        c.send(encodeFrame(opClose, closePayload(closeNormal, "\xff"), masked = false))
+      of "closemasked":   # RFC 6455 5.1: a server frame must not be masked
+        c.send(encodeFrame(opClose, closePayload(closeNormal), masked = true))
+      of "midclosemasked":  # the same masked close, interrupting a streamed message
+        c.send(encodeFrame(opText, "aa", masked = false, fin = false))
+        c.send(encodeFrame(opClose, closePayload(closeNormal), masked = true))
       of "eofnow":        # drop the transport with no close frame (abnormal closure)
         discard           # wsAcceptOne closes the socket on the way out
       else: discard
-      if ctx.sawEof != nil and cmd != "eofnow":
-        ctx.sawEof[] = false
+      if (ctx.sawEof != nil or ctx.closeBody != nil) and cmd != "eofnow":
+        if ctx.sawEof != nil: ctx.sawEof[] = false
+        # Decode what the client sends back so a test can assert on its close frame
+        # (a protocol error must answer 1002, never echo the bad frame).
+        var back: WsDecoder
+        var gotClose = false
         try:
           while true:
             let b = c.recv(4096, timeout = 1500)   # bounded: never hang the suite
             if b.len == 0:
-              ctx.sawEof[] = true
+              if ctx.sawEof != nil: ctx.sawEof[] = true
               break
+            back.feed(b)
+            var rf: Frame
+            while back.next(rf):
+              if rf.opcode == opClose and not gotClose:
+                gotClose = true
+                if ctx.closeBody != nil: ctx.closeBody[] = rf.payload
         except CatchableError: discard             # timeout: the client kept it open
 
 proc startWs(th: var Thread[WsSrv], run: proc(ctx: WsSrv) {.thread.}, port: var int) =
@@ -243,4 +264,15 @@ proc startWsMisbehave*(th: var Thread[WsSrv], port: var int, sawEof: var bool) =
   var ready = false
   createThread(th, serveWsMisbehave,
                WsSrv(ready: addr ready, portOut: addr port, sawEof: addr sawEof))
+  while not ready: sleep(1)
+
+proc startWsMisbehaveClose*(th: var Thread[WsSrv], port: var int, sawEof: var bool,
+                            closeBody: var string) =
+  ## The misbehaving server, reporting both the teardown flag and the payload of the
+  ## close frame the client answered with, so a test can tell a 1002 protocol-error
+  ## close from an echo of the peer's own bad frame.
+  var ready = false
+  createThread(th, serveWsMisbehave,
+               WsSrv(ready: addr ready, portOut: addr port, sawEof: addr sawEof,
+                     closeBody: addr closeBody))
   while not ready: sleep(1)
