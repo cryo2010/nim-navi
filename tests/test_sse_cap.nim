@@ -62,7 +62,7 @@ proc runFloodSse(arg: tuple[sendTimeoutMs: int, tag: string]) {.thread.} =
                   "Connection: close\r\n\r\n")
       let dataLine = "data: " & repeat('x', LinePayload) & "\n"
       for i in 0 ..< LineCount:
-        client.send(dataLine)
+        client.send(dataLine, flags = {})
         if i mod 32 == 0 or i == LineCount - 1: diag(tag & "sent line " & $i)
       diag(tag & "all lines sent")
     except CatchableError as e:
@@ -72,11 +72,11 @@ proc runFloodSse(arg: tuple[sendTimeoutMs: int, tag: string]) {.thread.} =
     diag(tag & "done")
 
 suite "sync SSE size cap (#292) [diag round 2]":
-  test "A: navi client, server send timeout 3s":
+  test "A: navi client, flood sent with flags = {}":
     diag("A cli: start")
     portChan.open()
     var th: Thread[(int, string)]
-    createThread(th, runFloodSse, (3000, "A"))
+    createThread(th, runFloodSse, (0, "A"))
     let port = portChan.recv()
     let api = newNavi()
     let s = api.sse("http://127.0.0.1:" & $port & "/events",
