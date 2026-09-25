@@ -14,6 +14,48 @@ suite "websocket handshake":
     check base64.decode(genKey()).len == 16
     check genKey() != genKey()
 
+suite "websocket handshake response validation (RFC 6455 4.1)":
+  const clientKey = "dGhlIHNhbXBsZSBub25jZQ=="
+
+  proc head101(fields: string): string =
+    ## A 101 head whose fields are exactly `fields` (each line CRLF-terminated).
+    "HTTP/1.1 101 Switching Protocols\r\n" & fields & "\r\n"
+
+  test "validate101 should accept a 101 with the accept, Upgrade and Connection fields":
+    check validate101(head101(
+      "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
+      "Sec-WebSocket-Accept: " & acceptFor(clientKey) & "\r\n"), clientKey)
+
+  test "validate101 should reject a 101 with a correct accept but no Upgrade (#286)":
+    check not validate101(head101(
+      "Connection: Upgrade\r\n" &
+      "Sec-WebSocket-Accept: " & acceptFor(clientKey) & "\r\n"), clientKey)
+
+  test "validate101 should reject a 101 with a correct accept but no Connection (#286)":
+    check not validate101(head101(
+      "Upgrade: websocket\r\n" &
+      "Sec-WebSocket-Accept: " & acceptFor(clientKey) & "\r\n"), clientKey)
+
+  test "validate101 should accept Connection: keep-alive, Upgrade (#286)":
+    check validate101(head101(
+      "Upgrade: WebSocket\r\nConnection: keep-alive, Upgrade\r\n" &
+      "Sec-WebSocket-Accept: " & acceptFor(clientKey) & "\r\n"), clientKey)
+
+  test "validate101 should reject an Upgrade naming another protocol (#286)":
+    check not validate101(head101(
+      "Upgrade: h2c\r\nConnection: Upgrade\r\n" &
+      "Sec-WebSocket-Accept: " & acceptFor(clientKey) & "\r\n"), clientKey)
+
+  test "validate101 should reject a mismatched Sec-WebSocket-Accept":
+    check not validate101(head101(
+      "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
+      "Sec-WebSocket-Accept: " & acceptFor("other") & "\r\n"), clientKey)
+
+  test "validate101 should reject a non-101 status":
+    check not validate101("HTTP/1.1 200 OK\r\nUpgrade: websocket\r\n" &
+      "Connection: Upgrade\r\nSec-WebSocket-Accept: " & acceptFor(clientKey) &
+      "\r\n\r\n", clientKey)
+
 suite "websocket frame codec":
   test "the frame codec should encode the masked Hello example (RFC 6455 5.7)":
     let wire = encodeFrame(opText, "Hello", masked = true,

@@ -398,13 +398,36 @@ proc upgradeRequest*(u: Url, key: string, extra: Headers): string =
   for (k, v) in extra.pairs: result.add(k & ": " & v & "\r\n")
   result.add("\r\n")
 
+proc hasToken(value, token: string): bool =
+  ## True when the comma-separated list `value` carries `token` (case-insensitive,
+  ## surrounding whitespace ignored). RFC 9110 5.6.1 list syntax, as used by the
+  ## `Upgrade` and `Connection` fields of the opening handshake.
+  for part in value.split(','):
+    if cmpIgnoreCase(part.strip(), token) == 0: return true
+  false
+
 proc validate101*(responseHead, key: string): bool =
-  ## True when `responseHead` (the status line + headers) is a 101 whose
-  ## Sec-WebSocket-Accept matches `key`.
+  ## True when `responseHead` (the status line + headers) completes the opening
+  ## handshake (RFC 6455 4.1): a 101 status, a Sec-WebSocket-Accept matching
+  ## `key`, an `Upgrade` field carrying the `websocket` token, and a `Connection`
+  ## field carrying the `upgrade` token. All three field checks are
+  ## case-insensitive.
+  ##
+  ## The Upgrade/Connection tokens are not decoration: without them a proxy or
+  ## origin that answers 101 for some other protocol (or replays a cached
+  ## response) would hand the client a stream it then parses as WebSocket frames.
   let lines = responseHead.splitLines
   if lines.len == 0 or not lines[0].startsWith("HTTP/1.1 101"): return false
+  var acceptOk = false
+  var upgradeOk = false
+  var connectionOk = false
   for line in lines[1 .. ^1]:
     let (name, value, ok) = parseHeaderLine(line)
-    if ok and cmpIgnoreCase(name, "sec-websocket-accept") == 0:
-      return value == acceptFor(key)
-  false
+    if not ok: continue
+    if cmpIgnoreCase(name, "sec-websocket-accept") == 0:
+      acceptOk = value == acceptFor(key)
+    elif cmpIgnoreCase(name, "upgrade") == 0:
+      if value.hasToken("websocket"): upgradeOk = true
+    elif cmpIgnoreCase(name, "connection") == 0:
+      if value.hasToken("upgrade"): connectionOk = true
+  acceptOk and upgradeOk and connectionOk
