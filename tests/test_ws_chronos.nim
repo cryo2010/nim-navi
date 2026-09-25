@@ -152,6 +152,53 @@ suite "chronos websocket protocol-error teardown (#281)":
     check outcome == "raised:ValueError"
     check sawEof
 
+suite "chronos websocket streaming desync teardown (#284)":
+  # The streaming read path desyncs on the same protocol errors, and only `drain`
+  # used to tear down: a direct readChunk/stream() left the transport alive.
+  test "stream() should fail the connection when a message starts with a continuation":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("orphan")
+      try:
+        discard await ws.stream()
+        result = "no error"
+      except IOError as e:
+        result = "raised:" & $e.name
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == "raised:IOError"
+    check sawEof
+
+  test "readChunk should fail the connection on a data frame where a continuation is due":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("datamid")
+      let r = await ws.stream()
+      result = await r.readChunk()             # the opening fragment
+      try:
+        discard await r.readChunk()            # a new text frame, not a continuation
+        result.add "|no error"
+      except IOError as e:
+        result.add "|raised:" & $e.name
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == "aa|raised:IOError"
+    check sawEof
+
 import navi/core/response as resp   # ProtocolError
 
 suite "WebSocket transport selection (chronos)":

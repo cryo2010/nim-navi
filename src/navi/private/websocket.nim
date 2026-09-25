@@ -435,7 +435,14 @@ proc readDataFrame(ws: WebSocket): Frame =
   ## the way; keepalive applies (via `kaRecv`). A transport EOF yields a close frame.
   while true:
     var f: Frame
-    while not ws.dec.next(f):
+    var got = false
+    while not got:
+      try:                                     # a malformed frame fails the
+        got = ws.dec.next(f)                   # connection (see receive)
+      except ValueError:
+        ws.failClose(closeProtocolError)
+        raise
+      if got: break
       let chunk = ws.kaRecv()
       if chunk.len == 0:
         ws.open = false
@@ -472,6 +479,9 @@ proc openStreamReader(ws: WebSocket): WsReader =
     result.done = true
     ws.closeOnFrame(f)
   else:
+    # A desync is a protocol error like any other: fail the connection (1002)
+    # rather than leaving the transport open behind the raise (#284).
+    ws.failClose(closeProtocolError)
     raise newException(IOError, "navi: WebSocket message started with a continuation frame")
 
 proc readChunk*(r: WsReader): string =
@@ -490,6 +500,7 @@ proc readChunk*(r: WsReader): string =
     r.ws.closeOnFrame(f)
     return ""
   else:
+    r.ws.failClose(closeProtocolError)         # tear down, don't just raise (#284)
     raise newException(IOError, "navi: expected a continuation frame mid-message")
 
 proc drain*(r: WsReader, sink: BodySink) =

@@ -191,6 +191,11 @@ proc serveWsMisbehave(ctx: WsSrv) {.thread.} =
         c.send(encodeFrame(opText, "nope", masked = true))
       of "badutf8":       # RFC 6455 8.1: a text message must be valid UTF-8
         c.send(encodeFrame(opText, "\xff\xfe", masked = false))
+      of "orphan":        # RFC 6455 5.4: a continuation with no message open
+        c.send(encodeFrame(opContinuation, "x", masked = false, fin = true))
+      of "datamid":       # RFC 6455 5.4: a data frame where a continuation is due
+        c.send(encodeFrame(opText, "aa", masked = false, fin = false))
+        c.send(encodeFrame(opText, "bb", masked = false, fin = true))
       else: discard
       if ctx.sawEof != nil:
         ctx.sawEof[] = false

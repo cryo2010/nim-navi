@@ -457,6 +457,41 @@ suite "websocket protocol-error teardown (#281)":
     check sawEof
     ws.close()
 
+suite "websocket streaming desync teardown (#284)":
+  # The streaming read path desyncs on the same protocol errors, and only `drain`
+  # used to tear down: a direct readChunk/stream() left the transport alive.
+  test "stream() should fail the connection when a message starts with a continuation":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("orphan")
+    expect IOError:
+      discard ws.stream()
+    joinThread(th)
+    check sawEof
+    ws.close()
+
+  test "readChunk should fail the connection on a data frame where a continuation is due":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("datamid")
+    let r = ws.stream()
+    check r.readChunk() == "aa"                # the opening fragment
+    expect IOError:
+      discard r.readChunk()                    # a new text frame, not a continuation
+    joinThread(th)
+    check sawEof
+    ws.close()
+
 suite "websocket keepalive":
   test "receive should raise TimeoutError when keepalive gets no response":
     var th: Thread[WsSrv]
