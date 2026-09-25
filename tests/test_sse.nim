@@ -128,6 +128,28 @@ suite "sse parser":
     p.feed("\xBFdata: y\n\n")
     check p.drain()[0].data == "y"
 
+  test "a short first feed that is not a BOM is preserved (#244)":
+    # The other half of the fragmented-start rule: holding back on a 1-2 byte first
+    # feed must not eat those bytes when they turn out not to be a BOM. A stream that
+    # opens with a one-byte read still parses its first field.
+    var p = initSseParser()
+    p.feed("d")                        # 1 byte: cannot decide yet
+    p.feed("a")                        # 2 bytes: still cannot decide
+    p.feed("ta: x\n\n")
+    check p.drain()[0].data == "x"
+
+  test "a first feed that shares a prefix with the BOM is preserved (#244)":
+    # EF BB followed by anything but BF is not a BOM, so both bytes stay in the
+    # stream -- here as the start of a (harmlessly ignored) unknown field name,
+    # which proves they were not dropped: the real event that follows still fires.
+    var p = initSseParser()
+    p.feed("\xEF\xBB")
+    p.feed("field: v\ndata: z\n\n")
+    let ev = p.drain()
+    check ev.len == 1
+    check ev[0].data == "z"
+    check ev[0].event == "message"     # "\xEF\xBBfield" is not "event": still default
+
   test "a data field with no value should contribute an empty line":
     var p = initSseParser()
     p.feed("data\ndata: y\n\n")       # "data" alone -> empty string in the buffer
