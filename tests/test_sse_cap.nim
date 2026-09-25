@@ -1,10 +1,23 @@
-## DIAGNOSTIC COPY (ci/diag-sse-cap-windows): the #292 sync SSE cap test with
-## timestamped progress written to $SSE_CAP_DIAG from both threads, so a Windows
-## hang can be located. Not for merge.
+## DIAGNOSTIC COPY (ci/diag-sse-cap-windows), round 2. Not for merge.
+## A: navi client against a server whose sends carry a 3 s timeout.
+## B: raw std/net client (reads ~16.8 MB then closes) against a server with no
+##    send timeout: hangs => Winsock does not wake a blocked send on peer reset.
 import unittest
-import std/[net, options, strutils, os, times, locks]
+import std/[net, options, strutils, os, times, locks, nativesockets]
 import navi
 import navi/proto/sse   # maxSseEventBytes
+
+when defined(windows):
+  from std/winlean import SOL_SOCKET
+  var SO_SNDTIMEO {.importc, header: "winsock2.h".}: cint
+  proc setSendTimeout(s: Socket, ms: int) =
+    setSockOptInt(s.getFd, SOL_SOCKET.int, SO_SNDTIMEO.int, ms)   # win: DWORD ms
+else:
+  import std/posix
+  proc setSendTimeout(s: Socket, ms: int) =
+    var tv = Timeval(tv_sec: posix.Time(ms div 1000),
+                     tv_usec: Suseconds((ms mod 1000) * 1000))
+    discard setsockopt(s.getFd, SOL_SOCKET, SO_SNDTIMEO, addr tv, SockLen(sizeof tv))
 
 var diagLock: Lock
 initLock(diagLock)
@@ -24,24 +37,25 @@ const
   LinePayload = 64 * 1024
   LineCount = maxSseEventBytes div LinePayload + 8
 
-proc runFloodSse() {.thread.} =
+proc runFloodSse(arg: tuple[sendTimeoutMs: int, tag: string]) {.thread.} =
   {.cast(gcsafe).}:
-    diag("srv: start")
+    let tag = arg.tag & " srv: "
+    diag(tag & "start")
     var srv = newSocket()
     srv.setSockOpt(OptReuseAddr, true)
     srv.bindAddr(Port(0), "127.0.0.1")
     srv.listen()
     portChan.send(srv.getLocalAddr()[1].int)
-    diag("srv: listening")
     var client: Socket
     srv.accept(client)
-    diag("srv: accepted")
+    if arg.sendTimeoutMs > 0: client.setSendTimeout(arg.sendTimeoutMs)
+    diag(tag & "accepted")
     var line = ""
     while true:
       line = ""
       client.readLine(line, timeout = 2000)
       if line.len == 0 or line == "\c\l": break
-    diag("srv: request headers drained")
+    diag(tag & "request headers drained")
     try:
       client.send("HTTP/1.1 200 OK\r\n" &
                   "Content-Type: text/event-stream\r\n" &
@@ -49,41 +63,57 @@ proc runFloodSse() {.thread.} =
       let dataLine = "data: " & repeat('x', LinePayload) & "\n"
       for i in 0 ..< LineCount:
         client.send(dataLine)
-        if i mod 16 == 0 or i == LineCount - 1: diag("srv: sent line " & $i)
-      diag("srv: all lines sent")
+        if i mod 32 == 0 or i == LineCount - 1: diag(tag & "sent line " & $i)
+      diag(tag & "all lines sent")
     except CatchableError as e:
-      diag("srv: send raised " & $e.name & ": " & e.msg)
+      diag(tag & "send raised " & $e.name & ": " & e.msg)
     try: client.close() except CatchableError: discard
-    diag("srv: client closed")
     try: srv.close() except CatchableError: discard
-    diag("srv: done")
+    diag(tag & "done")
 
-suite "sync SSE size cap (#292) [diag]":
-  test "a feed() cap breach should close the underlying handle, not just raise":
-    diag("cli: start")
+suite "sync SSE size cap (#292) [diag round 2]":
+  test "A: navi client, server send timeout 3s":
+    diag("A cli: start")
     portChan.open()
-    var th: Thread[void]
-    createThread(th, runFloodSse)
+    var th: Thread[(int, string)]
+    createThread(th, runFloodSse, (3000, "A"))
     let port = portChan.recv()
-    diag("cli: port " & $port)
     let api = newNavi()
     let s = api.sse("http://127.0.0.1:" & $port & "/events",
                     reconnect = false, idleTimeoutMs = 10_000)
-    diag("cli: sse opened, httpVersion=" & s.httpVersion())
     var msg = ""
     try:
       discard s.next()
     except ValueError as e:
       msg = e.msg
-    diag("cli: next() -> " & msg)
+    diag("A cli: next() -> " & msg)
     check "limit" in msg
-    diag("cli: httpVersion=" & s.httpVersion())
     check s.httpVersion() == ""
-    let n2 = s.next()
-    diag("cli: second next() isNone=" & $n2.isNone)
-    check n2.isNone
+    check s.next().isNone
     s.close()
-    diag("cli: closed; joining")
+    diag("A cli: closed; joining")
     joinThread(th)
-    diag("cli: joined")
+    diag("A cli: joined")
+    portChan.close()
+
+  test "B: raw client reads 16.8 MB then closes, server has no send timeout":
+    diag("B cli: start")
+    portChan.open()
+    var th: Thread[(int, string)]
+    createThread(th, runFloodSse, (0, "B"))
+    let port = portChan.recv()
+    var c = newSocket()
+    c.connect("127.0.0.1", Port(port))
+    c.send("GET /events HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+    var got = 0
+    while got < 16_800_000:
+      let chunk = c.recv(65536, timeout = 10_000)
+      if chunk.len == 0: break
+      got += chunk.len
+    diag("B cli: read " & $got & " bytes; closing")
+    c.close()
+    diag("B cli: closed; joining")
+    joinThread(th)
+    diag("B cli: joined")
+    check got >= 16_800_000
     portChan.close()
