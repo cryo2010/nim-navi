@@ -429,7 +429,7 @@ func main() {
 
 	host := envStr("NAVI_HOST", "127.0.0.1")
 	basePort := envInt("NAVI_BASE_PORT", 9443)
-	servers := envInt("NAVI_SERVERS", 5)
+	servers := envInt("NAVI_SERVER_COUNT", 5)
 	if servers < 1 {
 		servers = 1
 	}

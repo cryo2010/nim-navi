@@ -31,7 +31,7 @@ verify a SHA-1 and fail hard on mismatch.
 | `NAVI_CLIENT` | `all` | navi client: `sync` \| `asyncdispatch` \| `chronos` \| `js` \| `all` |
 | `NAVI_THREADS` | (cores) | navi native clients run this many client THREADS in one process (one event loop per thread; one navi client per thread; total concurrency split across them; throughput merged in-process). Set `1` for single-thread. (`NAVI_PROCS` is a legacy alias.) |
 | `NAVI_LANGS` | `all` | reference langs to include: `all` \| `navi` \| `go` \| `rust` \| `node` \| `python` \| `std` (csv) |
-| `NAVI_SERVERS` | `5` | fast Go server instances; clients round-robin across them |
+| `NAVI_SERVER_COUNT` | `5` | fast Go server instances; clients round-robin across them |
 | `NAVI_SECONDS` | `20` | measured window per cell |
 | `NAVI_WARMUP_SECONDS` | `2` | unmeasured warmup before the window |
 | `NAVI_MODE` | `pooled` | `pooled` (reuse connections) \| `cold` (fresh connection per request) |

@@ -14,7 +14,7 @@ here="$root/tests/stress"
 workload="${NAVI_WORKLOAD:-requests}"
 proto="${NAVI_PROTO:-h2}"
 client="${NAVI_CLIENT:-all}"
-servers="${NAVI_SERVERS:-5}"
+servers="${NAVI_SERVER_COUNT:-5}"
 host="${NAVI_HOST:-127.0.0.1}"
 base_port="${NAVI_BASE_PORT:-9443}"
 
@@ -246,7 +246,7 @@ case "$workload" in
 esac
 
 export NAVI_CERT="$cert" NAVI_HOST="$host" NAVI_BASE_PORT="$base_port"
-export NAVI_WORKLOAD="$workload" NAVI_SERVERS="$servers"
+export NAVI_WORKLOAD="$workload" NAVI_SERVER_COUNT="$servers"
 export PYTHONPATH="$here/server"          # so hypercorn finds app.py as `app`
 cd "$here/server"
 

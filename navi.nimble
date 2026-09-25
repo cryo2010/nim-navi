@@ -89,7 +89,7 @@ proc runStress(workload: string) =
   let image = if h3: "navi-stress-h3" else: "navi-stress"
   exec "docker build -f " & dockerfile & " -t " & image & " ."
   exec "docker run --rm -e NAVI_WORKLOAD=" & workload &
-       " -e NAVI_PROTO -e NAVI_CLIENT -e NAVI_SERVERS" &
+       " -e NAVI_PROTO -e NAVI_CLIENT -e NAVI_SERVER_COUNT" &
        " -e NAVI_SECONDS -e NAVI_CLIENT_COUNT -e NAVI_CONCURRENCY" &
        " -e NAVI_REQ_COMPRESSION -e NAVI_RESP_COMPRESSION -e NAVI_CONTENT_TYPES" &
        " -e NAVI_STREAM_BYTES -e NAVI_REPORT_SECONDS -e NAVI_LOG_ERRORS" &
@@ -221,7 +221,7 @@ proc runBench(workload: string) =
   let netem = if getEnv("NAVI_NETEM", "0") == "1": "--cap-add=NET_ADMIN " else: ""
   exec "docker build -f " & dockerfile & " -t " & image & " ."
   exec "docker run --rm " & netem & "-e NAVI_WORKLOAD=" & workload &
-       " -e NAVI_PROTO -e NAVI_CLIENT -e NAVI_LANGS -e NAVI_SERVERS" &
+       " -e NAVI_PROTO -e NAVI_CLIENT -e NAVI_LANGS -e NAVI_SERVER_COUNT" &
        " -e NAVI_THREADS -e NAVI_PROCS" &
        " -e NAVI_SECONDS -e NAVI_WARMUP_SECONDS -e NAVI_MODE -e NAVI_CLIENT_COUNT" &
        " -e NAVI_CONCURRENCY -e NAVI_REQ_COMPRESSION -e NAVI_RESP_COMPRESSION" &

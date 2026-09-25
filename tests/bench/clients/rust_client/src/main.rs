@@ -114,7 +114,7 @@ fn main() {
 async fn run(proto: String, workload: String) {
     let host = env_str("NAVI_HOST", "127.0.0.1");
     let base_port: u16 = env_parse("NAVI_BASE_PORT", 9443);
-    let servers: usize = env_parse("NAVI_SERVERS", 5);
+    let servers: usize = env_parse("NAVI_SERVER_COUNT", 5);
     let clients: usize = env_parse("NAVI_CLIENT_COUNT", 3);
     let concurrency: usize = env_parse("NAVI_CONCURRENCY", 8);
     let cold = env_str("NAVI_MODE", "pooled") == "cold";

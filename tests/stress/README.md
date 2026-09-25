@@ -24,7 +24,7 @@ checksum and fails hard on any mismatch.
 | --- | --- | --- |
 | `PROTO` | `h2` | `h1` \| `h2` \| `h3` \| `all` (h3 uses the h3 image) |
 | `CLIENT` | `all` | `sync` \| `asyncdispatch` \| `chronos` \| `js` \| `all` |
-| `SERVERS` | `5` | server instances; requests round-robin across them |
+| `SERVER_COUNT` | `5` | server instances; requests round-robin across them |
 | `SECONDS` | `60` | runtime per (client × protocol) cell |
 | `CLIENT_COUNT` | `3` | concurrent navi client instances per cell |
 | `CONCURRENCY` | `8` | in-flight requests per client (async fan-out) |

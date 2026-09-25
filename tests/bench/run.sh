@@ -23,7 +23,7 @@ langs="${NAVI_LANGS:-all}"          # reference langs: all|navi|go|rust|node|pyt
 # all-cores comparison with Go/Rust (which also use all cores within one process).
 # Default: the machine's core count. (NAVI_PROCS is honored as a legacy alias.)
 threads="${NAVI_THREADS:-${NAVI_PROCS:-$(nproc 2>/dev/null || echo 1)}}"
-servers="${NAVI_SERVERS:-5}"
+servers="${NAVI_SERVER_COUNT:-5}"
 host="${NAVI_HOST:-127.0.0.1}"
 base_port="${NAVI_BASE_PORT:-9443}"
 
@@ -136,7 +136,7 @@ case "$workload" in
 esac
 
 export NAVI_CERT="$cert" NAVI_HOST="$host" NAVI_BASE_PORT="$base_port"
-export NAVI_WORKLOAD="$workload" NAVI_SERVERS="$servers" NAVI_THREADS="$threads"
+export NAVI_WORKLOAD="$workload" NAVI_SERVER_COUNT="$servers" NAVI_THREADS="$threads"
 
 # The native clients run one navi client per thread in one process. navi's shared
 # process-globals have been hardened for this (the HPACK Huffman table is a const flat

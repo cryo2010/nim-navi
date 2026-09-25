@@ -14,7 +14,7 @@ type
     backend*: string         ## sync|asyncdispatch|chronos|js (label; the binary is the backend)
     host*: string
     basePort*: int           ## first server port; instance i listens on basePort+i
-    servers*: int            ## number of server instances to round-robin
+    servers*: int            ## server instances to round-robin (NAVI_SERVER_COUNT)
     seconds*: float          ## measured duration
     warmupSeconds*: float    ## unmeasured warmup before the timed window
     mode*: string            ## pooled (reuse connections) | cold (fresh conn per request)
@@ -42,7 +42,7 @@ proc loadConfig*(backend: string): Config =
     backend: backend,
     host: getEnv("NAVI_HOST", "127.0.0.1"),
     basePort: getInt("NAVI_BASE_PORT", 9443),
-    servers: max(1, getInt("NAVI_SERVERS", 5)),
+    servers: max(1, getInt("NAVI_SERVER_COUNT", 5)),
     seconds: getFloat("NAVI_SECONDS", 20.0),
     warmupSeconds: getFloat("NAVI_WARMUP_SECONDS", 2.0),
     mode: getEnv("NAVI_MODE", "pooled"),

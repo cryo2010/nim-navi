@@ -369,7 +369,7 @@ honest exit code.
 |------|---------|---------|
 | `NAVI_PROTO` | `h2` | `h1` \| `h2` \| `h3` \| `all`. `all` iterates h1+h2+h3 (and uses the h3 image). `h3`/`all` build the heavier `Dockerfile.h3` (ngtcp2/nghttp3/OpenSSL-3.5 + Caddy) and a `-d:naviHttp3` client |
 | `NAVI_CLIENT` | `all` | `sync` \| `asyncdispatch` \| `chronos` \| `js` \| `all` |
-| `NAVI_SERVERS` | `5` | Number of server instances; requests round-robin across them |
+| `NAVI_SERVER_COUNT` | `5` | Number of server instances; requests round-robin across them |
 | `NAVI_SECONDS` | `60` | Runtime per (client × protocol) cell |
 | `NAVI_CLIENT_COUNT` | `3` | Concurrent navi client instances per cell |
 | `NAVI_CONCURRENCY` | `32` | In-flight requests per client (async fan-out width) |

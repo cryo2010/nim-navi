@@ -83,7 +83,7 @@ async function main() {
 
   const host = envStr('NAVI_HOST', '127.0.0.1');
   const basePort = envInt('NAVI_BASE_PORT', 9443);
-  let servers = envInt('NAVI_SERVERS', 5);
+  let servers = envInt('NAVI_SERVER_COUNT', 5);
   if (servers < 1) servers = 1;
   const seconds = envFloat('NAVI_SECONDS', 20);
   const warmup = envFloat('NAVI_WARMUP_SECONDS', 2);

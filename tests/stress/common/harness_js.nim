@@ -29,7 +29,7 @@ proc loadJsCfg*(): JsCfg =
     host: $envJs("NAVI_HOST", "127.0.0.1"),
     proto: $envJs("NAVI_PROTO", "h2"),
     basePort: envInt("NAVI_BASE_PORT", 9443),
-    servers: max(1, envInt("NAVI_SERVERS", 5)),
+    servers: max(1, envInt("NAVI_SERVER_COUNT", 5)),
     clients: max(1, envInt("NAVI_CLIENT_COUNT", 3)),
     concurrency: max(1, envInt("NAVI_CONCURRENCY", 8)),
     reportSeconds: max(1, envInt("NAVI_REPORT_SECONDS", 60)),

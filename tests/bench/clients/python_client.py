@@ -39,7 +39,7 @@ def env_float(name, default):
 
 HOST = env_str("NAVI_HOST", "127.0.0.1")
 BASE_PORT = env_int("NAVI_BASE_PORT", 9443)
-SERVERS = env_int("NAVI_SERVERS", 5)
+SERVERS = env_int("NAVI_SERVER_COUNT", 5)
 PROTO = env_str("NAVI_PROTO", "h2")
 SECONDS = env_float("NAVI_SECONDS", 20)
 WARMUP_SECONDS = env_float("NAVI_WARMUP_SECONDS", 2)
