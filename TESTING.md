@@ -1,13 +1,13 @@
 # Testing
 
 A registry of every test in navi, what it verifies, and how it runs. navi is an
-HTTP **client** with four backends (sync/OpenSSL, asyncdispatch/OpenSSL,
+HTTP **client** with four interchangeable clients (sync/OpenSSL, asyncdispatch/OpenSSL,
 chronos/OpenSSL, js/fetch), and the tests are organized so a single sans-io core
-is validated once and each backend is validated as a thin adapter over it. Tests
+is validated once and each client is validated as a thin adapter over it. Tests
 fall into six groups:
 
 1. [Default unit + integration suite](#default-suite-nimble-test) (`nimble test`)
-2. [Cross-backend compile checks](#cross-backend-compile-checks)
+2. [Cross-client compile checks](#cross-client-compile-checks)
 3. [Interop suites](#interop-suites) (live servers: openssl / nghttpd / Docker)
 4. [Memory-safety checks](#memory-safety-checks) (leak / valgrind / sanitizers)
 5. [Fuzzing](#fuzzing)
@@ -37,12 +37,12 @@ nimble tlsVersion         # TLS min/max version pinning (needs openssl w/ TLS 1.
 nimble happyEyeballs      # RFC 8305 address racing (needs openssl)
 nimble cipherSuite        # cipher / ciphersuite selection (needs openssl w/ TLS 1.3)
 nimble tlsPinning         # in-memory CA + SPKI pinning + verify callback (needs openssl)
-nimble socks              # SOCKS5 proxy + user/pass auth, all native backends (needs python3)
-nimble unixSocket         # Unix domain socket transport, native backends (needs python3)
+nimble socks              # SOCKS5 proxy + user/pass auth, all native clients (needs python3)
+nimble unixSocket         # Unix domain socket transport, native clients (needs python3)
 nimble servers            # h2 vs nginx / Caddy / h2o (needs Docker + openssl)
 nimble streamConcurrent   # 50x simultaneous streamed up+down over the h2 mux (needs Docker)
 nimble sse                # SSE reconnect + Last-Event-ID resume over the h2 mux (needs Docker)
-nimble httpbin            # full httpbin breadth, 4 backends (needs Docker + openssl)
+nimble httpbin            # full httpbin breadth, 4 clients (needs Docker + openssl)
 nimble chronosCafile      # chronos custom-CA verify (needs openssl + chronos)
 nimble wsjs               # navi/js WebSocket under Node
 nimble jsCookieJar        # navi/js cookie jar under Node
@@ -71,7 +71,7 @@ nimble stress             # short smoke of all five stress workloads
 
 CI runs a Windows leg (`.github/workflows/windows.yml`) alongside the Linux one,
 because navi has Windows-only branches -- the socket layer in the sync and
-asyncdispatch backends, the X509 declarations in `openssl_ctx` (`std/openssl` hides
+asyncdispatch clients, the X509 declarations in `openssl_ctx` (`std/openssl` hides
 its whole X509 block behind `not defined(windows)`), and the codec DLL names -- that
 `ci.yml` never compiles.
 
@@ -99,7 +99,7 @@ What the Windows leg covers, and why each part is there:
 | --- | --- |
 | `test`, `compile` | The Windows-only branches. The suite is plain-TCP, but `openssl_ctx` resolves its dynlib symbols at module init, so a missing or misplaced declaration fails every binary that links it -- at startup, not on first call. |
 | `examples`, `streaming`, `leak` | Real 3 MiB streamed round trips, hash-verified, and heap growth. |
-| `wss` | TLS handshake plus WebSocket framing on each native backend. |
+| `wss` | TLS handshake plus WebSocket framing on each native client. |
 | `interop-tls`, `badssl` | The **certificate-verification** path. `verifyPeer` returns early when verify is off, so nothing else reaches `X509_check_host` / `SSL_get_peer_certificate`. Verified by sabotage: a host check hard-wired to "match" leaves the 350-test suite fully green and is caught only by badssl's wrong-host case. |
 
 Not runnable on a Windows runner, and staying on Linux CI: everything Docker-based
@@ -166,9 +166,9 @@ end-to-end suites drive).
 
 ---
 
-## Cross-backend compile checks
+## Cross-client compile checks
 
-navi's four entries are guarded to different backends, so each must be built the
+navi's four entries are guarded to different clients, so each must be built the
 way its consumers will build it. These jobs are compile-only unless noted.
 
 | Check | CI | Verifies |
@@ -205,29 +205,29 @@ own **`streaming`** matrix job (four separate checks) — see the row below and 
 | `servers.sh` → `servers_{sync,async}.nim` | **yes** (`multiserver`) | h2 client against three unrelated stacks (nginx, Caddy/Go, h2o) over TLS via docker compose, plus the chronos h1+TLS leg; ALPN negotiation and a 256 KiB body (receive flow control) |
 | `streaming_concurrent/` (`nimble streamConcurrent`) | local | Concurrent streaming (navi/asyncdispatch): fires N (default 50, `NAVI_CONCURRENT_N`) simultaneous streamed downloads, then uploads, then a mixed batch, over one h2 connection against the FastAPI server; verifies every transfer by SHA-1 and asserts they all multiplexed onto a single connection (`openedConnections == 1`). Docker compose, one command |
 | `sse/` (`nimble sse`) | **yes** (`SSE reconnect interop`) | SSE reconnection (navi/asyncdispatch): a FastAPI SSE server drops the connection after 3 events per request, so the client must reconnect and resume from Last-Event-ID to receive all 10 events in order over the h2 mux. Also exercises the SSE client shutdown (close joins the mux). Docker compose, one command |
-| `httpbin.sh` → `httpbin_test.nim`, `httpbin_js.nim` | **yes** (`httpbin`) | Full httpbin breadth (every method, bodies, auth, redirects, decompression, cookies) behind Caddy (TLS+h2) across all four backends; also streaming download via `stream()`/`each` on all four and streamed body upload (`body = producer`) on the native backends (buffered on js); offline (never published to the host) |
+| `httpbin.sh` → `httpbin_test.nim`, `httpbin_js.nim` | **yes** (`httpbin`) | Full httpbin breadth (every method, bodies, auth, redirects, decompression, cookies) behind Caddy (TLS+h2) across all four clients; also streaming download via `stream()`/`each` on all four and streamed body upload (`body = producer`) on the native clients (buffered on js); offline (never published to the host) |
 | `badssl.nim` (`badssl.yml`) | **yes** (`badssl TLS conformance`) | Certificate-verification conformance: navi rejects invalid server certs with verification on (the default) and accepts a valid one. Hits badssl.com (network) |
 | `chronos_cafile.sh` → `chronos_cafile.nim` | local | Custom-CA verification for chronos/BearSSL (`TlsConfig.caFile`): a server cert signed by a private CA is verified against that CA (uses a dNSName SAN, which BearSSL matches) |
 | `live.nim` (`live.yml`) | nightly | Real public servers/CDNs (Google, Cloudflare, …) to catch h2/TLS bugs only independent stacks provoke. Network; never a per-PR gate |
 
 ### File streaming
 
-Streaming is verified per **backend × direction**, always by hashing the transfer
+Streaming is verified per **client × direction**, always by hashing the transfer
 against the original. Upload uses a pull-based body producer (`body = producer`); download uses
 the `stream()` handle: `stream(url)` returns a headers-first `StreamResponse`, and
 `each`/`drain` pull the body chunk by chunk.
 
-The download `chunk` is per backend: `string` on the native backends (sync,
+The download `chunk` is per client: `string` on the native clients (sync,
 asyncdispatch, chronos), moved out of navi's read buffer with no copy, and
 `seq[byte]` on js (its bytes come from a JS Uint8Array). The consumer is awaited on
-the async backends, so a slow consumer applies cooperative backpressure: over h2
+the async clients, so a slow consumer applies cooperative backpressure: over h2
 the stream's receive window is only replenished (`ackRecv`) after each chunk is
 taken, so the peer stalls that one stream without blocking the mux reader or the
 other multiplexed streams; over h1 the awaited consumer pauses the read loop. The
 `nghttpd_async` interop asserts a 256 KiB body reaches `each` in **more than one
 call** (incremental, not buffered whole) and that the mux heap stays flat across
 5000 requests (no leak or deadlock in the drain path). Handle lifetime is covered
-per backend: a full drain returns the connection to the pool (and it is reused),
+per client: a full drain returns the connection to the pool (and it is reused),
 and a failed drain closes rather than pools it.
 
 | | `navi` (sync) | `navi/asyncdispatch` | `navi/chronos` | `navi/js` |
@@ -239,11 +239,11 @@ Where each is exercised:
 
 - **Dedicated `streaming` job** (4 checks) — sync, both directions, over http/1.1
   and http/2, asserting the protocol and a 3 MiB hash match (`streaming.sh`).
-- **httpbin job** — download via `stream()`/`each` on all four backends;
-  streamed body upload (`body = producer`) on the three native backends, and buffered on js
+- **httpbin job** — download via `stream()`/`each` on all four clients;
+  streamed body upload (`body = producer`) on the three native clients, and buffered on js
   (`httpbin_test.nim` builds for sync/async/chronos, `httpbin_js.nim` for js).
 - **nghttpd `interop` job** — streamed body upload (`body = producer`) over real h2 on the
-  sync backend and the async mux, plus the incremental `each` drain over the mux.
+  sync client and the async mux, plus the incremental `each` drain over the mux.
 - **Backpressure (sans-io, `test_h2_conn`)** — the flow-control gating an awaited
   `each`/`drain` consumer relies on: a `sinkMode` stream holds its stream
   `WINDOW_UPDATE` past the replenish threshold until `ackRecv` releases it (a normal
@@ -254,7 +254,7 @@ Where each is exercised:
   `test_stream_decompress` decodes a streamed body through `each`.
 
 `navi/js` **buffers** a streamed request body (`body = producer`) (drains the producer, then sends one body):
-`fetch` cannot reliably stream a request body. See the backend matrix in the
+`fetch` cannot reliably stream a request body. See the client matrix in the
 README.
 
 ---
@@ -277,7 +277,7 @@ reference cycle could differ (`arc` does not collect cycles).
 
 `leak.nim`/`leak_valgrind.nim` cover the plain GET path; this matrix drives every
 client surface (h1/h2, streaming up/down, compressed bodies, SSE, WebSocket) on
-every backend and looks for a leak that is specific to a protocol or a teardown
+every client and looks for a leak that is specific to a protocol or a teardown
 path. One `tests/leakcheck/runner.nim` (native) / `js_leak.nim` (js) opens a fresh
 client each iteration, runs one scenario, and tears it down fully; a leak-free
 navi then leaves nothing behind.
@@ -296,7 +296,7 @@ navi then leaves nothing behind.
 Scenario/target coverage follows navi's real capabilities: h2 is TLS+ALPN only, so
 there are no http2-plaintext cells and `chronos` (BearSSL, h1-only) is excluded
 from the pure-h2 GET but still runs the streaming/SSE scenarios over h1+TLS; the js
-backend buffers request bodies and the runtime owns h2, so it has no stream-up or
+client buffers request bodies and the runtime owns h2, so it has no stream-up or
 http2-GET cells. A local FastAPI/Hypercorn server (`tests/leakcheck/server.py`,
 plaintext h1 + TLS h1/h2) serves every scenario. Run one cell locally:
 
@@ -344,7 +344,7 @@ servers** (FastAPI/hypercorn for h1/h2; a Caddy front for h3), distributes reque
 across them, and prints a status-code + RSS report every interval. Responses are
 tallied into a counter and **discarded** (never retained), so memory stays flat over
 a multi-hour soak; the two streaming workloads verify a 1 GiB checksum and **fail
-hard** on any mismatch. The async backends fan out many parallel requests.
+hard** on any mismatch. The async clients fan out many parallel requests.
 
 | Task | Workload |
 |------|----------|
@@ -355,9 +355,9 @@ hard** on any mismatch. The async backends fan out many parallel requests.
 | `nimble stressStreamDownload` | Stream 1 GiB down (`stream()`/`each`, hashed and discarded); the **client** verifies against `x-sha1` and hard-fails on mismatch |
 | `nimble stress` | Short smoke of all five (20 s cells, 64 MiB streams) |
 
-Each task builds one image and runs the **backend × protocol** matrix inside the
-container. The four backends map to `sync` / `asyncdispatch` / `chronos` (one async
-source, built twice) / `js` (Node); a cell whose backend can't do the workload is
+Each task builds one image and runs the **client × protocol** matrix inside the
+container. The four clients map to `sync` / `asyncdispatch` / `chronos` (one async
+source, built twice) / `js` (Node); a cell whose client can't do the workload is
 **skipped with a printed reason** (see gaps below), not silently. `nimble` does not
 propagate a task's exit code (nim-lang/nimble#1802): read the final
 `== <workload>: all cells passed ==` banner, or run the `docker run` directly for an
@@ -368,10 +368,10 @@ honest exit code.
 | Var | Default | Meaning |
 |------|---------|---------|
 | `NAVI_PROTO` | `h2` | `h1` \| `h2` \| `h3` \| `all`. `all` iterates h1+h2+h3 (and uses the h3 image). `h3`/`all` build the heavier `Dockerfile.h3` (ngtcp2/nghttp3/OpenSSL-3.5 + Caddy) and a `-d:naviHttp3` client |
-| `NAVI_BACKEND` | `all` | `sync` \| `asyncdispatch` \| `chronos` \| `js` \| `all` |
+| `NAVI_CLIENT` | `all` | `sync` \| `asyncdispatch` \| `chronos` \| `js` \| `all` |
 | `NAVI_SERVERS` | `5` | Number of server instances; requests round-robin across them |
-| `NAVI_SECONDS` | `60` | Runtime per (backend × protocol) cell |
-| `NAVI_CLIENTS` | `3` | navi clients per backend |
+| `NAVI_SECONDS` | `60` | Runtime per (client × protocol) cell |
+| `NAVI_CLIENTS` | `3` | Concurrent navi client instances per cell |
 | `NAVI_CONCURRENCY` | `32` | In-flight requests per client (async fan-out width) |
 | `NAVI_REQ_COMPRESSION` | `gzip` | Request body encoding: `none` \| `gzip` \| `deflate` (native only) |
 | `NAVI_RESP_COMPRESSION` | `gzip` | Response encoding requested via `x-want-encoding`: `none` \| `gzip` \| `deflate` \| `br` \| `zstd` |
@@ -384,11 +384,11 @@ honest exit code.
 Example — a 10-minute h1/h2/h3 requests soak on chronos, reporting each minute:
 
 ```sh
-NAVI_SECONDS=600 NAVI_PROTO=all NAVI_BACKEND=chronos \
+NAVI_SECONDS=600 NAVI_PROTO=all NAVI_CLIENT=chronos \
   nimble stressRequests
 ```
 
-**Backend/protocol gaps** (skipped with a reason, not run):
+**Client/protocol gaps** (skipped with a reason, not run):
 
 - `js` + `streamUpload` — `fetch` cannot stream a request body (navi/js buffers it,
   which would defeat a 1 GiB soak), so there is no js upload client.

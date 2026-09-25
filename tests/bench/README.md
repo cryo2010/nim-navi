@@ -1,10 +1,10 @@
 # navi benchmarks
 
 Focused, Dockerized, cross-language benchmarks split by **workload** (mirroring
-`tests/stress/`), with protocol, backend, server count, and runtime as configurable
+`tests/stress/`), with protocol, client, server count, and runtime as configurable
 `NAVI_*` dimensions. Each cell runs every applicable client against N fast Go TLS
 servers and prints one ranked table of **throughput + latency percentiles** per
-`(workload, protocol)`: navi's four backends (sync / asyncdispatch / chronos / js)
+`(workload, protocol)`: navi's four clients (sync / asyncdispatch / chronos / js)
 alongside Go, Rust, Node, Python, and Nim `std/httpclient` reference clients.
 
 Clients are **time-boxed** (`NAVI_SECONDS`) after an unmeasured warmup and record
@@ -28,14 +28,14 @@ verify a SHA-1 and fail hard on mismatch.
 | Var | Default | Meaning |
 | --- | --- | --- |
 | `NAVI_PROTO` | `h2` | `h1` \| `h2` \| `h3` \| `all` (h3 is navi-only + needs the h3 image) |
-| `NAVI_BACKEND` | `all` | navi backends: `sync` \| `asyncdispatch` \| `chronos` \| `js` \| `all` |
-| `NAVI_THREADS` | (cores) | navi native backends run this many client THREADS in one process (one event loop per thread; one navi client per thread; total concurrency split across them; throughput merged in-process). Set `1` for single-thread. (`NAVI_PROCS` is a legacy alias.) |
+| `NAVI_CLIENT` | `all` | navi client: `sync` \| `asyncdispatch` \| `chronos` \| `js` \| `all` |
+| `NAVI_THREADS` | (cores) | navi native clients run this many client THREADS in one process (one event loop per thread; one navi client per thread; total concurrency split across them; throughput merged in-process). Set `1` for single-thread. (`NAVI_PROCS` is a legacy alias.) |
 | `NAVI_LANGS` | `all` | reference langs to include: `all` \| `navi` \| `go` \| `rust` \| `node` \| `python` \| `std` (csv) |
 | `NAVI_SERVERS` | `5` | fast Go server instances; clients round-robin across them |
 | `NAVI_SECONDS` | `20` | measured window per cell |
 | `NAVI_WARMUP_SECONDS` | `2` | unmeasured warmup before the window |
 | `NAVI_MODE` | `pooled` | `pooled` (reuse connections) \| `cold` (fresh connection per request) |
-| `NAVI_CLIENTS` | `3` | clients per backend |
+| `NAVI_CLIENTS` | `3` | concurrent navi client instances per cell |
 | `NAVI_CONCURRENCY` | `8` | in-flight ops per client (fan-out width) |
 | `NAVI_STREAM_BYTES` | `1073741824` | bytes per streaming transfer (1 GiB; lower for a smoke) |
 | `NAVI_NETEM` | `0` | `1` adds a lossy-link regime (`tc netem`; needs `--cap-add=NET_ADMIN`, added automatically) |
@@ -50,7 +50,7 @@ verify a SHA-1 and fail hard on mismatch.
 
 ## Fair comparison
 
-navi's async backend is single-threaded (one event loop per core, like Node/asyncio).
+navi's async clients are single-threaded (one event loop per core, like Node/asyncio).
 Two things keep the comparison apples-to-apples with the multi-core Go/Rust clients:
 
 - **Multi-core:** `NAVI_THREADS` (default = cores) runs one navi client per thread in a
@@ -71,7 +71,7 @@ navi's transport is already competitive (its per-transfer latency beats both).
 ## Notes
 
 - Not in CI (Docker + h3 toolchain + multi-minute runs are too heavy). Run manually.
-- The `h3` numbers include the Caddy proxy hop and compare navi backends only.
+- The `h3` numbers include the Caddy proxy hop and compare navi clients only.
 - nimble does not propagate a task's exit code (nim-lang/nimble#1802); read the
   `== <workload>: all cells ran ==` banner / the docker exit code for pass/fail.
 
@@ -79,7 +79,7 @@ navi's transport is already competitive (its per-transfer latency beats both).
 
 ```
 NAVI_PROTO=h2 NAVI_SECONDS=20 nimble benchRequests          # h2 requests, all languages
-NAVI_LANGS=navi NAVI_PROTO=all nimble benchRequests         # navi backends only, h1/h2/h3
+NAVI_LANGS=navi NAVI_PROTO=all nimble benchRequests         # navi clients only, h1/h2/h3
 NAVI_STREAM_BYTES=$((64*1024*1024)) nimble benchStreamDownload
 NAVI_NETEM=1 NAVI_PROTO=all nimble benchRequests            # lossy link: h3 vs h2
 nimble bench                                                # smoke all five (10s cells)

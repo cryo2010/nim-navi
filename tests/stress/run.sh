@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Per-workload stress harness. Stands up N TLS servers (FastAPI via hypercorn for
 # h1/h2; a Caddy front for h3), then builds and runs the workload client for each
-# backend x protocol cell, distributing requests across the servers. Every cell
+# client x protocol cell, distributing requests across the servers. Every cell
 # prints a status+RSS report each interval; the streaming cells verify a 1 GiB
 # checksum and fail hard on mismatch.
 #
@@ -13,7 +13,7 @@ here="$root/tests/stress"
 
 workload="${NAVI_WORKLOAD:-requests}"
 proto="${NAVI_PROTO:-h2}"
-backend="${NAVI_BACKEND:-all}"
+client="${NAVI_CLIENT:-all}"
 servers="${NAVI_SERVERS:-5}"
 host="${NAVI_HOST:-127.0.0.1}"
 base_port="${NAVI_BASE_PORT:-9443}"
@@ -251,18 +251,18 @@ export PYTHONPATH="$here/server"          # so hypercorn finds app.py as `app`
 cd "$here/server"
 
 common="--path:$root/src -d:ssl -d:release --hints:off"
-# The single per-backend binary picks its protocol at runtime, so build it with h3
+# The single per-client binary picks its protocol at runtime, so build it with h3
 # support whenever the run includes an h3 cell (h3 or all); h1/h2 cells just don't
 # use the h3 code. Needs the h3 image's toolchain (nimble stressX selects it).
 { [ "$proto" = "h3" ] || [ "$proto" = "all" ]; } && common="$common -d:naviHttp3"
 
-# Which backends to run (skip those without a client source for this workload).
-case "$backend" in all) backends=(sync asyncdispatch chronos js) ;; *) backends=("$backend") ;; esac
+# Which clients to run (skip those without a source for this workload).
+case "$client" in all) clients=(sync asyncdispatch chronos js) ;; *) clients=("$client") ;; esac
 case "$proto"   in all) protos=(h1 h2 h3) ;; *) protos=("$proto") ;; esac
 
 fail=0
-for be in "${backends[@]}"; do
-  # locate & build this backend's client binary
+for be in "${clients[@]}"; do
+  # locate & build this client's binary
   bin=""
   case "$be" in
     sync)          [ -f "$here/clients/${src}_sync.nim" ] && { bin="$work/${src}_sync"; nim c $common -d:naviStressSync -o:"$bin" "$here/clients/${src}_sync.nim" || fail=1; } ;;
@@ -270,7 +270,7 @@ for be in "${backends[@]}"; do
     chronos)       bin="$work/${src}_ch"; nim c $common -d:useChronos -o:"$bin" "$here/clients/${src}.nim" || fail=1 ;;
     js)            [ -n "$js_src" ] && [ -f "$here/clients/${js_src}.nim" ] && { bin="$work/${js_src}.js"; nim js --path:"$root/src" -d:release --hints:off -o:"$bin" "$here/clients/${js_src}.nim" || fail=1; } ;;
   esac
-  [ -z "$bin" ] && { echo "[$workload $be] skip: no client for this backend/workload"; continue; }
+  [ -z "$bin" ] && { echo "[$workload $be] skip: no source for this client/workload"; continue; }
 
   for pr in "${protos[@]}"; do
     # js/undici has no HTTP/3 (mirrors config.nim skipReason): without this it would
@@ -291,12 +291,12 @@ for be in "${backends[@]}"; do
     # Then the chaos sidecar (canary-first). A start/readiness failure is a cell
     # failure: dump the log, stop everything, move on.
     start_chaos "$pr" || { stop_servers; fail=1; continue; }
-    export NAVI_BACKEND="$be" NAVI_PROTO="$pr"
+    export NAVI_CLIENT="$be" NAVI_PROTO="$pr"
     chaos_tag=""; [ "$chaos" != none ] && chaos_tag=" | chaos=$chaos"
     echo "== stress: $workload | $be | $pr | ${servers} servers${chaos_tag} =="
     # When chaos is on, wrap the cell in coreutils `timeout` as the outermost hang
     # backstop (belt-and-suspenders behind navi's own timeouts and the in-process
-    # watchdog, and the sync backend's only watchdog): NAVI_SECONDS + 180s slack,
+    # watchdog, and the sync client's only watchdog): NAVI_SECONDS + 180s slack,
     # SIGKILL 10s after SIGTERM. A timeout expiry is a failure like any other.
     run_cell() {
       if [ "$chaos" != none ]; then

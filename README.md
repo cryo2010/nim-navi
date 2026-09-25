@@ -179,7 +179,7 @@ Two clients carry caveats:
   BearSSL, reaching full TLS parity: ALPN + HTTP/2, TLS 1.3, cipher selection,
   mTLS, and session resumption. TLS therefore links OpenSSL and requires a
   `-d:ssl` build (plaintext `http` does not). HTTP/3 (opt-in via `-d:naviHttp3`)
-  is available here too, as on the other OpenSSL backends.
+  is available here too, as on the other OpenSSL clients.
 - **`navi/js` runs on `fetch`/`WebSocket`,** so the platform owns connections,
   cookies, redirects, decompression, and TLS; navi keeps request building,
   retries, throw-on-non-2xx, and middleware. Its WebSocket wraps the native one, so
@@ -265,7 +265,7 @@ let api = newNavi(config)
 | `retry.methods` | `set[HttpVerb]` | `{GET, HEAD, PUT, DELETE, OPTIONS}` | Verbs eligible for retry. |
 | `retry.statuses` | `seq[int]` | `@[408, 413, 429, 500, 502, 503, 504]` | Response statuses that trigger a retry. |
 | `throwHttpErrors` | `bool` | `true` | Raise `HttpError` on a non-2xx response. |
-| `unixSocket` | `string` | `""` | Dial this Unix socket path instead of TCP (POSIX; native backends); the URL host is used only for the Host header and TLS SNI. Bypasses proxies. |
+| `unixSocket` | `string` | `""` | Dial this Unix socket path instead of TCP (POSIX; native clients); the URL host is used only for the Host header and TLS SNI. Bypasses proxies. |
 | `timeouts.connect` | `int` | `0` | TCP connect + TLS handshake deadline (ms); `0` disables. |
 | `timeouts.read` | `int` | `0` | Per-read idle deadline (ms); `0` disables. |
 | `timeouts.total` | `int` | `0` | Whole-request deadline including retries/redirects (ms); `0` disables. |
@@ -632,7 +632,7 @@ type), so the same middleware source compiles on all of them.
 #### Included middleware
 
 Ready-made middleware ships under `mw`, imported to **mirror your client import**
-(the middleware type is per-backend, so there is no single universal import):
+(the middleware type is per-client, so there is no single universal import):
 
 | Your client | Middleware import |
 | --- | --- |
@@ -662,7 +662,7 @@ api.config.middleware = @[
 - **`rateLimit(perSec, burst = 0)`** — token bucket; over budget, a request waits
   its turn (async: awaits; sync: blocks). `burst` defaults to `ceil(perSec)`.
 - **`concurrencyLimit(maxInFlight)`** — caps concurrent in-flight requests (native
-  async backends; a no-op on the serial sync client, and omitted on `navi/js`
+  async clients; a no-op on the serial sync client, and omitted on `navi/js`
   where the runtime manages fetch concurrency).
 - **`bearer(token)`**, **`basic(user, pass)`** — set the `Authorization` header.
 
@@ -807,7 +807,7 @@ delivery rule and early-stop semantics are the same either way.
 
 The request `body` is dispatched by type. A `string` is the raw body; a `JsonNode`
 is sent as JSON; a `Multipart` as `multipart/form-data`; a `BodyProducer`, a closure
-`BodyIterator`, or (on the async backends) an async producer (`proc(): Future[string]`)
+`BodyIterator`, or (on the async clients) an async producer (`proc(): Future[string]`)
 streams a chunked upload; and any other value is serialized to JSON via
 `std/jsonutils`. `form` still encodes a urlencoded body and is outranked by a typed
 `body`.
@@ -836,7 +836,7 @@ let it = iterator (): string {.closure.} =
 discard api.request(POST, "https://example.com/upload", body = it)
 ```
 
-On the **async backends** (`navi/asyncdispatch`, `navi/chronos`) `body` also accepts
+On the **async clients** (`navi/asyncdispatch`, `navi/chronos`) `body` also accepts
 an **async producer** (`proc(): Future[string]`): the engine `await`s each call, so
 producing a chunk can itself await. That lets you pipe a streaming download into a
 streaming upload in constant memory, without a thread or buffering the whole body:
@@ -852,7 +852,7 @@ proc pipe() {.async.} =
 
 Like the synchronous `BodyProducer`, an async producer is **not replayable**: a
 request carrying one is sent once and never auto-retried, redirected (307/308), or
-digest-replayed, since its producer cannot rewind. The sync backend rejects an async
+digest-replayed, since its producer cannot rewind. The sync client rejects an async
 producer at compile time (it has no event loop to await it). Two paths buffer instead
 of streaming, awaiting each chunk into a full body before sending: HTTP/3 (its C-side
 body pull is synchronous) and `navi/js` (`fetch` cannot stream a request body), so

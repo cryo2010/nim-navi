@@ -77,7 +77,7 @@ proc runStress(workload: string) =
   # Build the stress image and run one workload, passing every NAVI_* knob
   # through. The h3 image (with the ngtcp2/nghttp3/OpenSSL-3.5 client toolchain +
   # Caddy) is only used when NAVI_PROTO is h3; h1/h2 use the light image.
-  # Backend x protocol are iterated inside the container (run.sh). NB: nimble does
+  # Client x protocol are iterated inside the container (run.sh). NB: nimble does
   # not propagate a task's exit code (nim-lang/nimble#1802), so a failure shows in
   # the output but this exits 0 -- run the docker command directly, or read the
   # final "== <workload>: all cells passed ==" banner, for CI-grade pass/fail.
@@ -89,7 +89,7 @@ proc runStress(workload: string) =
   let image = if h3: "navi-stress-h3" else: "navi-stress"
   exec "docker build -f " & dockerfile & " -t " & image & " ."
   exec "docker run --rm -e NAVI_WORKLOAD=" & workload &
-       " -e NAVI_PROTO -e NAVI_BACKEND -e NAVI_SERVERS" &
+       " -e NAVI_PROTO -e NAVI_CLIENT -e NAVI_SERVERS" &
        " -e NAVI_SECONDS -e NAVI_CLIENTS -e NAVI_CONCURRENCY" &
        " -e NAVI_REQ_COMPRESSION -e NAVI_RESP_COMPRESSION -e NAVI_CONTENT_TYPES" &
        " -e NAVI_STREAM_BYTES -e NAVI_REPORT_SECONDS -e NAVI_LOG_ERRORS" &
@@ -141,27 +141,27 @@ task cipherSuite, "Cipher-suite selection enforcement (needs openssl with TLS 1.
   # Servers pinned to one TLS 1.2 cipher / one TLS 1.3 ciphersuite; pins must hold.
   exec "bash tests/interop/cipher_suite.sh"
 
-task caVerify, "Private-CA (TlsConfig.caFile) verification, sync backend (needs openssl)":
+task caVerify, "Private-CA (TlsConfig.caFile) verification, sync client (needs openssl)":
   # A server cert signed by a throwaway CA: navi must trust it via caFile and
   # reject it without the CA (private root is not in the system trust store).
   exec "bash tests/interop/ca_verify.sh"
 
-task tlsPinning, "In-memory CA bundle + SPKI pinning + verify callback, sync backend (needs openssl)":
+task tlsPinning, "In-memory CA bundle + SPKI pinning + verify callback, sync client (needs openssl)":
   # A server signed by a throwaway CA: navi must trust it via an in-memory
   # caBundle, honor a matching SPKI pin (reject a wrong one), and run the verify
   # callback (accept/reject, and even with chain verification disabled).
   exec "bash tests/interop/tls_pin.sh"
 
-task socks, "SOCKS5 proxy tunnelling + user/pass auth, all native backends (needs python3)":
+task socks, "SOCKS5 proxy tunnelling + user/pass auth, all native clients (needs python3)":
   # A local HTTP origin behind two SOCKS5 proxies (no-auth and user/pass): navi
   # must tunnel through, authenticate, and reject wrong credentials, on the sync,
-  # asyncdispatch and chronos backends.
+  # asyncdispatch and chronos clients.
   exec "bash tests/interop/socks5.sh"
 
-task unixSocket, "Unix domain socket transport, all native backends (POSIX; needs python3)":
+task unixSocket, "Unix domain socket transport, all native clients (POSIX; needs python3)":
   # An AF_UNIX HTTP server that echoes the Host header: navi must dial the socket
   # path, send the URL host as Host, and reject an over-long path, on the sync,
-  # asyncdispatch and chronos backends.
+  # asyncdispatch and chronos clients.
   exec "bash tests/interop/unixsocket.sh"
 
 task streaming, "File-streaming interop: http1/http2 x upload/download (needs nghttpd + openssl)":
@@ -209,7 +209,7 @@ proc runBench(workload: string) =
   # Build the bench image and run one workload, passing every NAVI_* knob through.
   # Mirrors runStress: the h3 image (ngtcp2/nghttp3/OpenSSL-3.5 client toolchain +
   # Caddy) is used when NAVI_PROTO is h3/all; h1/h2 use the light image. Each cell
-  # prints a ranked throughput+latency table across navi's backends + the reference
+  # prints a ranked throughput+latency table across navi's clients + the reference
   # clients. NB: nimble does not propagate a task's exit code (nim-lang/nimble#1802),
   # so a failed cell shows in the output but this exits 0 -- run the docker command
   # directly, or read the final "== <workload>: all cells ran ==" banner, for
@@ -221,7 +221,7 @@ proc runBench(workload: string) =
   let netem = if getEnv("NAVI_NETEM", "0") == "1": "--cap-add=NET_ADMIN " else: ""
   exec "docker build -f " & dockerfile & " -t " & image & " ."
   exec "docker run --rm " & netem & "-e NAVI_WORKLOAD=" & workload &
-       " -e NAVI_PROTO -e NAVI_BACKEND -e NAVI_LANGS -e NAVI_SERVERS" &
+       " -e NAVI_PROTO -e NAVI_CLIENT -e NAVI_LANGS -e NAVI_SERVERS" &
        " -e NAVI_THREADS -e NAVI_PROCS" &
        " -e NAVI_SECONDS -e NAVI_WARMUP_SECONDS -e NAVI_MODE -e NAVI_CLIENTS" &
        " -e NAVI_CONCURRENCY -e NAVI_REQ_COMPRESSION -e NAVI_RESP_COMPRESSION" &
@@ -265,17 +265,17 @@ task demoWssBrowser, "Browser wss demo: mkcert cert + wss server + page (needs m
   # wss echo server, and prints the URL to open.
   exec "bash examples/websocket/wss_browser.sh"
 
-task demoWssSync, "wss echo round trip on the sync backend (navi)":
+task demoWssSync, "wss echo round trip on the sync client (navi)":
   # Builds and starts the wss echo server, runs the sync client, cleans up.
   exec "bash examples/websocket/wss_demo.sh sync"
 
-task demoWssAsync, "wss echo round trip on the asyncdispatch backend (navi/asyncdispatch)":
+task demoWssAsync, "wss echo round trip on the asyncdispatch client (navi/asyncdispatch)":
   exec "bash examples/websocket/wss_demo.sh asyncdispatch"
 
-task demoWssChronos, "wss echo round trip on the chronos backend (needs the chronos package)":
+task demoWssChronos, "wss echo round trip on the chronos client (needs the chronos package)":
   exec "bash examples/websocket/wss_demo.sh chronos"
 
-task demoWs, "Run the WebSocket demos for every backend + browser page (Docker)":
+task demoWs, "Run the WebSocket demos for every client + browser page (Docker)":
   # Builds and runs one container: the native clients print their round trip,
   # then a page for the navi/js client is served at http://localhost:8000/.
   let compose = "docker compose -f demos/websocket/docker-compose.yml"
