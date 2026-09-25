@@ -101,6 +101,15 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **A buffered compressed body that ends mid-member now raises instead of being
+  returned part-decoded.** Buffered decoding no longer has its own copy of each
+  codec: it feeds the body to the same decoder a streamed response uses, so the
+  multi-member/multi-frame rules, the raw-deflate fallback and the size cap have one
+  home and a buffered fetch cannot disagree with a streamed one about the same bytes.
+  The visible change is truncation: a `br` or `zstd` body cut short used to come back
+  silently partial, and now raises `IOError` with the same
+  "compressed response body truncated" message the streamed path uses (a truncated
+  gzip body already raised, as a generic malformed-body error) (#244).
 - **A streamed `zstd` body made of several concatenated frames is decoded whole.**
   RFC 8878 allows a zstd body to be a run of frames back to back, the way RFC 1952
   allows a gzip body to be several members. The buffered path already decoded them
