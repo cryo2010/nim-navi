@@ -126,6 +126,12 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **The chronos client shuts a socket down before closing it, so the last write is
+  delivered.** chronos's `closeWait` calls `closesocket` straight away, with no
+  `shutdown` first; on Windows that could drop the bytes written just before the
+  close, so a WebSocket close frame (or a TLS close_notify) sent right before
+  `close` reached the peer as a bare EOF. `close` now sends FIN first (bounded to a
+  second, best effort), matching what the asyncdispatch client already did.
 - **A buffered compressed body that ends mid-member now raises instead of being
   returned part-decoded.** Buffered decoding no longer has its own copy of each
   codec: it feeds the body to the same decoder a streamed response uses, so the

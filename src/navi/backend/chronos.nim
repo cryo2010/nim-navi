@@ -14,6 +14,10 @@ import ./api
 import ./tls_store, ./tunnel, ./timing
 import ../core/response  # for navi's TimeoutError
 import ../core/socks
+
+const shutdownGraceMs = 1000
+  ## upper bound on the FIN handshake `gracefulShutdown` waits for before `close`
+  ## falls through to `closesocket` anyway
 from ./happyeyeballs import heAttemptDelayMs
 when defined(ssl):
   import ./openssl_ctx, ./chronos_tls
@@ -418,6 +422,19 @@ proc discardParked(c: Conn) =
   c.parked.fut = nil
   if not fut.finished(): fut.cancelSoon()
 
+proc gracefulShutdown*(transport: StreamTransport) {.async.} =
+  ## Send FIN before the socket is closed, so bytes already written are delivered
+  ## ahead of the close. chronos's `closeWait` calls `closesocket` straight away,
+  ## and on Windows a socket closed that way can drop the last write on the floor
+  ## (a WebSocket close frame written right before `close` arrived at the peer as a
+  ## bare EOF); Microsoft's own guidance is to `shutdown` first, which is what the
+  ## asyncdispatch client's `shutdownConn` already does. Best effort and bounded:
+  ## a peer that never drains its receive buffer must not turn `close` into a hang.
+  if transport.isNil: return
+  try:
+    discard await withTimeout(transport.shutdownWait(), shutdownGraceMs.milliseconds)
+  except CatchableError: discard          # already reset / closed: nothing to flush
+
 proc close*(c: Conn): Future[void] {.async.} =
   c.discardParked()
   when defined(ssl):
@@ -426,6 +443,7 @@ proc close*(c: Conn): Future[void] {.async.} =
       if c.ownsCtx and not c.ctx.isNil: destroyCtx(c.ctx)
       return
   if not c.writer.isNil: await c.writer.closeWait()
+  await gracefulShutdown(c.transport)
   if not c.reader.isNil: await c.reader.closeWait()
   if not c.transport.isNil: await c.transport.closeWait()
 

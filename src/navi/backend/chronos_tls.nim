@@ -193,6 +193,13 @@ when defined(ssl):
     ## Order matters: closing the transport first lets a background reader parked
     ## in `readOnce` complete with a clean EOF and unwind, rather than racing a
     ## freed SSL; it also avoids leaking the reader's in-flight read future.
+    # FIN before closesocket, so the close_notify (and any last record) written just
+    # before this is delivered rather than dropped with the socket (see
+    # `gracefulShutdown` in chronos.nim for the Windows failure this prevents).
+    if not t.transport.isNil:
+      try:
+        discard await withTimeout(t.transport.shutdownWait(), 1000.milliseconds)
+      except CatchableError: discard
     try: await t.transport.closeWait()
     except CatchableError: discard
     if not t.sslp.isNil:
