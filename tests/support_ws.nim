@@ -22,6 +22,7 @@ import navi/proto/ws   # sans-io WS core (handshake + frame codec)
 type WsSrv* = object
   ready: ptr bool
   portOut: ptr int
+  sawEof: ptr bool     ## optional: set to whether the client tore the transport down
 
 proc wsBind(ctx: WsSrv): Socket =
   ## Ephemeral loopback listener; report the bound port, then mark ready.
@@ -165,6 +166,42 @@ proc serveWsStreamEcho(ctx: WsSrv) {.thread.} =
           of wmBinary: c.send(encodeFrame(opBinary, o.message.data, masked = false))
           of wmClose: running = false
 
+proc serveWsMisbehave(ctx: WsSrv) {.thread.} =
+  ## Handshake, then answer the client's first text frame with the deliberately
+  ## broken reply its payload names, and watch what the client does next: `sawEof`
+  ## records whether it tore the transport down within a second, which is what a
+  ## protocol error must do (a leaked transport would just stay open).
+  wsAcceptOne(ctx, server, c):
+    if wsHandshake(c):
+      var dec: WsDecoder
+      var cmd = ""
+      var alive = true
+      while alive and cmd.len == 0:
+        var f: Frame
+        while not dec.next(f):
+          let chunk = c.recv(4096)
+          if chunk.len == 0:
+            alive = false
+            break
+          dec.feed(chunk)
+        if not alive: break
+        if f.opcode == opText: cmd = f.payload
+      case cmd
+      of "masked":        # RFC 6455 5.1: a server-to-client frame must not be masked
+        c.send(encodeFrame(opText, "nope", masked = true))
+      of "badutf8":       # RFC 6455 8.1: a text message must be valid UTF-8
+        c.send(encodeFrame(opText, "\xff\xfe", masked = false))
+      else: discard
+      if ctx.sawEof != nil:
+        ctx.sawEof[] = false
+        try:
+          while true:
+            let b = c.recv(4096, timeout = 1500)   # bounded: never hang the suite
+            if b.len == 0:
+              ctx.sawEof[] = true
+              break
+        except CatchableError: discard             # timeout: the client kept it open
+
 proc startWs(th: var Thread[WsSrv], run: proc(ctx: WsSrv) {.thread.}, port: var int) =
   ## Launch a WS server on an ephemeral port, write it to `port` (a mutable `var`),
   ## and block until it is listening.
@@ -177,3 +214,10 @@ proc startWsSilent*(th: var Thread[WsSrv], port: var int) = startWs(th, serveWsS
 proc startWsStall*(th: var Thread[WsSrv], port: var int) = startWs(th, serveWsStall, port)
 proc startWsPingCounter*(th: var Thread[WsSrv], port: var int) = startWs(th, serveWsPingCounter, port)
 proc startWsStreamEcho*(th: var Thread[WsSrv], port: var int) = startWs(th, serveWsStreamEcho, port)
+
+proc startWsMisbehave*(th: var Thread[WsSrv], port: var int, sawEof: var bool) =
+  ## The misbehaving server, plus the teardown flag it reports (see serveWsMisbehave).
+  var ready = false
+  createThread(th, serveWsMisbehave,
+               WsSrv(ready: addr ready, portOut: addr port, sawEof: addr sawEof))
+  while not ready: sleep(1)

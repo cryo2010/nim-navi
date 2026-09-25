@@ -6,7 +6,7 @@
 # --- WebSocket (RFC 6455) ---
 
 export ws.WsMessage, ws.WsMessageKind, ws.closeNormal, ws.closeGoingAway,
-       ws.closeMessageTooBig, ws.WsMessageTooLarge
+       ws.closeProtocolError, ws.closeMessageTooBig, ws.WsMessageTooLarge
 
 type
   WsKind = enum wkH1, wkH2, wkH3
@@ -209,12 +209,34 @@ proc send*(ws: WebSocket, data: string, binary = false): Future[void] {.async.} 
 proc ping*(ws: WebSocket, data = ""): Future[void] {.async.} =
   await ws.sendRaw(encodeFrame(opPing, data))
 
+proc failClose(ws: WebSocket, code: uint16): Future[void] {.async.} =
+  ## Fail the connection after a protocol error (RFC 6455 7.1.7): tell the peer why
+  ## (best effort), then tear the transport down. Idempotent, and it never raises
+  ## over the error that triggered it, so a caller can `raise` straight after.
+  if ws.open:
+    ws.open = false
+    try: await ws.sendRaw(encodeFrame(opClose, closePayload(code)))
+    except CatchableError: discard
+  try: await ws.closeRaw()
+  except CatchableError: discard
+
 proc receive*(ws: WebSocket): Future[WsMessage] {.async.} =
   ## Await a full message, answering pings and reassembling fragments. A close
-  ## returns `wmClose` (and the connection is then closed).
+  ## returns `wmClose` (and the connection is then closed). A protocol error from
+  ## the peer fails the connection (close 1002) and raises.
   while true:
     var f: Frame
-    while not ws.dec.next(f):
+    var got = false
+    while not got:
+      # A malformed frame header (RSV set, reserved opcode, oversized control
+      # frame, bad length) is a protocol error like any other: fail the connection
+      # instead of leaving the transport open with a desynced decoder.
+      try:
+        got = ws.dec.next(f)
+      except ValueError:
+        await ws.failClose(closeProtocolError)
+        raise
+      if got: break
       let chunk = await ws.kaRecv()
       if chunk.len == 0:                        # peer closed: tear the transport down
         ws.open = false                        # now (h2/h3: close the dedicated conn)
@@ -225,11 +247,14 @@ proc receive*(ws: WebSocket): Future[WsMessage] {.async.} =
     try:
       o = ws.asmb.offer(f, ws.maxMessageBytes, rejectMasked = true)
     except WsMessageTooLarge:
-      if ws.open:      # tell the peer why (1009), then drop the connection
-        try: await ws.sendRaw(encodeFrame(opClose, closePayload(closeMessageTooBig)))
-        except CatchableError: discard
-        ws.open = false
-        await ws.closeRaw()
+      await ws.failClose(closeMessageTooBig)   # tell the peer why (1009), then drop
+      raise
+    except ValueError:
+      # Every other `offer` rejection is a protocol error (a masked server frame, a
+      # bad close body or code, invalid UTF-8, broken fragmentation): close with
+      # 1002 and tear the transport down, else it leaks and the assembler stays
+      # desynced for the next receive.
+      await ws.failClose(closeProtocolError)
       raise
     case o.reply
     of wrPong:

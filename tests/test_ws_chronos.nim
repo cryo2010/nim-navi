@@ -104,6 +104,54 @@ suite "chronos websocket client end to end":
     check chunks == @["one", "-two", "-three"]
     check echoed == "aabbcc"
 
+suite "chronos websocket protocol-error teardown (#281)":
+  # A protocol error from the peer must fail the connection (RFC 6455 7.1.7), not
+  # just raise: the transport has to be torn down, else it leaks and the decoder
+  # stays desynced. The server reports whether the client actually dropped it.
+  test "receive should fail the connection when the server sends a masked frame":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("masked")
+      try:
+        discard await ws.receive()
+        result = "no error"
+      except ValueError as e:
+        result = "raised:" & $e.name
+      # deliberately no close(): the driver must have torn the transport down
+      # itself, which is exactly what `sawEof` below proves.
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == "raised:ValueError"
+    check sawEof                               # torn down, not leaked
+
+  test "receive should fail the connection on invalid UTF-8 in a text message":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("badutf8")
+      try:
+        discard await ws.receive()
+        result = "no error"
+      except ValueError as e:
+        result = "raised:" & $e.name
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == "raised:ValueError"
+    check sawEof
+
 import navi/core/response as resp   # ProtocolError
 
 suite "WebSocket transport selection (chronos)":

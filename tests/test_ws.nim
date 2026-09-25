@@ -423,6 +423,40 @@ suite "websocket client end to end":
     ws.close()                                 # idempotent no-op: already dropped on 1009
     joinThread(th)
 
+suite "websocket protocol-error teardown (#281)":
+  # A protocol error from the peer must fail the connection (RFC 6455 7.1.7), not
+  # just raise: the transport has to be torn down, else it leaks and the decoder
+  # stays desynced. The server reports whether the client actually dropped it.
+  test "receive should fail the connection when the server sends a masked frame":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("masked")
+    expect ValueError:
+      discard ws.receive()
+    joinThread(th)
+    check sawEof                               # torn down, not leaked
+    ws.close()                                 # idempotent no-op
+
+  test "receive should fail the connection on invalid UTF-8 in a text message":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("badutf8")
+    expect ValueError:
+      discard ws.receive()
+    joinThread(th)
+    check sawEof
+    ws.close()
+
 suite "websocket keepalive":
   test "receive should raise TimeoutError when keepalive gets no response":
     var th: Thread[WsSrv]
