@@ -34,7 +34,7 @@ jobs:
           docker build -f tests/stress/Dockerfile.h3 -t navi-stress-h3 .
           docker run --rm \
             -e NAVI_WORKLOAD=requests \
-            -e NAVI_CHAOS=all -e NAVI_PROTO=all -e NAVI_BACKEND=all \
+            -e NAVI_CHAOS=all -e NAVI_PROTO=all -e NAVI_CLIENT=all \
             -e NAVI_SECONDS=120 -e NAVI_REPORT_SECONDS=30 \
             navi-stress-h3
 
@@ -55,7 +55,7 @@ jobs:
           docker build -f tests/stress/Dockerfile -t navi-stress .
           if docker run --rm \
               -e NAVI_WORKLOAD=requests \
-              -e NAVI_CHAOS=all -e NAVI_PROTO=h1 -e NAVI_BACKEND=chronos \
+              -e NAVI_CHAOS=all -e NAVI_PROTO=h1 -e NAVI_CLIENT=chronos \
               -e NAVI_SECONDS=30 -e NAVI_REPORT_SECONDS=10 \
               -e NAVI_CHAOS_SELFTEST=fd \
               navi-stress; then

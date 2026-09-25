@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Per-workload benchmark harness. Stands up N fast Go TLS servers (a Caddy front for
 # h3), then for each protocol builds+runs every applicable client -- navi's four
-# backends plus the cross-language reference clients (Go/Rust/Node/Python/std) -- and
+# clients plus the cross-language reference clients (Go/Rust/Node/Python/std) -- and
 # prints one ranked throughput+latency table per (workload, protocol) cell. Clients
 # are time-boxed (NAVI_SECONDS) and record per-request latency; the streaming cells
 # also verify a SHA-1 and fail hard on mismatch.
@@ -14,16 +14,16 @@ here="$root/tests/bench"
 
 workload="${NAVI_WORKLOAD:-requests}"
 proto="${NAVI_PROTO:-h2}"
-backend="${NAVI_BACKEND:-all}"      # navi backends: sync|asyncdispatch|chronos|js|all
+client="${NAVI_CLIENT:-all}"       # navi clients: sync|asyncdispatch|chronos|js|all
 langs="${NAVI_LANGS:-all}"          # reference langs: all|navi|go|rust|node|python|std (csv ok)
-# navi's async backend is single-threaded (one event loop = one core), like Node; it
-# scales across cores by running one client per THREAD (one event loop per thread),
+# navi's async clients are single-threaded (one event loop = one core), like Node; they
+# scale across cores by running one client per THREAD (one event loop per thread),
 # each with its own navi client and its share of the offered load. The client spawns
 # NAVI_THREADS threads and merges them into one RESULT in-process -- a single-process,
 # all-cores comparison with Go/Rust (which also use all cores within one process).
 # Default: the machine's core count. (NAVI_PROCS is honored as a legacy alias.)
 threads="${NAVI_THREADS:-${NAVI_PROCS:-$(nproc 2>/dev/null || echo 1)}}"
-servers="${NAVI_SERVERS:-5}"
+servers="${NAVI_SERVER_COUNT:-5}"
 host="${NAVI_HOST:-127.0.0.1}"
 base_port="${NAVI_BASE_PORT:-9443}"
 
@@ -136,7 +136,7 @@ case "$workload" in
 esac
 
 export NAVI_CERT="$cert" NAVI_HOST="$host" NAVI_BASE_PORT="$base_port"
-export NAVI_WORKLOAD="$workload" NAVI_SERVERS="$servers" NAVI_THREADS="$threads"
+export NAVI_WORKLOAD="$workload" NAVI_SERVER_COUNT="$servers" NAVI_THREADS="$threads"
 
 # The native clients run one navi client per thread in one process. navi's shared
 # process-globals have been hardened for this (the HPACK Huffman table is a const flat
@@ -157,13 +157,13 @@ fi
 case "$proto" in all) protos=(h1 h2 h3) ;; *) protos=("$proto") ;; esac
 # WebSocket is an h1 upgrade (reference WS libs are h1-only), so ws runs h1 only.
 [ "$workload" = ws ] && protos=(h1)
-case "$backend" in all) navi_backends=(sync asyncdispatch chronos js) ;; *) navi_backends=("$backend") ;; esac
+case "$client" in all) navi_clients=(sync asyncdispatch chronos js) ;; *) navi_clients=("$client") ;; esac
 
 want_lang() { case ",$langs," in *,all,*|*",$1,"*) return 0 ;; *) return 1 ;; esac; }
 
 # --- build the clients once (each picks proto/mode at runtime via env) --------
 declare -A NAVI_BIN
-for be in "${navi_backends[@]}"; do
+for be in "${navi_clients[@]}"; do
   case "$be" in
     sync)          [ -f "$here/clients/${src}_sync.nim" ] && { nim c $common -o:"$work/${src}_sync" "$here/clients/${src}_sync.nim" && NAVI_BIN[sync]="$work/${src}_sync"; } ;;
     asyncdispatch) nim c $common -o:"$work/${src}_ad" "$here/clients/${src}.nim" && NAVI_BIN[asyncdispatch]="$work/${src}_ad" ;;
@@ -226,12 +226,12 @@ print_table() {   # <cellfile> <workload> <proto>
 run_cell() {   # <proto>: run every applicable client for this protocol, print table
   local pr="$1" cell="$work/cell.$pr"; : > "$cell"
   export NAVI_PROTO="$pr"
-  # navi backends
-  for be in "${navi_backends[@]}"; do
+  # navi clients
+  for be in "${navi_clients[@]}"; do
     [ -n "${NAVI_BIN[$be]:-}" ] || continue
-    export NAVI_BACKEND="$be"
+    export NAVI_CLIENT="$be"
     # Report each row as <language>/<package>. navi is Nim source (even navi-js, which
-    # is Nim compiled to js), with the backend as the package variant.
+    # is Nim compiled to js), with the client variant as the package variant.
     local dn
     case "$be" in
       sync)          dn="nim/navi-sync" ;;
@@ -244,8 +244,8 @@ run_cell() {   # <proto>: run every applicable client for this protocol, print t
       [ "$pr" = h3 ] && { echo "  [$dn $pr]: skip js/undici has no HTTP/3"; continue; }
       run_client "$dn" "$cell" env NODE_EXTRA_CA_CERTS="$cert" node "$work/${js_src}.js"
     else
-      # Native backends thread internally (NAVI_THREADS clients, one per thread) and
-      # emit a single merged RESULT, so this is just one process per backend.
+      # Native clients thread internally (NAVI_THREADS clients, one per thread) and
+      # emit a single merged RESULT, so this is just one process per client.
       run_client "$dn" "$cell" "${NAVI_BIN[$be]}"
     fi
   done

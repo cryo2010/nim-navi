@@ -1,7 +1,7 @@
 # navi stress workloads
 
 Focused, Dockerized soak tests, split by **workload** (what the client does) with
-protocol, backend, server count, compression, and runtime as configurable
+protocol, client, server count, compression, and runtime as configurable
 dimensions. Each runs many navi clients against N TLS servers, prints a status +
 memory report every interval (responses are tallied and discarded, so memory
 stays flat over a long soak), and — for the streaming workloads — verifies a 1 GiB
@@ -23,10 +23,10 @@ checksum and fails hard on any mismatch.
 | Var | Default | Meaning |
 | --- | --- | --- |
 | `PROTO` | `h2` | `h1` \| `h2` \| `h3` \| `all` (h3 uses the h3 image) |
-| `BACKEND` | `all` | `sync` \| `asyncdispatch` \| `chronos` \| `js` \| `all` |
-| `SERVERS` | `5` | server instances; requests round-robin across them |
-| `SECONDS` | `60` | runtime per (backend × protocol) cell |
-| `CLIENTS` | `3` | navi clients per backend |
+| `CLIENT` | `all` | `sync` \| `asyncdispatch` \| `chronos` \| `js` \| `all` |
+| `SERVER_COUNT` | `5` | server instances; requests round-robin across them |
+| `SECONDS` | `60` | runtime per (client × protocol) cell |
+| `CLIENT_COUNT` | `3` | concurrent navi client instances per cell |
 | `CONCURRENCY` | `8` | in-flight requests per client (async fan-out) |
 | `REQ_COMPRESSION` | `gzip` | request body: `none` \| `gzip` \| `deflate` (native; **octet/text only**) |
 | `RESP_COMPRESSION` | `gzip` | response via `x-want-encoding`: `none` \| `gzip` \| `deflate` \| `br` \| `zstd` |
@@ -45,7 +45,7 @@ The `requests` workload rotates four body kinds through `/echo`:
 Example:
 
 ```
-NAVI_SECONDS=600 NAVI_PROTO=all NAVI_BACKEND=chronos \
+NAVI_SECONDS=600 NAVI_PROTO=all NAVI_CLIENT=chronos \
   nimble stressRequests
 ```
 
@@ -68,7 +68,7 @@ violated, no FD leak, no memory leak. Violations use greppable prefixes
 
 **Modes** (all three protocols implemented). Strict modes assert an exact outcome
 class and hard-fail on a miss; tolerant modes accept any catchable typed navi
-error (truncation-vs-reset classification legitimately differs across backends, so
+error (truncation-vs-reset classification legitimately differs across clients, so
 the class is tallied, not enforced). Every mode is also subject to the four
 universal invariants:
 
@@ -88,7 +88,7 @@ universal invariants:
 **Established protocol deviations.** `zerowindow` is **h2-only**: aioquic grants
 QUIC flow-control credit automatically inside `transmit()`, so an h3 server cannot
 starve the client's window. The two pure never-respond modes (`stall`,
-`stall-on-accept`) are **skipped on the sync backend only** (a sync read-timeout
+`stall-on-accept`) are **skipped on the sync client only** (a sync read-timeout
 gap on a zero-byte-response TLS connection; a documented follow-up); async runs
 them. **js is excluded from chaos entirely** (hostile-input handling there is
 undici's, not navi's; js cells can't pin the protocol or measure navi's FD/heap),
@@ -121,7 +121,7 @@ same mode and reruns with the same seed are identical. Ports derive from
 `NAVI_BASE_PORT + NAVI_CHAOS_PORTBAND` (`+0` data, `+1` vanish-on-accept, `+2`
 stall-on-accept, `+99` a plain-HTTP `/health` control port), loopback only.
 
-**Backends:** asyncdispatch and chronos run the full async driver
+**Clients:** asyncdispatch and chronos run the full async driver
 (`NAVI_CHAOS_CONC` workers + an in-process hang watchdog); sync interleaves one
 chaos request per `NAVI_CHAOS_CONC` verified requests (its hang backstop is navi's
 timeouts plus a coreutils `timeout` wrapper). **js is excluded** (hostile-input
@@ -162,7 +162,7 @@ under a self-test is itself the bug, so these **expect the FAILURES banner**:
 
 **Seeded schedule + digest.** The schedule is driven by an explicit seedable PRNG
 (xoshiro256\*\*, not `std/random`'s shared state), seeded with `NAVI_CHAOS_SEED`
-mixed with a stable hash of `workload|proto|backend`, so cells differ but reruns
+mixed with a stable hash of `workload|proto|client`, so cells differ but reruns
 are byte-identical. At startup each cell prints a schedule line, e.g.
 `[requests h1 chronos chaos] seed=1 modes=stall,slowbody,... digest=<16 hex>`. The
 digest is a purely structural hash of `seed` + the resolved proto-filtered mode
@@ -183,7 +183,7 @@ comparing digests (attempt tallies can wobble slightly with timing).
 | `CHAOS_SELFTEST` | *(unset)* | `fd` \| `mem` \| `hang`: plant a deliberate leak/hang to prove the assertions fire (expects FAILURES) |
 
 ```
-NAVI_CHAOS=all NAVI_PROTO=h1 NAVI_BACKEND=all nimble stressRequests
+NAVI_CHAOS=all NAVI_PROTO=h1 NAVI_CLIENT=all nimble stressRequests
 ```
 
 ## Layout
@@ -192,7 +192,7 @@ NAVI_CHAOS=all NAVI_PROTO=h1 NAVI_BACKEND=all nimble stressRequests
   (status counter + RSS from `/proc/self/statm`), `servers` (round-robin),
   `streamcontent` (fixed-block + incremental SHA-1), `httpset` (proto → version set),
   `chaos` (client-side chaos driver: seeded schedule, workers/watchdog, outcome
-  classification; split into `chaos_async`/`chaos_sync` for the two backend models),
+  classification; split into `chaos_async`/`chaos_sync` for the two client models),
   `leakcheck` (FD/heap/RSS sampling + assertions).
 - `chaos/` — the Python asyncio misbehaving-server sidecar: `chaos_server.py`
   (entrypoint + control port), `modes.py` (registry + wire helpers), `h1.py`,
@@ -200,23 +200,23 @@ NAVI_CHAOS=all NAVI_PROTO=h1 NAVI_BACKEND=all nimble stressRequests
   TCP Alt-Svc discovery leg), `requirements.txt` (`h2`).
 - `clients/` — one client per workload. The async source (`*.nim`) is built for
   both asyncdispatch and (`-d:useChronos`) chronos; `*_sync.nim` is the sync
-  backend; `*_js.nim` runs under Node. run.sh skips any backend whose client
-  source is absent, so partial backend coverage degrades gracefully.
+  client; `*_js.nim` runs under Node. run.sh skips any client whose source
+  is absent, so partial client coverage degrades gracefully.
 - `server/app.py` — one FastAPI app (echo, ws, events, upload, download) served by
   hypercorn (h1/h2); Caddy fronts it for h3.
 - `Dockerfile` (h1/h2) and `Dockerfile.h3` (adds the ngtcp2/nghttp3/OpenSSL-3.5
   client toolchain + Caddy). `run.sh` orchestrates: cert, N servers, the
-  backend × protocol matrix, cleanup, and a final pass/fail banner.
+  client × protocol matrix, cleanup, and a final pass/fail banner.
 
 ## Notes
 
 - `nimble` does not propagate a task's exit code (nim-lang/nimble#1802): read the
   final `== <workload>: all cells passed ==` banner, or run the `docker run`
   directly for an honest exit code.
-- RSS is read on Linux (everything is Dockerized); the js backend reports
+- RSS is read on Linux (everything is Dockerized); the js client reports
   `process.memoryUsage().rss`.
 - CI runs a nightly chaos rotation (`.github/workflows/stress-chaos.yml`): the full
-  `NAVI_CHAOS=all NAVI_PROTO=all NAVI_BACKEND=all` matrix (must end `all cells
+  `NAVI_CHAOS=all NAVI_PROTO=all NAVI_CLIENT=all` matrix (must end `all cells
   passed`) plus a `NAVI_CHAOS_SELFTEST=fd` job that inverts the exit code and passes
   only when the FD assertion fails the run. Both use `docker run` directly, not
   nimble, so the container exit code is honest.

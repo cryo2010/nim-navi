@@ -429,7 +429,7 @@ func main() {
 
 	host := envStr("NAVI_HOST", "127.0.0.1")
 	basePort := envInt("NAVI_BASE_PORT", 9443)
-	servers := envInt("NAVI_SERVERS", 5)
+	servers := envInt("NAVI_SERVER_COUNT", 5)
 	if servers < 1 {
 		servers = 1
 	}
@@ -454,7 +454,7 @@ func main() {
 		tlsCfg:       tlsCfg,
 		expect:       expect,
 		cold:         envStr("NAVI_MODE", "pooled") == "cold",
-		clients:      envInt("NAVI_CLIENTS", 3),
+		clients:      envInt("NAVI_CLIENT_COUNT", 3),
 		concurrency:  envInt("NAVI_CONCURRENCY", 8),
 		streamBytes:  envInt64("NAVI_STREAM_BYTES", 1073741824),
 		measureStart: start.Add(time.Duration(warmup * float64(time.Second))),
