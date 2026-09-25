@@ -46,6 +46,12 @@ template sendRequest(conn, req: typed; asyncStream: typed = nil) =
   if asyncBody:
     when compiles(await asyncStream()):
       await sendAll(conn, serializeHead(req, chunked = true))
+      # Coalesce small producer chunks into one write (#299): a producer yielding
+      # many tiny chunks would otherwise cost a socket write -- and a TLS record,
+      # with its own header and MAC -- each. The buffer holds raw body bytes and is
+      # framed as ONE chunk when it is flushed: wire chunk boundaries need not match
+      # producer boundaries (RFC 9112 7.1), only the framing must stay valid.
+      var pending = newStringOfCap(h1CoalesceSize)
       while true:
         # The producer is a bare closure (portable spelling, no chronos raises
         # annotation); navi's contract is it raises at most CatchableError. Discharge
@@ -55,23 +61,53 @@ template sendRequest(conn, req: typed; asyncStream: typed = nil) =
           {.cast(raises: [CatchableError]).}:
             chunk = await asyncStream()
         if chunk.len == 0: break
-        await sendAll(conn, encodeChunk(chunk))
-      await sendAll(conn, finalChunk(req))
+        if chunk.len >= h1CoalesceSize:
+          # Already big enough to fill a write on its own: frame it directly instead
+          # of copying it through the buffer.
+          if pending.len > 0:
+            await sendAll(conn, encodeChunk(pending))
+            pending.setLen(0)
+          await sendAll(conn, encodeChunk(chunk))
+        else:
+          pending.add(chunk)
+          if pending.len >= h1CoalesceSize:
+            await sendAll(conn, encodeChunk(pending))
+            pending.setLen(0)
+      # Producer EOF: the terminator (plus any trailers) rides along with whatever is
+      # still buffered, so a small streamed upload costs one body write in total.
+      var tail = newStringOfCap(pending.len + 64)
+      tail.addChunk(pending)
+      tail.add(finalChunk(req))
+      await sendAll(conn, tail)
   elif req.bodyStream != nil:
     await sendAll(conn, serializeHead(req, chunked = true))
+    var pending = newStringOfCap(h1CoalesceSize)   # see the coalescing note above
     while true:
       # single-threaded client; the producer need not be gcsafe (see h1.emitBody)
       var chunk: string
       {.cast(gcsafe).}:
         chunk = req.bodyStream()
       if chunk.len == 0: break
-      await sendAll(conn, encodeChunk(chunk))
-    await sendAll(conn, finalChunk(req))
+      if chunk.len >= h1CoalesceSize:
+        if pending.len > 0:
+          await sendAll(conn, encodeChunk(pending))
+          pending.setLen(0)
+        await sendAll(conn, encodeChunk(chunk))
+      else:
+        pending.add(chunk)
+        if pending.len >= h1CoalesceSize:
+          await sendAll(conn, encodeChunk(pending))
+          pending.setLen(0)
+    var tail = newStringOfCap(pending.len + 64)
+    tail.addChunk(pending)
+    tail.add(finalChunk(req))
+    await sendAll(conn, tail)
   elif req.trailers.len > 0:
     await sendAll(conn, serializeHead(req, chunked = true))
-    if req.body.len > 0:
-      await sendAll(conn, encodeChunk(req.body))
-    await sendAll(conn, finalChunk(req))
+    var framed = newStringOfCap(req.body.len + 64)
+    framed.addChunk(req.body)
+    framed.add(finalChunk(req))
+    await sendAll(conn, framed)
   else:
     # Send the head and body separately rather than `serializeHead(req) & req.body`,
     # which would allocate a whole (head + body)-sized buffer and copy the entire

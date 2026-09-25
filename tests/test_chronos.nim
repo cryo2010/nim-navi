@@ -206,6 +206,25 @@ suite "chronos entry end to end":
     check res.body == "alpha beta gamma"
     joinThread(th)
 
+  test "an async producer's tiny chunks should coalesce into few wire chunks (#299)":
+    const port = 9255
+    var th: Thread[ServerCtx]
+    var chunks = 0
+    startUploadEcho(th, port, addr chunks)
+    proc run(): Future[Response] {.async.} =
+      let left = new int
+      left[] = 1000
+      proc getChunks(): Future[string] {.async.} =
+        if left[] <= 0: return ""
+        dec left[]
+        return "0123456789"
+      return await newNavi().put("http://127.0.0.1:" & $port & "/", body = getChunks)
+    let res = waitFor run()
+    check res.status == 200
+    check res.body == "0123456789".repeat(1000)
+    joinThread(th)
+    check chunks == 1     # 10 KB of tiny chunks -> one buffered write
+
   test "an async producer should pipe a streaming download into an upload":
     const srcPort = 9253
     const dstPort = 9254

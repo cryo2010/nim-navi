@@ -69,19 +69,34 @@ proc serializeRequest*(req: Request): string =
 
 const chunkTerminator* = "0\r\n\r\n"
 
+const h1CoalesceSize* = 16 * 1024
+  ## Target size for the streamed-upload write buffer (#299). A producer that yields
+  ## many tiny chunks would otherwise cost one socket write -- and, under TLS, one
+  ## record with its own header and MAC -- per chunk. The send loop buffers raw body
+  ## bytes until it holds this much, then frames the buffer as a single chunk and
+  ## writes it; a producer chunk already this large is framed and written on its own.
+  ## 16 KiB is the maximum TLS record payload, so a full buffer still fits one record.
+
+proc addChunk*(buf: var string, data: string) =
+  ## Append one HTTP/1.1 chunked-transfer frame for `data` to `buf`. Lets the send
+  ## loop pack the last chunk and the terminator into a single write without an
+  ## intermediate per-chunk string. An empty `data` appends nothing: an empty chunk
+  ## would encode as "0\r\n\r\n", a premature body terminator (#274).
+  if data.len == 0: return
+  let hex = fmt"{data.len:X}"
+  buf.add hex
+  buf.add "\r\n"
+  buf.add data
+  buf.add "\r\n"
+
 proc encodeChunk*(data: string): string =
   ## One HTTP/1.1 chunked-transfer frame: `<hex-size>\r\n<data>\r\n`. `data` must be
   ## non-empty. Built into a single preallocated buffer (the payload is copied once)
   ## rather than chained `&` temporaries, since this runs per chunk of a streamed
   ## upload.
-  if data.len == 0: return ""   # an empty chunk would encode as "0\r\n\r\n", a premature
-                                # body terminator; never emit one mid-stream (#274)
-  let hex = fmt"{data.len:X}"
-  result = newStringOfCap(hex.len + data.len + 4)
-  result.add hex
-  result.add "\r\n"
-  result.add data
-  result.add "\r\n"
+  if data.len == 0: return ""
+  result = newStringOfCap(data.len + 20)
+  result.addChunk(data)
 
 proc finalChunk*(req: Request): string =
   ## The terminating zero-length chunk plus any request trailer fields (RFC 9110

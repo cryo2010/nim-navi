@@ -457,6 +457,48 @@ suite "sync entry end to end":
     check res.body == "hello streaming world"
     joinThread(th)
 
+  test "a streamed upload of many tiny chunks should coalesce into few wire chunks (#299)":
+    const port = 8957
+    var th: Thread[ServerCtx]
+    var chunks = 0
+    startUploadEcho(th, port, addr chunks)
+
+    let api = newNavi()
+    var left = 1000
+    let res = api.request(POST, "http://127.0.0.1:" & $port & "/",
+      body = BodyProducer(proc(): string =
+        if left > 0:
+          result = "0123456789"
+          dec left))
+    check res.status == 200
+    check res.body == "0123456789".repeat(1000)   # every byte, in order
+    joinThread(th)
+    # 10 KB of body fits one 16 KiB buffer, so the 1000 producer chunks leave as a
+    # single chunk frame in a single write instead of 1000 of each.
+    check chunks == 1
+
+  test "a streamed upload should send a large producer chunk unbuffered (#299)":
+    const port = 8958
+    var th: Thread[ServerCtx]
+    var chunks = 0
+    startUploadEcho(th, port, addr chunks)
+
+    let big = "x".repeat(20 * 1024)               # over the coalescing target
+    let parts = @["head", big, "tail"]
+    let api = newNavi()
+    var i = 0
+    let res = api.request(POST, "http://127.0.0.1:" & $port & "/",
+      body = BodyProducer(proc(): string =
+        if i < parts.len:
+          result = parts[i]
+          inc i))
+    check res.status == 200
+    check res.body == "head" & big & "tail"
+    joinThread(th)
+    # "head" is flushed to make way for the big chunk, which is framed on its own;
+    # "tail" rides with the terminator.
+    check chunks == 3
+
   test "the client should connect over IPv6 loopback":
     const port = 8977
     var th: Thread[ServerCtx]
