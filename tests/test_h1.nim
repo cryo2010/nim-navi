@@ -217,6 +217,39 @@ suite "h1 parse":
       p.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcXX0\r\n\r\n")
     except ValueError as e: msg = e.msg
     check "CRLF" in msg
+    # The desynced response must never look complete or poolable: returning the
+    # connection to the pool would leave the unread remainder on the wire, where the
+    # next request on it parses stale body bytes as its status line.
+    check not p.finished
+    check not p.keepAliveAfter()
+
+  test "the h1 parser should reject a bare-LF chunk terminator (#244)":
+    # A lone LF after chunk-data is the same framing desync: one byte of the next
+    # chunk-size line would be swallowed as the missing CR.
+    var p = initH1Parser()
+    var msg = ""
+    try:
+      p.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\n0\r\n\r\n")
+    except ValueError as e: msg = e.msg
+    check "CRLF" in msg
+    check not p.keepAliveAfter()
+
+  test "the h1 parser should reject a CR-only chunk terminator across feeds (#244)":
+    # The terminator can straddle reads: the parser waits for both bytes, then
+    # rejects "\r" followed by anything other than "\n".
+    var p = initH1Parser()
+    var msg = ""
+    try:
+      p.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r")
+      check not p.finished                # still waiting for the second byte
+      p.feed("X0\r\n\r\n")
+    except ValueError as e: msg = e.msg
+    check "CRLF" in msg
+    check not p.keepAliveAfter()
+
+  test "a chunked response whose chunks are properly terminated stays poolable (#244)":
+    check parseKA("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" &
+                  "3\r\nabc\r\n0\r\n\r\n")
 
   test "the h1 parser should reject Transfer-Encoding: chunked together with Content-Length (#271)":
     var p = initH1Parser()
