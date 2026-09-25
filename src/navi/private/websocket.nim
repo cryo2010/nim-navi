@@ -5,7 +5,8 @@
 # --- WebSocket (RFC 6455) ---
 
 export ws.WsMessage, ws.WsMessageKind, ws.closeNormal, ws.closeGoingAway,
-       ws.closeProtocolError, ws.closeMessageTooBig, ws.WsMessageTooLarge
+       ws.closeProtocolError, ws.closeMessageTooBig, ws.closeNoStatus,
+       ws.closeAbnormal, ws.WsMessageTooLarge
 
 type
   WsKind = enum wkH1, wkH2, wkH3
@@ -239,8 +240,10 @@ proc websocketH2(client: Navi, u: Url, headers: Headers,
     raise newException(ProtocolError,
       "navi: server does not support WebSocket over HTTP/2 " &
       "(no SETTINGS_ENABLE_CONNECT_PROTOCOL); use an h1 WebSocket")
-  var extra = headers
-  extra["sec-websocket-version"] = wsVersion
+  # One field policy for every Extended CONNECT (h2 and h3): wsExtraFields drops
+  # the h1-only handshake fields and the hop-by-hop ones, and adds
+  # sec-websocket-version. h2ConnectHeaderList then applies the h2 rules.
+  let extra = initHeaders(wsExtraFields(headers))
   let sid = h2.openStream()
   conn.sendAll(h2.encodeRequestHead(sid, h2ConnectHeaderList(u, "websocket", extra)))
   while not h2.headersReady(sid):        # await the CONNECT response headers
@@ -321,10 +324,15 @@ proc websocket*(client: Navi, url: string, headers = initHeaders(),
       "the sync client (h2/h3 need TLS; h3 also needs {H3} + -d:naviHttp3)")
 
 proc send*(ws: WebSocket, data: string, binary = false) =
-  ## Send a text (default) or binary message. Client frames are masked.
+  ## Send a text (default) or binary message. Client frames are masked. Raises
+  ## `IOError` once the WebSocket is closed (or closing), rather than writing into
+  ## a torn-down transport and failing with whatever the socket layer says.
+  if not ws.open: raise newException(IOError, "navi: send on a closed WebSocket")
   ws.sendRaw(encodeFrame(if binary: opBinary else: opText, data))
 
 proc ping*(ws: WebSocket, data = "") =
+  ## Send a ping. Raises `IOError` on a closed WebSocket (see `send`).
+  if not ws.open: raise newException(IOError, "navi: ping on a closed WebSocket")
   ws.sendRaw(encodeFrame(opPing, data))
 
 proc kaRecv(ws: WebSocket): string =
@@ -375,7 +383,10 @@ proc receive*(ws: WebSocket): WsMessage =
       if chunk.len == 0:                       # peer closed: tear the transport down
         ws.open = false                        # now (h3: join the pump) so it is not
         ws.closeRaw()                          # leaked when the caller's close() no-ops
-        return WsMessage(kind: wmClose, closeCode: closeGoingAway)
+        # RFC 6455 7.4.1: a transport that ends without a close frame is 1006, a
+        # code that only ever surfaces locally. The streaming path reports the
+        # same, so an abrupt EOF looks identical whichever way you read.
+        return WsMessage(kind: wmClose, closeCode: closeAbnormal)
       ws.dec.feed(chunk)
     var o: WsOutcome
     try:
@@ -406,6 +417,12 @@ proc close*(ws: WebSocket, code = closeNormal, reason = "") =
   ## Send a close frame (if still open) and tear the transport down. Idempotent: safe
   ## to call after a peer-close, which already set open=false and tore down -- the
   ## transport teardown still runs (once) so an already-closed h3 pump is not leaked.
+  ##
+  ## `code` must be one that may appear on the wire: 1005, 1006 and 1015 are
+  ## reserved for local use (RFC 6455 7.4.1) and raise `ValueError`.
+  if code == closeNoStatus or code == closeAbnormal or code == 1015'u16:
+    raise newException(ValueError, "navi: WebSocket close code " & $code &
+      " is reserved and must never be sent (RFC 6455 7.4.1)")
   if ws.open:
     ws.open = false
     try: ws.sendRaw(encodeFrame(opClose, closePayload(code, reason)))
@@ -420,6 +437,9 @@ type
     ## `wmClose` if a close arrived instead). Consume with `each`/`readChunk`.
     ws: WebSocket
     kind*: WsMessageKind
+    closeCode*: uint16       ## set when `kind` is wmClose, or when a close ends the
+                             ## stream early: the peer's code, 1005 when it sent none,
+                             ## 1006 when the transport just ended (as `receive`)
     first: string            ## the first data frame's payload, buffered by `stream`
     hasFirst: bool
     done: bool               ## the fin frame has been consumed
@@ -430,6 +450,12 @@ type
     ws: WebSocket
     binary: bool
     started: bool
+
+proc frameCloseCode(f: Frame): uint16 =
+  ## The code a close frame carries: RFC 6455 7.1.5 surfaces an absent one as 1005,
+  ## and the EOF frame `readDataFrame` synthesizes carries 1006.
+  if f.payload.len >= 2: uint16((ord(f.payload[0]) shl 8) or ord(f.payload[1]))
+  else: closeNoStatus
 
 proc readDataFrame(ws: WebSocket): Frame =
   ## The next non-control frame (data / continuation / close), answering pings along
@@ -448,7 +474,10 @@ proc readDataFrame(ws: WebSocket): Frame =
       if chunk.len == 0:
         ws.open = false
         ws.closeRaw()                          # tear down on EOF (see receive)
-        return Frame(fin: true, opcode: opClose, payload: "")
+        # 1006 in the synthetic frame, so the reader reports the same code as
+        # `receive` does for a bodiless EOF. It is never echoed to the peer: the
+        # close handlers below only send while `open`, which EOF just cleared.
+        return Frame(fin: true, opcode: opClose, payload: closePayload(closeAbnormal))
       ws.dec.feed(chunk)
     case f.opcode
     of opPing: ws.sendRaw(encodeFrame(opPong, f.payload)); continue
@@ -477,6 +506,7 @@ proc openStreamReader(ws: WebSocket): WsReader =
     result.done = f.fin
   of opClose:
     result.kind = wmClose
+    result.closeCode = frameCloseCode(f)
     result.done = true
     ws.closeOnFrame(f)
   else:
@@ -511,6 +541,7 @@ proc readChunk*(r: WsReader): string =
     return f.payload
   of opClose:                # a close interrupted the message: truncate and drop
     r.done = true
+    r.closeCode = frameCloseCode(f)            # 1005/1006 as in `receive`
     r.ws.closeOnFrame(f)
     return ""
   else:

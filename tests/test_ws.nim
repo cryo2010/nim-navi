@@ -457,6 +457,62 @@ suite "websocket protocol-error teardown (#281)":
     check sawEof
     ws.close()
 
+suite "websocket lifecycle guards (#289)":
+  test "send and ping should raise on a closed WebSocket":
+    var th: Thread[WsSrv]
+    var port: int
+    startWsEcho(th, port)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.close()
+    expect IOError:
+      ws.send("too late")
+    expect IOError:
+      ws.ping()
+    joinThread(th)
+
+  test "close should reject the close codes reserved for local use":
+    var th: Thread[WsSrv]
+    var port: int
+    startWsEcho(th, port)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    expect ValueError:
+      ws.close(closeNoStatus)                  # 1005: no status received
+    expect ValueError:
+      ws.close(closeAbnormal)                  # 1006: abnormal closure
+    expect ValueError:
+      ws.close(1015'u16)                       # 1015: TLS handshake failure
+    ws.close()                                 # a valid code still works
+    joinThread(th)
+
+  test "a transport EOF should surface as 1006 on both read paths":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("eofnow")                          # server drops us with no close frame
+    let m = ws.receive()
+    check m.kind == wmClose
+    check m.closeCode == closeAbnormal
+    joinThread(th)
+
+    var th2: Thread[WsSrv]
+    var port2: int
+    var sawEof2 = false
+    startWsMisbehave(th2, port2, sawEof2)
+    let ws2 = api.websocket("ws://127.0.0.1:" & $port2 & "/chat")
+    ws2.send("eofnow")
+    let r = ws2.stream()                       # the streaming path reports the same
+    check r.kind == wmClose
+    check r.closeCode == closeAbnormal
+    joinThread(th2)
+
 suite "websocket incremental UTF-8 validation (#282)":
   test "the scanner should accept a code point split across chunks":
     var v: WsUtf8Scanner

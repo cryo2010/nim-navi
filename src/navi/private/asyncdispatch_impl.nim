@@ -80,6 +80,9 @@ proc kaRecv(ws: WebSocket): Future[string] {.async.} =
       return chunk
     if ws.pingOutstanding:                   # pinged last interval, still nothing back
       ws.open = false
+      # Drop the parked read with the transport it was reading from: kept, it would
+      # be awaited again by the next receive() and never complete.
+      ws.pendingRecv = nil
       try: await ws.closeRaw() except CatchableError: discard
       raise newException(TimeoutError, "navi: websocket keepalive timed out")
     await ws.sendRaw(encodeFrame(opPing, ""))

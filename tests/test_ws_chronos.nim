@@ -104,6 +104,79 @@ suite "chronos websocket client end to end":
     check chunks == @["one", "-two", "-three"]
     check echoed == "aabbcc"
 
+suite "chronos websocket lifecycle guards (#289)":
+  test "send and ping should raise on a closed WebSocket":
+    var th: Thread[WsSrv]
+    var port: int
+    startWsEcho(th, port)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.close()
+      try:
+        await ws.send("too late")
+        result = "sent"
+      except IOError: result = "send raised"
+      try:
+        await ws.ping()
+        result.add "|pinged"
+      except IOError: result.add "|ping raised"
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == "send raised|ping raised"
+
+  test "close should reject the close codes reserved for local use":
+    var th: Thread[WsSrv]
+    var port: int
+    startWsEcho(th, port)
+
+    proc run(): Future[int] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      for code in [closeNoStatus, closeAbnormal, 1015'u16]:
+        try: await ws.close(code)
+        except ValueError: inc result
+      await ws.close()                         # a valid code still works
+
+    let rejected = waitFor run()
+    joinThread(th)
+    check rejected == 3
+
+  test "a transport EOF should surface as 1006 on both read paths":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    proc run(): Future[uint16] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("eofnow")                  # dropped with no close frame
+      let m = await ws.receive()
+      result = m.closeCode
+
+    let code = waitFor run()
+    joinThread(th)
+    check code == closeAbnormal
+
+    var th2: Thread[WsSrv]
+    var port2: int
+    var sawEof2 = false
+    startWsMisbehave(th2, port2, sawEof2)
+
+    proc run2(): Future[uint16] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port2 & "/chat")
+      await ws.send("eofnow")
+      let r = await ws.stream()                # the streaming path reports the same
+      result = r.closeCode
+
+    let code2 = waitFor run2()
+    joinThread(th2)
+    check code2 == closeAbnormal
+
 suite "chronos websocket protocol-error teardown (#281)":
   # A protocol error from the peer must fail the connection (RFC 6455 7.1.7), not
   # just raise: the transport has to be torn down, else it leaks and the decoder

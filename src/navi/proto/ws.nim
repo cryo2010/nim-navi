@@ -471,6 +471,12 @@ proc validate101*(responseHead, key: string): bool =
       if value.hasToken("upgrade"): connectionOk = true
   acceptOk and upgradeOk and connectionOk
 
+const
+  closeAbnormal* = 1006'u16
+    ## RFC 6455 7.4.1: reserved, never sent on the wire. Surfaced locally when the
+    ## transport ends without a close frame, so an abrupt EOF is distinguishable
+    ## from a clean closure.
+
 # --- incremental UTF-8 validation (for the streaming read path) ---
 
 type

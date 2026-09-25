@@ -202,8 +202,10 @@ proc serveWsMisbehave(ctx: WsSrv) {.thread.} =
       of "splitok":       # U+1F4A9 split across two frames: valid, must be accepted
         c.send(encodeFrame(opText, "\xf0\x9f", masked = false, fin = false))
         c.send(encodeFrame(opContinuation, "\x92\xa9", masked = false, fin = true))
+      of "eofnow":        # drop the transport with no close frame (abnormal closure)
+        discard           # wsAcceptOne closes the socket on the way out
       else: discard
-      if ctx.sawEof != nil:
+      if ctx.sawEof != nil and cmd != "eofnow":
         ctx.sawEof[] = false
         try:
           while true:
