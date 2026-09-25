@@ -79,6 +79,16 @@ suite "HTTP/3 fall-back discipline (#378)":
     check not mayFallBackFromH3(plain(POST), submitted = true)
     check not mayFallBackFromH3(plain(PATCH), submitted = true)
 
+  test "the streaming-response leg is gated by the verb, not by a request body":
+    # `stream`/SSE over h3 submits without a request body, so `isReplayable` is
+    # always true there; the gate that matters is the verb. A POST whose h3 stream
+    # was reset after `awaitHeaders` must NOT be re-sent over h2/h1, while a GET may.
+    var bodyless = plain(POST)
+    bodyless.body = ""
+    check not mayFallBackFromH3(bodyless, submitted = true)
+    check mayFallBackFromH3(bodyless, submitted = false)
+    check mayFallBackFromH3(plain(GET), submitted = true)
+
 suite "HTTP/3 fall-back with a streamed upload (#293)":
   proc streamed(verb: HttpVerb): Request =
     var r = Request(verb: verb, headers: initHeaders())

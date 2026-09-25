@@ -72,7 +72,13 @@ proc openStream(client: Navi, req0: Request): StreamResponse =
     # of the async openStreamConn skH3 path: open a QUIC connection, submit, read the
     # headers, and return a handle whose readChunk pulls the body. The connection is
     # per-stream (no sync h3 pooling, matching the buffered path) and closed at EOF /
-    # by the guard. Any QUIC failure falls through to the h2/h1 pool below.
+    # by the guard. A QUIC failure falls through to the h2/h1 pool below under the
+    # same discipline as the buffered leg (#378): a bare `QuicError` is provably
+    # pre-submit and may fall back for any method, while a `QuicSubmittedError`
+    # (raised by `awaitHeaders` once the stream is on the wire) only falls back when
+    # the request is replayable and idempotent. `stream` takes no request body here,
+    # but the verb still may be non-idempotent (a streamed POST response), so the
+    # gate matters: otherwise a submitted-then-reset POST is silently re-sent.
     if client.config.wantsH3 and rq.url.isTls and client.altSvc != nil:
       let ep = client.altSvc.h3Endpoint("https", rq.url.host, rq.url.port)
       if ep.isSome:
@@ -96,7 +102,11 @@ proc openStream(client: Navi, req0: Request): StreamResponse =
                 client: client, key: key, decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
             except CatchableError:
               conn.freeStream(sid); conn.close(); raise
-        except QuicError: discard   # fall back to the h2/h1 transport below
+        except QuicError as e:
+          # The inner handler above already freed the stream and closed the
+          # connection; all that is left is whether this request may be replayed.
+          if not mayFallBackFromH3(rq, e of QuicSubmittedError): raise
+          # otherwise fall back to the h2/h1 transport below
 
   for dead in reapExpired(client.pool):    # close idle connections past idleConnTimeout
     try: dead.transport.close() except CatchableError: discard
