@@ -1,71 +1,89 @@
-## Sync SSE size-cap teardown (#292): a `maxSseEventBytes` breach raises out of
-## `next`, and the underlying stream must not be left open behind it. Plain HTTP
-## over a loopback socket (no TLS), so it runs on this host; the TLS feature path
-## is exercised in the Docker/CI interop suite.
+## DIAGNOSTIC COPY (ci/diag-sse-cap-windows): the #292 sync SSE cap test with
+## timestamped progress written to $SSE_CAP_DIAG from both threads, so a Windows
+## hang can be located. Not for merge.
 import unittest
-import std/[net, options, strutils]
+import std/[net, options, strutils, os, times, locks]
 import navi
 import navi/proto/sse   # maxSseEventBytes
 
-# A one-shot loopback server that speaks a valid SSE response and then streams an
-# unbounded single event: `data:` lines with no terminating blank line, so the
-# parser accumulates them until the cap trips. It never stops on its own; the
-# client is expected to tear the connection down, which surfaces here as a failing
-# send (swallowed, so the worker thread exits cleanly either way).
+var diagLock: Lock
+initLock(diagLock)
+let diagPath = getEnv("SSE_CAP_DIAG", "")
+let t0 = epochTime()
+
+proc diag(msg: string) =
+  if diagPath.len == 0: return
+  withLock diagLock:
+    let f = open(diagPath, fmAppend)
+    f.writeLine(formatFloat(epochTime() - t0, ffDecimal, 3), " ", msg)
+    f.close()
+
 var portChan: Channel[int]
 
 const
-  LinePayload = 64 * 1024                    # bytes of `x` per data line
-  # enough lines to carry the accumulated event past the cap, with margin
+  LinePayload = 64 * 1024
   LineCount = maxSseEventBytes div LinePayload + 8
 
 proc runFloodSse() {.thread.} =
-  var srv = newSocket()
-  srv.setSockOpt(OptReuseAddr, true)
-  srv.bindAddr(Port(0), "127.0.0.1")
-  srv.listen()
-  portChan.send(srv.getLocalAddr()[1].int)
-  var client: Socket
-  srv.accept(client)
-  var line = ""
-  while true:                       # drain the request headers to the blank line
-    line = ""
-    client.readLine(line, timeout = 2000)
-    # std/net readLine yields "" on a closed peer and the sentinel "\c\l" for an
-    # empty (blank) line: the blank line is the end of the request headers.
-    if line.len == 0 or line == "\c\l": break
-  try:
-    client.send("HTTP/1.1 200 OK\r\n" &
-                "Content-Type: text/event-stream\r\n" &
-                "Connection: close\r\n\r\n")
-    let dataLine = "data: " & repeat('x', LinePayload) & "\n"
-    for _ in 0 ..< LineCount:
-      client.send(dataLine)         # no blank line: one ever-growing event
-  except CatchableError:
-    discard                         # the client tore the connection down: expected
-  try: client.close() except CatchableError: discard
-  try: srv.close() except CatchableError: discard
+  {.cast(gcsafe).}:
+    diag("srv: start")
+    var srv = newSocket()
+    srv.setSockOpt(OptReuseAddr, true)
+    srv.bindAddr(Port(0), "127.0.0.1")
+    srv.listen()
+    portChan.send(srv.getLocalAddr()[1].int)
+    diag("srv: listening")
+    var client: Socket
+    srv.accept(client)
+    diag("srv: accepted")
+    var line = ""
+    while true:
+      line = ""
+      client.readLine(line, timeout = 2000)
+      if line.len == 0 or line == "\c\l": break
+    diag("srv: request headers drained")
+    try:
+      client.send("HTTP/1.1 200 OK\r\n" &
+                  "Content-Type: text/event-stream\r\n" &
+                  "Connection: close\r\n\r\n")
+      let dataLine = "data: " & repeat('x', LinePayload) & "\n"
+      for i in 0 ..< LineCount:
+        client.send(dataLine)
+        if i mod 16 == 0 or i == LineCount - 1: diag("srv: sent line " & $i)
+      diag("srv: all lines sent")
+    except CatchableError as e:
+      diag("srv: send raised " & $e.name & ": " & e.msg)
+    try: client.close() except CatchableError: discard
+    diag("srv: client closed")
+    try: srv.close() except CatchableError: discard
+    diag("srv: done")
 
-suite "sync SSE size cap (#292)":
+suite "sync SSE size cap (#292) [diag]":
   test "a feed() cap breach should close the underlying handle, not just raise":
+    diag("cli: start")
     portChan.open()
     var th: Thread[void]
     createThread(th, runFloodSse)
-    let port = portChan.recv()             # blocks until the worker has bound + listened
+    let port = portChan.recv()
+    diag("cli: port " & $port)
     let api = newNavi()
     let s = api.sse("http://127.0.0.1:" & $port & "/events",
                     reconnect = false, idleTimeoutMs = 10_000)
+    diag("cli: sse opened, httpVersion=" & s.httpVersion())
     var msg = ""
     try:
-      discard s.next()                     # reads until the accumulated event trips the cap
+      discard s.next()
     except ValueError as e:
       msg = e.msg
-    check "limit" in msg                   # the cap, not some other failure
-    # The regression: the breach used to escape `next` with the stream handle still
-    # open, leaking the socket (and, on h2, a mux slot) for the life of the stream.
-    # `httpVersion` is "" exactly when the handle has been released.
+    diag("cli: next() -> " & msg)
+    check "limit" in msg
+    diag("cli: httpVersion=" & s.httpVersion())
     check s.httpVersion() == ""
-    check s.next().isNone                  # no handle, reconnect off: cleanly ended
-    s.close()                              # idempotent; unblocks a still-sending server
+    let n2 = s.next()
+    diag("cli: second next() isNone=" & $n2.isNone)
+    check n2.isNone
+    s.close()
+    diag("cli: closed; joining")
     joinThread(th)
+    diag("cli: joined")
     portChan.close()
