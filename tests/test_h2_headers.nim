@@ -45,6 +45,17 @@ suite "h2 request header mapping":
     req.hasStreamedBody = true
     check not h2HeaderList(req).has("content-length")
 
+  test "an expect-gated request must never carry Expect over h2 (#392)":
+    # `expectContinueMs` is an HTTP/1.1 knob: the header is added to a local copy of
+    # the request inside the h1 send path, so `req` itself never carries it and the
+    # h2 (and h3) field lists, built from `req`, cannot pick it up. h2 has flow
+    # control, which makes the expectation pointless there.
+    var req = post()
+    req.expectContinueMs = 5000
+    req.bodyStream = proc(): string = ""
+    req.hasStreamedBody = true
+    check not h2HeaderList(req).has("expect")
+
   test "a buffered body should keep the caller's Content-Length":
     var req = post()
     req.body = "hello"

@@ -99,6 +99,12 @@ type
     maxRedirects*: int              ## redirects to follow, 0 disables (default 20)
     retry*: RetryPolicy             ## retry policy for transient failures
     maxResponseBytes*: int          ## cap on response body size; 0 (default) unlimited
+    expectContinueMs*: int          ## opt-in `Expect: 100-continue` gate for HTTP/1.1
+                                    ## requests that carry a body: how long to wait for
+                                    ## the server's interim 100 before sending the body,
+                                    ## in ms. 0 (default) disables it entirely (no
+                                    ## `Expect` header is sent). HTTP/1.1 only: h2, h3
+                                    ## and `navi/js` never send the header.
     auth*: Auth                     ## Authorization applied to every request
     proxy*: string                  ## proxy URL; "" falls back to env vars
     unixSocket*: string             ## connect over this Unix socket path instead of
@@ -151,6 +157,10 @@ type
                                 ## is treated as non-replayable too. Set by the request
                                 ## builder / async `requestResolved`.
     absoluteForm*: bool         ## use absolute-URI on the request line (http proxy)
+    expectContinueMs*: int      ## copied from `NaviConfigBase.expectContinueMs` by
+                                ## `buildRequest`, so the h1 send path sees it whichever
+                                ## body arm is in play (buffered, `bodyStream`, or an
+                                ## async producer). 0 (default) = no `Expect` gate.
     deadlineMs*: int            ## per-attempt connect/total budget override, in ms; 0
                                 ## means "use config.timeouts.total". The sync and batch
                                 ## retry loops set this to the REMAINING whole-request
@@ -159,6 +169,14 @@ type
                                 ## backends ignore it (their outer `guard` bounds the
                                 ## whole request); their connect already `discard`s the
                                 ## total deadline.
+
+proc carriesBody*(req: Request): bool =
+  ## Whether this request will put content on the wire: a buffered body, a sync
+  ## `bodyStream` producer, or an async producer (flagged `hasStreamedBody`). The
+  ## `Expect: 100-continue` gate consults it, since RFC 9110 10.1.1 only defines the
+  ## expectation for a request that actually has content -- sending it on a bodyless
+  ## request would make the server wait for a body that never comes.
+  req.body.len > 0 or req.bodyStream != nil or req.hasStreamedBody
 
 proc defaultRetryPolicy*(): RetryPolicy =
   ## Retry idempotent methods up to twice on transient statuses, backing off
@@ -202,6 +220,9 @@ proc totalMsFor*(opts: NaviConfigBase, req: Request): int =
   ## sync backend acts on this at connect; the async backends bound the whole
   ## request with their outer `guard` instead.
   if req.deadlineMs > 0: req.deadlineMs else: opts.timeouts.total
+proc expectContinueMs*(opts: NaviConfigBase): int = opts.expectContinueMs
+  ## How long to wait for an interim `100 Continue` before sending an HTTP/1.1
+  ## request body, in ms; 0 (the default) disables the `Expect: 100-continue` gate.
 proc h2KeepAliveMs*(opts: NaviConfigBase): int = opts.timeouts.h2KeepAlive
   ## HTTP/2 PING keepalive interval in ms for a connection with active streams; 0
   ## disables. Detects a dead/wedged connection (no PONG) so its streams fail over.
@@ -423,6 +444,7 @@ proc buildRequest*(opts: NaviConfigBase, verb: HttpVerb, target: string,
   let resolved = resolveBody(body, form)
   result.body = resolved.content
   result.bodyStream = resolved.stream
+  result.expectContinueMs = opts.expectContinueMs
   if resolved.stream != nil:
     result.hasStreamedBody = true   # a sync producer is non-replayable (see isReplayable)
   if resolved.contentType.len > 0 and not result.headers.contains("content-type"):

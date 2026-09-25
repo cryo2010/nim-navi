@@ -140,6 +140,28 @@ suite "toBody through buildRequest":
     check r.body == ""
     check r.bodyStream != nil
 
+  test "expectContinueMs should be copied from the config onto the request (#392)":
+    # The h1 send path reads it off the Request, so every body arm (buffered,
+    # `bodyStream`, and the async producer threaded outside the request) sees the
+    # same client-level setting.
+    var cfg = NaviConfigBase()
+    cfg.expectContinueMs = 1500
+    check cfg.expectContinueMs == 1500      # the accessor reads the field
+    let r = buildRequest(cfg, POST, "http://x.test/", body = toBody("hi"))
+    check r.expectContinueMs == 1500
+    check build(toBody("hi")).expectContinueMs == 0   # default config: gate off
+
+  test "carriesBody should be true only for a request that puts content on the wire":
+    # What gates the Expect header: RFC 9110 10.1.1 only defines the expectation for
+    # a request with content, and a server told to expect one it never gets stalls.
+    check not build(ResolvedBody()).carriesBody()
+    check build(toBody("hi")).carriesBody()
+    let p: BodyProducer = proc(): string = ""
+    check build(toBody(p)).carriesBody()
+    var asyncish = build(ResolvedBody())
+    asyncish.hasStreamedBody = true          # an async producer, threaded outside req
+    check asyncish.carriesBody()
+
 suite "BodyIterator wrapping producer":
   test "the wrapper should skip empty mid-stream yields and end at finished":
     let parts = @["a", "", "b", "", "c"]

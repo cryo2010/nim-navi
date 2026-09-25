@@ -36,6 +36,41 @@ suite "h1 serialize":
     check "Transfer-Encoding: chunked\r\n" in head
     check "content-length" notin head.toLowerAscii
 
+  test "expectContinue should add the field without copying the request (#392)":
+    # The gate asks the serializer for the field instead of setting it on a clone of
+    # the Request (which would clone a buffered body too, the copy #244 removed).
+    var req = Request(verb: POST, url: parseUrl("http://h/"), body: "hello")
+    req.headers = initHeaders()
+    let head = serializeHead(req, chunked = false, expectContinue = true)
+    check head.count("Expect: 100-continue\r\n") == 1
+    check "Content-Length: 5\r\n" in head              # the rest of the head is unchanged
+    check head.endsWith("\r\n\r\n")                   # and it is still only a head
+    check "expect" notin serializeHead(req).toLowerAscii  # off by default
+
+  test "a caller-supplied Expect should never be duplicated or overridden (#392)":
+    var own = Request(verb: POST, url: parseUrl("http://h/"), body: "hello")
+    own.headers = initHeaders()
+    own.headers["Expect"] = "100-continue"
+    # The header loop already emitted the caller's field; navi must not add a second.
+    check serializeHead(own, chunked = false, expectContinue = true)
+            .count("100-continue") == 1
+    check own.sendsExpectContinue()        # it is the expectation navi waits for
+
+    var foreign = Request(verb: POST, url: parseUrl("http://h/"), body: "hello")
+    foreign.headers = initHeaders()
+    foreign.headers["Expect"] = "something-else"
+    let fhead = serializeHead(foreign, chunked = false, expectContinue = true)
+    check "Expect: something-else\r\n" in fhead
+    check "100-continue" notin fhead       # the caller's expectation stands alone
+    check not foreign.sendsExpectContinue()  # so the gate must not wait on it
+
+  test "sendsExpectContinue should be true for a request with no Expect of its own":
+    var bare = Request(verb: POST, url: parseUrl("http://h/"), body: "hi")
+    bare.headers = initHeaders()
+    check bare.sendsExpectContinue()
+    bare.headers["expect"] = "  100-CONTINUE  "   # case and padding insensitive
+    check bare.sendsExpectContinue()
+
   test "a caller-supplied Content-Length should survive on the buffered path":
     var req = Request(verb: POST, url: parseUrl("http://h/"), body: "hello")
     req.headers = initHeaders()
@@ -398,6 +433,17 @@ suite "h1 parse":
 
   test "keepAliveAfter should reuse a plain keep-alive response (#272)":
     check parseKA("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+
+  test "keepAliveAfter should retire a connection whose request body was skipped (#392)":
+    # An expect-gated upload the server answered (413/401/417) before the body went
+    # out: the response is complete and self-delimited, but the peer may still be
+    # waiting for that body and would read the NEXT request on this connection as it.
+    var p = initH1Parser()
+    p.feed("HTTP/1.1 413 Content Too Large\r\nContent-Length: 2\r\n\r\nno")
+    check p.finished
+    check p.keepAliveAfter()             # reusable on its own terms...
+    p.markBodySkipped()
+    check not p.keepAliveAfter()         # ...but not with a body still owed
 
 suite "url port parsing":
   test "an explicit port and the scheme defaults parse":

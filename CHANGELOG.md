@@ -8,6 +8,31 @@ onward (pre-1.0, minor versions may include breaking changes).
 ## [Unreleased]
 
 ### Added
+- **An opt-in `Expect: 100-continue` gate for HTTP/1.1 uploads (`expectContinueMs`).**
+  Setting `config.expectContinueMs` (ms; `0`, the default, disables it) makes the h1
+  send path put `Expect: 100-continue` on the request head and wait that long for the
+  server's interim `100 Continue` before sending the body, so an upload an endpoint
+  will refuse (413, 401, 403, ...) costs the head instead of the whole body and the
+  producer is never pulled. If the server answers with a final status instead, the
+  body is withheld and the connection is **not pooled** afterwards (a peer still
+  waiting for that body would read the next request as it). If the server stays
+  silent, the body is sent once the timeout lapses (RFC 9110 10.1.1), and a `100` that
+  lands after that is discarded like any other interim. A `417 Expectation Failed` is
+  surfaced as an ordinary response rather than silently retried without the header,
+  since navi's streamed bodies are non-replayable by contract. The header is added to
+  a local copy of the request inside the h1 send, so h2/h3 never carry it and a retry,
+  redirect or digest replay does not inherit it; it is only ever sent on a request
+  that actually has a body. Native clients only (`navi/js` leaves request framing to
+  `fetch`) (#392).
+- **A bounded `recvWithin` transport op on the three native clients.** A read that
+  gives up after a deadline and leaves the connection usable, unlike the (terminal)
+  per-read timeout. The sync client only polls readiness, so nothing is consumed on
+  expiry; the asyncdispatch and chronos clients **park** the unfinished read on the
+  connection and resume it from the next `recvSome`, so its bytes reach the next
+  reader instead of being swallowed (asyncdispatch cannot cancel at all, and a
+  cancelled chronos read can drop bytes it already took off the transport). This is
+  what lets the `Expect: 100-continue` gate wait for the interim response and then
+  carry on reading the same connection (#392).
 - **`WsReader.closeCode`** on every client: the peer's close code once a
   streamed message ends in a close frame (1005 when the peer sent none, 1006 on a
   bodiless EOF). `closeAbnormal`, `closeProtocolError` and `closeNoStatus` are now

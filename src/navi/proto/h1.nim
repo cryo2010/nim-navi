@@ -8,11 +8,34 @@
 import std/strutils
 import ../core/[headers, url, request, response]
 
-proc serializeHead*(req: Request, chunked = false): string =
+proc sendsExpectContinue*(req: Request): bool =
+  ## Whether an `expectContinue` head for this request will actually put
+  ## `Expect: 100-continue` on the wire. navi adds the field when the caller set no
+  ## `Expect` of their own, and a caller who set that exact expectation keeps theirs
+  ## (same field, same meaning, so no duplicate is emitted).
+  ##
+  ## Any OTHER `Expect` value is a caller extension navi neither sends 100-continue
+  ## for nor understands, so the gate must not wait on it: the send path checks this
+  ## before arming the wait, otherwise a foreign expectation would stall the upload
+  ## for the whole `expectContinueMs` before the body went out.
+  var present = false
+  for v in req.headers.getAll("expect"):
+    present = true
+    if cmpIgnoreCase(v.strip(), "100-continue") == 0: return true
+  not present
+
+proc serializeHead*(req: Request, chunked = false, expectContinue = false): string =
   ## Request line, headers, and the terminating blank line (no body). Adds Host
   ## when missing, and either Transfer-Encoding: chunked (streaming upload) or
   ## Content-Length. HTTP/1.1 keeps connections alive by default, which pooling
   ## relies on.
+  ##
+  ## `expectContinue` adds `Expect: 100-continue` (the h1 upload gate, #392). It is a
+  ## parameter here rather than a field the caller sets on a copy of the request: a
+  ## copy would clone the whole `Request`, buffered body included, to add one field,
+  ## which is the very copy #244 removed from this path. Building it into the head
+  ## string costs the field and nothing else, and keeps the header off `req`, so h2/h3
+  ## (which build their field lists from `req`) can never pick it up.
   # navi owns transfer framing: a streamed body (`bodyStream`) or trailers select the
   # chunked path (`chunked = true`, which frames the body and adds the header). A caller
   # must not set Transfer-Encoding by hand -- on the buffered path (`chunked = false`)
@@ -61,6 +84,10 @@ proc serializeHead*(req: Request, chunked = false): string =
       # Content-Length: 0 so servers/WAFs that require a length don't stall or 411 on
       # a bodyless POST/PUT/PATCH (#274). GET/HEAD/etc. carry no length by default.
       result.add("Content-Length: 0\r\n")
+  # The caller's own Expect, if any, was already emitted by the header loop above;
+  # adding a second one would send two expectations for one request.
+  if expectContinue and not req.headers.contains("expect"):
+    result.add("Expect: 100-continue\r\n")
   result.add("\r\n")
 
 proc serializeRequest*(req: Request): string =
@@ -161,6 +188,12 @@ type
                             ## has arrived, so the peer demonstrably began responding even
                             ## before the final headers -- mirrors h2's `responseBegan`,
                             ## so a later drop is a truncation, not a keep-alive race
+    bodySkipped: bool       ## the request body was never put on the wire: an
+                            ## `Expect: 100-continue` upload the server answered with a
+                            ## final status instead of a 100. The peer may still be
+                            ## waiting for that body, so the connection must not be
+                            ## pooled (`keepAliveAfter`) even though the response itself
+                            ## is complete and self-delimited
 
 proc initH1Parser*(streaming = false, headRequest = false): H1Parser =
   result.state = stStatusLine
@@ -224,6 +257,13 @@ proc responseBegan*(p: H1Parser): bool {.inline.} =
   ## but a close after ONLY a 1xx interim (which the parser discards) must also count as
   ## "the peer began responding," so it is not misread as a safe keep-alive race.
   p.sawInterim or p.headersReady
+
+proc markBodySkipped*(p: var H1Parser) =
+  ## Record that the request body was withheld (an expect-gated upload the server
+  ## answered before we sent it). Consulted by `keepAliveAfter`: a server that
+  ## neither closed nor discarded the expectation would read the next request on this
+  ## connection as the missing body, so the connection is retired instead of pooled.
+  p.bodySkipped = true
 
 proc takeLine(p: var H1Parser, line: var string): bool =
   ## Pop one CRLF-terminated line from the buffer, if a full line is present.
@@ -460,6 +500,8 @@ proc keepAliveAfter*(p: H1Parser): bool =
   ## that did not ask to close.
   if p.state != stDone: return false
   if p.bodyMode == bmUntilClose: return false
+  # An expect-gated request whose body we never sent: see `markBodySkipped`.
+  if p.bodySkipped: return false
   # Only pool an HTTP/1.1 peer. HTTP/1.0 keep-alive (via `Connection: keep-alive`) is
   # spec-permitted (RFC 9112 6.3) but notoriously ambiguous through proxies, so we
   # deliberately decline to reuse a 1.0 connection rather than risk a desync (#274).

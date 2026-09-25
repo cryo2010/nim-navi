@@ -1217,3 +1217,227 @@ suite "streamed request body is not retried":
     proc asyncProducer(): Future[string] = discard   # the exact async producer shape
     check not compiles(api.put("http://127.0.0.1/", body = asyncProducer))
     check not compiles(api.request(PUT, "http://127.0.0.1/", body = asyncProducer))
+
+suite "buffered h1 send framing":
+  test "a small buffered body packed with the head must be sent exactly once (#244)":
+    # `h1SendHead` packs a body up to h1CoalesceSize into the head write and
+    # `h1SendBody` then skips it; both ask the same `h1PacksBody`, so they cannot
+    # disagree. If they did, the surplus (or missing) bytes would leave the SECOND
+    # request on this pooled connection starting mid-body, which the server reports as
+    # `desynced`. The second body is deliberately over the cap, so the two-write branch
+    # is covered too.
+    var port = 0
+    var accepts = 0
+    var desynced = false
+    var th: Thread[BodyEchoKaCtx]
+    startBodyEchoKeepAlive(th, port, requests = 2, addr accepts, addr desynced)
+
+    let api = newNavi()
+    let key = "http://127.0.0.1:" & $port
+    let small = api.post(key & "/", body = "small")
+    check small.status == 200
+    check small.body == "small"              # packed into the head write, sent once
+    check api.pool.idleCount(key) == 1
+
+    let big = "z".repeat(h1CoalesceSize + 1)  # over the cap: head and body are two writes
+    let large = api.post(key & "/", body = big)
+    check large.status == 200
+    check large.body == big                   # a duplicated first body would land here
+    joinThread(th)
+    check accepts == 1                        # both requests used the one connection
+    check not desynced                        # every head began on a request line
+
+suite "sync Expect: 100-continue gate (#392)":
+  test "an expect-gated upload should wait for the 100 and then send the body":
+    var port = 0
+    var sawExpect = false
+    var bodyLen = 0
+    var th: Thread[ExpectCtx]
+    startExpect(th, port, emSend100, addr sawExpect, addr bodyLen)
+
+    let api = newNavi()
+    api.config.expectContinueMs = 2000
+    let key = "http://127.0.0.1:" & $port
+    let parts = @["hello ", "expect ", "world"]
+    var i = 0
+    let res = api.request(POST, key & "/",
+      body = BodyProducer(proc(): string =
+        if i < parts.len:
+          result = parts[i]
+          inc i))
+    check res.status == 200
+    check res.body == "hello expect world"
+    joinThread(th)
+    check sawExpect                       # the header went out on the head
+    check bodyLen == "hello expect world".len
+    check api.pool.idleCount(key) == 1    # a completed gate leaves the conn reusable
+
+  test "a final status before the body should withhold it and never pull the producer":
+    var port = 0
+    var sawExpect = false
+    var bodyLen = -1
+    var th: Thread[ExpectCtx]
+    startExpect(th, port, emReject, addr sawExpect, addr bodyLen)
+
+    let api = newNavi()
+    api.config.expectContinueMs = 2000
+    api.config.throwHttpErrors = false    # surface the 413 as a response
+    let key = "http://127.0.0.1:" & $port
+    var pulls = 0
+    let res = api.request(POST, key & "/",
+      body = BodyProducer(proc(): string =
+        inc pulls
+        "never sent"))
+    check res.status == 413
+    check res.body == "too large"
+    joinThread(th)
+    check sawExpect
+    check pulls == 0                      # the producer was never touched
+    check bodyLen == 0
+    # The peer may still be waiting for the body it refused, so the connection must
+    # not be pooled: the next request on it would be read as that missing body.
+    check api.pool.idleCount(key) == 0
+
+  test "a silent server should get the body once expectContinueMs lapses":
+    var port = 0
+    var sawExpect = false
+    var bodyLen = 0
+    var th: Thread[ExpectCtx]
+    startExpect(th, port, emIgnore, addr sawExpect, addr bodyLen)
+
+    let api = newNavi()
+    api.config.expectContinueMs = 150     # the server never answers the expectation
+    let key = "http://127.0.0.1:" & $port
+    var sent = false
+    let res = api.request(POST, key & "/",
+      body = BodyProducer(proc(): string =
+        if sent: return ""
+        sent = true
+        "sent anyway"))
+    check res.status == 200               # RFC 9110 10.1.1: send the body regardless
+    check res.body == "sent anyway"
+    joinThread(th)
+    check sawExpect
+    check bodyLen == "sent anyway".len
+
+  test "a 100 arriving after the gate expired should be discarded, not read as final":
+    var port = 0
+    var bodyLen = 0
+    var th: Thread[ExpectCtx]
+    startExpect(th, port, emLate100, nil, addr bodyLen)
+
+    let api = newNavi()
+    api.config.expectContinueMs = 100     # the 100 lands only once the body starts
+    let key = "http://127.0.0.1:" & $port
+    var sent = false
+    let res = api.request(POST, key & "/",
+      body = BodyProducer(proc(): string =
+        if sent: return ""
+        sent = true
+        "late continue"))
+    check res.status == 200               # the interim did not become the final status
+    check res.body == "late continue"
+    joinThread(th)
+    check bodyLen == "late continue".len
+
+  test "the gate must not outlive the total deadline (#392)":
+    # `expectContinueMs` is the caller's bound on the wait, never a licence to run past
+    # the request's own deadline: against a server that answers neither the expectation
+    # nor anything else, the total deadline must fire at ~300 ms, not at 5 s.
+    var port = 0
+    var th: Thread[ExpectCtx]
+    startExpect(th, port, emIgnore)
+
+    let api = newNavi()
+    api.config.expectContinueMs = 5000          # far longer than the deadline below
+    api.config.timeouts.total = 300
+    var sent = false
+    let t0 = getMonoTime()
+    var raised = false
+    try:
+      discard api.request(POST, "http://127.0.0.1:" & $port & "/",
+        body = BodyProducer(proc(): string =
+          if sent: return ""
+          sent = true
+          "held back"))
+    except response.TimeoutError:
+      raised = true
+    let elapsed = (getMonoTime() - t0).inMilliseconds
+    check raised
+    check elapsed >= 250                        # it really did wait out the deadline
+    check elapsed < 3000                        # but nothing like the 5 s gate
+    joinThread(th)
+
+  test "a caller's foreign Expect value should send the body without waiting (#392)":
+    # navi waits only for the expectation it asked for. An `Expect` the caller set to
+    # something else is their extension: no server answers it with a 100, so arming the
+    # gate would stall the upload for the whole budget before the body went out.
+    var port = 0
+    var sawExpect = true                  # the peer looks for 100-continue specifically
+    var bodyLen = 0
+    var th: Thread[ExpectCtx]
+    startExpect(th, port, emIgnore, addr sawExpect, addr bodyLen)
+
+    let api = newNavi()
+    api.config.expectContinueMs = 5000    # a gate here would stall the test for 5 s
+    api.config.headers["Expect"] = "some-extension"
+    let t0 = getMonoTime()
+    var sent = false
+    let res = api.request(POST, "http://127.0.0.1:" & $port & "/",
+      body = BodyProducer(proc(): string =
+        if sent: return ""
+        sent = true
+        "straight out"))
+    let elapsed = (getMonoTime() - t0).inMilliseconds
+    check res.status == 200
+    check res.body == "straight out"
+    joinThread(th)
+    check not sawExpect                   # the caller's value went out, not 100-continue
+    check bodyLen == "straight out".len
+    check elapsed < 2000                  # nothing waited on the foreign expectation
+
+  test "a caller's own Expect: 100-continue should still be gated, and sent once (#392)":
+    var port = 0
+    var sawExpect = false
+    var bodyLen = 0
+    var th: Thread[ExpectCtx]
+    startExpect(th, port, emSend100, addr sawExpect, addr bodyLen)
+
+    let api = newNavi()
+    api.config.expectContinueMs = 2000
+    api.config.headers["Expect"] = "100-continue"   # the caller set it themselves
+    let res = api.request(POST, "http://127.0.0.1:" & $port & "/",
+      body = "own header")
+    check res.status == 200
+    check res.body == "own header"
+    joinThread(th)
+    check sawExpect
+    check bodyLen == "own header".len
+
+  test "a bodyless request should never carry the Expect header":
+    var port = 0
+    var sawExpect = true                  # must be cleared by the server
+    var th: Thread[ExpectCtx]
+    startExpect(th, port, emIgnore, addr sawExpect)
+
+    let api = newNavi()
+    api.config.expectContinueMs = 2000    # long: a gate here would hang the test
+    let res = api.get("http://127.0.0.1:" & $port & "/")
+    check res.status == 200
+    joinThread(th)
+    check not sawExpect
+
+  test "expectContinueMs = 0 should send no Expect header at all":
+    var port = 0
+    var sawExpect = true
+    var bodyLen = 0
+    var th: Thread[ExpectCtx]
+    startExpect(th, port, emIgnore, addr sawExpect, addr bodyLen)
+
+    let api = newNavi()                   # default config: the gate is off
+    let res = api.post("http://127.0.0.1:" & $port & "/", body = "plain")
+    check res.status == 200
+    check res.body == "plain"
+    joinThread(th)
+    check not sawExpect
+    check bodyLen == "plain".len

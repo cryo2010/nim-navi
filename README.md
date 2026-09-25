@@ -154,6 +154,7 @@ Every client shares the same API, and the below table details where they differ.
 | Max TLS version | system | system | system | runtime |
 | Keep-alive / connection pool | ✓ | ✓ | ✓ | ✗ |
 | Streaming upload | ✓ | ✓ | ✓ | buffered |
+| `Expect: 100-continue` (`expectContinueMs`) | ✓ | ✓ | ✓ | ✗ |
 | Streaming download (pull) | ✓ | ✓ | ✓ | ✓ |
 | Sink download (push, `sink =`) | ✓ | ✓ | ✓ | ✓ |
 | Cookie jar | ✓ | ✓ | ✓ | ✓ |
@@ -250,6 +251,7 @@ let api = newNavi(config)
 | --- | --- | --- | --- |
 | `auth` | `Auth` | `akNone` | Authorization for every request; build via `basicAuth` / `bearerAuth` / `digestAuth`. |
 | `decompress` | `bool` | `true` | Decode `gzip`/`deflate`/`br`/`zstd` response bodies. |
+| `expectContinueMs` | `int` | `0` | Wait this many ms for an interim `100 Continue` before sending an HTTP/1.1 request body (`Expect: 100-continue`); `0` disables the gate. |
 | `headers` | `Headers` | empty | Headers sent on every request. |
 | `http` | `set[HttpVersion]` | `{H1, H2}` | HTTP versions to negotiate; add `H3` (needs `-d:naviHttp3`). |
 | `idleConnTimeout` | `int` | `0` | Evict and close an idle pooled connection after this many ms; `0` = no timeout. |
@@ -866,6 +868,49 @@ type Note = object
   title, body: string
 discard api.post("https://example.com/notes", body = Note(title: "hi", body: "there"))
 ```
+
+#### Expect: 100-continue
+
+A large upload to an endpoint that may refuse it (too big, unauthorized, wrong
+content type) wastes the whole body before the refusal arrives. Setting
+`expectContinueMs` makes navi send `Expect: 100-continue` on the request head and
+wait up to that many milliseconds for the server's interim `100 Continue` before it
+sends the body:
+
+```nim
+let api = newNavi()
+api.config.expectContinueMs = 1000        # 0 (the default) disables the gate
+
+let res = api.request(POST, "https://example.com/upload",
+  body = openFileProducer("big.bin"))     # never pulled if the server refuses first
+```
+
+What happens in each case:
+
+- **`100 Continue` arrives** - the body is sent and the exchange continues normally.
+- **A final status arrives instead** (413, 401, 403, ...) - the body is **never
+  sent** and the producer is **never pulled**; you get that response. The connection
+  is not pooled afterwards, since a server that neither closed it nor discarded the
+  expectation would read your next request as the missing body.
+- **The server stays silent** until the timeout - the body is sent anyway and the
+  response is read as usual (RFC 9110 10.1.1). A `100` that arrives late, after the
+  body already started, is discarded like any other interim response.
+- **A `417 Expectation Failed`** is surfaced to you as an ordinary response. navi
+  does **not** silently retry without the header: streamed bodies are non-replayable
+  by contract, and re-sending a non-idempotent request behind your back would break
+  that. Set `expectContinueMs = 0` for an origin that rejects the expectation.
+
+The gate is added only to requests that actually carry a body, and only on
+**HTTP/1.1**: the field is written into the request head by the h1 send path itself,
+never onto the request, so HTTP/2 and HTTP/3 (which have flow control and no use for
+it) never see it, and it is not inherited by a retry, a redirect hop, or a digest
+replay. It is not available on `navi/js`, whose `fetch` transport owns the request
+framing.
+
+Setting the header yourself is respected either way: `Expect: 100-continue` is not
+duplicated and is gated exactly as if navi had added it (you still need
+`expectContinueMs` for navi to *wait*), while any other `Expect` value is sent as you
+wrote it and never waited on, since no server answers it with a `100`.
 
 ### Server-Sent Events
 

@@ -1078,3 +1078,183 @@ proc startCache*(th: var Thread[CacheSrv], c: var CacheSrv) =
   createThread(th, serveCache, c)
   while not ready: sleep(5)
 
+
+# --- keep-alive body echo (#244 packed head+body write) -----------------------
+
+type BodyEchoKaCtx* = object
+  portOut*: ptr int
+  ready*: ptr bool
+  requests*: int        ## keep-alive requests to answer on the one connection
+  accepts*: ptr int     ## connections accepted (1 proves the pool was reused)
+  desynced*: ptr bool   ## set when a request head does not begin with a method token,
+                        ## i.e. stray bytes from the previous request were still on the
+                        ## wire when this one started
+
+proc serveBodyEchoKeepAlive(ctx: BodyEchoKaCtx) {.thread.} =
+  ## Answer `requests` keep-alive requests on ONE connection, reading each request's
+  ## Content-Length body in full and echoing it back. Because every byte of every body
+  ## is consumed exactly, a body written twice (or not at all) leaves the NEXT request
+  ## head starting mid-body, which `desynced` reports -- that is what makes this the
+  ## guard for the packed head+body write: whoever sends the buffered body, the head
+  ## phase or the body phase, must send it exactly once. (Checking the method token is
+  ## what catches it; the client itself parses a desynced exchange happily, since the
+  ## surplus bytes are absorbed by the server's scan to the blank line.)
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(0), "127.0.0.1")
+  server.listen()
+  ctx.portOut[] = server.getLocalAddr()[1].int
+  ctx.ready[] = true
+  var client = acceptClient(server)
+  if ctx.accepts != nil: ctx.accepts[] = 1
+  for _ in 0 ..< ctx.requests:
+    var head = ""
+    while not head.endsWith("\r\n\r\n"):
+      let c = client.recv(1)
+      if c.len == 0: break
+      head.add c
+    if head.len == 0: break
+    if ctx.desynced != nil and
+       not (head.startsWith("POST ") or head.startsWith("PUT ") or
+            head.startsWith("PATCH ") or head.startsWith("GET ")):
+      ctx.desynced[] = true
+    let cl = headerValue(head, "content-length")
+    let want = if cl.len > 0: parseInt(cl) else: 0
+    var body = ""
+    while body.len < want:
+      let part = client.recv(want - body.len)
+      if part.len == 0: break
+      body.add part
+    client.send("HTTP/1.1 200 OK\r\nContent-Length: " & $body.len &
+                "\r\nConnection: keep-alive\r\n\r\n" & body)
+  client.close()
+  server.close()
+
+proc startBodyEchoKeepAlive*(th: var Thread[BodyEchoKaCtx], port: var int,
+                             requests: int, accepts: ptr int = nil,
+                             desynced: ptr bool = nil) =
+  ## Launch the keep-alive body-echo peer on an ephemeral port (reported via `port`)
+  ## and block until it is listening.
+  var ready = false
+  createThread(th, serveBodyEchoKeepAlive,
+    BodyEchoKaCtx(portOut: addr port, ready: addr ready, requests: requests,
+                  accepts: accepts, desynced: desynced))
+  while not ready: sleep(1)
+
+# --- Expect: 100-continue peers (#392) ---------------------------------------
+# Four servers, one per branch of the expect-gated h1 send. Each reports whether
+# the request head actually carried `Expect: 100-continue` (`sawExpect`) so a test
+# can assert the header is sent only where it should be, and echoes the body it
+# received back as the response body so a test can assert what reached the wire.
+
+type
+  ExpectMode* = enum
+    emSend100       ## reply "100 Continue", then read the body and echo it
+    emReject        ## reply a FINAL 413 instead of the 100, never reading the body
+    emIgnore        ## never reply 100: the client must send the body after its
+                    ## expectContinueMs lapses (RFC 9110 10.1.1) and still get the 200
+    emLate100       ## stay silent until body bytes arrive, THEN send the 100: the
+                    ## interim lands after the gate expired and must be discarded
+
+  ExpectCtx* = object
+    portOut*: ptr int
+    ready*: ptr bool
+    mode*: ExpectMode
+    sawExpect*: ptr bool   ## the request head carried Expect: 100-continue
+    bodyLen*: ptr int      ## bytes of request body the server actually read
+
+proc readChunkedBody(c: Socket, prefix: string): string =
+  ## Decode a chunked request body, `prefix` holding bytes of the first size line
+  ## already taken off the socket (the late-100 server peeks one byte to learn the
+  ## client started sending).
+  var pending = prefix
+  proc line(): string =
+    while true:
+      let i = pending.find("\r\n")
+      if i >= 0:
+        result = pending[0 ..< i]
+        pending = pending[i + 2 .. ^1]
+        return
+      let part = c.recv(1)
+      if part.len == 0: return pending
+      pending.add part
+  proc exactly(n: int): string =
+    while pending.len < n:
+      let part = c.recv(n - pending.len)
+      if part.len == 0: break
+      pending.add part
+    result = pending[0 ..< min(n, pending.len)]
+    pending = pending[min(n, pending.len) .. ^1]
+  while true:
+    let sizeLine = line().strip()
+    if sizeLine.len == 0: break
+    let n = parseHexInt(sizeLine)
+    if n == 0:
+      discard exactly(2)            # the CRLF closing the zero chunk
+      break
+    result.add exactly(n)
+    discard exactly(2)              # the CRLF after the chunk data
+
+proc serveExpect(ctx: ExpectCtx) {.thread.} =
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(0), "127.0.0.1")
+  server.listen()
+  ctx.portOut[] = server.getLocalAddr()[1].int
+  ctx.ready[] = true
+  var client = acceptClient(server)
+  var head = ""
+  while not head.endsWith("\r\n\r\n"):
+    let c = client.recv(1)
+    if c.len == 0: break
+    head.add c
+  if ctx.sawExpect != nil:
+    ctx.sawExpect[] = "100-continue" in headerValue(head, "expect").toLowerAscii
+  let chunked = "chunked" in headerValue(head, "transfer-encoding").toLowerAscii
+  var prefix = ""
+  case ctx.mode
+  of emSend100:
+    client.send("HTTP/1.1 100 Continue\r\n\r\n")
+  of emReject:
+    # A final status before the body, and the body is never read: the client must
+    # withhold it (never pulling its producer) and must not pool this connection.
+    const msg = "too large"
+    client.send("HTTP/1.1 413 Content Too Large\r\nContent-Length: " & $msg.len &
+                "\r\n\r\n" & msg)
+    if ctx.bodyLen != nil: ctx.bodyLen[] = 0
+    sleep(50)                       # let the client finish reading before the FIN
+    client.close()
+    server.close()
+    return
+  of emIgnore:
+    discard                         # say nothing: the client's gate must lapse
+  of emLate100:
+    prefix = client.recv(1)         # block until the post-timeout body starts
+    client.send("HTTP/1.1 100 Continue\r\n\r\n")
+  var body = ""
+  if chunked:
+    body = readChunkedBody(client, prefix)
+  else:
+    let cl = headerValue(head, "content-length")
+    let want = if cl.len > 0: parseInt(cl) else: 0
+    body = prefix
+    while body.len < want:
+      let part = client.recv(want - body.len)
+      if part.len == 0: break
+      body.add part
+  if ctx.bodyLen != nil: ctx.bodyLen[] = body.len
+  client.send("HTTP/1.1 200 OK\r\nContent-Length: " & $body.len &
+              "\r\nConnection: keep-alive\r\n\r\n" & body)
+  sleep(50)                         # keep-alive: let the client pool or retire it
+  client.close()
+  server.close()
+
+proc startExpect*(th: var Thread[ExpectCtx], port: var int, mode: ExpectMode,
+                  sawExpect: ptr bool = nil, bodyLen: ptr int = nil) =
+  ## Launch the expect-continue peer for `mode` on an ephemeral port (reported via
+  ## `port`) and block until it is listening.
+  var ready = false
+  createThread(th, serveExpect,
+    ExpectCtx(portOut: addr port, ready: addr ready, mode: mode,
+              sawExpect: sawExpect, bodyLen: bodyLen))
+  while not ready: sleep(1)

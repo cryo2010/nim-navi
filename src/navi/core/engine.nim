@@ -12,6 +12,7 @@
 ## pool may have been closed by the server in the meantime, so a failed reused
 ## attempt is retried once on a fresh connection.
 
+import std/[monotimes, times]
 import ./headers, ./url, ./request, ./response, ./pool, ./decompress, ./redirect,
        ./retry, ./cookies, ./proxy, ./session, ./h2glue, ./digest, ./cancel,
        ./sinkgate
@@ -60,23 +61,87 @@ template coalesceChunk(conn, pending, chunk: typed) =
       pending.setLen(0)
     pending.add(chunk)
 
-template sendRequest(conn, req: typed; asyncStream: typed = nil) =
-  ## Write the request, streaming the body as chunked transfer-encoding when a
-  ## producer is set. A buffered body with trailers is also sent chunked (trailers
-  ## only exist in chunked transfer-encoding); otherwise the body is sent buffered.
+template h1Chunked(req, asyncStream: typed): bool =
+  ## Whether this request's body is framed as chunked transfer-encoding: a streamed
+  ## upload (a sync `bodyStream` or an async producer) or a buffered body carrying
+  ## trailers, which only exist in the chunked framing. The head and the body phases
+  ## below must agree on this, so it is decided in one place.
+  block:
+    var streamed = req.bodyStream != nil
+    when compiles(await asyncStream()):
+      if not asyncStream.isNil: streamed = true
+    streamed or req.trailers.len > 0
+
+template h1PacksBody(req, asyncStream, packSmallBody: typed): bool =
+  ## Whether the head write carries the buffered body with it (#244). Two competing
+  ## costs: `serializeHead(req) & req.body` copies the entire upload just to prepend a
+  ## ~200-byte head (again on every retry and redirect hop), while sending head and
+  ## body as two writes costs an extra syscall and, under TLS, an extra record with its
+  ## own header and MAC -- and an extra TCP segment, since every backend sets
+  ## TCP_NODELAY (sync/asyncdispatch set the socket option, chronos connects with
+  ## SocketFlags.TcpNoDelay), so nothing coalesces the two writes for us. Neither
+  ## stalls (NODELAY means no Nagle wait for the peer's ACK), but the small-request
+  ## case is the common one, so the size picks the cheaper side: a body up to one
+  ## write buffer is packed with the head into a single write (a bounded, cheap copy,
+  ## the same trade the streamed-upload path makes in `coalesceChunk`), a larger one
+  ## goes out as two writes and is never copied.
+  ##
+  ## Only the buffered arm can pack: a chunked body (a producer, or trailers) is
+  ## framed by the body phase, not written raw. `packSmallBody` is the caller's veto:
+  ## `sendRequest` allows it, the `Expect: 100-continue` gate does not, since holding
+  ## the body back until the interim response is the entire point there. The head and
+  ## the body phase both consult this one predicate, so they cannot disagree about who
+  ## wrote the body.
+  packSmallBody and req.body.len > 0 and req.body.len <= h1CoalesceSize and
+    not h1Chunked(req, asyncStream)
+
+template h1SendHead(conn, req: typed; asyncStream: typed = nil;
+                    expectContinue: typed = false;
+                    packSmallBody: typed = false) =
+  ## Write the request head (request line, headers, terminating blank line), plus a
+  ## small buffered body when `packSmallBody` lets it ride along (see `h1PacksBody`).
+  ## Separated from the body phase so the `Expect: 100-continue` gate (#392) can wait
+  ## between the two; `sendRequest` below is just the two phases back to back.
+  ##
+  ## `expectContinue` asks the serializer for `Expect: 100-continue`, which it writes
+  ## straight into the head string. Nothing is added to `req`, so h2/h3 never see the
+  ## field (they build their field lists from `req` itself, and the expectation is
+  ## meaningless where there is flow control) and a retry, redirect or digest replay of
+  ## the same `Request` does not inherit it. A caller who set the field by hand keeps
+  ## their own value. Passing a flag rather than adding the field to a copy of the
+  ## request matters for a large buffered upload: the copy would clone the body too
+  ## (#244). Arguments are positional on purpose: `expectContinue` is a template
+  ## parameter, so a named `expectContinue =` would be hygienically renamed and stop
+  ## matching serializeHead's parameter.
+  mixin await, sendAll
+  let chunkedHead = h1Chunked(req, asyncStream)
+  let head = serializeHead(req, chunkedHead, expectContinue)
+  if h1PacksBody(req, asyncStream, packSmallBody):
+    var whole = newStringOfCap(head.len + req.body.len)
+    whole.add head
+    whole.add req.body
+    await sendAll(conn, whole)
+  else:
+    await sendAll(conn, head)
+
+template h1SendBody(conn, req: typed; asyncStream: typed = nil;
+                    packSmallBody: typed = false) =
+  ## Write the request body, framed as `h1SendHead` advertised, and nothing else. A
+  ## bodyless request writes nothing, and so does a buffered one whose body the head
+  ## write already packed (same `packSmallBody`, same `h1PacksBody` verdict).
   ##
   ## `asyncStream` (async backends only) is an awaited pull-based producer: the send
   ## awaits it once per chunk, so producing a chunk can itself await (e.g. piping a
   ## streaming download into the upload). It outranks the sync `bodyStream`. On the
   ## sync backend the awaited branch is dropped at compile time (`await` of a
   ## Future-returning proc does not compile there), so the sync send stays identical.
+  mixin await, sendAll
   when compiles(await asyncStream()):
     let asyncBody = not asyncStream.isNil
   else:
     const asyncBody = false
   if asyncBody:
     when compiles(await asyncStream()):
-      await sendAll(conn, serializeHead(req, chunked = true))
       # Small producer chunks are coalesced into one write (see coalesceChunk, #299).
       var pending = newStringOfCap(h1CoalesceSize)
       while true:
@@ -96,7 +161,6 @@ template sendRequest(conn, req: typed; asyncStream: typed = nil) =
       tail.add(finalChunk(req))
       await sendAll(conn, tail)
   elif req.bodyStream != nil:
-    await sendAll(conn, serializeHead(req, chunked = true))
     var pending = newStringOfCap(h1CoalesceSize)   # see coalesceChunk above
     while true:
       # single-threaded client; the producer need not be gcsafe (see h1.emitBody)
@@ -110,34 +174,51 @@ template sendRequest(conn, req: typed; asyncStream: typed = nil) =
     tail.add(finalChunk(req))
     await sendAll(conn, tail)
   elif req.trailers.len > 0:
-    await sendAll(conn, serializeHead(req, chunked = true))
     var framed = newStringOfCap(req.body.len + 64)
     framed.addChunk(req.body)
     framed.add(finalChunk(req))
     await sendAll(conn, framed)
-  else:
-    # Buffered body. Two competing costs: `serializeHead(req) & req.body` copies the
-    # entire upload just to prepend a ~200-byte head (again on every retry and
-    # redirect hop), while sending head and body as two writes costs an extra syscall
-    # and, under TLS, an extra record with its own header and MAC -- and an extra TCP
-    # segment, since every backend sets TCP_NODELAY (sync/asyncdispatch set the socket
-    # option, chronos connects with SocketFlags.TcpNoDelay), so nothing coalesces the
-    # two writes for us. Neither stalls (NODELAY means no Nagle wait for the peer's
-    # ACK), but the small-request case is the common one, so pick per body size:
-    # bodies up to one write buffer are packed with the head into a single write (a
-    # bounded, cheap copy, the same trade the streamed-upload path makes in
-    # `coalesceChunk`), larger ones go out as two writes and are never copied.
-    let head = serializeHead(req)
-    if req.body.len == 0:
-      await sendAll(conn, head)
-    elif req.body.len <= h1CoalesceSize:
-      var whole = newStringOfCap(head.len + req.body.len)
-      whole.add head
-      whole.add req.body
-      await sendAll(conn, whole)
-    else:
-      await sendAll(conn, head)
+  elif req.body.len > 0:
+    # Buffered body. The head write already took it when `h1PacksBody` said so (the
+    # small-body pack, #244); otherwise it is a large body, written on its own and
+    # never copied.
+    if not h1PacksBody(req, asyncStream, packSmallBody):
       await sendAll(conn, req.body)
+
+template sendRequest(conn, req: typed; asyncStream: typed = nil) =
+  ## Write the whole request: the head, then the body, framed as chunked transfer-
+  ## encoding when a producer is set or trailers are attached. The two phases are
+  ## separate templates so the `Expect: 100-continue` gate can interpose a bounded
+  ## read between them; with no gate they run back to back exactly as before, and
+  ## `packSmallBody` keeps a small buffered body in the same write as the head (#244).
+  h1SendHead(conn, req, asyncStream, expectContinue = false, packSmallBody = true)
+  h1SendBody(conn, req, asyncStream, packSmallBody = true)
+
+template h1ClassifySend(sendErr, hasProducer: typed) =
+  ## WRITE-TIME classification of an h1 send that failed BEFORE any response, shared
+  ## by the plain send and by both phases of the expect-gated send.
+  ##
+  ## A reused pooled connection the server RST while idle fails at WRITE time with a
+  ## plain transport error (sync "socket write failed" / "SSL_write failed" IOError,
+  ## asyncdispatch OSError, chronos AsyncStreamError) -- none of them a
+  ## KeepAliveRaceError/UnprocessedError the replay layer accepts, so it would decline
+  ## the request even for an idempotent method. Reclassify it as the ambiguous
+  ## keep-alive race (request written or partially written, no response began),
+  ## restoring the idempotent / Idempotency-Key replay a pre-response write failure
+  ## warrants (matching Go net/http; RFC 9110 9.2.2).
+  ##
+  ## Only a BUFFERED-body request is reclassified: a streamed body
+  ## (`bodyStream`/`asyncStream`) is non-replayable (`isReplayable` is false), so the
+  ## retry layer would decline a replay regardless, and its send can raise from the
+  ## user's producer -- which must keep its own exception type, not become a race. A
+  ## cancellation (chronos guard / CancelToken) must also propagate untouched. `when
+  ## declared(CancelledError)` resolves at the instantiation site, so it is inert on
+  ## the sync/asyncdispatch backends (no cancellation).
+  when declared(CancelledError):
+    if sendErr of CancelledError: raise
+  if hasProducer: raise             # producer error / non-replayable streamed body
+  raise newException(KeepAliveRaceError,
+    "navi: http/1.1 send failed before any response: " & sendErr.msg)
 
 template h1SendAndReadHeaders*(transport, req, streaming: typed;
                                asyncStream: typed = nil): H1Parser =
@@ -147,38 +228,78 @@ template h1SendAndReadHeaders*(transport, req, streaming: typed;
   ## The header/body split lets a pull-based caller return a handle here and drain
   ## the body later. `asyncStream` (async backends only) is an awaited body producer
   ## passed through to `sendRequest`; nil on the sync path.
-  mixin await, sendAll, recvSome
+  mixin await, sendAll, recvSome, recvWithin
   block:
-    # WRITE-TIME classification. A reused pooled connection the server RST while idle
-    # fails at WRITE time with a plain transport error (sync "socket write failed" /
-    # "SSL_write failed" IOError, asyncdispatch OSError, chronos AsyncStreamError) --
-    # none of them a KeepAliveRaceError/UnprocessedError the replay layer accepts, so it
-    # would decline the request even for an idempotent method. Wrap the send and classify
-    # a transport write failure as the ambiguous keep-alive race (request written or
-    # partially written, no response began), restoring the idempotent / Idempotency-Key
-    # replay a pre-response write failure warrants (matching Go net/http; RFC 9110 9.2.2).
-    #
-    # Only reclassify a BUFFERED-body request: a streamed body (`bodyStream`/`asyncStream`)
-    # is non-replayable (`isReplayable` is false), so the retry layer would decline a
-    # replay regardless, and its send can raise from the user's producer -- which must keep
-    # its own exception type, not become a race. A cancellation (chronos guard / CancelToken)
-    # must also propagate untouched. `when declared(CancelledError)` resolves at the
-    # instantiation site, so it is inert on the sync/asyncdispatch backends (no cancellation).
     var hasProducer = req.bodyStream != nil
     when compiles(await asyncStream()):
       if not asyncStream.isNil: hasProducer = true
-    try:
-      sendRequest(transport, req, asyncStream)
-    except CatchableError as sendErr:
-      when declared(CancelledError):
-        if sendErr of CancelledError: raise
-      if hasProducer: raise             # producer error / non-replayable streamed body
-      raise newException(KeepAliveRaceError,
-        "navi: http/1.1 send failed before any response: " & sendErr.msg)
+    # The opt-in `Expect: 100-continue` gate (#392). Three conditions, all necessary:
+    # the knob is on; the request actually carries content (RFC 9110 10.1.1 defines the
+    # expectation in terms of the body, and a server told to expect one it never gets
+    # would stall); and the head will really carry `Expect: 100-continue`
+    # (`sendsExpectContinue`) rather than some other expectation the caller set, which
+    # no server answers with a 100 and which would therefore stall the upload for the
+    # whole budget before the body went out. h1 only: h2/h3 have flow control and never
+    # see the header (see `h1SendHead`).
+    let expectGateMs =
+      if req.expectContinueMs > 0 and (hasProducer or req.carriesBody()) and
+         req.sendsExpectContinue():
+        req.expectContinueMs
+      else: 0
     let noBody = req.verb == HEAD          # a HEAD response never carries a body
     # positional args: `streaming` is a template param, so a named `streaming =`
     # would be hygienically renamed and not match initH1Parser's parameter.
     var parser = initH1Parser(streaming, noBody)
+    try:
+      if expectGateMs > 0: h1SendHead(transport, req, asyncStream, true)
+      else: sendRequest(transport, req, asyncStream)
+    except CatchableError as sendErr:
+      h1ClassifySend(sendErr, hasProducer)
+    if expectGateMs > 0:
+      # Wait (bounded) for the peer to say something about the expectation. The reads
+      # are `recvWithin`, the one bounded read that leaves the connection usable when
+      # it expires -- a per-read timeout is terminal, so it could not be used here.
+      # The loop re-reads on a partial head, and stops as soon as ANY response began:
+      # `responseBegan and not headersReady` is exactly "a 1xx (the 100) arrived",
+      # since `finishHeaders` discards an interim and reopens the status line.
+      var peerClosed = false
+      let gateEnd = getMonoTime() + initDuration(milliseconds = expectGateMs)
+      while not parser.responseBegan and not parser.finished:
+        let leftMs = int((gateEnd - getMonoTime()).inMilliseconds)
+        if leftMs <= 0: break
+        let got = await recvWithin(transport, leftMs)
+        if got.timedOut: break
+        if got.data.len == 0:
+          parser.eof()                     # peer closed instead of answering
+          peerClosed = true
+          break
+        parser.feed(got.data)
+      if parser.headersReady:
+        # A FINAL status arrived instead of the 100 (413 Payload Too Large, 401, 417
+        # Expectation Failed, ...): the whole point of the gate is not to upload a body
+        # the server has already refused, so it is never sent. The peer may nonetheless
+        # still be waiting for it, in which case it would read the NEXT request on this
+        # connection as the missing body -- so the connection is retired rather than
+        # pooled (`markBodySkipped` -> `keepAliveAfter` is false).
+        #
+        # A 417 is surfaced as an ordinary response, not silently retried without the
+        # header: navi's streamed bodies are non-replayable by contract, and quietly
+        # re-sending a non-idempotent request behind the caller's back would break that.
+        # Set `expectContinueMs = 0` for an origin that rejects the expectation.
+        parser.markBodySkipped()
+      elif not peerClosed:
+        # Either the 100 arrived, or the gate expired with the server silent. RFC 9110
+        # 10.1.1: a client that gets no interim response within a reasonable time SHOULD
+        # send the body anyway, so both cases send it. A 100 that arrives late (after the
+        # timeout, with the body already going out) is just another interim to the parser
+        # -- `finishHeaders` discards it and keeps reading for the final status.
+        try:
+          h1SendBody(transport, req, asyncStream)
+        except CatchableError as sendErr:
+          # The peer already began replying (the 100), so a failure now is not the
+          # ambiguous "written but no response" race: keep the transport error as is.
+          if parser.responseBegan: raise
+          h1ClassifySend(sendErr, hasProducer)
     while not parser.headersReady and not parser.finished:
       let chunk = await recvSome(transport)
       if chunk.len == 0: parser.eof(); break
