@@ -5,7 +5,7 @@
 ## across the sync, asyncdispatch, and chronos backends and unit-testable in
 ## isolation.
 
-import std/[strutils, strformat]
+import std/strutils
 import ../core/[headers, url, request, response]
 
 proc serializeHead*(req: Request, chunked = false): string =
@@ -78,23 +78,39 @@ const h1CoalesceSize* = 16 * 1024
   ## this large is framed and written on its own. 16 KiB is the maximum TLS record
   ## payload, so a full buffer always fits one record.
 
+const hexDigits = "0123456789ABCDEF"
+
+proc addChunkSize(buf: var string, n: Positive) =
+  ## Append `n` as an uppercase hex chunk-size, written digit by digit straight into
+  ## `buf`. `fmt"{n:X}"` would allocate a throwaway string per chunk of a streamed
+  ## upload, which is the one allocation a chunk header does not need.
+  var digits {.noinit.}: array[16, char]        # 16 nibbles spans the whole int range
+  var i = 0
+  var v = int(n)
+  while v > 0:
+    digits[i] = hexDigits[v and 0xf]
+    inc i
+    v = v shr 4
+  while i > 0:
+    dec i
+    buf.add digits[i]
+
 proc addChunk*(buf: var string, data: string) =
   ## Append one HTTP/1.1 chunked-transfer frame for `data` to `buf`. Lets the send
   ## loop pack the last chunk and the terminator into a single write without an
   ## intermediate per-chunk string. An empty `data` appends nothing: an empty chunk
   ## would encode as "0\r\n\r\n", a premature body terminator (#274).
   if data.len == 0: return
-  let hex = fmt"{data.len:X}"
-  buf.add hex
+  buf.addChunkSize(data.len)
   buf.add "\r\n"
   buf.add data
   buf.add "\r\n"
 
 proc encodeChunk*(data: string): string =
   ## One HTTP/1.1 chunked-transfer frame: `<hex-size>\r\n<data>\r\n`. `data` must be
-  ## non-empty. Built into a single preallocated buffer (the payload is copied once)
-  ## rather than chained `&` temporaries, since this runs per chunk of a streamed
-  ## upload.
+  ## non-empty. Built into a single preallocated buffer (the payload is copied once,
+  ## the size written in place) rather than chained `&` temporaries, since this runs
+  ## per chunk of a streamed upload.
   if data.len == 0: return ""
   result = newStringOfCap(data.len + 20)
   result.addChunk(data)

@@ -62,6 +62,21 @@ suite "h1 serialize":
     check encodeChunk("") == ""
     check encodeChunk("ab") == "2\r\nab\r\n"
 
+  test "encodeChunk should write the chunk size as uppercase hex at every width (#244)":
+    # The size is written digit by digit into the output buffer rather than through a
+    # formatted temporary, so check the boundaries a hand-rolled hex writer can get
+    # wrong: single digit, nibble rollover, and a multi-byte size.
+    for n in [1, 9, 10, 15, 16, 17, 255, 256, 4095, 4096, 1048576]:
+      let data = repeat('x', n)
+      check encodeChunk(data) == fmt"{n:X}" & "\r\n" & data & "\r\n"
+
+  test "addChunk should append frames to an existing buffer and skip empty data (#244)":
+    var buf = "head:"
+    buf.addChunk("")                  # an empty chunk would be a premature terminator
+    buf.addChunk("abc")
+    buf.addChunk(repeat('y', 26))
+    check buf == "head:3\r\nabc\r\n1A\r\n" & repeat('y', 26) & "\r\n"
+
   test "validateRequest should reject CR/LF in the request path (#274)":
     var req = Request(verb: GET, url: parseUrl("http://h/a"))
     req.url = parseUrl("http://h/a")
