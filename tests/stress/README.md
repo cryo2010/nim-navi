@@ -26,7 +26,7 @@ checksum and fails hard on any mismatch.
 | `CLIENT` | `all` | `sync` \| `asyncdispatch` \| `chronos` \| `js` \| `all` |
 | `SERVERS` | `5` | server instances; requests round-robin across them |
 | `SECONDS` | `60` | runtime per (client × protocol) cell |
-| `CLIENTS` | `3` | concurrent navi client instances per cell |
+| `CLIENT_COUNT` | `3` | concurrent navi client instances per cell |
 | `CONCURRENCY` | `8` | in-flight requests per client (async fan-out) |
 | `REQ_COMPRESSION` | `gzip` | request body: `none` \| `gzip` \| `deflate` (native; **octet/text only**) |
 | `RESP_COMPRESSION` | `gzip` | response via `x-want-encoding`: `none` \| `gzip` \| `deflate` \| `br` \| `zstd` |

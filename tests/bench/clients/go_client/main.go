@@ -454,7 +454,7 @@ func main() {
 		tlsCfg:       tlsCfg,
 		expect:       expect,
 		cold:         envStr("NAVI_MODE", "pooled") == "cold",
-		clients:      envInt("NAVI_CLIENTS", 3),
+		clients:      envInt("NAVI_CLIENT_COUNT", 3),
 		concurrency:  envInt("NAVI_CONCURRENCY", 8),
 		streamBytes:  envInt64("NAVI_STREAM_BYTES", 1073741824),
 		measureStart: start.Add(time.Duration(warmup * float64(time.Second))),

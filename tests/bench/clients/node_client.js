@@ -2,7 +2,7 @@
 //
 // Dispatches on NAVI_WORKLOAD: "requests" (buffered GET/POST/PUT), or the
 // streaming pairs "streamDownload"/"streamUpload". All paths are time-boxed
-// (unmeasured warmup then a measured window), run NAVI_CLIENTS*NAVI_CONCURRENCY
+// (unmeasured warmup then a measured window), run NAVI_CLIENT_COUNT*NAVI_CONCURRENCY
 // async workers, and land each measured unit in a log-bucketed latency
 // histogram whose scheme (floor(log2(us)*64)) matches the Go/Nim/Rust/Python
 // peers so the p50/p99/p999 columns are comparable. For "requests" the unit is
@@ -88,7 +88,7 @@ async function main() {
   const seconds = envFloat('NAVI_SECONDS', 20);
   const warmup = envFloat('NAVI_WARMUP_SECONDS', 2);
   const cold = envStr('NAVI_MODE', 'pooled') === 'cold';
-  const clients = envInt('NAVI_CLIENTS', 3);
+  const clients = envInt('NAVI_CLIENT_COUNT', 3);
   const concurrency = envInt('NAVI_CONCURRENCY', 8);
   const streamBytes = envInt('NAVI_STREAM_BYTES', 1073741824);
 

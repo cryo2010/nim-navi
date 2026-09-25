@@ -18,7 +18,7 @@ type
     seconds*: float          ## measured duration
     warmupSeconds*: float    ## unmeasured warmup before the timed window
     mode*: string            ## pooled (reuse connections) | cold (fresh conn per request)
-    clients*: int            ## navi clients per backend
+    clients*: int            ## concurrent navi client instances (NAVI_CLIENT_COUNT)
     concurrency*: int        ## in-flight requests per client (async fan-out width)
     reqCompression*: string  ## none|gzip|deflate (request body; native only)
     respCompression*: string ## none|gzip|deflate|br|zstd (asked via x-want-encoding)
@@ -46,7 +46,7 @@ proc loadConfig*(backend: string): Config =
     seconds: getFloat("NAVI_SECONDS", 20.0),
     warmupSeconds: getFloat("NAVI_WARMUP_SECONDS", 2.0),
     mode: getEnv("NAVI_MODE", "pooled"),
-    clients: max(1, getInt("NAVI_CLIENTS", 3)),
+    clients: max(1, getInt("NAVI_CLIENT_COUNT", 3)),
     concurrency: max(1, getInt("NAVI_CONCURRENCY", 8)),
     reqCompression: getEnv("NAVI_REQ_COMPRESSION", "gzip"),
     respCompression: getEnv("NAVI_RESP_COMPRESSION", "gzip"),

@@ -90,7 +90,7 @@ proc runStress(workload: string) =
   exec "docker build -f " & dockerfile & " -t " & image & " ."
   exec "docker run --rm -e NAVI_WORKLOAD=" & workload &
        " -e NAVI_PROTO -e NAVI_CLIENT -e NAVI_SERVERS" &
-       " -e NAVI_SECONDS -e NAVI_CLIENTS -e NAVI_CONCURRENCY" &
+       " -e NAVI_SECONDS -e NAVI_CLIENT_COUNT -e NAVI_CONCURRENCY" &
        " -e NAVI_REQ_COMPRESSION -e NAVI_RESP_COMPRESSION -e NAVI_CONTENT_TYPES" &
        " -e NAVI_STREAM_BYTES -e NAVI_REPORT_SECONDS -e NAVI_LOG_ERRORS" &
        " -e NAVI_RECYCLE -e NAVI_KEEPALIVE_MAX -e NAVI_KEEPALIVE_TIMEOUT" &
@@ -223,7 +223,7 @@ proc runBench(workload: string) =
   exec "docker run --rm " & netem & "-e NAVI_WORKLOAD=" & workload &
        " -e NAVI_PROTO -e NAVI_CLIENT -e NAVI_LANGS -e NAVI_SERVERS" &
        " -e NAVI_THREADS -e NAVI_PROCS" &
-       " -e NAVI_SECONDS -e NAVI_WARMUP_SECONDS -e NAVI_MODE -e NAVI_CLIENTS" &
+       " -e NAVI_SECONDS -e NAVI_WARMUP_SECONDS -e NAVI_MODE -e NAVI_CLIENT_COUNT" &
        " -e NAVI_CONCURRENCY -e NAVI_REQ_COMPRESSION -e NAVI_RESP_COMPRESSION" &
        " -e NAVI_STREAM_BYTES -e NAVI_REPORT_SECONDS" &
        " -e NAVI_NETEM -e NAVI_NETEM_DELAY -e NAVI_NETEM_LOSS " & image

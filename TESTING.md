@@ -371,7 +371,7 @@ honest exit code.
 | `NAVI_CLIENT` | `all` | `sync` \| `asyncdispatch` \| `chronos` \| `js` \| `all` |
 | `NAVI_SERVERS` | `5` | Number of server instances; requests round-robin across them |
 | `NAVI_SECONDS` | `60` | Runtime per (client × protocol) cell |
-| `NAVI_CLIENTS` | `3` | Concurrent navi client instances per cell |
+| `NAVI_CLIENT_COUNT` | `3` | Concurrent navi client instances per cell |
 | `NAVI_CONCURRENCY` | `32` | In-flight requests per client (async fan-out width) |
 | `NAVI_REQ_COMPRESSION` | `gzip` | Request body encoding: `none` \| `gzip` \| `deflate` (native only) |
 | `NAVI_RESP_COMPRESSION` | `gzip` | Response encoding requested via `x-want-encoding`: `none` \| `gzip` \| `deflate` \| `br` \| `zstd` |

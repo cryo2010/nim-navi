@@ -35,7 +35,7 @@ verify a SHA-1 and fail hard on mismatch.
 | `NAVI_SECONDS` | `20` | measured window per cell |
 | `NAVI_WARMUP_SECONDS` | `2` | unmeasured warmup before the window |
 | `NAVI_MODE` | `pooled` | `pooled` (reuse connections) \| `cold` (fresh connection per request) |
-| `NAVI_CLIENTS` | `3` | concurrent navi client instances per cell |
+| `NAVI_CLIENT_COUNT` | `3` | concurrent navi client instances per cell |
 | `NAVI_CONCURRENCY` | `8` | in-flight ops per client (fan-out width) |
 | `NAVI_STREAM_BYTES` | `1073741824` | bytes per streaming transfer (1 GiB; lower for a smoke) |
 | `NAVI_NETEM` | `0` | `1` adds a lossy-link regime (`tc netem`; needs `--cap-add=NET_ADMIN`, added automatically) |

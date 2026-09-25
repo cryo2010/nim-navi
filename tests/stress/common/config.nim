@@ -19,7 +19,7 @@ type
     basePort*: int           ## first server port; instance i listens on basePort+i
     servers*: int            ## number of server instances to round-robin
     seconds*: float          ## soak duration
-    clients*: int            ## navi clients per backend
+    clients*: int            ## concurrent navi client instances (NAVI_CLIENT_COUNT)
     concurrency*: int        ## in-flight requests per client (async fan-out width)
     reqCompression*: string  ## none|gzip|deflate (request body; native only, octet/text only)
     respCompression*: string ## none|gzip|deflate|br|zstd (asked via x-want-encoding)
@@ -106,7 +106,7 @@ proc loadConfig*(backend: string): Config =
     basePort: getInt("NAVI_BASE_PORT", 9443),
     servers: max(1, getInt("NAVI_SERVERS", 5)),
     seconds: getFloat("NAVI_SECONDS", 60.0),
-    clients: max(1, getInt("NAVI_CLIENTS", 3)),
+    clients: max(1, getInt("NAVI_CLIENT_COUNT", 3)),
     concurrency: max(1, getInt("NAVI_CONCURRENCY", 8)),
     reqCompression: getEnv("NAVI_REQ_COMPRESSION", "gzip"),
     respCompression: getEnv("NAVI_RESP_COMPRESSION", "gzip"),
