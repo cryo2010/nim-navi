@@ -18,7 +18,9 @@ type
     reconnect: bool
     baseRetryMs: int
     retryMs: int
+    minRetryMs: int       ## floor under every delay (a retry: 0 cannot spin us)
     maxRetryMs: int
+    sawEvent: bool        ## the current connection delivered at least one event
     idleTimeoutMs: int    ## bound on a single read / (re)open wait; 0 = unbounded
     handle: StreamResponse
     parser: SseParser
@@ -50,7 +52,8 @@ proc sse*(client: Navi, target: string, verb = GET,
           headers = initHeaders(), body = "",
           params: seq[(string, string)] = @[],
           lastEventId = "", reconnect = true,
-          retryMs = 3000, maxRetryMs = 30_000, idleTimeoutMs = 45_000,
+          retryMs = 3000, maxRetryMs = 30_000,
+          minRetryMs = defaultSseMinRetryMs, idleTimeoutMs = 45_000,
           cancel: CancelToken = nil): Future[SseStream] {.async.} =
   ## Open a Server-Sent Events stream. The initial response is validated up front (a
   ## non-200 or non `text/event-stream` response raises). Consume events with `next`
@@ -67,6 +70,12 @@ proc sse*(client: Navi, target: string, verb = GET,
   ## byte -- including a keep-alive `:` comment -- resets it, so a live-but-quiet
   ## stream is not disturbed; set 0 to disable (only for a server known to go silent
   ## for long stretches without sending keep-alives).
+  ##
+  ## `minRetryMs` floors every reconnect delay, including one the server asked for
+  ## with `retry:`, so a `retry: 0` (or a server that answers 200 and closes with no
+  ## events) cannot spin the reconnect loop. It is capped by `maxRetryMs`. A connect
+  ## that closes without delivering an event also doubles the delay; only a connect
+  ## that delivered at least one event resets it to the base.
   var cfg = client.config
   cfg.maxResponseBytes = 0
   cfg.timeouts.read = 0
@@ -76,8 +85,11 @@ proc sse*(client: Navi, target: string, verb = GET,
   if not h.contains("cache-control"): h["cache-control"] = "no-cache"
   let s = SseStream(
     client: newNavi(cfg), verb: verb, target: target, headers: h, params: params,
-    cancel: cancel, reconnect: reconnect, baseRetryMs: retryMs, retryMs: retryMs,
-    maxRetryMs: maxRetryMs, idleTimeoutMs: idleTimeoutMs, parser: initSseParser(lastEventId))
+    cancel: cancel, reconnect: reconnect,
+    baseRetryMs: sseRetryDelay(retryMs, minRetryMs, maxRetryMs),
+    retryMs: sseRetryDelay(retryMs, minRetryMs, maxRetryMs),
+    minRetryMs: minRetryMs, maxRetryMs: maxRetryMs,
+    idleTimeoutMs: idleTimeoutMs, parser: initSseParser(lastEventId))
   s.client.jar = client.jar          # share cookies with the caller
   let openFut = s.openConn()
   if idleTimeoutMs > 0 and not await withTimeout(openFut, msOf(idleTimeoutMs)):
@@ -104,6 +116,16 @@ proc httpVersion*(s: SseStream): string =
 
 proc lastEventId*(s: SseStream): string = s.parser.lastEventId()
 
+proc dropConn(s: SseStream) =
+  ## Release the current connection and fold it into the reconnect delay: a connect
+  ## that delivered at least one event resets the delay to the base, one that
+  ## delivered none steps it up, so a server that accepts and immediately closes
+  ## backs off instead of being hammered (#291).
+  s.handle = nil
+  if s.sawEvent: s.retryMs = s.baseRetryMs
+  else: s.retryMs = sseBackoff(s.retryMs, s.baseRetryMs, s.minRetryMs, s.maxRetryMs)
+  s.sawEvent = false
+
 proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
   ## The next event, or none once the stream ends. Reconnects transparently on a
   ## drop when enabled, resending Last-Event-ID.
@@ -112,7 +134,8 @@ proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
     let ev = s.parser.next()
     if ev.isSome:
       if s.parser.retryMs() >= 0:
-        s.baseRetryMs = min(s.parser.retryMs(), s.maxRetryMs)
+        s.baseRetryMs = sseRetryDelay(s.parser.retryMs(), s.minRetryMs, s.maxRetryMs)
+      s.sawEvent = true                  # this connect earned a base-delay reset
       # A server that floods events lets the read complete synchronously every time,
       # so this loop can run the whole soak without the underlying read ever parking.
       # Two things then go wrong -- both only under such a flood; a normally-paced
@@ -139,17 +162,16 @@ proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
       return ev
     if s.handle == nil:
       if not s.reconnect: return none(SseEvent)
-      await sleepAsync(msOf(min(s.retryMs, s.maxRetryMs)))
+      await sleepAsync(msOf(sseRetryDelay(s.retryMs, s.minRetryMs, s.maxRetryMs)))
       if s.closed: return none(SseEvent)    # closed during the backoff: do not reconnect
       try:
         let openFut = s.openConn()
         if s.idleTimeoutMs > 0 and not await withTimeout(openFut, msOf(s.idleTimeoutMs)):
           raise newException(IOError, "navi: SSE reconnect timed out")
         await openFut
-        s.retryMs = s.baseRetryMs
       except CatchableError:
         if s.closed: return none(SseEvent)
-        s.retryMs = min(max(s.retryMs, s.baseRetryMs) * 2, s.maxRetryMs)
+        s.retryMs = sseBackoff(s.retryMs, s.baseRetryMs, s.minRetryMs, s.maxRetryMs)
         continue
     var chunk = ""
     try:
@@ -180,16 +202,16 @@ proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
         except CatchableError: discard
         try: discard await readFut
         except CatchableError: discard
-        s.handle = nil
+        s.dropConn()
         if not s.reconnect: return none(SseEvent)
         continue
       chunk = await readFut
     except CatchableError:
-      s.handle = nil
+      s.dropConn()
       if not s.reconnect: raise
       continue
     if chunk.len == 0:
-      s.handle = nil
+      s.dropConn()
       if not s.reconnect: return none(SseEvent)
       continue
     # A maxSseEventBytes breach raises straight out of `next`. Dispose the handle

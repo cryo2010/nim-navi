@@ -128,6 +128,15 @@ jobs:
           nim js --path:src --hints:off -o:js_mw_async.js     src/navi/asyncdispatch/mw.nim
           nim js --path:src --hints:off -o:js_mw_chronos.js   src/navi/chronos/mw.nim
 
+      # navi/js does not use proto/ws at runtime (the runtime's WebSocket does the
+      # framing), but the sans-io codec must keep building for js, and js is navi's
+      # only 32-bit-`int` target: running the vectors under Node is the only place
+      # the 64-bit frame-length guards (#285) face an `int` that can truncate.
+      - name: navi/proto/ws codec under Node (32-bit int target)
+        run: |
+          nim js --path:src --hints:off -o:js_ws_codec.js tests/js_ws_codec.nim
+          node js_ws_codec.js
+
       # Run the script directly (not `nimble wsjs`): nimble does not propagate a
       # task's exit code (nim-lang/nimble#1802). jsws.sh uses `set -e`.
       - name: navi/js WebSocket runtime test
@@ -143,6 +152,11 @@ jobs:
       # the navi/js gated-sink path at runtime (nim check -b:js is not enough).
       - name: navi/js response sink runtime test
         run: bash tests/interop/js_sink.sh
+
+      # SSE reconnect delay under Node: a `retry: 0` server and one that answers
+      # 200 then closes with no events must not spin the reconnect loop (#291).
+      - name: navi/js SSE reconnect delay runtime test
+        run: bash tests/interop/js_sse_retry.sh
 
   sanitize:
     runs-on: ubuntu-latest

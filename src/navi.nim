@@ -23,7 +23,7 @@ from std/strutils import startsWith, find, splitLines, strip, cmpIgnoreCase,
 when defined(naviHttp3):
   import navi/core/altsvc
   import navi/backend/quic
-export sse.SseEvent
+export sse.SseEvent, sse.defaultSseMinRetryMs
 
 claimEntry("navi")
 export public
@@ -99,7 +99,7 @@ proc initNaviConfig*(): NaviConfig =
   NaviConfig(
     prefixUrl: "", headers: initHeaders(), http: defaultHttpVersions, tls: defaultTls(),
     decompress: true, throwHttpErrors: true, maxRedirects: 20,
-    retry: defaultRetryPolicy(), maxResponseBytes: 0,
+    retry: defaultRetryPolicy(), maxResponseBytes: 0, expectContinueMs: 0,
     auth: Auth(), proxy: "", unixSocket: "",
     maxIdleConns: 0, maxIdleConnsPerHost: 0, idleConnTimeout: 0,
     timeouts: Timeouts(), resolvedProxy: nil, middleware: @[])

@@ -33,9 +33,21 @@ type
     ## API-consistency check with the native backends rather than a memory guard.
 
 const
+  # Close codes (RFC 6455 7.4.1); the same set the native clients re-export, so
+  # cross-client code can name them without a backend switch.
   closeNormal* = 1000'u16
   closeGoingAway* = 1001'u16
-  closeMessageTooBig* = 1009'u16
+  closeProtocolError* = 1002'u16
+  closeMessageTooBig* = 1009'u16   ## RFC 6455 7.4.1: a message exceeded a size limit
+  closeNoStatus* = 1005'u16
+    ## RFC 6455 7.1.5: surfaced (never sent on the wire) when a close frame carries
+    ## no status code, so an application can distinguish it from an explicit 1000.
+    ## The runtime reports it as the `CloseEvent` code, so navi surfaces it as-is.
+  closeAbnormal* = 1006'u16
+    ## RFC 6455 7.4.1: reserved, never sent on the wire. Surfaced locally when the
+    ## transport ends without a close frame, so an abrupt EOF is distinguishable
+    ## from a clean closure. The runtime reports it as the `CloseEvent` code, so
+    ## navi surfaces it as-is.
 
 # --- native WebSocket bindings ---
 proc jsNewSocket(url: cstring): JsObject {.importjs: "new WebSocket(#)".}
@@ -133,7 +145,18 @@ proc receive*(ws: WebSocket): Future[WsMessage] {.async.} =
 proc close*(ws: WebSocket, code = closeNormal, reason = ""): Future[void] {.async.} =
   ## Close the connection. Idempotent. Returns a Future to match the native
   ## async backends (`await ws.close()`).
+  ##
+  ## `code` must be one that may appear on the wire: 1005, 1006 and 1015 are
+  ## reserved for local use (RFC 6455 7.4.1) and raise `ValueError` -- but only
+  ## while a close frame would actually be sent. Once the socket is closed there is
+  ## nothing to send, so mirroring a code `receive` reported (`ws.close(m.closeCode)`,
+  ## which is 1005 or 1006 after a codeless close or an abrupt EOF) is a safe no-op.
+  ## Same rule as the native clients; without it the runtime would throw its own
+  ## `InvalidAccessError` instead.
   if not ws.open: return
+  if code == closeNoStatus or code == closeAbnormal or code == 1015'u16:
+    raise newException(ValueError, "navi: WebSocket close code " & $code &
+      " is reserved and must never be sent (RFC 6455 7.4.1)")
   ws.open = false
   ws.raw.jsClose(int(code), cstring(reason))
 
@@ -146,8 +169,13 @@ proc close*(ws: WebSocket, code = closeNormal, reason = ""): Future[void] {.asyn
 type
   WsSink = proc(chunk: string): Future[void]
   WsReader* = ref object
+    ## A message being received incrementally. `kind` is the message type (or
+    ## `wmClose` if a close arrived instead). Consume with `each`/`readChunk`.
     ws: WebSocket
     kind*: WsMessageKind
+    closeCode*: uint16       ## set when `kind` is wmClose, or when a close ends the
+                             ## stream early: the peer's code, 1005 when it sent none,
+                             ## 1006 when the transport just ended (as `receive`)
     msg: string
     consumed: bool
   WsWriter* = ref object
@@ -156,8 +184,13 @@ type
     buf: string
 
 proc openStreamReader(ws: WebSocket): Future[WsReader] {.async.} =
+  ## The runtime delivers whole messages, so a close can never interrupt one
+  ## part-way here: it arrives as its own `wmClose`, and its `closeCode` carries
+  ## straight over from the `CloseEvent` (which already reports 1005 for a codeless
+  ## close and 1006 for a transport that just ended).
   let m = await ws.receive()
-  result = WsReader(ws: ws, kind: m.kind, msg: m.data, consumed: m.kind == wmClose)
+  result = WsReader(ws: ws, kind: m.kind, closeCode: m.closeCode, msg: m.data,
+                    consumed: m.kind == wmClose)
 
 proc readChunk*(r: WsReader): Future[string] {.async.} =
   ## The message as a single chunk (js cannot sub-stream), then "".

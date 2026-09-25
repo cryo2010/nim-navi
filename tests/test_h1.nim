@@ -2,7 +2,7 @@
 ## No sockets — bytes in, response out.
 
 import unittest
-import std/strutils
+import std/[strutils, strformat]
 import navi/core/[headers, url, request, response]
 import navi/proto/h1
 
@@ -36,6 +36,41 @@ suite "h1 serialize":
     check "Transfer-Encoding: chunked\r\n" in head
     check "content-length" notin head.toLowerAscii
 
+  test "expectContinue should add the field without copying the request (#392)":
+    # The gate asks the serializer for the field instead of setting it on a clone of
+    # the Request (which would clone a buffered body too, the copy #244 removed).
+    var req = Request(verb: POST, url: parseUrl("http://h/"), body: "hello")
+    req.headers = initHeaders()
+    let head = serializeHead(req, chunked = false, expectContinue = true)
+    check head.count("Expect: 100-continue\r\n") == 1
+    check "Content-Length: 5\r\n" in head              # the rest of the head is unchanged
+    check head.endsWith("\r\n\r\n")                   # and it is still only a head
+    check "expect" notin serializeHead(req).toLowerAscii  # off by default
+
+  test "a caller-supplied Expect should never be duplicated or overridden (#392)":
+    var own = Request(verb: POST, url: parseUrl("http://h/"), body: "hello")
+    own.headers = initHeaders()
+    own.headers["Expect"] = "100-continue"
+    # The header loop already emitted the caller's field; navi must not add a second.
+    check serializeHead(own, chunked = false, expectContinue = true)
+            .count("100-continue") == 1
+    check own.sendsExpectContinue()        # it is the expectation navi waits for
+
+    var foreign = Request(verb: POST, url: parseUrl("http://h/"), body: "hello")
+    foreign.headers = initHeaders()
+    foreign.headers["Expect"] = "something-else"
+    let fhead = serializeHead(foreign, chunked = false, expectContinue = true)
+    check "Expect: something-else\r\n" in fhead
+    check "100-continue" notin fhead       # the caller's expectation stands alone
+    check not foreign.sendsExpectContinue()  # so the gate must not wait on it
+
+  test "sendsExpectContinue should be true for a request with no Expect of its own":
+    var bare = Request(verb: POST, url: parseUrl("http://h/"), body: "hi")
+    bare.headers = initHeaders()
+    check bare.sendsExpectContinue()
+    bare.headers["expect"] = "  100-CONTINUE  "   # case and padding insensitive
+    check bare.sendsExpectContinue()
+
   test "a caller-supplied Content-Length should survive on the buffered path":
     var req = Request(verb: POST, url: parseUrl("http://h/"), body: "hello")
     req.headers = initHeaders()
@@ -61,6 +96,21 @@ suite "h1 serialize":
   test "encodeChunk should return empty for empty data rather than a premature terminator (#274)":
     check encodeChunk("") == ""
     check encodeChunk("ab") == "2\r\nab\r\n"
+
+  test "encodeChunk should write the chunk size as uppercase hex at every width (#244)":
+    # The size is written digit by digit into the output buffer rather than through a
+    # formatted temporary, so check the boundaries a hand-rolled hex writer can get
+    # wrong: single digit, nibble rollover, and a multi-byte size.
+    for n in [1, 9, 10, 15, 16, 17, 255, 256, 4095, 4096, 1048576]:
+      let data = repeat('x', n)
+      check encodeChunk(data) == fmt"{n:X}" & "\r\n" & data & "\r\n"
+
+  test "addChunk should append frames to an existing buffer and skip empty data (#244)":
+    var buf = "head:"
+    buf.addChunk("")                  # an empty chunk would be a premature terminator
+    buf.addChunk("abc")
+    buf.addChunk(repeat('y', 26))
+    check buf == "head:3\r\nabc\r\n1A\r\n" & repeat('y', 26) & "\r\n"
 
   test "validateRequest should reject CR/LF in the request path (#274)":
     var req = Request(verb: GET, url: parseUrl("http://h/a"))
@@ -120,6 +170,93 @@ suite "h1 parse":
       p.feed($ch)
     check p.finished
     check p.toResponse().body == "hello world!"
+
+  test "the h1 parser should read a large chunked body fed in tiny fragments (#244)":
+    # The read-cursor rewrite must stay linear: 256 KiB of body handed over in
+    # 3-byte feeds is ~90k feeds, each of which used to memmove the whole remaining
+    # buffer down. Also covers chunk data, chunk terminators and chunk-size lines
+    # straddling feed boundaries.
+    var body = newStringOfCap(256 * 1024)
+    var i = 0
+    while body.len < 256 * 1024:
+      body.add($i & ",")
+      inc i
+    var raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+    var off = 0
+    while off < body.len:                       # many chunks, uneven sizes
+      let n = min(1 + (off mod 7000), body.len - off)
+      raw.add(fmt"{n:X}" & "\r\n" & body[off ..< off + n] & "\r\n")
+      off += n
+    raw.add("0\r\n\r\n")
+    var p = initH1Parser()
+    off = 0
+    while off < raw.len:
+      let n = min(3, raw.len - off)
+      p.feed(raw.toOpenArray(off, off + n - 1))
+      off += n
+    check p.finished
+    check p.keepAliveAfter()
+    check p.toResponse().body == body
+
+  test "the h1 parser should stream a chunk incrementally instead of buffering it whole (#244)":
+    # A chunk larger than one read must not be held in the parser until complete:
+    # the streaming path drains what has arrived, which is also what makes the
+    # response size cap effective mid-chunk.
+    var p = initH1Parser(streaming = true)
+    p.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nA\r\n01234")
+    check p.takeBody() == "01234"               # half a 10-byte chunk, already out
+    check not p.finished
+    p.feed("56789\r\n0\r\n\r\n")
+    check p.takeBody() == "56789"
+    check p.finished
+    check p.keepAliveAfter()
+
+  test "the h1 parser should hold a chunk's last byte back until its CRLF is verified (#244)":
+    # Incremental delivery must not hand a streaming consumer a COMPLETE chunk on the
+    # strength of its size line alone: the final byte waits for the terminator, so a
+    # desynced or smuggled chunk can only ever deliver a strict prefix before the
+    # framing error is raised.
+    var p = initH1Parser(streaming = true)
+    p.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello")
+    var got = p.takeBody()
+    check got.len <= 4                          # all five bytes are here, four may go
+    var msg = ""
+    try:
+      p.feed("XX0\r\n\r\n")                      # terminator is not CRLF
+    except ValueError as e: msg = e.msg
+    got.add p.takeBody()
+    check "CRLF" in msg
+    check got.len <= 4
+    check "hello" notin got                     # the chunk never landed whole
+    check not p.finished
+    check not p.keepAliveAfter()
+
+  test "the h1 parser should deliver nothing of a one-byte chunk ended by a bare LF (#244)":
+    var p = initH1Parser(streaming = true)
+    var msg = ""
+    try:
+      p.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nA\n0\r\n\r\n")
+    except ValueError as e: msg = e.msg
+    check "CRLF" in msg
+    check p.takeBody() == ""
+    check not p.keepAliveAfter()
+
+  test "the h1 parser should ignore bytes that arrive after a keep-alive response (#244)":
+    # A pooled connection can deliver the tail of the current response and the head
+    # of whatever the server sends next in one read. The trailing bytes must not
+    # join the body, unfinish the response, or make it unpoolable.
+    var p = initH1Parser()
+    p.feed("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello" &
+           "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+    check p.finished
+    check p.toResponse().body == "hello"
+    check p.keepAliveAfter()
+    var q = initH1Parser()                      # same, split across feeds
+    q.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel")
+    q.feed("lo\r\n0\r\n\r\nHTTP/1.1 204 No")
+    check q.finished
+    check q.toResponse().body == "hello"
+    check q.keepAliveAfter()
 
   test "the h1 parser should read a length body split across many feeds":
     var p = initH1Parser()
@@ -217,6 +354,39 @@ suite "h1 parse":
       p.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcXX0\r\n\r\n")
     except ValueError as e: msg = e.msg
     check "CRLF" in msg
+    # The desynced response must never look complete or poolable: returning the
+    # connection to the pool would leave the unread remainder on the wire, where the
+    # next request on it parses stale body bytes as its status line.
+    check not p.finished
+    check not p.keepAliveAfter()
+
+  test "the h1 parser should reject a bare-LF chunk terminator (#244)":
+    # A lone LF after chunk-data is the same framing desync: one byte of the next
+    # chunk-size line would be swallowed as the missing CR.
+    var p = initH1Parser()
+    var msg = ""
+    try:
+      p.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\n0\r\n\r\n")
+    except ValueError as e: msg = e.msg
+    check "CRLF" in msg
+    check not p.keepAliveAfter()
+
+  test "the h1 parser should reject a CR-only chunk terminator across feeds (#244)":
+    # The terminator can straddle reads: the parser waits for both bytes, then
+    # rejects "\r" followed by anything other than "\n".
+    var p = initH1Parser()
+    var msg = ""
+    try:
+      p.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r")
+      check not p.finished                # still waiting for the second byte
+      p.feed("X0\r\n\r\n")
+    except ValueError as e: msg = e.msg
+    check "CRLF" in msg
+    check not p.keepAliveAfter()
+
+  test "a chunked response whose chunks are properly terminated stays poolable (#244)":
+    check parseKA("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" &
+                  "3\r\nabc\r\n0\r\n\r\n")
 
   test "the h1 parser should reject Transfer-Encoding: chunked together with Content-Length (#271)":
     var p = initH1Parser()
@@ -263,6 +433,17 @@ suite "h1 parse":
 
   test "keepAliveAfter should reuse a plain keep-alive response (#272)":
     check parseKA("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+
+  test "keepAliveAfter should retire a connection whose request body was skipped (#392)":
+    # An expect-gated upload the server answered (413/401/417) before the body went
+    # out: the response is complete and self-delimited, but the peer may still be
+    # waiting for that body and would read the NEXT request on this connection as it.
+    var p = initH1Parser()
+    p.feed("HTTP/1.1 413 Content Too Large\r\nContent-Length: 2\r\n\r\nno")
+    check p.finished
+    check p.keepAliveAfter()             # reusable on its own terms...
+    p.markBodySkipped()
+    check not p.keepAliveAfter()         # ...but not with a body still owed
 
 suite "url port parsing":
   test "an explicit port and the scheme defaults parse":

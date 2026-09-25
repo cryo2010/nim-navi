@@ -29,7 +29,7 @@ from std/strutils import startsWith, toLowerAscii
 import navi/private/entryguard
 import navi/proto/sse
 import navi/core/public
-export sse.SseEvent
+export sse.SseEvent, sse.defaultSseMinRetryMs
 import navi/core/retry
 import navi/core/sinkgate
 import navi/backend/js
@@ -39,7 +39,8 @@ claimEntry("navi/js")
 export public, asyncjs
 export jsws.WebSocket, jsws.WsMessage, jsws.WsMessageKind,
        jsws.send, jsws.receive, jsws.close, jsws.closeNormal, jsws.closeGoingAway,
-       jsws.closeMessageTooBig, jsws.WsMessageTooLarge,
+       jsws.closeProtocolError, jsws.closeMessageTooBig, jsws.closeNoStatus,
+       jsws.closeAbnormal, jsws.WsMessageTooLarge,
        jsws.WsReader, jsws.WsWriter, jsws.stream, jsws.streamBinary, jsws.each,
        jsws.readChunk, jsws.drain, jsws.write
 
@@ -82,7 +83,7 @@ proc initNaviConfig*(): NaviConfig =
   NaviConfig(
     prefixUrl: "", headers: initHeaders(), http: {}, tls: defaultTls(),
     decompress: false, throwHttpErrors: true, maxRedirects: 20,
-    retry: defaultRetryPolicy(), maxResponseBytes: 0,
+    retry: defaultRetryPolicy(), maxResponseBytes: 0, expectContinueMs: 0,
     auth: Auth(), proxy: "", unixSocket: "",
     maxIdleConns: 0, maxIdleConnsPerHost: 0, idleConnTimeout: 0,
     timeouts: Timeouts(), resolvedProxy: nil, middleware: @[])
@@ -467,7 +468,9 @@ type
     reconnect: bool
     baseRetryMs: int
     retryMs: int
+    minRetryMs: int           ## floor under every delay (a retry: 0 cannot spin us)
     maxRetryMs: int
+    sawEvent: bool            ## the current connection delivered at least one event
     res: JsObject             ## current fetch Response
     controller: JsObject      ## AbortController for the current body
     reader: JsObject          ## its ReadableStream reader
@@ -506,6 +509,7 @@ proc sse*(client: Navi, target: string, verb = GET,
           params: seq[(string, string)] = @[],
           lastEventId = "", reconnect = true,
           retryMs = 3000, maxRetryMs = 30_000,
+          minRetryMs = defaultSseMinRetryMs,
           cancel: CancelToken = nil): Future[SseStream] {.async.} =
   ## Open a Server-Sent Events stream over fetch. The initial response is validated
   ## up front (a non-200 or non `text/event-stream` response raises). Consume with
@@ -513,14 +517,23 @@ proc sse*(client: Navi, target: string, verb = GET,
   ## transparently on a drop, resending Last-Event-ID and honoring the server's
   ## retry: (backoff to `maxRetryMs`), unless `reconnect` is false. Redirects,
   ## cookies, and decoding are the runtime's, as elsewhere on js.
+  ##
+  ## `minRetryMs` floors every reconnect delay, including one the server asked for
+  ## with `retry:`, so a `retry: 0` (or a server that answers 200 and closes with no
+  ## events) cannot spin the reconnect loop. It is capped by `maxRetryMs`. A connect
+  ## that closes without delivering an event also doubles the delay; only a connect
+  ## that delivered at least one event resets it to the base.
   var h = headers
   if not h.contains("accept"): h["accept"] = "text/event-stream"
   if not h.contains("cache-control"): h["cache-control"] = "no-cache"
   let s = SseStream(
     client: client, req: buildRequest(client.config, verb, target, h, toBody(body),
                                       params = params),
-    reconnect: reconnect, baseRetryMs: retryMs, retryMs: retryMs,
-    maxRetryMs: maxRetryMs, parser: initSseParser(lastEventId))
+    reconnect: reconnect,
+    baseRetryMs: sseRetryDelay(retryMs, minRetryMs, maxRetryMs),
+    retryMs: sseRetryDelay(retryMs, minRetryMs, maxRetryMs),
+    minRetryMs: minRetryMs, maxRetryMs: maxRetryMs,
+    parser: initSseParser(lastEventId))
   await s.openConn()
   s.started = true
   return s
@@ -536,6 +549,16 @@ proc close*(s: SseStream) =
 
 proc lastEventId*(s: SseStream): string = s.parser.lastEventId()
 
+proc dropConn(s: SseStream) =
+  ## Release the current connection and fold it into the reconnect delay: a connect
+  ## that delivered at least one event resets the delay to the base, one that
+  ## delivered none steps it up, so a server that accepts and immediately closes
+  ## backs off instead of being hammered (#291).
+  s.haveConn = false
+  if s.sawEvent: s.retryMs = s.baseRetryMs
+  else: s.retryMs = sseBackoff(s.retryMs, s.baseRetryMs, s.minRetryMs, s.maxRetryMs)
+  s.sawEvent = false
+
 proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
   ## The next event, or none once the stream ends. Reconnects transparently on a
   ## drop when enabled, resending Last-Event-ID.
@@ -544,28 +567,28 @@ proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
     let ev = s.parser.next()
     if ev.isSome:
       if s.parser.retryMs() >= 0:
-        s.baseRetryMs = min(s.parser.retryMs(), s.maxRetryMs)
+        s.baseRetryMs = sseRetryDelay(s.parser.retryMs(), s.minRetryMs, s.maxRetryMs)
+      s.sawEvent = true                  # this connect earned a base-delay reset
       return ev
     if not s.haveConn:
       if not s.reconnect: return none(SseEvent)
-      await sleep(min(s.retryMs, s.maxRetryMs))
+      await sleep(sseRetryDelay(s.retryMs, s.minRetryMs, s.maxRetryMs))
       try:
         await s.openConn()
-        s.retryMs = s.baseRetryMs
       except CatchableError:
         if s.closed: return none(SseEvent)
-        s.retryMs = min(max(s.retryMs, s.baseRetryMs) * 2, s.maxRetryMs)
+        s.retryMs = sseBackoff(s.retryMs, s.baseRetryMs, s.minRetryMs, s.maxRetryMs)
         continue
     var chunk = ""
     try:
       chunk = await readTextChunk(s.reader, s.decoder)
     except CatchableError:
       abortBody(s.controller)
-      s.haveConn = false
+      s.dropConn()
       if not s.reconnect: raise
       continue
     if chunk.len == 0:
-      s.haveConn = false
+      s.dropConn()
       if not s.reconnect: return none(SseEvent)
       continue
     try:

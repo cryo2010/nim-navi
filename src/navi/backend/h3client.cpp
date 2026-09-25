@@ -130,6 +130,24 @@ struct Stream {
   bool tunnel_fin = false;
 };
 
+// Stream bytes that reached us before the nghttp3 session existed. The session is
+// created by navi_h3_bind once the handshake completes, but the server's control
+// stream (which carries its SETTINGS) can ride in the very datagram that completes
+// it, and ngtcp2 never re-delivers what a recv_stream_data callback consumed. Such
+// bytes are parked here and replayed into nghttp3 by navi_h3_bind, so nothing the
+// peer sent is lost -- without it the peer's SETTINGS can vanish, which the Extended
+// CONNECT gate (and QPACK encoder instructions) would then wait for forever.
+struct PendingStreamData {
+  std::int64_t id;
+  std::string data;
+  bool fin;
+};
+
+// Cap on the pre-bind hold-back. The window is a single handshake round trip, so a
+// well-behaved peer sends a few hundred bytes; past this the peer is misbehaving and
+// the connection is failed rather than buffered without bound.
+constexpr std::size_t kPreBindMaxBytes = 256 * 1024;
+
 // One QUIC/h3 connection. RAII: the destructor releases the library objects and
 // the socket in the required order, replacing the old manual cleanup + goto.
 struct H3Conn {
@@ -150,6 +168,16 @@ struct H3Conn {
                             // draining): a clean end, not a transport error
   unsigned long long max_body = 0;  // navi maxResponseBytes: cap on a single response
                                     // body the driver will buffer (0 = unlimited)
+  // The peer's SETTINGS (RFC 9114 7.2.4), recorded by on_recv_settings.
+  // `peer_settings` flips once the server's SETTINGS frame has been received, and
+  // `peer_connect_protocol` carries its SETTINGS_ENABLE_CONNECT_PROTOCOL. The
+  // WebSocket path gates its Extended CONNECT on both (RFC 9220 / RFC 8441 3);
+  // nghttp3 has no getter for the remote settings, so the callback is the only way
+  // to see them.
+  bool peer_settings = false;
+  bool peer_connect_protocol = false;
+  std::deque<PendingStreamData> prebind;   // see PendingStreamData
+  std::size_t prebind_bytes = 0;
   std::unordered_map<int64_t, Stream> streams;   // live streams by id
   // Self-pipe (RAII: closed with the connection) so another thread can interrupt the
   // pump's poll() to flush an outbound frame promptly -- the sync WebSocket's pump
@@ -216,8 +244,23 @@ int on_recv_stream_data(ngtcp2_conn *conn, std::uint32_t flags,
                         std::int64_t stream_id, std::uint64_t, const std::uint8_t *data,
                         std::size_t datalen, void *ud, void *) {
   auto *c = static_cast<H3Conn *>(ud);
-  if (!c->h3) return 0;
   int fin = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0;
+  if (!c->h3) {   // before navi_h3_bind: park it for replay instead of dropping it
+    if (c->prebind_bytes + datalen > kPreBindMaxBytes) {
+      std::fprintf(stderr, "h3: peer sent too much before the session was bound\n");
+      return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+    try {
+      c->prebind.push_back(
+        {stream_id,
+         std::string(reinterpret_cast<const char *>(data), datalen),
+         fin != 0});
+    } catch (...) {
+      return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+    c->prebind_bytes += datalen;
+    return 0;   // the flow-control offsets are extended when it is replayed
+  }
   nghttp3_ssize n = nghttp3_conn_read_stream(c->h3, stream_id, data, datalen, fin);
   if (n < 0) return NGTCP2_ERR_CALLBACK_FAILURE;
   ngtcp2_conn_extend_max_stream_offset(conn, stream_id, static_cast<std::uint64_t>(n));
@@ -393,6 +436,24 @@ int on_deferred_consume(nghttp3_conn *, std::int64_t stream_id, std::size_t cons
     ngtcp2_conn_extend_max_stream_offset(c->conn, stream_id, consumed);
     ngtcp2_conn_extend_max_offset(c->conn, consumed);
   }
+  return 0;
+}
+
+// The peer's SETTINGS frame landed: record that it arrived and whether it enabled
+// the Extended CONNECT protocol (RFC 9220). navi's WebSocket-over-h3 handshake waits
+// for this before it may submit a CONNECT, exactly as the h2 path waits for the h2
+// SETTINGS (issue #393). nghttp3 >= 1.14 deprecates `recv_settings` in favour of
+// `recv_settings2` (a nghttp3_proto_settings), so bind whichever the headers offer;
+// both carry enable_connect_protocol, which is all this needs.
+#if defined(NGHTTP3_VERSION_NUM) && NGHTTP3_VERSION_NUM >= 0x010e00
+int on_recv_settings(nghttp3_conn *, const nghttp3_proto_settings *settings,
+                     void *cud) {
+#else
+int on_recv_settings(nghttp3_conn *, const nghttp3_settings *settings, void *cud) {
+#endif
+  auto *c = static_cast<H3Conn *>(cud);
+  c->peer_connect_protocol = settings->enable_connect_protocol != 0;
+  c->peer_settings = true;
   return 0;
 }
 
@@ -771,6 +832,11 @@ int navi_h3_bind(H3Conn *c) {
   cb.end_stream = on_end_stream;
   cb.deferred_consume = on_deferred_consume;
   cb.acked_stream_data = on_body_acked;   // free acked streamed-upload chunks
+#if defined(NGHTTP3_VERSION_NUM) && NGHTTP3_VERSION_NUM >= 0x010e00
+  cb.recv_settings2 = on_recv_settings;   // peer SETTINGS: gates Extended CONNECT
+#else
+  cb.recv_settings = on_recv_settings;
+#endif
   if (nghttp3_conn_client_new(&c->h3, &cb, &settings, nullptr, c) != 0) return -1;
   std::int64_t ctrl, qenc, qdec;
   if (ngtcp2_conn_open_uni_stream(c->conn, &ctrl, nullptr) != 0 ||
@@ -780,6 +846,24 @@ int navi_h3_bind(H3Conn *c) {
   if (nghttp3_conn_bind_control_stream(c->h3, ctrl) != 0 ||
       nghttp3_conn_bind_qpack_streams(c->h3, qenc, qdec) != 0)
     return -1;
+  // Feed nghttp3 whatever the peer sent before this session existed (see
+  // PendingStreamData), in arrival order, and only now extend the flow-control
+  // offsets for it.
+  for (const auto &p : c->prebind) {
+    nghttp3_ssize n = nghttp3_conn_read_stream(
+      c->h3, p.id, reinterpret_cast<const std::uint8_t *>(p.data.data()),
+      p.data.size(), p.fin ? 1 : 0);
+    if (n < 0) {
+      std::fprintf(stderr, "h3 bind: read_stream: %s\n",
+                   nghttp3_strerror(static_cast<int>(n)));
+      return -1;
+    }
+    ngtcp2_conn_extend_max_stream_offset(c->conn, p.id,
+                                         static_cast<std::uint64_t>(n));
+    ngtcp2_conn_extend_max_offset(c->conn, static_cast<std::uint64_t>(n));
+  }
+  c->prebind.clear();
+  c->prebind_bytes = 0;
   return 0;
 }
 
@@ -1024,6 +1108,17 @@ std::int64_t navi_h3_submit(H3Conn *c, const char *method, const char *path_,
     return -1;
   }
 }
+
+// 1 once the peer's SETTINGS frame has been received (RFC 9114 7.2.4). Until then
+// nothing is known about the server's capabilities, so the Extended CONNECT path
+// drives the connection until this turns 1 before it decides anything (#393).
+int navi_h3_peer_settings_seen(H3Conn *c) { return c->peer_settings ? 1 : 0; }
+
+// 1 if the peer's SETTINGS carried SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 9220), i.e.
+// the server allows the Extended CONNECT method. Meaningful only once
+// navi_h3_peer_settings_seen is 1; it reads 0 before that, like a server that never
+// enabled it.
+int navi_h3_peer_allows_connect(H3Conn *c) { return c->peer_connect_protocol ? 1 : 0; }
 
 // Open a WebSocket-over-h3 tunnel (RFC 9220 Extended CONNECT): a bidi stream whose
 // request is :method=CONNECT + :protocol, left open (no END_STREAM) for full-duplex

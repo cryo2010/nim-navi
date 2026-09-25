@@ -91,6 +91,52 @@ suite "streamed bodies across a redirect (#295)":
     check not hop.hasStreamedBody
     check not preservesBody(302, r.verb)
 
+suite "a body-dropping hop sends no body at all (#395)":
+  # `preservesBody` is false exactly when the rewrite drops the body, and that is the
+  # signal `followRedirects` uses to stop threading the async producer into the next
+  # hop. Nothing may survive the rewrite that would frame a body on the wire: a
+  # leftover producer would make the rewritten GET a `Transfer-Encoding: chunked`
+  # request with a lone `0\r\n\r\n` body.
+  test "a 303 leaves nothing on the hop that would frame a body":
+    for verb in [POST, PUT, PATCH, GET]:
+      var r = req(verb, "https://a.test/x")
+      r.trailers.add("x-checksum", "abc")
+      r.bodyStream = proc(): string = ""
+      r.hasStreamedBody = true
+      let hop = redirectRequest(r, 303, "https://a.test/y")
+      check not preservesBody(303, verb)   # so the producer is dropped too
+      check hop.verb == GET
+      check hop.body == ""
+      check hop.bodyStream == nil
+      check not hop.hasStreamedBody
+      check hop.trailers.len == 0
+
+  test "a 301/302 off a non-GET/HEAD method leaves nothing that would frame a body":
+    for status in [301, 302]:
+      var r = req(POST, "https://a.test/x")
+      r.trailers.add("x-checksum", "abc")
+      r.bodyStream = proc(): string = ""
+      r.hasStreamedBody = true
+      let hop = redirectRequest(r, status, "https://a.test/y")
+      check not preservesBody(status, POST)
+      check hop.verb == GET
+      check hop.body == ""
+      check hop.bodyStream == nil
+      check not hop.hasStreamedBody
+      check hop.trailers.len == 0
+
+  test "a hop that keeps the body keeps its framing, so it is never auto-followed":
+    # The mirror image: 307 preserves everything, which is why a non-replayable body
+    # makes `followRedirects` surface the 3xx instead of re-sending it (#295).
+    var r = req(POST, "https://a.test/x")
+    r.bodyStream = proc(): string = ""
+    r.hasStreamedBody = true
+    let hop = redirectRequest(r, 307, "https://a.test/y")
+    check preservesBody(307, POST)
+    check hop.verb == POST
+    check hop.bodyStream != nil
+    check hop.hasStreamedBody
+
 suite "sink gate redirect delivery":
   # The gate must mirror followRedirects exactly: a hop is surfaced (so its body IS
   # delivered to the caller's sink) only when the hop would carry a non-replayable

@@ -244,6 +244,52 @@ suite "chronos entry end to end":
     joinThread(srcTh)
     joinThread(dstTh)
 
+  test "a 303 that drops a streamed upload should send the next hop bodiless (#395)":
+    # The rewrite makes the hop a plain GET, so the async producer must be dropped
+    # with the body: the hop goes out with no Transfer-Encoding, no Content-Length
+    # and no bytes, not as a chunked GET with an already-empty producer.
+    const port = 9267
+    var th: Thread[ServerCtx]
+    startUploadRedirect(th, port, 303)
+    proc run(): Future[Response] {.async.} =
+      let parts = @["alpha ", "beta ", "gamma"]
+      let idx = new int
+      proc getChunks(): Future[string] {.async.} =
+        if idx[] >= parts.len: return ""
+        let p = parts[idx[]]
+        inc idx[]
+        return p
+      return await newNavi().put("http://127.0.0.1:" & $port & "/", body = getChunks)
+    let res = waitFor run()
+    check res.status == 200
+    check res.body == "arrived"
+    check res.headers.get("x-echo-hop1-body") == "alpha beta gamma"
+    check res.headers.get("x-echo-method") == "GET"
+    check res.headers.get("x-echo-transfer-encoding") == ""
+    check res.headers.get("x-echo-content-length") == ""
+    check res.headers.get("x-echo-hop2-bytes") == "0"
+    joinThread(th)
+
+  test "a 307 must not replay a streamed upload: the 3xx is surfaced (#295)":
+    const port = 9268
+    var th: Thread[ServerCtx]
+    startUploadRedirect(th, port, 307)
+    proc run(): Future[Response] {.async.} =
+      let parts = @["alpha ", "beta ", "gamma"]
+      let idx = new int
+      proc getChunks(): Future[string] {.async.} =
+        if idx[] >= parts.len: return ""
+        let p = parts[idx[]]
+        inc idx[]
+        return p
+      var cfg = initNaviConfig()
+      cfg.throwHttpErrors = false
+      return await newNavi(cfg).put("http://127.0.0.1:" & $port & "/", body = getChunks)
+    let res = waitFor run()
+    check res.status == 307             # preserved body + spent producer: not followed
+    check res.headers.get("location") == "/final"
+    joinThread(th)
+
   test "an async producer PUT should not be retried (non-replayable body)":
     var port = 0
     var count = 0
@@ -288,3 +334,121 @@ suite "chronos TLS config":
     except CatchableError as e: msg = e.msg
     # a refused connection to :1, not the old "tls13 is unavailable" rejection
     check "tls13 is unavailable" notin msg
+
+suite "chronos Expect: 100-continue gate (#392)":
+  test "an expect-gated upload should wait for the 100 and then send the body":
+    var port = 0
+    var sawExpect = false
+    var bodyLen = 0
+    var th: Thread[ExpectCtx]
+    startExpect(th, port, emSend100, addr sawExpect, addr bodyLen)
+    let key = "http://127.0.0.1:" & $port
+
+    proc run(key: string): Future[(Response, int)] {.async.} =
+      let api = newNavi()
+      api.config.expectContinueMs = 2000
+      let parts = @["hello ", "expect ", "world"]
+      let idx = new int
+      proc getChunks(): Future[string] {.async.} =
+        if idx[] >= parts.len: return ""
+        let p = parts[idx[]]
+        inc idx[]
+        return p
+      let r = await api.request(POST, key & "/", body = getChunks)
+      return (r, api.pool.idleCount(key))
+    let (res, idle) = waitFor run(key)
+    check res.status == 200
+    check res.body == "hello expect world"
+    joinThread(th)
+    check sawExpect
+    check bodyLen == "hello expect world".len
+    check idle == 1
+
+  test "a final status before the body should withhold it and never pull the producer":
+    var port = 0
+    var sawExpect = false
+    var bodyLen = -1
+    var th: Thread[ExpectCtx]
+    startExpect(th, port, emReject, addr sawExpect, addr bodyLen)
+    let key = "http://127.0.0.1:" & $port
+
+    proc run(key: string): Future[(Response, int, int)] {.async.} =
+      let api = newNavi()
+      api.config.expectContinueMs = 2000
+      api.config.throwHttpErrors = false
+      let pulls = new int
+      proc getChunks(): Future[string] {.async.} =
+        inc pulls[]
+        return "never sent"
+      let r = await api.request(POST, key & "/", body = getChunks)
+      return (r, pulls[], api.pool.idleCount(key))
+    let (res, pulls, idle) = waitFor run(key)
+    check res.status == 413
+    check res.body == "too large"
+    joinThread(th)
+    check sawExpect
+    check pulls == 0
+    check bodyLen == 0
+    check idle == 0              # the peer may still expect the body: never pooled
+
+  test "a silent server should get the body once expectContinueMs lapses":
+    # Also the chronos parked-read test: the gate races the read against a timer with
+    # `race` rather than cancelling it, so the abandoned read is parked intact and
+    # must hand the 200 to the read that follows the body send.
+    var port = 0
+    var sawExpect = false
+    var bodyLen = 0
+    var th: Thread[ExpectCtx]
+    startExpect(th, port, emIgnore, addr sawExpect, addr bodyLen)
+    let key = "http://127.0.0.1:" & $port
+
+    proc run(key: string): Future[Response] {.async.} =
+      let api = newNavi()
+      api.config.expectContinueMs = 150
+      let sent = new bool
+      proc getChunks(): Future[string] {.async.} =
+        if sent[]: return ""
+        sent[] = true
+        return "sent anyway"
+      return await api.request(POST, key & "/", body = getChunks)
+    let res = waitFor run(key)
+    check res.status == 200
+    check res.body == "sent anyway"
+    joinThread(th)
+    check sawExpect
+    check bodyLen == "sent anyway".len
+
+  test "a 100 arriving after the gate expired should be discarded, not read as final":
+    var port = 0
+    var bodyLen = 0
+    var th: Thread[ExpectCtx]
+    startExpect(th, port, emLate100, nil, addr bodyLen)
+    let key = "http://127.0.0.1:" & $port
+
+    proc run(key: string): Future[Response] {.async.} =
+      let api = newNavi()
+      api.config.expectContinueMs = 100
+      let sent = new bool
+      proc getChunks(): Future[string] {.async.} =
+        if sent[]: return ""
+        sent[] = true
+        return "late continue"
+      return await api.request(POST, key & "/", body = getChunks)
+    let res = waitFor run(key)
+    check res.status == 200
+    check res.body == "late continue"
+    joinThread(th)
+    check bodyLen == "late continue".len
+
+  test "a bodyless request should never carry the Expect header":
+    var port = 0
+    var sawExpect = true
+    var th: Thread[ExpectCtx]
+    startExpect(th, port, emIgnore, addr sawExpect)
+
+    let api = newNavi()
+    api.config.expectContinueMs = 2000
+    let res = waitFor api.get("http://127.0.0.1:" & $port & "/")
+    check res.status == 200
+    joinThread(th)
+    check not sawExpect

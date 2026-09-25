@@ -83,6 +83,16 @@ proc runRacePeer*(arg: RacePeerArg) {.thread.} =
       client.send(encodeRstStream(reqStream, errCancel))     # terminal reset (not REFUSED)
     elif arg.mode == pmRefusedThenClose:
       client.send(encodeRstStream(reqStream, errRefusedStream))  # provably unprocessed
+  # Drain what the client sent after its HEADERS (the DATA frame, the SETTINGS ACK)
+  # before closing. Closing with unread bytes in the receive buffer sends an RST
+  # instead of a FIN, and on Windows an RST discards whatever the client has not read
+  # yet, i.e. the frame this peer just sent: the 103 case then looks like a drop
+  # before any response and is misclassified as the keep-alive race. The drain ends
+  # on the recv timeout (the client never closes first here) or on its EOF.
+  try:
+    while true:
+      if client.recv(4096, timeout = 200).len == 0: break
+  except CatchableError: discard              # timeout: the buffer is drained
   client.close()
   listener.close()
 

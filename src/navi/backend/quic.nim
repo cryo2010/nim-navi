@@ -160,6 +160,21 @@ proc navi_h3_read_body*(c: pointer, sid: int64, buf: ptr char, cap: csize_t,
 proc navi_h3_stream_free*(c: pointer, sid: int64) {.importc, cdecl.}
   ## drop a stream (after eof+reset check, or to abandon a handle)
 
+# The peer's SETTINGS (RFC 9114 7.2.4), which the Extended CONNECT handshake gates on.
+proc navi_h3_peer_settings_seen*(c: pointer): cint {.importc, cdecl.}
+  ## 1 once the peer's SETTINGS frame has been received.
+proc navi_h3_peer_allows_connect*(c: pointer): cint {.importc, cdecl.}
+  ## 1 if that SETTINGS carried SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 9220); only
+  ## meaningful once navi_h3_peer_settings_seen is 1.
+
+const h3NoConnectProtocolErr* =
+  "navi: server does not support WebSocket over HTTP/3 " &
+  "(no SETTINGS_ENABLE_CONNECT_PROTOCOL); use an h1 WebSocket"
+  ## Raised as a `ProtocolError` when the peer's SETTINGS does not enable the
+  ## Extended CONNECT protocol. Word for word the h2 wording (private/websocket.nim
+  ## and h2mux_common.openConnect) with the version swapped, so the diagnostic reads
+  ## the same whichever transport the WebSocket was asked to use.
+
 # WebSocket-over-h3 tunnel (RFC 9220 Extended CONNECT): open a CONNECT stream with a
 # :protocol, then push outbound frames as DATA and drain inbound via navi_h3_read_body.
 proc navi_h3_open_connect*(c: pointer, path, reqHeaders, protocol: cstring): int64
@@ -502,14 +517,33 @@ proc openWsH3*(host: string, port: int, sni, caFile: string, verify: bool,
                        caFile.cstring, (if verify: 1.cint else: 0.cint),
                        culonglong(0))   # WebSocket frames stream via read_body: no buffered cap
   if h == nil: raise newException(QuicError, "navi: HTTP/3 connect failed")
+  # connectMs wins, then totalMs, else a 30s handshake default (mirroring how the
+  # sync `connect` resolves establishMs, but with an explicit backend floor). It
+  # bounds both halves of the handshake: the wait for the peer's SETTINGS and the
+  # wait for the CONNECT response.
+  let handshakeMs = establishMs(connectMs, totalMs, 30_000)
+  let deadline = epochTime() + float(handshakeMs) / 1000.0
+  # RFC 9220 / RFC 8441 3: an Extended CONNECT may only be sent once the peer's
+  # SETTINGS has arrived AND enabled SETTINGS_ENABLE_CONNECT_PROTOCOL. Drive the
+  # connection until that SETTINGS lands (a deterministic signal, not an idle guess),
+  # then require the capability -- so a server without it fails fast with a clear
+  # diagnostic instead of late via a stream reset (#393). Same gate, same wording as
+  # the h2 path in private/websocket.nim.
+  while navi_h3_peer_settings_seen(h) == 0:
+    if epochTime() > deadline:
+      navi_h3_close(h)
+      raise newException(QuicError, "navi: h3 WebSocket handshake timed out")
+    if navi_h3_pump(h) != 0 or navi_h3_draining(h) != 0:
+      navi_h3_close(h)
+      raise newException(QuicError,
+        "navi: HTTP/3 connection closed before the server's SETTINGS")
+  if navi_h3_peer_allows_connect(h) == 0:
+    navi_h3_close(h)
+    raise newException(response.ProtocolError, h3NoConnectProtocolErr)
   let reqHdr = encodeH3Fields(headers)
   let sid = navi_h3_open_connect(h, path.cstring, reqHdr.cstring, "websocket".cstring)
   if sid < 0:
     navi_h3_close(h); raise newException(QuicError, "navi: h3 Extended CONNECT failed")
-  # connectMs wins, then totalMs, else a 30s handshake default (mirroring how the
-  # sync `connect` resolves establishMs, but with an explicit backend floor).
-  let handshakeMs = establishMs(connectMs, totalMs, 30_000)
-  let deadline = epochTime() + float(handshakeMs) / 1000.0
   var status: clong
   var hbuf = newString(16 * 1024)
   var ready: cint

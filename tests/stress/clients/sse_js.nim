@@ -17,7 +17,8 @@ proc main() {.async.} =
 
   var streams: seq[SseStream]
   for _ in 0 ..< cfg.concurrency:
-    streams.add await api.sse(pool.pick() & "/events", retryMs = 20, maxRetryMs = 100)
+    streams.add await api.sse(pool.pick() & "/events", retryMs = 20, maxRetryMs = 100,
+                              minRetryMs = 20)
 
   let start = nowMs()
   let deadline = start + cfg.seconds * 1000.0

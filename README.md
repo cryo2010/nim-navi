@@ -154,6 +154,7 @@ Every client shares the same API, and the below table details where they differ.
 | Max TLS version | system | system | system | runtime |
 | Keep-alive / connection pool | ✓ | ✓ | ✓ | ✗ |
 | Streaming upload | ✓ | ✓ | ✓ | buffered |
+| `Expect: 100-continue` (`expectContinueMs`) | ✓ | ✓ | ✓ | ✗ |
 | Streaming download (pull) | ✓ | ✓ | ✓ | ✓ |
 | Sink download (push, `sink =`) | ✓ | ✓ | ✓ | ✓ |
 | Cookie jar | ✓ | ✓ | ✓ | ✓ |
@@ -250,6 +251,7 @@ let api = newNavi(config)
 | --- | --- | --- | --- |
 | `auth` | `Auth` | `akNone` | Authorization for every request; build via `basicAuth` / `bearerAuth` / `digestAuth`. |
 | `decompress` | `bool` | `true` | Decode `gzip`/`deflate`/`br`/`zstd` response bodies. |
+| `expectContinueMs` | `int` | `0` | Wait this many ms for an interim `100 Continue` before sending an HTTP/1.1 request body (`Expect: 100-continue`); `0` disables the gate. |
 | `headers` | `Headers` | empty | Headers sent on every request. |
 | `http` | `set[HttpVersion]` | `{H1, H2}` | HTTP versions to negotiate; add `H3` (needs `-d:naviHttp3`). |
 | `idleConnTimeout` | `int` | `0` | Evict and close an idle pooled connection after this many ms; `0` = no timeout. |
@@ -867,6 +869,49 @@ type Note = object
 discard api.post("https://example.com/notes", body = Note(title: "hi", body: "there"))
 ```
 
+#### Expect: 100-continue
+
+A large upload to an endpoint that may refuse it (too big, unauthorized, wrong
+content type) wastes the whole body before the refusal arrives. Setting
+`expectContinueMs` makes navi send `Expect: 100-continue` on the request head and
+wait up to that many milliseconds for the server's interim `100 Continue` before it
+sends the body:
+
+```nim
+let api = newNavi()
+api.config.expectContinueMs = 1000        # 0 (the default) disables the gate
+
+let res = api.request(POST, "https://example.com/upload",
+  body = openFileProducer("big.bin"))     # never pulled if the server refuses first
+```
+
+What happens in each case:
+
+- **`100 Continue` arrives** - the body is sent and the exchange continues normally.
+- **A final status arrives instead** (413, 401, 403, ...) - the body is **never
+  sent** and the producer is **never pulled**; you get that response. The connection
+  is not pooled afterwards, since a server that neither closed it nor discarded the
+  expectation would read your next request as the missing body.
+- **The server stays silent** until the timeout - the body is sent anyway and the
+  response is read as usual (RFC 9110 10.1.1). A `100` that arrives late, after the
+  body already started, is discarded like any other interim response.
+- **A `417 Expectation Failed`** is surfaced to you as an ordinary response. navi
+  does **not** silently retry without the header: streamed bodies are non-replayable
+  by contract, and re-sending a non-idempotent request behind your back would break
+  that. Set `expectContinueMs = 0` for an origin that rejects the expectation.
+
+The gate is added only to requests that actually carry a body, and only on
+**HTTP/1.1**: the field is written into the request head by the h1 send path itself,
+never onto the request, so HTTP/2 and HTTP/3 (which have flow control and no use for
+it) never see it, and it is not inherited by a retry, a redirect hop, or a digest
+replay. It is not available on `navi/js`, whose `fetch` transport owns the request
+framing.
+
+Setting the header yourself is respected either way: `Expect: 100-continue` is not
+duplicated and is gated exactly as if navi had added it (you still need
+`expectContinueMs` for navi to *wait*), while any other `Expect` value is sent as you
+wrote it and never waited on, since no server answers it with a `100`.
+
 ### Server-Sent Events
 
 `sse()` opens a `text/event-stream` and returns a handle consumed with a pull
@@ -885,8 +930,16 @@ s.close()
 Because `next()` is a pull (it returns `none` at end), `each` is a real loop, so
 `break`/`continue`/`return` work inside it. Parameters: `verb`/`body`/`headers`/
 `params` (POST-SSE, auth), `lastEventId` (resume a prior stream), `reconnect`
-(default true), and `retryMs`/`maxRetryMs` (reconnect backoff). The initial response
-must be `200 text/event-stream`, or `sse()` raises.
+(default true), and `retryMs`/`minRetryMs`/`maxRetryMs` (reconnect backoff). The
+initial response must be `200 text/event-stream`, or `sse()` raises.
+
+`minRetryMs` (default 100, capped by `maxRetryMs`) is a **floor under every
+reconnect delay**, including one the server asked for with `retry:`, so a `retry: 0`
+cannot turn the reconnect loop into a busy loop. A connect that closes **without
+delivering an event** doubles the delay up to `maxRetryMs`; only a connect that
+delivered at least one event resets it to the base. Together those bound a
+misbehaving server (200 then instant close) to backing off instead of being
+hammered.
 
 The stream runs with the size cap and read/total timeouts off (SSE is long-lived)
 and shares the client's cookie jar. **Call `close()` when done** so the connection
@@ -925,6 +978,22 @@ await ws.close()
 is the payload (or the reason on a close); `closeCode` is set on `wmClose`. navi
 answers pings automatically and reassembles fragmented messages, so `receive` always
 yields a whole message. Middleware does not apply to `websocket()`.
+
+`closeCode` reports what the peer actually sent, following RFC 6455 7.1.5, and two of
+its values never appear on the wire:
+
+| `closeCode` | meaning |
+| --- | --- |
+| the peer's code | the close frame carried a status code (`closeNormal` = 1000, `closeGoingAway` = 1001, ...) |
+| `closeNoStatus` (1005) | the close frame carried **no** status code, which is legal and distinct from an explicit 1000 |
+| `closeAbnormal` (1006) | the transport ended with no close frame at all |
+
+The same codes surface on the streaming path (`WsReader.closeCode`) and on `navi/js`.
+Because 1005 and 1006 are reserved for local use they are never written into a close
+frame: navi's echo of a codeless close is itself a close frame with an empty body, and
+`close(code)` rejects 1005/1006/1015 while a frame would still go out. Mirroring a
+received code back on teardown (`ws.close(msg.closeCode)`) is a safe no-op: the socket
+is already closed by then, so nothing is sent.
 
 Pass `maxMessageBytes` to bound a reassembled message; a peer can otherwise grow a
 single message without limit via continuation frames. When a message exceeds the cap,
@@ -988,12 +1057,29 @@ ws.stream(writer):
     writer.write(chunk)                # `await writer.write(chunk)` on the async clients
 ```
 
+A close can end a streamed read instead of a message: the reader's `kind` is then
+`wmClose` and `reader.closeCode` carries the reason -- the peer's code, `closeNoStatus`
+(1005) when it sent none, or `closeAbnormal` (1006) when the transport just ended with
+no close frame. The same three codes come back from `receive` as `msg.closeCode`, and
+`closeNormal`/`closeGoingAway`/`closeProtocolError`/`closeMessageTooBig`/`closeNoStatus`/
+`closeAbnormal` are exported by all four clients. 1005, 1006 and 1015 are reserved for
+local use (RFC 6455 7.4.1), so `close()` refuses to send them -- but only while a frame
+would actually go out, which makes mirroring a reported code back (`ws.close(msg.closeCode)`)
+a safe no-op after the peer has already closed.
+
+```nim
+let reader = ws.stream()
+if reader.kind == wmClose:
+  echo "peer closed: ", reader.closeCode        # 1005 / 1006 / whatever it sent
+```
+
 Like `StreamResponse.each`, the reader's `each` body runs as a proc, so `break`/
 `continue`/`return` cannot escape it; raise to stop early (which closes the connection).
 An exception inside a `stream(writer)` block also closes the connection, since a
 half-sent message cannot be completed. On `navi/js` the runtime owns framing, so a
 streamed read yields the message as a single chunk and a streamed write buffers until
-the block exits.
+the block exits; `closeCode` comes from the runtime's `CloseEvent`, which reports the
+same 1005 and 1006 the native clients synthesise.
 
 On `navi/js` the WebSocket wraps the runtime's native one, so custom handshake
 `headers` are ignored and the runtime handles ping/pong; the send/receive/close

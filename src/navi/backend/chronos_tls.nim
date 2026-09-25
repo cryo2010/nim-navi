@@ -30,8 +30,29 @@ when defined(ssl):
                             ## reads) dereferences it -- so it must outlive the ssl
       writeLock: AsyncLock  ## serialize SSL_write + wbio drains so concurrent streams
                             ## (and post-handshake output) never interleave on the wire
+      inBuf: string         ## reusable ciphertext scratch for the READ path's feedIn,
+                            ## allocated once per connection instead of per read
+      wrInBuf: string       ## the same for the WRITE path's feedIn, which is not
+                            ## mutually exclusive with the read path (see FeedSide).
+                            ## Allocated lazily: only a renegotiation/key update
+                            ## during a write ever needs it
 
   const tlsBufSize = 65536   # drain multiple TLS records per read (see naviReadBufSize)
+
+  type FeedSide = enum
+    ## Which pump is reading ciphertext, and so which scratch buffer it owns.
+    ##
+    ## `feedIn` is reachable from two paths that are NOT mutually exclusive: the read
+    ## path (`handshake`, then `readSome`, which on an h2 connection is a background
+    ## mux reader parked for as long as the connection is idle) and the write path's
+    ## SSL_ERROR_WANT_READ branch, which holds `writeLock` but no read lock. A TLS 1.3
+    ## key update or a renegotiation can therefore start a second `readOnce` while the
+    ## first is still parked. The two must never target the same buffer: whichever
+    ## completed second would overwrite bytes the first had not yet handed to the
+    ## read-BIO, and the corrupted ciphertext would fail the connection. One buffer per
+    ## side is the invariant that keeps every in-flight `readOnce` on its own memory.
+    fsRead
+    fsWrite
 
   proc sslPtr*(t: ChronosTls): SslPtr = t.sslp
     ## The underlying SSL, for `negotiatedProtocol` / `verifyPeer` after handshake.
@@ -43,7 +64,8 @@ when defined(ssl):
     ## are set here; the caller then `await`s `handshake`.
     let (ssl, rbio, wbio) = newClientSslMem(ctx, host, slot)
     ChronosTls(transport: transport, sslp: ssl, rbio: rbio, wbio: wbio,
-               slot: slot, writeLock: newAsyncLock())
+               slot: slot, writeLock: newAsyncLock(),
+               inBuf: newStringUninit(tlsBufSize))   # overwritten by every readOnce
 
   proc drainOut(t: ChronosTls) {.async.} =
     ## Push any ciphertext OpenSSL queued in the write-BIO onto the transport.
@@ -51,7 +73,7 @@ when defined(ssl):
     while true:
       let pending = bioCtrlPending(t.wbio)
       if pending <= 0: break
-      var buf = newString(pending)
+      var buf = newStringUninit(pending)   # bioRead fills it, then setLen(n): no zero-fill
       let n = bioRead(t.wbio, cast[cstring](addr buf[0]), pending.cint)
       if n <= 0: break
       buf.setLen(n)
@@ -62,20 +84,27 @@ when defined(ssl):
     try: await t.drainOut()
     finally: t.writeLock.release()
 
-  proc feedIn(t: ChronosTls): Future[bool] {.async.} =
+  proc feedIn(t: ChronosTls, side: FeedSide): Future[bool] {.async.} =
     ## Read one chunk of ciphertext from the transport into the read-BIO. Returns
     ## false on EOF -- a clean peer close, or the transport being closed under us
     ## during teardown. Swallowing the closed/errored-transport exception (rather
     ## than letting it propagate up through readSome/recvSome) lets chronos retire
     ## the in-flight read cleanly instead of leaking its future + our stack trace.
-    var buf = newString(tlsBufSize)
+    ##
+    ## The ciphertext lands in one of the connection's own scratch buffers rather than
+    ## a fresh 64 KiB string per read: the bytes are copied straight into the read-BIO
+    ## and the buffer is never handed to a caller, so reuse cannot alias anything.
+    ## `side` picks the buffer, and the two sides must stay separate: see FeedSide.
+    if side == fsWrite and t.wrInBuf.len == 0:
+      t.wrInBuf = newStringUninit(tlsBufSize)     # first renegotiation on this conn
+    let buf = if side == fsWrite: addr t.wrInBuf else: addr t.inBuf
     var n = 0
     try:
-      n = await t.transport.readOnce(addr buf[0], buf.len)
+      n = await t.transport.readOnce(addr buf[][0], buf[].len)
     except CatchableError:
       return false
     if n <= 0: return false
-    discard bioWrite(t.rbio, cast[cstring](addr buf[0]), n.cint)
+    discard bioWrite(t.rbio, cast[cstring](addr buf[][0]), n.cint)
     return true
 
   proc handshake*(t: ChronosTls) {.async.} =
@@ -92,7 +121,7 @@ when defined(ssl):
       case err
       of SSL_ERROR_WANT_READ:
         await t.flushOut()          # send what we have (ClientHello) first
-        if not await t.feedIn():
+        if not await t.feedIn(fsRead):
           raise newException(IOError, "navi: TLS peer closed during handshake")
       of SSL_ERROR_WANT_WRITE:
         await t.flushOut()
@@ -119,7 +148,8 @@ when defined(ssl):
             await t.drainOut()
           of SSL_ERROR_WANT_READ:            # renegotiation / key update wants input
             await t.drainOut()
-            if not await t.feedIn():
+            # fsWrite: a read-path readOnce may be parked right now (see FeedSide).
+            if not await t.feedIn(fsWrite):
               raise newException(IOError, "navi: TLS closed during write")
           else:
             raise newException(IOError, "navi: TLS write failed")
@@ -129,7 +159,10 @@ when defined(ssl):
   proc readSome*(t: ChronosTls): Future[string] {.async.} =
     ## Decrypt and return one chunk of application data, or "" on a clean close
     ## (close_notify or peer EOF). Raises on a genuine protocol error.
-    var buf = newString(tlsBufSize)
+    # Not the shared `inBuf`: this buffer becomes the caller's chunk, so it must be
+    # its own allocation. Uninitialized, though -- SSL_read overwrites what it uses
+    # and `setLen` drops the rest, so the 64 KiB zero-fill was pure waste per read.
+    var buf = newStringUninit(tlsBufSize)
     while true:
       # OpenSSL's error queue is per THREAD, not per SSL, and `SSL_get_error` is
       # documented to be reliable only when that queue was empty before the I/O call:
@@ -145,7 +178,7 @@ when defined(ssl):
       case err
       of SSL_ERROR_WANT_READ:
         await t.flushOut()                   # rare post-handshake output first
-        if not await t.feedIn(): return ""   # peer closed: EOF for the parser
+        if not await t.feedIn(fsRead): return ""  # peer closed: EOF for the parser
       of SSL_ERROR_WANT_WRITE:
         await t.flushOut()
       of SSL_ERROR_ZERO_RETURN:
@@ -160,6 +193,13 @@ when defined(ssl):
     ## Order matters: closing the transport first lets a background reader parked
     ## in `readOnce` complete with a clean EOF and unwind, rather than racing a
     ## freed SSL; it also avoids leaking the reader's in-flight read future.
+    # FIN before closesocket, so the close_notify (and any last record) written just
+    # before this is delivered rather than dropped with the socket (see
+    # `gracefulShutdown` in chronos.nim for the Windows failure this prevents).
+    if not t.transport.isNil:
+      try:
+        discard await withTimeout(t.transport.shutdownWait(), 1000.milliseconds)
+      except CatchableError: discard
     try: await t.transport.closeWait()
     except CatchableError: discard
     if not t.sslp.isNil:

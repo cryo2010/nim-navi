@@ -52,51 +52,12 @@ proc inflateEnd(strm: ptr ZStream): cint
 proc inflateReset(strm: ptr ZStream): cint
   {.cdecl, importc: "inflateReset", dynlib: zlibDll.}
 
-proc checkDecompressLimit(produced, limit: int) =
-  ## Abort a buffered decode the moment its output passes `maxResponseBytes`
-  ## (0 = off), so a compression bomb is never fully materialized. The streaming
-  ## path enforces the same cap per chunk in the engine.
-  if limit > 0 and produced > limit:
-    raise newException(ResponseTooLargeError,
-      "navi: decompressed response exceeds maxResponseBytes (" & $limit & ")")
-
 proc addBytes(dst: var string, src: string, n: int) {.inline.} =
   ## Append the first `n` bytes of `src` to `dst` in place, no intermediate slice.
   if n <= 0: return
   let old = dst.len
   dst.setLen(old + n)
   copyMem(addr dst[old], unsafeAddr src[0], n)
-
-proc inflateBytes(src: string, windowBits: cint, limit: int): string =
-  if src.len == 0: return ""
-  var strm = ZStream()
-  # zlib only checks the major version character, so "1" is sufficient.
-  if inflateInit2(addr strm, windowBits, "1", cint(sizeof(ZStream))) != zOk:
-    raise newException(ValueError, "navi: zlib inflateInit failed")
-  defer: discard inflateEnd(addr strm)
-  strm.nextIn = cast[ptr uint8](unsafeAddr src[0])
-  strm.availIn = cuint(src.len)
-  var chunk = newString(16384)
-  while true:
-    strm.nextOut = cast[ptr uint8](addr chunk[0])
-    strm.availOut = cuint(chunk.len)
-    let ret = inflate(addr strm, zNoFlush)
-    if ret != zOk and ret != zStreamEnd:
-      raise newException(ValueError, "navi: malformed compressed body")
-    let produced = chunk.len - int(strm.availOut)
-    if produced > 0:
-      result.addBytes(chunk, produced)
-      checkDecompressLimit(result.len, limit)
-    if ret == zStreamEnd:
-      # A gzip body may be several concatenated members (RFC 1952); zlib returns
-      # Z_STREAM_END at each boundary. If input remains, reset and decode the next
-      # member instead of stopping at the first (curl/Go do the same). Trailing
-      # bytes that are not a valid member then surface as a malformed body.
-      if strm.availIn == 0: break
-      if inflateReset(addr strm) != zOk:
-        raise newException(ValueError, "navi: zlib inflateReset failed")
-      continue
-    if strm.availIn == 0 and produced == 0: break  # truncated: stop, no progress
 
 # --- brotli (libbrotlidec), streaming decode ---
 when defined(windows):
@@ -160,29 +121,6 @@ const
   brSuccess = cint(1)
   brNeedOutput = cint(3)
 
-proc decodeBrotli(src: string, limit: int): string =
-  if src.len == 0: return ""
-  loadBrotli()
-  let s = brotliCreate(nil, nil, nil)
-  if s == nil: raise newException(ValueError, "navi: brotli init failed")
-  defer: brotliDestroy(s)
-  var availIn = csize_t(src.len)
-  var nextIn = cast[ptr uint8](unsafeAddr src[0])
-  var chunk = newString(16384)
-  while true:
-    var availOut = csize_t(chunk.len)
-    var nextOut = cast[ptr uint8](addr chunk[0])
-    let r = brotliStream(s, availIn, nextIn, availOut, nextOut, nil)
-    let produced = chunk.len - int(availOut)
-    if produced > 0:
-      result.addBytes(chunk, produced)
-      checkDecompressLimit(result.len, limit)
-    if r == brSuccess: break
-    if r == brNeedOutput: continue        # buffer full, keep draining
-    if r < brSuccess:                     # BROTLI_DECODER_RESULT_ERROR
-      raise newException(ValueError, "navi: malformed brotli body")
-    break                                 # NEEDS_MORE_INPUT with no more input: truncated
-
 # --- zstd (libzstd), streaming decode ---
 when defined(windows):
   const zstdDll = "libzstd.dll"
@@ -227,31 +165,22 @@ proc loadZstd() =
     if zstdCreate == nil or zstdFree == nil or zstdStream == nil or zstdIsError == nil:
       raise newException(ValueError, "navi: " & zstdDll & " lacks expected symbols")
 
-proc decodeZstd(src: string, limit: int): string =
-  if src.len == 0: return ""
-  loadZstd()
-  let s = zstdCreate()
-  if s == nil: raise newException(ValueError, "navi: zstd init failed")
-  defer: discard zstdFree(s)
-  var input = ZstdBuffer(buf: unsafeAddr src[0], size: csize_t(src.len), pos: 0)
-  var chunk = newString(16384)
-  while true:
-    var output = ZstdBuffer(buf: addr chunk[0], size: csize_t(chunk.len), pos: 0)
-    let r = zstdStream(s, output, input)
-    if zstdIsError(r) != 0:
-      raise newException(ValueError, "navi: malformed zstd body")
-    if output.pos > 0:
-      result.addBytes(chunk, int(output.pos))
-      checkDecompressLimit(result.len, limit)
-    if r == 0 and input.pos >= input.size: break          # all frames decoded
-    if output.pos == 0 and input.pos >= input.size: break  # truncated, no progress
-
 # --- incremental (streaming) decoding ---
 #
 # A StreamDecoder keeps the codec state alive across chunks, so a response body
 # is decoded as it arrives instead of only once fully buffered. The C resources
 # are released by `=destroy` (there is no end-of-stream callback on a BodySink),
 # so a truncated stream still frees cleanly.
+#
+# Concatenation policy. gzip (RFC 1952) and zstd (RFC 8878 4) bodies may be several
+# members/frames back to back, and every one of them is part of the body: the decoder
+# resets at each boundary and keeps going while input remains, as curl and Go do.
+# brotli has no such framing, so a `br` body is exactly one stream and anything after
+# it is trailing data. Trailing bytes after the last member are never silently
+# dropped: bytes that cannot start another member fail the decode with "malformed
+# compressed body", and a trailing fragment that ends mid-member leaves the decoder
+# in `dsMidMember`, which `streamComplete` reports as a truncated body. That is at
+# least as strict as curl, which rejects trailing non-gzip bytes.
 
 type
   DecoderKind = enum dkZlib, dkBrotli, dkZstd
@@ -264,11 +193,12 @@ type
     dsMidMember  ## the last update stopped mid-member (more input expected); a
                  ## stream ending here is truncated
     dsAtBoundary ## the last update ended exactly at a clean stream boundary
-                 ## (Z_STREAM_END at a gzip member edge). More members may follow;
-                 ## a stream ending here is complete
-    dsDone       ## a terminal stream boundary was reached (brotli success / a
-                 ## completed zstd frame); no more input is decoded. Also a clean
-                 ## end, so a stream ending here is complete
+                 ## (Z_STREAM_END at a gzip member edge, or a completed zstd
+                 ## frame). More members/frames may follow; a stream ending here
+                 ## is complete
+    dsDone       ## a terminal stream boundary was reached (brotli success); no more
+                 ## input is decoded. Also a clean end, so a stream ending here is
+                 ## complete
   StreamDecoderObj = object
     state: DecoderState      ## lifecycle position (see DecoderState)
     scratch: string          ## reused decode-output buffer (grown once, not per chunk)
@@ -389,14 +319,30 @@ proc updateZstd(d: StreamDecoder, input: openArray[byte], capRemaining: int): st
     inb = ZstdBuffer(buf: cast[typeof(ZstdBuffer().buf)](unsafeAddr input[0]),
                      size: csize_t(input.len), pos: 0)
   decodeLoop(d, input, capRemaining):
-    if inb.pos >= inb.size: break              # input drained
+    if inb.pos >= inb.size: break              # input drained (the last step set the state)
+    d.state = dsMidMember                      # inside a frame until this step completes it
+    let wasAt = inb.pos                        # to prove the call made progress
     var outb = ZstdBuffer(buf: cast[typeof(ZstdBuffer().buf)](addr d.scratch[0]),
                           size: csize_t(d.scratch.len), pos: 0)
     let r = zstdStream(d.zds, outb, inb)
     if zstdIsError(r) != 0:
       raise newException(ValueError, "navi: malformed zstd body")
     emitScratch(d, result, int(outb.pos), capRemaining)
-    if r == 0: d.state = dsDone; break   # a full frame completed
+    if r == 0:
+      # A zstd body may be several concatenated frames (RFC 8878 4), exactly like a
+      # multi-member gzip body. A completed frame is a clean boundary, not the end of
+      # the body: libzstd starts the next frame on the same DStream, so keep decoding
+      # while input remains instead of latching `done` and dropping every later frame.
+      #
+      # `continue` is the one branch here that loops without an exit condition of its
+      # own, so it must never run on a call that did nothing. A frame end that consumed
+      # no input and produced no output cannot happen with a working libzstd (starting
+      # the next frame reads its magic at least), but a peer must not be able to spin
+      # the decode loop forever if one ever did. Stop instead, leaving the state at
+      # dsMidMember so the body is reported as truncated rather than silently short.
+      if inb.pos == wasAt and outb.pos == 0: break
+      d.state = dsAtBoundary
+      continue                                  # the loop top breaks once input drains
     if outb.pos == 0: break                     # no progress: needs more input
 
 proc update*(d: StreamDecoder, input: openArray[byte], capRemaining = -1): string =
@@ -500,6 +446,30 @@ proc markStreamDecoded*(resp: var Response) =
     resp.headers.del("content-encoding")
     resp.headers["content-length"] = $resp.body.len
 
+proc decodeOneLayer(encoding, src: string, limit: int): string =
+  ## Decode a fully-buffered body by running it through the same `StreamDecoder` the
+  ## streaming path uses, as a single chunk.
+  ##
+  ## There is deliberately no second, buffered implementation of each codec. Keeping
+  ## one meant every rule had to be written twice -- multi-member gzip and multi-frame
+  ## zstd, the raw-deflate fallback, what counts as malformed, when the size cap
+  ## fires -- and the two copies drifted: the buffered decoder handled concatenated
+  ## zstd frames while the streaming one silently dropped everything after the first,
+  ## so the same bytes gave different answers depending on how they were fetched.
+  ## Now a buffered fetch is just a streamed one with a single chunk.
+  ##
+  ## `limit` (maxResponseBytes, 0 = off) is enforced inside the decoder, so a
+  ## compression bomb is aborted mid-inflate rather than after the whole body is
+  ## materialized. A body that ends mid-member is reported as the truncation it is,
+  ## exactly as the streaming path does, instead of being handed back part-decoded.
+  if src.len == 0: return ""
+  let d = newStreamDecoder(encoding)
+  if d == nil: return src              # not reachable: decodeBody vets the encodings
+  result = d.update(src.toOpenArrayByte(0, src.high),
+                    if limit > 0: limit else: -1)
+  if d.state == dsMidMember:
+    raise newException(IOError, truncatedBodyErr)
+
 proc decodeBody*(resp: var Response, opts: NaviConfigBase) =
   ## Decompress the body in place per Content-Encoding, then drop the headers that
   ## described the encoded form. Handles a stacked encoding (e.g. `gzip, br`) by
@@ -517,23 +487,13 @@ proc decodeBody*(resp: var Response, opts: NaviConfigBase) =
       return   # an encoding we cannot decode: hand back the body as received
     encodings.add e
   if encodings.len == 0: return
-  # The header lists encodings in the order they were applied, so undo them from
-  # the last one back to the first. `limit` (maxResponseBytes) is enforced inside
-  # each decoder so a compression bomb is aborted mid-inflate, not after the whole
-  # body is materialized.
+  # The header lists encodings in the order they were applied, so undo them from the
+  # last one back to the first. Each layer goes through `decodeOneLayer`, i.e. the
+  # streaming decoder fed one chunk: the raw-deflate fallback that "deflate" needs
+  # (some servers send it headerless) is `newStreamDecoder`'s one-shot retry, so it
+  # no longer needs a decode-twice `try`/`except` here either.
   let limit = opts.maxResponseBytes
   for i in countdown(encodings.high, 0):
-    case encodings[i]
-    of "gzip", "x-gzip":
-      resp.body = inflateBytes(resp.body, wbAuto, limit)
-    of "deflate":
-      # "deflate" is officially zlib-wrapped, but some servers send raw deflate.
-      try: resp.body = inflateBytes(resp.body, wbAuto, limit)
-      except ValueError: resp.body = inflateBytes(resp.body, wbRaw, limit)
-    of "br":
-      resp.body = decodeBrotli(resp.body, limit)
-    of "zstd":
-      resp.body = decodeZstd(resp.body, limit)
-    else: discard
+    resp.body = decodeOneLayer(encodings[i], resp.body, limit)
   resp.headers.del("content-encoding")
   resp.headers["content-length"] = $resp.body.len

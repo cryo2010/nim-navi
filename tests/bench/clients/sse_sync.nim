@@ -20,8 +20,10 @@ proc sseThread(a: ptr BenchThread) {.thread, nimcall.} =
     var gate = initVersionGate(cfg)
     var last = getMonoTime()
     try:
-      let s = api.sse(pool.pick() & "/events", retryMs = 20, maxRetryMs = 100)
-        # match the async client's reconnect settings so cross-backend tables compare
+      # Match the async client's reconnect settings so cross-backend tables compare;
+      # minRetryMs lowers the default 100 ms floor to keep those settings in force.
+      let s = api.sse(pool.pick() & "/events", retryMs = 20, maxRetryMs = 100,
+                      minRetryMs = 20)
       s.each(ev):
         gate.sample(s.httpVersion)
         let now = getMonoTime()

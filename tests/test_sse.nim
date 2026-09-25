@@ -128,6 +128,28 @@ suite "sse parser":
     p.feed("\xBFdata: y\n\n")
     check p.drain()[0].data == "y"
 
+  test "a short first feed that is not a BOM is preserved (#244)":
+    # The other half of the fragmented-start rule: holding back on a 1-2 byte first
+    # feed must not eat those bytes when they turn out not to be a BOM. A stream that
+    # opens with a one-byte read still parses its first field.
+    var p = initSseParser()
+    p.feed("d")                        # 1 byte: cannot decide yet
+    p.feed("a")                        # 2 bytes: still cannot decide
+    p.feed("ta: x\n\n")
+    check p.drain()[0].data == "x"
+
+  test "a first feed that shares a prefix with the BOM is preserved (#244)":
+    # EF BB followed by anything but BF is not a BOM, so both bytes stay in the
+    # stream -- here as the start of a (harmlessly ignored) unknown field name,
+    # which proves they were not dropped: the real event that follows still fires.
+    var p = initSseParser()
+    p.feed("\xEF\xBB")
+    p.feed("field: v\ndata: z\n\n")
+    let ev = p.drain()
+    check ev.len == 1
+    check ev[0].data == "z"
+    check ev[0].event == "message"     # "\xEF\xBBfield" is not "event": still default
+
   test "a data field with no value should contribute an empty line":
     var p = initSseParser()
     p.feed("data\ndata: y\n\n")       # "data" alone -> empty string in the buffer
@@ -189,3 +211,35 @@ suite "sse parser DoS hardening":
     except ValueError:
       raised = true
     check raised
+
+suite "sse reconnect delay policy (#291)":
+  # The floor and the empty-connect backoff are shared by every client's reconnect
+  # loop, so the arithmetic is pinned here; the socket-level behaviour lives in
+  # test_sse_retry*.nim.
+  test "a retry: 0 is lifted to the floor instead of reconnecting instantly":
+    check sseRetryDelay(0, defaultSseMinRetryMs, 30_000) == 100
+
+  test "the floor is itself capped by the ceiling":
+    check sseRetryDelay(0, 500, 200) == 200          # a floor cannot exceed the max
+    check sseRetryDelay(50, 0, 30_000) == 50         # floor off: the value stands
+
+  test "a delay between the floor and the ceiling is left alone, above it is capped":
+    check sseRetryDelay(3000, 100, 30_000) == 3000
+    check sseRetryDelay(60_000, 100, 30_000) == 30_000
+
+  test "a nonsense (negative) delay lands on the floor, never below zero":
+    check sseRetryDelay(-5, 100, 30_000) == 100
+    check sseRetryDelay(-5, 0, 30_000) == 0
+
+  test "the backoff doubles and saturates at the ceiling":
+    check sseBackoff(100, 100, 100, 30_000) == 200
+    check sseBackoff(200, 100, 100, 30_000) == 400
+    check sseBackoff(20_000, 100, 100, 30_000) == 30_000
+    check sseBackoff(30_000, 100, 100, 30_000) == 30_000
+
+  test "the backoff starts from the floor even when the base is zero":
+    check sseBackoff(0, 0, 100, 30_000) == 200       # a retry: 0 server still backs off
+    check sseBackoff(100, 100, 100, 100) == 100      # floor == ceiling: nowhere to go
+
+  test "the backoff cannot overflow on an extreme ceiling":
+    check sseBackoff(int.high div 2 + 10, 0, 0, int.high) == int.high

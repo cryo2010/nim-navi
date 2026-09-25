@@ -5,14 +5,37 @@
 ## across the sync, asyncdispatch, and chronos backends and unit-testable in
 ## isolation.
 
-import std/[strutils, strformat]
+import std/strutils
 import ../core/[headers, url, request, response]
 
-proc serializeHead*(req: Request, chunked = false): string =
+proc sendsExpectContinue*(req: Request): bool =
+  ## Whether an `expectContinue` head for this request will actually put
+  ## `Expect: 100-continue` on the wire. navi adds the field when the caller set no
+  ## `Expect` of their own, and a caller who set that exact expectation keeps theirs
+  ## (same field, same meaning, so no duplicate is emitted).
+  ##
+  ## Any OTHER `Expect` value is a caller extension navi neither sends 100-continue
+  ## for nor understands, so the gate must not wait on it: the send path checks this
+  ## before arming the wait, otherwise a foreign expectation would stall the upload
+  ## for the whole `expectContinueMs` before the body went out.
+  var present = false
+  for v in req.headers.getAll("expect"):
+    present = true
+    if cmpIgnoreCase(v.strip(), "100-continue") == 0: return true
+  not present
+
+proc serializeHead*(req: Request, chunked = false, expectContinue = false): string =
   ## Request line, headers, and the terminating blank line (no body). Adds Host
   ## when missing, and either Transfer-Encoding: chunked (streaming upload) or
   ## Content-Length. HTTP/1.1 keeps connections alive by default, which pooling
   ## relies on.
+  ##
+  ## `expectContinue` adds `Expect: 100-continue` (the h1 upload gate, #392). It is a
+  ## parameter here rather than a field the caller sets on a copy of the request: a
+  ## copy would clone the whole `Request`, buffered body included, to add one field,
+  ## which is the very copy #244 removed from this path. Building it into the head
+  ## string costs the field and nothing else, and keeps the header off `req`, so h2/h3
+  ## (which build their field lists from `req`) can never pick it up.
   # navi owns transfer framing: a streamed body (`bodyStream`) or trailers select the
   # chunked path (`chunked = true`, which frames the body and adds the header). A caller
   # must not set Transfer-Encoding by hand -- on the buffered path (`chunked = false`)
@@ -61,6 +84,10 @@ proc serializeHead*(req: Request, chunked = false): string =
       # Content-Length: 0 so servers/WAFs that require a length don't stall or 411 on
       # a bodyless POST/PUT/PATCH (#274). GET/HEAD/etc. carry no length by default.
       result.add("Content-Length: 0\r\n")
+  # The caller's own Expect, if any, was already emitted by the header loop above;
+  # adding a second one would send two expectations for one request.
+  if expectContinue and not req.headers.contains("expect"):
+    result.add("Expect: 100-continue\r\n")
   result.add("\r\n")
 
 proc serializeRequest*(req: Request): string =
@@ -78,23 +105,39 @@ const h1CoalesceSize* = 16 * 1024
   ## this large is framed and written on its own. 16 KiB is the maximum TLS record
   ## payload, so a full buffer always fits one record.
 
+const hexDigits = "0123456789ABCDEF"
+
+proc addChunkSize(buf: var string, n: Positive) =
+  ## Append `n` as an uppercase hex chunk-size, written digit by digit straight into
+  ## `buf`. `fmt"{n:X}"` would allocate a throwaway string per chunk of a streamed
+  ## upload, which is the one allocation a chunk header does not need.
+  var digits {.noinit.}: array[16, char]        # 16 nibbles spans the whole int range
+  var i = 0
+  var v = int(n)
+  while v > 0:
+    digits[i] = hexDigits[v and 0xf]
+    inc i
+    v = v shr 4
+  while i > 0:
+    dec i
+    buf.add digits[i]
+
 proc addChunk*(buf: var string, data: string) =
   ## Append one HTTP/1.1 chunked-transfer frame for `data` to `buf`. Lets the send
   ## loop pack the last chunk and the terminator into a single write without an
   ## intermediate per-chunk string. An empty `data` appends nothing: an empty chunk
   ## would encode as "0\r\n\r\n", a premature body terminator (#274).
   if data.len == 0: return
-  let hex = fmt"{data.len:X}"
-  buf.add hex
+  buf.addChunkSize(data.len)
   buf.add "\r\n"
   buf.add data
   buf.add "\r\n"
 
 proc encodeChunk*(data: string): string =
   ## One HTTP/1.1 chunked-transfer frame: `<hex-size>\r\n<data>\r\n`. `data` must be
-  ## non-empty. Built into a single preallocated buffer (the payload is copied once)
-  ## rather than chained `&` temporaries, since this runs per chunk of a streamed
-  ## upload.
+  ## non-empty. Built into a single preallocated buffer (the payload is copied once,
+  ## the size written in place) rather than chained `&` temporaries, since this runs
+  ## per chunk of a streamed upload.
   if data.len == 0: return ""
   result = newStringOfCap(data.len + 20)
   result.addChunk(data)
@@ -125,9 +168,10 @@ type
     state: H1State
     buf: string
     pos: int                ## read cursor into `buf`: bytes consumed but not yet
-                            ## dropped. Consuming advances `pos`; `feed` compacts the
-                            ## consumed prefix in one shift (like h2's FrameDecoder),
-                            ## avoiding an O(lines x bodyBytes) front-`delete` memmove.
+                            ## dropped. Consuming advances `pos`; `feed` reclaims the
+                            ## consumed prefix periodically (see `compact`), like h2's
+                            ## FrameDecoder, avoiding the O(lines x bodyBytes) memmove
+                            ## a front `delete` per consumed span costs.
     bodyMode: H1BodyMode
     remaining: int          ## bytes left in current length-delimited span
     status: int
@@ -144,6 +188,12 @@ type
                             ## has arrived, so the peer demonstrably began responding even
                             ## before the final headers -- mirrors h2's `responseBegan`,
                             ## so a later drop is a truncation, not a keep-alive race
+    bodySkipped: bool       ## the request body was never put on the wire: an
+                            ## `Expect: 100-continue` upload the server answered with a
+                            ## final status instead of a 100. The peer may still be
+                            ## waiting for that body, so the connection must not be
+                            ## pooled (`keepAliveAfter`) even though the response itself
+                            ## is complete and self-delimited
 
 proc initH1Parser*(streaming = false, headRequest = false): H1Parser =
   result.state = stStatusLine
@@ -151,11 +201,21 @@ proc initH1Parser*(streaming = false, headRequest = false): H1Parser =
   result.streaming = streaming
   result.headRequest = headRequest
 
-proc emitBody(p: var H1Parser, chunk: string) =
+proc addRange(dst: var string, src: string, first, n: int) {.inline.} =
+  ## Append `src[first ..< first + n]` to `dst` without materializing the slice as
+  ## its own string first. Body bytes are copied out of the parse buffer once per
+  ## read on the hot path, so the slice temporary is pure overhead.
+  if n <= 0: return
+  let start = dst.len
+  dst.setLen(start + n)
+  copyMem(addr dst[start], unsafeAddr src[first], n)
+
+proc emitBody(p: var H1Parser, first, n: int) =
+  ## Hand `buf[first ..< first + n]` to the body sink for this parser's mode.
   if p.streaming:
-    p.pending.add(chunk)
+    p.pending.addRange(p.buf, first, n)
   else:
-    p.body.add(chunk)
+    p.body.addRange(p.buf, first, n)
 
 proc setStreaming*(p: var H1Parser, streaming: bool) =
   ## Flip the streaming flag after the headers are in (the gated-drain path decides
@@ -197,6 +257,13 @@ proc responseBegan*(p: H1Parser): bool {.inline.} =
   ## but a close after ONLY a 1xx interim (which the parser discards) must also count as
   ## "the peer began responding," so it is not misread as a safe keep-alive race.
   p.sawInterim or p.headersReady
+
+proc markBodySkipped*(p: var H1Parser) =
+  ## Record that the request body was withheld (an expect-gated upload the server
+  ## answered before we sent it). Consulted by `keepAliveAfter`: a server that
+  ## neither closed nor discarded the expectation would read the next request on this
+  ## connection as the missing body, so the connection is retired instead of pooled.
+  p.bodySkipped = true
 
 proc takeLine(p: var H1Parser, line: var string): bool =
   ## Pop one CRLF-terminated line from the buffer, if a full line is present.
@@ -311,14 +378,14 @@ proc step(p: var H1Parser): bool =
     of bmLength:
       let take = min(p.remaining, avail)
       if take == 0: return false
-      p.emitBody(p.buf[p.pos ..< p.pos + take])
+      p.emitBody(p.pos, take)
       p.pos += take
       dec p.remaining, take
       if p.remaining == 0: p.state = stDone
       true
     of bmUntilClose:
       if avail == 0: return false
-      p.emitBody(p.buf[p.pos ..< p.buf.len])
+      p.emitBody(p.pos, avail)
       p.pos = p.buf.len
       false # need EOF to terminate; drained for now
     else: false
@@ -339,16 +406,42 @@ proc step(p: var H1Parser): bool =
     p.state = if p.remaining == 0: stTrailers else: stChunkData
     true
   of stChunkData:
-    if p.buf.len - p.pos < p.remaining + 2: return false # need data + trailing CRLF
-    # RFC 9112 7.1: chunk-data is terminated by CRLF. Verify it instead of blindly
-    # consuming two bytes -- a missing CRLF is a framing desync that would otherwise
-    # deliver a corrupted body and could leave the pooled connection poisoned.
-    if p.buf[p.pos + p.remaining] != '\r' or p.buf[p.pos + p.remaining + 1] != '\n':
-      raise newException(ValueError, "h1: chunk data not terminated by CRLF")
-    p.emitBody(p.buf[p.pos ..< p.pos + p.remaining])
-    p.pos += p.remaining + 2
-    p.state = stChunkSize
-    true
+    # Emit what of the chunk has arrived instead of waiting for all of it: a server
+    # is free to declare one multi-megabyte chunk, and buffering it whole would hold
+    # that chunk in the parser even on the streaming path, where the size cap
+    # (applied to emitted bytes) could then never fire to stop it. Chunk boundaries
+    # are framing, not delivery units (RFC 9112 7.1).
+    #
+    # Incremental delivery stops one byte short, though: the LAST byte of a chunk is
+    # held back until its terminating CRLF has been verified, so no chunk is ever
+    # fully delivered on the strength of a size line alone. A desynced or smuggled
+    # chunk therefore cannot land complete in a sink before the error is raised, and
+    # what a streaming consumer did receive is always a strict prefix of the chunk,
+    # exactly as a body cut short by a dropped connection is.
+    let avail = p.buf.len - p.pos
+    if avail >= p.remaining + 2:
+      # The rest of the chunk and its terminator are both here. RFC 9112 7.1:
+      # chunk-data is terminated by CRLF. Verify it instead of blindly consuming two
+      # bytes -- a missing CRLF is a framing desync that would otherwise deliver a
+      # corrupted body and could leave the pooled connection poisoned. Raising here
+      # leaves the parser short of stDone, so `keepAliveAfter` refuses the connection.
+      if p.buf[p.pos + p.remaining] != '\r' or p.buf[p.pos + p.remaining + 1] != '\n':
+        raise newException(ValueError, "h1: chunk data not terminated by CRLF")
+      p.emitBody(p.pos, p.remaining)
+      p.pos += p.remaining + 2
+      p.remaining = 0
+      p.state = stChunkSize
+      true
+    else:
+      # Still mid-chunk: deliver everything except the final byte. `remaining` never
+      # reaches 0 on this path, so the terminator check above is the only way out of
+      # a chunk. A 1-byte chunk delivers nothing here, by the same rule.
+      let take = min(avail, p.remaining - 1)
+      if take <= 0: return false
+      p.emitBody(p.pos, take)
+      p.pos += take
+      dec p.remaining, take
+      true
   of stTrailers:
     var line: string
     if not p.takeLine(line): return false
@@ -362,12 +455,30 @@ proc step(p: var H1Parser): bool =
   of stDone:
     false
 
+const h1CompactMin = 8 * 1024
+  ## Smallest consumed prefix worth shifting the retained bytes for (see `compact`).
+
+proc compact(p: var H1Parser) =
+  ## Reclaim the consumed prefix of the parse buffer. Fully consumed is the common
+  ## case (a read that ends on a frame boundary) and costs nothing but a `setLen`.
+  ## Otherwise the retained bytes are moved down IN PLACE, and only once the prefix
+  ## is both worth reclaiming and at least as large as what the move copies -- so
+  ## shifting stays amortized O(1) per byte rather than re-copying a large retained
+  ## remainder on every feed to drop a few consumed header bytes.
+  if p.pos == 0: return
+  if p.pos >= p.buf.len:
+    p.buf.setLen(0)
+  elif p.pos >= h1CompactMin and p.pos >= p.buf.len - p.pos:
+    let keep = p.buf.len - p.pos
+    moveMem(addr p.buf[0], addr p.buf[p.pos], keep)
+    p.buf.setLen(keep)
+  else:
+    return                               # leave the prefix; the cursor skips it
+  p.pos = 0
+
 proc feed*(p: var H1Parser, data: openArray[char]) =
   ## Supply received bytes and drive the state machine as far as it can go.
-  if p.pos > 0:                          # drop the consumed prefix in one shift
-    if p.pos >= p.buf.len: p.buf.setLen(0)
-    else: p.buf = p.buf[p.pos .. ^1]
-    p.pos = 0
+  p.compact()
   if data.len > 0:
     let start = p.buf.len
     p.buf.setLen(start + data.len)
@@ -389,6 +500,8 @@ proc keepAliveAfter*(p: H1Parser): bool =
   ## that did not ask to close.
   if p.state != stDone: return false
   if p.bodyMode == bmUntilClose: return false
+  # An expect-gated request whose body we never sent: see `markBodySkipped`.
+  if p.bodySkipped: return false
   # Only pool an HTTP/1.1 peer. HTTP/1.0 keep-alive (via `Connection: keep-alive`) is
   # spec-permitted (RFC 9112 6.3) but notoriously ambiguous through proxies, so we
   # deliberately decline to reuse a 1.0 connection rather than risk a desync (#274).

@@ -8,10 +8,39 @@ onward (pre-1.0, minor versions may include breaking changes).
 ## [Unreleased]
 
 ### Added
-- **`WsReader.closeCode`** on the native clients: the peer's close code once a
+- **An opt-in `Expect: 100-continue` gate for HTTP/1.1 uploads (`expectContinueMs`).**
+  Setting `config.expectContinueMs` (ms; `0`, the default, disables it) makes the h1
+  send path put `Expect: 100-continue` on the request head and wait that long for the
+  server's interim `100 Continue` before sending the body, so an upload an endpoint
+  will refuse (413, 401, 403, ...) costs the head instead of the whole body and the
+  producer is never pulled. If the server answers with a final status instead, the
+  body is withheld and the connection is **not pooled** afterwards (a peer still
+  waiting for that body would read the next request as it). If the server stays
+  silent, the body is sent once the timeout lapses (RFC 9110 10.1.1), and a `100` that
+  lands after that is discarded like any other interim. A `417 Expectation Failed` is
+  surfaced as an ordinary response rather than silently retried without the header,
+  since navi's streamed bodies are non-replayable by contract. The header is added to
+  a local copy of the request inside the h1 send, so h2/h3 never carry it and a retry,
+  redirect or digest replay does not inherit it; it is only ever sent on a request
+  that actually has a body. Native clients only (`navi/js` leaves request framing to
+  `fetch`) (#392).
+- **A bounded `recvWithin` transport op on the three native clients.** A read that
+  gives up after a deadline and leaves the connection usable, unlike the (terminal)
+  per-read timeout. The sync client only polls readiness, so nothing is consumed on
+  expiry; the asyncdispatch and chronos clients **park** the unfinished read on the
+  connection and resume it from the next `recvSome`, so its bytes reach the next
+  reader instead of being swallowed (asyncdispatch cannot cancel at all, and a
+  cancelled chronos read can drop bytes it already took off the transport). This is
+  what lets the `Expect: 100-continue` gate wait for the interim response and then
+  carry on reading the same connection (#392).
+- **`WsReader.closeCode`** on every client: the peer's close code once a
   streamed message ends in a close frame (1005 when the peer sent none, 1006 on a
   bodiless EOF). `closeAbnormal`, `closeProtocolError` and `closeNoStatus` are now
-  re-exported by the drivers (#289).
+  re-exported by all four drivers, `navi/js` included, so cross-client code can name
+  them without a per-client switch. On `navi/js` the code comes straight from the
+  runtime's `CloseEvent`, which already reports 1005 and 1006 for those two cases,
+  and `close()` now rejects the reserved 1005/1006/1015 while a frame would still be
+  sent, exactly as the native clients do (#289, #396).
 - **A `stream` namespace view: `api.stream.get(url)` opens a streaming download.**
   Streaming downloads now have the same two-layer shape as the rest of navi: a
   verb-named sugar over a full-control layer. `api.stream` returns a zero-cost view
@@ -64,6 +93,20 @@ onward (pre-1.0, minor versions may include breaking changes).
   trailers ride the last write, so a chatty producer no longer costs one write and
   one TLS record per chunk. Chunks at or above the threshold are written directly
   (#299).
+- **The HTTP/1.1 response parser holds at most one read of body bytes, and shifts
+  its parse buffer less.** Chunk data is emitted as it arrives instead of being
+  buffered whole, so a server that declares one multi-megabyte chunk no longer parks
+  that chunk in the parser and the response size cap can fire mid-chunk; the
+  consumed prefix is reclaimed in place (and only once the shift pays for itself)
+  rather than by rebuilding the buffer on every read; and body bytes are appended
+  straight out of the parse buffer with no slice temporary. A chunk whose data is not
+  followed by CRLF is still rejected before the response can complete, so the
+  connection is never pooled (#244).
+- **A small buffered upload leaves with the request head in one write.** A body up
+  to 16 KiB (one TLS record) is packed with the head, so the common small request
+  costs one write and one TLS record instead of two; a larger body is still written
+  separately and never copied to prepend the head. Streamed chunk sizes are written
+  into the output buffer directly, without a formatted temporary per chunk (#244).
 - **BREAKING: the request `body` is now type-dispatched, and the `json`,
   `multipart`, and `bodyStream` parameters are removed (no deprecation).** The
   `body` argument of `request`/`post`/`put`/`patch` dispatches on its type: a
@@ -83,6 +126,83 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **The chronos client shuts a socket down before closing it, so the last write is
+  delivered.** chronos's `closeWait` calls `closesocket` straight away, with no
+  `shutdown` first; on Windows that could drop the bytes written just before the
+  close, so a WebSocket close frame (or a TLS close_notify) sent right before
+  `close` reached the peer as a bare EOF. `close` now sends FIN first (bounded to a
+  second, best effort), matching what the asyncdispatch client already did.
+- **A buffered compressed body that ends mid-member now raises instead of being
+  returned part-decoded.** Buffered decoding no longer has its own copy of each
+  codec: it feeds the body to the same decoder a streamed response uses, so the
+  multi-member/multi-frame rules, the raw-deflate fallback and the size cap have one
+  home and a buffered fetch cannot disagree with a streamed one about the same bytes.
+  The visible change is truncation: a `br` or `zstd` body cut short used to come back
+  silently partial, and now raises `IOError` with the same
+  "compressed response body truncated" message the streamed path uses (a truncated
+  gzip body already raised, as a generic malformed-body error) (#244).
+- **A streamed `zstd` body made of several concatenated frames is decoded whole.**
+  RFC 8878 allows a zstd body to be a run of frames back to back, the way RFC 1952
+  allows a gzip body to be several members. The buffered path already decoded them
+  all, but the incremental decoder marked itself done at the first frame end, so a
+  streamed (or h2-muxed) multi-frame body was silently truncated to its first frame.
+  A completed frame is now treated as a clean boundary and decoding continues while
+  input remains, exactly as the gzip member path does. Trailing bytes after the last
+  member/frame are still rejected rather than ignored (#244).
+- **WebSocket over HTTP/3 now gates its Extended CONNECT on the server's
+  `SETTINGS_ENABLE_CONNECT_PROTOCOL`.** The h3 path opened the CONNECT stream as soon
+  as the QUIC handshake finished, without waiting for the peer's SETTINGS or checking
+  that it allowed the extended CONNECT protocol, contrary to RFC 9220 / RFC 8441 3
+  (navi advertised the setting to the server, which says nothing about the server).
+  An origin that does not support WebSocket over h3 therefore failed late and
+  obscurely, via a stream reset or an h3 error, where the h2 path fails immediately
+  with a clear diagnostic. All three h3 clients (sync, asyncdispatch, chronos) now
+  drive the connection until the peer's SETTINGS frame lands, bounded by the same
+  connect/handshake deadline, and then raise the h2 path's `ProtocolError` -- "navi:
+  server does not support WebSocket over HTTP/3 (no SETTINGS_ENABLE_CONNECT_PROTOCOL);
+  use an h1 WebSocket" -- before anything is submitted (#393).
+- **The h3 driver no longer drops stream data that arrives before its nghttp3 session
+  is bound.** The session is created once the QUIC handshake completes, but the
+  server's control stream (carrying its SETTINGS) can ride in the very datagram that
+  completes the handshake, and ngtcp2 never re-delivers what the receive callback
+  consumed, so those bytes were lost. They are now parked (bounded) and replayed into
+  nghttp3 at bind time, with their flow-control offsets extended then. Found while
+  adding the Extended CONNECT gate above, which otherwise waited forever for a
+  SETTINGS frame that had already been thrown away (#393).
+- **A misbehaving SSE server can no longer spin the reconnect loop.** The reconnect
+  delay had no lower bound, so a server that sent `retry: 0` reduced it to
+  `sleep(0)`, and a server that answered 200 and closed with no events reset the
+  backoff on every connect (the reset was tied to a successful connect, not to a
+  delivered event) -- either one reconnected as fast as the loop could run, hammering
+  the server. Every client (sync, asyncdispatch, chronos, js) now floors every delay
+  at the new `minRetryMs` (default 100 ms, itself capped by `maxRetryMs`), including
+  a delay the server asked for with `retry:`, and doubles the delay after any connect
+  that closed without delivering an event; only a connect that delivered at least one
+  event resets it to the base (#291).
+- **A redirect hop that drops a streamed upload no longer sends an empty chunked
+  body.** `followRedirects` threaded the async body producer into every hop, so after
+  a rewrite that drops the body (303 on any verb, 301/302 off a non-GET/HEAD method)
+  the next hop went out as a GET with `Transfer-Encoding: chunked` and a producer that
+  was already at EOF, i.e. a lone `0\r\n\r\n` body. Harmless on the wire for a
+  conformant server, but a GET with a chunked body is something intermediaries log or
+  reject, and it disagreed with the sync path, which sends nothing once `bodyStream`
+  is nil. The producer is now dropped with the body, so such a hop is a plain bodiless
+  request on every client and over h1 and h2 alike. A 307/308 hop is unaffected: a
+  non-replayable body is still never followed there, the 3xx is surfaced (#395, #295).
+- **`navi/proto/ws` compiles under `nim js` again.** The module's `js` branch was
+  documented as a fallback that keeps a `nim js` build compiling, but the build
+  failed: `checksums/sha1` reaches `std/endians`, which is native-only (`copyMem`),
+  and the frame codec's word-wise masking and unmasked-payload copy call `copyMem`
+  too. The js target now hashes the handshake accept with a small pure-Nim SHA-1
+  (cross-checked against `checksums` in the unit suite), masks and copies byte-wise,
+  and draws its masking keys and handshake nonces from the Web Crypto CSPRNG
+  (`globalThis.crypto.getRandomValues`) instead of a fixed-seed `std/random`, raising
+  rather than falling back to a predictable PRNG on a runtime without it. The 8-byte
+  frame length is also emitted out of a `uint64` now, since a shift past 31 is
+  undefined on a 32-bit `int`. navi/js still does not use this module at runtime (the
+  runtime's `WebSocket` does the framing), but js is navi's only 32-bit-`int` target,
+  so `tests/js_ws_codec.nim` now runs the RFC 6455 vectors and the #285 frame-length
+  guard under Node in CI, where a truncating `int` is real (#394).
 - **A closing TLS connection no longer breaks the other live TLS connections on the
   same thread.** OpenSSL's error queue is per THREAD, not per `SSL`, and
   `SSL_get_error` is documented to be reliable only when that queue was empty before
@@ -167,8 +287,12 @@ onward (pre-1.0, minor versions may include breaking changes).
   1000-1014/3000-4999), or a non-UTF-8 reason surfaced as a clean `wmClose` and was
   echoed back to the peer verbatim. They now run the same checks `receive` does --
   one shared `ws.parseClose` -- and fail the connection with 1002 before raising.
-  A synthetic EOF (no close frame at all) is still reported as 1006, never
-  validated or echoed.
+  A masked server frame (RFC 6455 5.1) is rejected on the streaming path too, as
+  `receive` already did through `offer(rejectMasked = true)`, so a masked close can
+  no longer be echoed back either; and a `WsReader` whose message was cut short by a
+  rejected close reports `closeCode == closeProtocolError`, the code the connection
+  was failed with. A synthetic EOF (no close frame at all) is still reported as
+  1006, never validated or echoed (#283).
 - **WebSocket driver hygiene:** `send`/`ping` on a closed socket raise a clear
   `IOError` instead of poking a torn-down transport; `close(code)` rejects the
   reserved codes 1005/1006/1015; the keepalive-death path drops its stale pending
