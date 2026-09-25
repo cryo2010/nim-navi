@@ -8,10 +8,14 @@ onward (pre-1.0, minor versions may include breaking changes).
 ## [Unreleased]
 
 ### Added
-- **`WsReader.closeCode`** on the native clients: the peer's close code once a
+- **`WsReader.closeCode`** on every client: the peer's close code once a
   streamed message ends in a close frame (1005 when the peer sent none, 1006 on a
   bodiless EOF). `closeAbnormal`, `closeProtocolError` and `closeNoStatus` are now
-  re-exported by the drivers (#289).
+  re-exported by all four drivers, `navi/js` included, so cross-client code can name
+  them without a per-client switch. On `navi/js` the code comes straight from the
+  runtime's `CloseEvent`, which already reports 1005 and 1006 for those two cases,
+  and `close()` now rejects the reserved 1005/1006/1015 while a frame would still be
+  sent, exactly as the native clients do (#289, #396).
 - **A `stream` namespace view: `api.stream.get(url)` opens a streaming download.**
   Streaming downloads now have the same two-layer shape as the rest of navi: a
   verb-named sugar over a full-control layer. `api.stream` returns a zero-cost view

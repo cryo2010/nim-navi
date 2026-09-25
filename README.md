@@ -988,12 +988,29 @@ ws.stream(writer):
     writer.write(chunk)                # `await writer.write(chunk)` on the async clients
 ```
 
+A close can end a streamed read instead of a message: the reader's `kind` is then
+`wmClose` and `reader.closeCode` carries the reason -- the peer's code, `closeNoStatus`
+(1005) when it sent none, or `closeAbnormal` (1006) when the transport just ended with
+no close frame. The same three codes come back from `receive` as `msg.closeCode`, and
+`closeNormal`/`closeGoingAway`/`closeProtocolError`/`closeMessageTooBig`/`closeNoStatus`/
+`closeAbnormal` are exported by all four clients. 1005, 1006 and 1015 are reserved for
+local use (RFC 6455 7.4.1), so `close()` refuses to send them -- but only while a frame
+would actually go out, which makes mirroring a reported code back (`ws.close(msg.closeCode)`)
+a safe no-op after the peer has already closed.
+
+```nim
+let reader = ws.stream()
+if reader.kind == wmClose:
+  echo "peer closed: ", reader.closeCode        # 1005 / 1006 / whatever it sent
+```
+
 Like `StreamResponse.each`, the reader's `each` body runs as a proc, so `break`/
 `continue`/`return` cannot escape it; raise to stop early (which closes the connection).
 An exception inside a `stream(writer)` block also closes the connection, since a
 half-sent message cannot be completed. On `navi/js` the runtime owns framing, so a
 streamed read yields the message as a single chunk and a streamed write buffers until
-the block exits.
+the block exits; `closeCode` comes from the runtime's `CloseEvent`, which reports the
+same 1005 and 1006 the native clients synthesise.
 
 On `navi/js` the WebSocket wraps the runtime's native one, so custom handshake
 `headers` are ignored and the runtime handles ping/pong; the send/receive/close

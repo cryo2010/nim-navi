@@ -39,7 +39,8 @@ claimEntry("navi/js")
 export public, asyncjs
 export jsws.WebSocket, jsws.WsMessage, jsws.WsMessageKind,
        jsws.send, jsws.receive, jsws.close, jsws.closeNormal, jsws.closeGoingAway,
-       jsws.closeMessageTooBig, jsws.WsMessageTooLarge,
+       jsws.closeProtocolError, jsws.closeMessageTooBig, jsws.closeNoStatus,
+       jsws.closeAbnormal, jsws.WsMessageTooLarge,
        jsws.WsReader, jsws.WsWriter, jsws.stream, jsws.streamBinary, jsws.each,
        jsws.readChunk, jsws.drain, jsws.write
 
