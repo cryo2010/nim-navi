@@ -3,3 +3,4 @@ nimcache/
 tests/test_*
 tests/leak
 tests/leak_sanitize
+.claude/
