@@ -745,8 +745,8 @@ template followRedirects*(client, startReq, resp: typed; asyncStream: typed = ni
   ## Issue `startReq`, following redirects into `resp`. Expands inline so its
   ## `await`s run in the caller's async proc. `asyncStream` (async only) is the
   ## awaited upload producer for the initial send; a streamed request is
-  ## non-replayable, so it breaks before any redirect rewrite (below) and the
-  ## producer is never pulled a second time. `userSink`/`gate` (when set) stream the
+  ## non-replayable, so it breaks before any redirect rewrite that would carry its
+  ## body forward (below) and the producer is never pulled a second time. `userSink`/`gate` (when set) stream the
   ## FINAL body: this loop refreshes the gate's per-hop fields (hops, limit, whether
   ## this hop is replayable, and whether digest is still armed) before each `run`, so
   ## the drain site can tell whether the response is the surfaced one.
@@ -770,12 +770,15 @@ template followRedirects*(client, startReq, resp: typed; asyncStream: typed = ni
     decodeBody(resp, client.config)
     let location = resp.headers.get("location")
     if shouldFollowRedirect(resp.status, hops, limit, location):
-      # 307/308 preserve the method and body (redirect.nim). A streamed body
-      # (`bodyStream`) can't be rewound after the first attempt pulled its
-      # producer, so auto-following would send a truncated body. Return the
-      # redirect response to the caller instead. (301/302/303 rewrite to a
-      # bodyless GET, so they carry no stream to replay.)
-      if not isReplayable(rreq) and (resp.status == 307 or resp.status == 308):
+      # A hop that carries the body forward (307/308 always; 301/302 when the method
+      # is already GET/HEAD, which is NOT rewritten -- redirect.nim) cannot be followed
+      # with a streamed body: `bodyStream` (or an async producer, flagged by
+      # `hasStreamedBody`) can't be rewound after the first attempt pulled it, so the
+      # next hop would upload a truncated body. Return the redirect response to the
+      # caller instead (#295). A hop that DROPS the body (303, and 301/302 off a
+      # non-GET/HEAD method, both rewritten to a bodyless GET) carries no stream to
+      # replay and is followed as usual.
+      if not isReplayable(rreq) and preservesBody(resp.status, rreq.verb):
         break
       rreq = redirectRequest(rreq, resp.status, location)
       inc hops
