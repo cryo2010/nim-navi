@@ -156,6 +156,52 @@ suite "async websocket protocol-error teardown (#281)":
     check outcome == "raised:ValueError"
     check sawEof
 
+suite "async websocket streaming text validation (#282)":
+  # The streaming read path never buffers the whole message, so it validates each
+  # chunk as it arrives instead of relying on the assembler's whole-message check.
+  test "a streamed text message should be rejected when a code point is invalid across frames":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("splitbad")
+      let r = await ws.stream()
+      try:
+        while (await r.readChunk()).len > 0: discard
+        result = "no error"
+      except ValueError as e:
+        result = "raised:" & $e.name
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == "raised:ValueError"
+    check sawEof
+
+  test "a streamed text message should accept a code point split across frames":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false                         # not asserted here: nothing failed
+    startWsMisbehave(th, port, sawEof)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("splitok")
+      let r = await ws.stream()
+      while true:
+        let chunk = await r.readChunk()
+        if chunk.len == 0: break
+        result.add chunk
+      await ws.close()
+
+    let msg = waitFor run()
+    joinThread(th)
+    check msg == "\xf0\x9f\x92\xa9"            # U+1F4A9, whole again
+
 suite "async websocket streaming desync teardown (#284)":
   # The streaming read path desyncs on the same protocol errors, and only `drain`
   # used to tear down: a direct readChunk/stream() left the transport alive.

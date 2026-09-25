@@ -288,6 +288,7 @@ type
     first: string
     hasFirst: bool
     done: bool
+    utf8: WsUtf8Scanner      ## running UTF-8 check for a text message (RFC 6455 8.1)
   WsWriter* = ref object
     ## A message being sent incrementally; `write` each fragment.
     ws: WebSocket
@@ -344,16 +345,29 @@ proc openStreamReader(ws: WebSocket): Future[WsReader] {.async.} =
     await ws.failClose(closeProtocolError)
     raise newException(IOError, "navi: WebSocket message started with a continuation frame")
 
+proc checkTextUtf8(r: WsReader, chunk: string): Future[void] {.async.} =
+  ## Validate a streamed text message's UTF-8 as it arrives (RFC 6455 8.1). The
+  ## whole message is never buffered here, so each chunk is checked on arrival,
+  ## with a code point split across frames carried into the next chunk and
+  ## required to be complete once the message ends. A failure is a protocol
+  ## error: fail the connection, then raise.
+  if r.kind != wmText: return
+  if not r.utf8.scanUtf8(chunk) or (r.done and r.utf8.midCodePoint):
+    await r.ws.failClose(closeProtocolError)
+    raise newException(ValueError, "navi: invalid UTF-8 in a WebSocket text message")
+
 proc readChunk*(r: WsReader): Future[string] {.async.} =
   ## The next chunk of the streamed message (one frame's payload), or "" at its end.
   if r.hasFirst:
     r.hasFirst = false
+    await r.checkTextUtf8(r.first)
     return r.first
   if r.done: return ""
   let f = await r.ws.readDataFrame()
   case f.opcode
   of opContinuation:
     r.done = f.fin
+    await r.checkTextUtf8(f.payload)
     return f.payload
   of opClose:
     r.done = true

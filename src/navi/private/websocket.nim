@@ -423,6 +423,7 @@ type
     first: string            ## the first data frame's payload, buffered by `stream`
     hasFirst: bool
     done: bool               ## the fin frame has been consumed
+    utf8: WsUtf8Scanner      ## running UTF-8 check for a text message (RFC 6455 8.1)
   WsWriter* = ref object
     ## A message being sent incrementally. `write` each fragment; the final frame is
     ## sent by the `stream` block on exit.
@@ -484,16 +485,29 @@ proc openStreamReader(ws: WebSocket): WsReader =
     ws.failClose(closeProtocolError)
     raise newException(IOError, "navi: WebSocket message started with a continuation frame")
 
+proc checkTextUtf8(r: WsReader, chunk: string) =
+  ## Validate a streamed text message's UTF-8 as it arrives (RFC 6455 8.1). The
+  ## whole message is never buffered here, so each chunk is checked on arrival,
+  ## with a code point split across frames carried into the next chunk and
+  ## required to be complete once the message ends. A failure is a protocol
+  ## error: fail the connection, then raise.
+  if r.kind != wmText: return
+  if not r.utf8.scanUtf8(chunk) or (r.done and r.utf8.midCodePoint):
+    r.ws.failClose(closeProtocolError)
+    raise newException(ValueError, "navi: invalid UTF-8 in a WebSocket text message")
+
 proc readChunk*(r: WsReader): string =
   ## The next chunk of the streamed message (one frame's payload), or "" at its end.
   if r.hasFirst:
     r.hasFirst = false
+    r.checkTextUtf8(r.first)
     return r.first
   if r.done: return ""
   let f = r.ws.readDataFrame()
   case f.opcode
   of opContinuation:
     r.done = f.fin
+    r.checkTextUtf8(f.payload)
     return f.payload
   of opClose:                # a close interrupted the message: truncate and drop
     r.done = true

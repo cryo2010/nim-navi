@@ -457,6 +457,64 @@ suite "websocket protocol-error teardown (#281)":
     check sawEof
     ws.close()
 
+suite "websocket incremental UTF-8 validation (#282)":
+  test "the scanner should accept a code point split across chunks":
+    var v: WsUtf8Scanner
+    check v.scanUtf8("\xf0\x9f")               # first half of U+1F4A9
+    check v.midCodePoint
+    check v.scanUtf8("\x92\xa9")
+    check not v.midCodePoint
+
+  test "the scanner should reject a surrogate split across chunks":
+    var v: WsUtf8Scanner
+    check v.scanUtf8("\xed\xa0")               # nothing complete yet
+    check not v.scanUtf8("\x80")               # U+D800: a surrogate, not a code point
+
+  test "the scanner should reject an invalid byte as soon as it lands":
+    var v: WsUtf8Scanner
+    check not v.scanUtf8("abc\xff")
+
+  test "the scanner should report a truncated tail when the message ends":
+    var v: WsUtf8Scanner
+    check v.scanUtf8("ok \xc3")                # a 2-byte sequence, one byte short
+    check v.midCodePoint
+
+suite "websocket streaming text validation (#282)":
+  # The streaming read path never buffers the whole message, so it validates each
+  # chunk as it arrives instead of relying on the assembler's whole-message check.
+  test "a streamed text message should be rejected when a code point is invalid across frames":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("splitbad")
+    let r = ws.stream()
+    expect ValueError:
+      while r.readChunk().len > 0: discard
+    joinThread(th)
+    check sawEof
+    ws.close()
+
+  test "a streamed text message should accept a code point split across frames":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("splitok")
+    let r = ws.stream()
+    var msg = ""
+    r.each(chunk):
+      msg.add chunk
+    check msg == "\xf0\x9f\x92\xa9"            # U+1F4A9, whole again
+    ws.close()
+    joinThread(th)
+
 suite "websocket streaming desync teardown (#284)":
   # The streaming read path desyncs on the same protocol errors, and only `drain`
   # used to tear down: a direct readChunk/stream() left the transport alive.

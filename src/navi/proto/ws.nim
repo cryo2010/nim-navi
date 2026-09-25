@@ -470,3 +470,43 @@ proc validate101*(responseHead, key: string): bool =
     elif cmpIgnoreCase(name, "connection") == 0:
       if value.hasToken("upgrade"): connectionOk = true
   acceptOk and upgradeOk and connectionOk
+
+# --- incremental UTF-8 validation (for the streaming read path) ---
+
+type
+  WsUtf8Scanner* = object
+    ## Validates a text message's UTF-8 as it arrives, chunk by chunk (RFC 6455
+    ## 8.1), for a streaming reader that never holds the whole message. A code
+    ## point split across two frames is carried here (at most 3 bytes) and checked
+    ## once the rest lands; `midCodePoint` must be false when the message ends.
+    carry: string
+
+proc midCodePoint*(v: WsUtf8Scanner): bool =
+  ## True while the bytes seen so far end part-way through a code point.
+  v.carry.len > 0
+
+proc utf8SeqLen(b: uint8): int =
+  ## How many bytes the code point started by lead byte `b` occupies. A byte that
+  ## cannot lead (a continuation byte, or 0xC0/0xC1/0xF5-0xFF) reports 1, so it is
+  ## validated -- and rejected -- immediately instead of being carried.
+  if b < 0x80'u8: 1
+  elif b >= 0xC2'u8 and b <= 0xDF'u8: 2
+  elif b >= 0xE0'u8 and b <= 0xEF'u8: 3
+  elif b >= 0xF0'u8 and b <= 0xF4'u8: 4
+  else: 1
+
+proc scanUtf8*(v: var WsUtf8Scanner, chunk: string): bool =
+  ## Validate `chunk` as the continuation of a UTF-8 byte stream, holding back a
+  ## trailing code point whose bytes have not all arrived. False once the stream is
+  ## malformed (the caller must then fail the connection).
+  var s = v.carry & chunk
+  v.carry = ""
+  # Find the last sequence's lead byte by walking back over at most three
+  # continuation bytes (10xxxxxx), and hold that sequence if it is still short.
+  var j = s.len
+  while j > 0 and s.len - j < 3 and (uint8(s[j - 1]) and 0xC0'u8) == 0x80'u8:
+    dec j
+  if j > 0 and utf8SeqLen(uint8(s[j - 1])) > s.len - (j - 1):
+    v.carry = s[j - 1 .. ^1]
+    s.setLen(j - 1)
+  isValidUtf8(s)

@@ -196,6 +196,12 @@ proc serveWsMisbehave(ctx: WsSrv) {.thread.} =
       of "datamid":       # RFC 6455 5.4: a data frame where a continuation is due
         c.send(encodeFrame(opText, "aa", masked = false, fin = false))
         c.send(encodeFrame(opText, "bb", masked = false, fin = true))
+      of "splitbad":      # a surrogate (U+D800) split across two frames: invalid
+        c.send(encodeFrame(opText, "\xed\xa0", masked = false, fin = false))
+        c.send(encodeFrame(opContinuation, "\x80", masked = false, fin = true))
+      of "splitok":       # U+1F4A9 split across two frames: valid, must be accepted
+        c.send(encodeFrame(opText, "\xf0\x9f", masked = false, fin = false))
+        c.send(encodeFrame(opContinuation, "\x92\xa9", masked = false, fin = true))
       else: discard
       if ctx.sawEof != nil:
         ctx.sawEof[] = false
