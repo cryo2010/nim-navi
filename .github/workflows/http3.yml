@@ -18,7 +18,6 @@ on:
       - 'src/navi/core/altsvc.nim'
       - 'src/navi.nim'
       - 'tests/interop/http3/**'
-      - 'docs/http3.md'
       - '.github/workflows/http3.yml'
   workflow_dispatch:
 
