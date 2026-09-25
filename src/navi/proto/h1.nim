@@ -125,9 +125,10 @@ type
     state: H1State
     buf: string
     pos: int                ## read cursor into `buf`: bytes consumed but not yet
-                            ## dropped. Consuming advances `pos`; `feed` compacts the
-                            ## consumed prefix in one shift (like h2's FrameDecoder),
-                            ## avoiding an O(lines x bodyBytes) front-`delete` memmove.
+                            ## dropped. Consuming advances `pos`; `feed` reclaims the
+                            ## consumed prefix periodically (see `compact`), like h2's
+                            ## FrameDecoder, avoiding the O(lines x bodyBytes) memmove
+                            ## a front `delete` per consumed span costs.
     bodyMode: H1BodyMode
     remaining: int          ## bytes left in current length-delimited span
     status: int
@@ -151,11 +152,21 @@ proc initH1Parser*(streaming = false, headRequest = false): H1Parser =
   result.streaming = streaming
   result.headRequest = headRequest
 
-proc emitBody(p: var H1Parser, chunk: string) =
+proc addRange(dst: var string, src: string, first, n: int) {.inline.} =
+  ## Append `src[first ..< first + n]` to `dst` without materializing the slice as
+  ## its own string first. Body bytes are copied out of the parse buffer once per
+  ## read on the hot path, so the slice temporary is pure overhead.
+  if n <= 0: return
+  let start = dst.len
+  dst.setLen(start + n)
+  copyMem(addr dst[start], unsafeAddr src[first], n)
+
+proc emitBody(p: var H1Parser, first, n: int) =
+  ## Hand `buf[first ..< first + n]` to the body sink for this parser's mode.
   if p.streaming:
-    p.pending.add(chunk)
+    p.pending.addRange(p.buf, first, n)
   else:
-    p.body.add(chunk)
+    p.body.addRange(p.buf, first, n)
 
 proc setStreaming*(p: var H1Parser, streaming: bool) =
   ## Flip the streaming flag after the headers are in (the gated-drain path decides
@@ -311,14 +322,14 @@ proc step(p: var H1Parser): bool =
     of bmLength:
       let take = min(p.remaining, avail)
       if take == 0: return false
-      p.emitBody(p.buf[p.pos ..< p.pos + take])
+      p.emitBody(p.pos, take)
       p.pos += take
       dec p.remaining, take
       if p.remaining == 0: p.state = stDone
       true
     of bmUntilClose:
       if avail == 0: return false
-      p.emitBody(p.buf[p.pos ..< p.buf.len])
+      p.emitBody(p.pos, avail)
       p.pos = p.buf.len
       false # need EOF to terminate; drained for now
     else: false
@@ -339,16 +350,42 @@ proc step(p: var H1Parser): bool =
     p.state = if p.remaining == 0: stTrailers else: stChunkData
     true
   of stChunkData:
-    if p.buf.len - p.pos < p.remaining + 2: return false # need data + trailing CRLF
-    # RFC 9112 7.1: chunk-data is terminated by CRLF. Verify it instead of blindly
-    # consuming two bytes -- a missing CRLF is a framing desync that would otherwise
-    # deliver a corrupted body and could leave the pooled connection poisoned.
-    if p.buf[p.pos + p.remaining] != '\r' or p.buf[p.pos + p.remaining + 1] != '\n':
-      raise newException(ValueError, "h1: chunk data not terminated by CRLF")
-    p.emitBody(p.buf[p.pos ..< p.pos + p.remaining])
-    p.pos += p.remaining + 2
-    p.state = stChunkSize
-    true
+    # Emit what of the chunk has arrived instead of waiting for all of it: a server
+    # is free to declare one multi-megabyte chunk, and buffering it whole would hold
+    # that chunk in the parser even on the streaming path, where the size cap
+    # (applied to emitted bytes) could then never fire to stop it. Chunk boundaries
+    # are framing, not delivery units (RFC 9112 7.1).
+    #
+    # Incremental delivery stops one byte short, though: the LAST byte of a chunk is
+    # held back until its terminating CRLF has been verified, so no chunk is ever
+    # fully delivered on the strength of a size line alone. A desynced or smuggled
+    # chunk therefore cannot land complete in a sink before the error is raised, and
+    # what a streaming consumer did receive is always a strict prefix of the chunk,
+    # exactly as a body cut short by a dropped connection is.
+    let avail = p.buf.len - p.pos
+    if avail >= p.remaining + 2:
+      # The rest of the chunk and its terminator are both here. RFC 9112 7.1:
+      # chunk-data is terminated by CRLF. Verify it instead of blindly consuming two
+      # bytes -- a missing CRLF is a framing desync that would otherwise deliver a
+      # corrupted body and could leave the pooled connection poisoned. Raising here
+      # leaves the parser short of stDone, so `keepAliveAfter` refuses the connection.
+      if p.buf[p.pos + p.remaining] != '\r' or p.buf[p.pos + p.remaining + 1] != '\n':
+        raise newException(ValueError, "h1: chunk data not terminated by CRLF")
+      p.emitBody(p.pos, p.remaining)
+      p.pos += p.remaining + 2
+      p.remaining = 0
+      p.state = stChunkSize
+      true
+    else:
+      # Still mid-chunk: deliver everything except the final byte. `remaining` never
+      # reaches 0 on this path, so the terminator check above is the only way out of
+      # a chunk. A 1-byte chunk delivers nothing here, by the same rule.
+      let take = min(avail, p.remaining - 1)
+      if take <= 0: return false
+      p.emitBody(p.pos, take)
+      p.pos += take
+      dec p.remaining, take
+      true
   of stTrailers:
     var line: string
     if not p.takeLine(line): return false
@@ -362,12 +399,30 @@ proc step(p: var H1Parser): bool =
   of stDone:
     false
 
+const h1CompactMin = 8 * 1024
+  ## Smallest consumed prefix worth shifting the retained bytes for (see `compact`).
+
+proc compact(p: var H1Parser) =
+  ## Reclaim the consumed prefix of the parse buffer. Fully consumed is the common
+  ## case (a read that ends on a frame boundary) and costs nothing but a `setLen`.
+  ## Otherwise the retained bytes are moved down IN PLACE, and only once the prefix
+  ## is both worth reclaiming and at least as large as what the move copies -- so
+  ## shifting stays amortized O(1) per byte rather than re-copying a large retained
+  ## remainder on every feed to drop a few consumed header bytes.
+  if p.pos == 0: return
+  if p.pos >= p.buf.len:
+    p.buf.setLen(0)
+  elif p.pos >= h1CompactMin and p.pos >= p.buf.len - p.pos:
+    let keep = p.buf.len - p.pos
+    moveMem(addr p.buf[0], addr p.buf[p.pos], keep)
+    p.buf.setLen(keep)
+  else:
+    return                               # leave the prefix; the cursor skips it
+  p.pos = 0
+
 proc feed*(p: var H1Parser, data: openArray[char]) =
   ## Supply received bytes and drive the state machine as far as it can go.
-  if p.pos > 0:                          # drop the consumed prefix in one shift
-    if p.pos >= p.buf.len: p.buf.setLen(0)
-    else: p.buf = p.buf[p.pos .. ^1]
-    p.pos = 0
+  p.compact()
   if data.len > 0:
     let start = p.buf.len
     p.buf.setLen(start + data.len)

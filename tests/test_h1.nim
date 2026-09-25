@@ -2,7 +2,7 @@
 ## No sockets — bytes in, response out.
 
 import unittest
-import std/strutils
+import std/[strutils, strformat]
 import navi/core/[headers, url, request, response]
 import navi/proto/h1
 
@@ -120,6 +120,93 @@ suite "h1 parse":
       p.feed($ch)
     check p.finished
     check p.toResponse().body == "hello world!"
+
+  test "the h1 parser should read a large chunked body fed in tiny fragments (#244)":
+    # The read-cursor rewrite must stay linear: 256 KiB of body handed over in
+    # 3-byte feeds is ~90k feeds, each of which used to memmove the whole remaining
+    # buffer down. Also covers chunk data, chunk terminators and chunk-size lines
+    # straddling feed boundaries.
+    var body = newStringOfCap(256 * 1024)
+    var i = 0
+    while body.len < 256 * 1024:
+      body.add($i & ",")
+      inc i
+    var raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+    var off = 0
+    while off < body.len:                       # many chunks, uneven sizes
+      let n = min(1 + (off mod 7000), body.len - off)
+      raw.add(fmt"{n:X}" & "\r\n" & body[off ..< off + n] & "\r\n")
+      off += n
+    raw.add("0\r\n\r\n")
+    var p = initH1Parser()
+    off = 0
+    while off < raw.len:
+      let n = min(3, raw.len - off)
+      p.feed(raw.toOpenArray(off, off + n - 1))
+      off += n
+    check p.finished
+    check p.keepAliveAfter()
+    check p.toResponse().body == body
+
+  test "the h1 parser should stream a chunk incrementally instead of buffering it whole (#244)":
+    # A chunk larger than one read must not be held in the parser until complete:
+    # the streaming path drains what has arrived, which is also what makes the
+    # response size cap effective mid-chunk.
+    var p = initH1Parser(streaming = true)
+    p.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nA\r\n01234")
+    check p.takeBody() == "01234"               # half a 10-byte chunk, already out
+    check not p.finished
+    p.feed("56789\r\n0\r\n\r\n")
+    check p.takeBody() == "56789"
+    check p.finished
+    check p.keepAliveAfter()
+
+  test "the h1 parser should hold a chunk's last byte back until its CRLF is verified (#244)":
+    # Incremental delivery must not hand a streaming consumer a COMPLETE chunk on the
+    # strength of its size line alone: the final byte waits for the terminator, so a
+    # desynced or smuggled chunk can only ever deliver a strict prefix before the
+    # framing error is raised.
+    var p = initH1Parser(streaming = true)
+    p.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello")
+    var got = p.takeBody()
+    check got.len <= 4                          # all five bytes are here, four may go
+    var msg = ""
+    try:
+      p.feed("XX0\r\n\r\n")                      # terminator is not CRLF
+    except ValueError as e: msg = e.msg
+    got.add p.takeBody()
+    check "CRLF" in msg
+    check got.len <= 4
+    check "hello" notin got                     # the chunk never landed whole
+    check not p.finished
+    check not p.keepAliveAfter()
+
+  test "the h1 parser should deliver nothing of a one-byte chunk ended by a bare LF (#244)":
+    var p = initH1Parser(streaming = true)
+    var msg = ""
+    try:
+      p.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nA\n0\r\n\r\n")
+    except ValueError as e: msg = e.msg
+    check "CRLF" in msg
+    check p.takeBody() == ""
+    check not p.keepAliveAfter()
+
+  test "the h1 parser should ignore bytes that arrive after a keep-alive response (#244)":
+    # A pooled connection can deliver the tail of the current response and the head
+    # of whatever the server sends next in one read. The trailing bytes must not
+    # join the body, unfinish the response, or make it unpoolable.
+    var p = initH1Parser()
+    p.feed("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello" &
+           "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+    check p.finished
+    check p.toResponse().body == "hello"
+    check p.keepAliveAfter()
+    var q = initH1Parser()                      # same, split across feeds
+    q.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel")
+    q.feed("lo\r\n0\r\n\r\nHTTP/1.1 204 No")
+    check q.finished
+    check q.toResponse().body == "hello"
+    check q.keepAliveAfter()
 
   test "the h1 parser should read a length body split across many feeds":
     var p = initH1Parser()
