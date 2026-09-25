@@ -63,6 +63,18 @@ proc replayableAfterError*(req: Request, e: ref Exception): bool =
   ## (body rewindability), which the caller must also check.
   isIdempotent(req.verb) or replayableAnyMethod(req, e)
 
+proc mayFallBackFromH3*(req: Request, submitted: bool): bool =
+  ## Whether an HTTP/3 attempt that failed with a `QuicError` may be re-sent over
+  ## h2/h1. `submitted` is false when the failure is provably pre-submit (the QUIC
+  ## connection was never established or was found closed, or the stream could not be
+  ## opened): nothing reached the server, so any method may fall back. Once the stream
+  ## has been submitted (`QuicSubmittedError`) the outcome is indeterminate -- the
+  ## server may have processed the request before the stream or connection died -- so
+  ## only an idempotent method may be re-sent, the same discipline the h1/h2
+  ## fall-through applies via `replayableAfterError` (RFC 9110 9.2.2, issue #378).
+  if not submitted: return true
+  isIdempotent(req.verb)
+
 proc shouldRetryAfterError*(attempt: int; bodyReplayable, replayableAnyMethod: bool;
                             verb: HttpVerb; policy: RetryPolicy): bool =
   ## Whether a raised transport error should be retried by the policy loop: attempts

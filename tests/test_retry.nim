@@ -60,3 +60,21 @@ suite "idempotency key (keep-alive-race replay opt-in)":
 
   test "the X-Idempotency-Key variant is also accepted (matches Go)":
     check hasIdempotencyKey(reqWith("X-Idempotency-Key"))
+
+suite "HTTP/3 fall-back discipline (#378)":
+  proc plain(verb: HttpVerb): Request =
+    Request(verb: verb, headers: initHeaders())
+
+  test "a pre-submit QUIC failure falls back for any method":
+    # Nothing reached the server (never connected / stream never opened), so even a
+    # POST may be sent again over h2/h1.
+    check mayFallBackFromH3(plain(POST), submitted = false)
+    check mayFallBackFromH3(plain(PATCH), submitted = false)
+    check mayFallBackFromH3(plain(GET), submitted = false)
+
+  test "a submitted-then-failed request only falls back when idempotent":
+    check mayFallBackFromH3(plain(GET), submitted = true)
+    check mayFallBackFromH3(plain(PUT), submitted = true)
+    check mayFallBackFromH3(plain(DELETE), submitted = true)
+    check not mayFallBackFromH3(plain(POST), submitted = true)
+    check not mayFallBackFromH3(plain(PATCH), submitted = true)

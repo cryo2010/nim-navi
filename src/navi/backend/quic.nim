@@ -47,7 +47,16 @@ type
 
   QuicError* = object of CatchableError
     ## QUIC/h3 transport failure (handshake, stream reset, timeout). The engine
-    ## will treat it as a signal to fall back to h2/h1 for the origin.
+    ## treats a bare `QuicError` as PROVABLY pre-submit -- the connection was never
+    ## established, was found closed, or the stream could not be opened -- so nothing
+    ## reached the server and any method may fall back to h2/h1 for the origin.
+
+  QuicSubmittedError* = object of QuicError
+    ## A QUIC/h3 failure raised AFTER the request was submitted on a stream: the
+    ## server may already have processed it, and a streamed body producer may
+    ## already have been pulled. Indeterminate, so the fall-through to h2/h1 is
+    ## only allowed for a replayable, idempotent request (see `mayFallBackFromH3`
+    ## in core/retry). Mirrors the h1/h2 `KeepAliveRaceError` classification.
 
   Http3Response* = object
     status*: int
@@ -252,13 +261,14 @@ proc request*(c: QuicConn, verb: string, path = "/",
         "navi: HTTP/3 request timed out after " & $deadlineMs & " ms")
     if navi_h3_pump(c.handle) != 0:
       navi_h3_stream_free(c.handle, sid)
-      raise newException(QuicError, "navi HTTP/3 pump failed")
+      raise newException(QuicSubmittedError, "navi HTTP/3 pump failed")
   if navi_h3_stream_done(c.handle, sid) == 0:      # connection drained before the response
     navi_h3_stream_free(c.handle, sid)
-    raise newException(QuicError, "navi HTTP/3 connection closed before response")
+    raise newException(QuicSubmittedError, "navi HTTP/3 connection closed before response")
   if navi_h3_stream_reset(c.handle, sid) != 0:
     navi_h3_stream_free(c.handle, sid)
-    raise newException(QuicError, "navi HTTP/3 " & verb & " " & path & " was reset")
+    raise newException(QuicSubmittedError,
+                       "navi HTTP/3 " & verb & " " & path & " was reset")
   if navi_h3_stream_too_large(c.handle, sid) != 0:
     navi_h3_stream_free(c.handle, sid)
     raise newException(ResponseTooLargeError, "navi: response exceeded maxResponseBytes")
@@ -279,7 +289,7 @@ proc request*(c: QuicConn, verb: string, path = "/",
         cast[ptr char](addr hbuf[0]), csize_t(hbuf.len), addr hlen,
         cast[ptr char](addr tbuf[0]), csize_t(tbuf.len), addr tlen) != 0:
       navi_h3_stream_free(c.handle, sid)
-      raise newException(QuicError, "navi HTTP/3 take_response failed")
+      raise newException(QuicSubmittedError, "navi HTTP/3 take_response failed")
     if int(blen) <= rbody.len and int(hlen) <= hbuf.len and int(tlen) <= tbuf.len:
       break
     if int(blen) > rbody.len: rbody = newString(int(blen))

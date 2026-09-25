@@ -19,6 +19,13 @@ proc requestOnConn*(qc: QuicConn, verb, path: string,
   ## Run one buffered HTTP/3 request on the shared connection, concurrently with
   ## others. Awaits the whole response. The request body is buffered (`body`) or
   ## streamed from `producer` (navi bodyStream); `trailers` are sent after the body.
+  ##
+  ## Failure classification (issue #378): everything up to and including the submit
+  ## raises a bare `QuicError` -- the request provably never reached the server and
+  ## `producer` was never pulled, so the caller may fall back to h2/h1 for any method.
+  ## Anything that fails once the stream is submitted raises `QuicSubmittedError`: the
+  ## server may have processed the request and the producer may have been drained, so
+  ## the caller must only fall back when the request is replayable and idempotent.
   if not qc.alive:
     raise newException(QuicError, "navi HTTP/3 connection is closed")
   let reqHdr = encodeH3Fields(headers)
@@ -48,12 +55,20 @@ proc requestOnConn*(qc: QuicConn, verb, path: string,
     if not consumed and qc.c != nil:       # cancelled, reset, or take failed: free the
       navi_h3_stream_free(qc.c, sid)       # C stream so an abandoned request isn't left
   wake(qc)
-  await fut
+  # Submitted: from here a QUIC failure is indeterminate (the server may have
+  # processed the request), so reclassify anything the reader fails this stream
+  # with -- a connection teardown, a transport error -- as `QuicSubmittedError`.
+  try:
+    await fut
+  except QuicSubmittedError:
+    raise
+  except QuicError as e:
+    raise newException(QuicSubmittedError, e.msg)
 
   if navi_h3_stream_reset(qc.c, sid) != 0:
     # The stream was reset/aborted, not answered. The defer frees its C-side entry;
     # raise so the engine falls back to h2/h1 instead of a bogus empty response.
-    raise newException(QuicError, "navi HTTP/3 stream was reset")
+    raise newException(QuicSubmittedError, "navi HTTP/3 stream was reset")
   if navi_h3_stream_too_large(qc.c, sid) != 0:
     # Body exceeded maxResponseBytes: the driver stopped buffering. A real (received)
     # response, so raise the same error the h1/h2 paths do rather than fall back.
@@ -77,7 +92,7 @@ proc requestOnConn*(qc: QuicConn, verb, path: string,
                              cast[ptr char](addr hbuf[0]), csize_t(hbuf.len), addr hlen,
                              cast[ptr char](addr tbuf[0]), csize_t(tbuf.len),
                              addr tlen) != 0:
-      raise newException(QuicError, "navi HTTP/3 take_response failed")
+      raise newException(QuicSubmittedError, "navi HTTP/3 take_response failed")
     if int(blen) <= rbody.len and int(hlen) <= hbuf.len and int(tlen) <= tbuf.len:
       break
     if int(blen) > rbody.len: rbody = newString(int(blen))
