@@ -93,12 +93,22 @@ proc acceptFor*(key: string): string =
 proc wsExtraFields*(headers: Headers): seq[(string, string)] =
   ## The user headers to carry on an Extended CONNECT (h2 RFC 8441 / h3 RFC 9220):
   ## connection-specific / hop-by-hop fields dropped (the pseudo-headers are added by
-  ## the backend), plus sec-websocket-version. Shared by all backends so the policy
+  ## the backend), plus sec-websocket-version. Shared by all clients so the policy
   ## stays in one place.
+  ##
+  ## The h1-only handshake fields go too. RFC 8441 3 drops the key/accept exchange
+  ## over Extended CONNECT, so a caller's copy is at best noise and at worst a
+  ## field the origin answers instead of the real handshake; `http2-settings`
+  ## belongs to the h2c upgrade (RFC 7540 3.2) and is meaningless here. And
+  ## sec-websocket-version is appended below, so a caller's copy is dropped rather
+  ## than emitted twice: duplicate fields are concatenated into "13, 8" by the
+  ## receiver (RFC 9110 5.2) and fail version negotiation.
   for (k, v) in headers.pairs:
     let lk = k.toLowerAscii
     if lk in ["host", "connection", "keep-alive", "proxy-connection",
-              "transfer-encoding", "upgrade"]: continue
+              "transfer-encoding", "upgrade", "http2-settings",
+              "sec-websocket-key", "sec-websocket-accept",
+              "sec-websocket-version"]: continue
     result.add((lk, v))
   result.add(("sec-websocket-version", wsVersion))
 
@@ -432,15 +442,16 @@ proc hasToken(value, token: string): bool =
 proc validate101*(responseHead, key: string): bool =
   ## True when `responseHead` (the status line + headers) completes the opening
   ## handshake (RFC 6455 4.1): a 101 status, a Sec-WebSocket-Accept matching
-  ## `key`, an `Upgrade` field carrying the `websocket` token, and a `Connection`
-  ## field carrying the `upgrade` token. All three field checks are
-  ## case-insensitive.
+  ## `key` (exactly one such field), an `Upgrade` field carrying the `websocket`
+  ## token, and a `Connection` field carrying the `upgrade` token. All three
+  ## field checks are case-insensitive.
   ##
   ## The Upgrade/Connection tokens are not decoration: without them a proxy or
   ## origin that answers 101 for some other protocol (or replays a cached
   ## response) would hand the client a stream it then parses as WebSocket frames.
   let lines = responseHead.splitLines
   if lines.len == 0 or not lines[0].startsWith("HTTP/1.1 101"): return false
+  var accepts = 0
   var acceptOk = false
   var upgradeOk = false
   var connectionOk = false
@@ -448,6 +459,11 @@ proc validate101*(responseHead, key: string): bool =
     let (name, value, ok) = parseHeaderLine(line)
     if not ok: continue
     if cmpIgnoreCase(name, "sec-websocket-accept") == 0:
+      # More than one accept field is a response-splitting tell: an intermediary
+      # (or a header-injecting origin) can prepend a matching copy to a response
+      # it did not compute. Fail the handshake even when one copy matches.
+      inc accepts
+      if accepts > 1: return false
       acceptOk = value == acceptFor(key)
     elif cmpIgnoreCase(name, "upgrade") == 0:
       if value.hasToken("websocket"): upgradeOk = true

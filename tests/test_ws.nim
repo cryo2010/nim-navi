@@ -52,6 +52,20 @@ suite "websocket handshake response validation (RFC 6455 4.1)":
       "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
       "Sec-WebSocket-Accept: " & acceptFor("other") & "\r\n"), clientKey)
 
+  test "validate101 should reject two Sec-WebSocket-Accept fields (#289)":
+    # One copy matches, so an accept-only check would let a split/injected
+    # response through.
+    check not validate101(head101(
+      "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
+      "Sec-WebSocket-Accept: " & acceptFor(clientKey) & "\r\n" &
+      "Sec-WebSocket-Accept: " & acceptFor("other") & "\r\n"), clientKey)
+
+  test "validate101 should reject two identical Sec-WebSocket-Accept fields (#289)":
+    check not validate101(head101(
+      "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
+      "Sec-WebSocket-Accept: " & acceptFor(clientKey) & "\r\n" &
+      "sec-websocket-accept: " & acceptFor(clientKey) & "\r\n"), clientKey)
+
   test "validate101 should reject a non-101 status":
     check not validate101("HTTP/1.1 200 OK\r\nUpgrade: websocket\r\n" &
       "Connection: Upgrade\r\nSec-WebSocket-Accept: " & acceptFor(clientKey) &
@@ -132,6 +146,36 @@ suite "websocket upgrade request (h1)":
     let req = upgradeRequest(u, nonce, initHeaders({"CONNECTION": "close"}))
     check req.count("Connection: ") == 1
     check "close" notin req
+
+suite "Extended CONNECT handshake fields (RFC 8441 / 9220)":
+  test "wsExtraFields should lowercase names and keep unrelated caller headers":
+    let f = wsExtraFields(initHeaders({"X-Trace": "abc"}))
+    check ("x-trace", "abc") in f
+
+  test "wsExtraFields should drop hop-by-hop and h1 upgrade fields":
+    let f = wsExtraFields(initHeaders({
+      "Host": "evil.test", "Connection": "Upgrade", "Upgrade": "websocket",
+      "Keep-Alive": "timeout=5", "Proxy-Connection": "keep-alive",
+      "Transfer-Encoding": "chunked"}))
+    for (k, _) in f:
+      check k notin ["host", "connection", "upgrade", "keep-alive",
+                     "proxy-connection", "transfer-encoding"]
+
+  test "wsExtraFields should drop a stray key, accept and http2-settings (#289)":
+    let f = wsExtraFields(initHeaders({
+      "Sec-WebSocket-Key": "AAAAAAAAAAAAAAAAAAAAAA==",
+      "Sec-WebSocket-Accept": "spoofed",
+      "HTTP2-Settings": "AAMAAABkAARAAAAAAAIAAAAA"}))
+    for (k, _) in f:
+      check k notin ["sec-websocket-key", "sec-websocket-accept", "http2-settings"]
+
+  test "wsExtraFields should emit exactly one sec-websocket-version (#289)":
+    var seen = 0
+    for (k, v) in wsExtraFields(initHeaders({"Sec-WebSocket-Version": "8"})):
+      if k == "sec-websocket-version":
+        inc seen
+        check v == "13"
+    check seen == 1
 
 suite "websocket frame codec":
   test "the frame codec should encode the masked Hello example (RFC 6455 5.7)":
