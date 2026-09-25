@@ -35,6 +35,17 @@ proc `[]=`*(h: var Headers, name, value: string) =
   if not written:
     h.fields.add((name, value))
 
+proc hasCtlChars*(s: string): bool =
+  ## True when `s` carries a CR, LF, or NUL. Such a character in a header name or
+  ## value (or in the request target or Host) splits an HTTP/1.1 message: the peer
+  ## reads the bytes after the CRLF as further header lines, or as a whole
+  ## smuggled request. `validateRequest` applies this to every request the engine
+  ## dispatches; the WebSocket opening handshake never builds a `Request`, so it
+  ## calls this directly on its own field set.
+  for c in s:
+    if c in {'\r', '\n', '\0'}: return true
+  false
+
 proc parseHeaderLine*(line: string): tuple[name, value: string, ok: bool] =
   ## Split one HTTP/1.x field line ("Name: value") at the first colon, stripping
   ## surrounding whitespace from both sides. `ok` is false when there is no colon

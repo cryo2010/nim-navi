@@ -3,6 +3,7 @@
 import unittest
 import std/[base64, strutils]
 import navi/proto/ws
+import navi/core/[url, headers]   # parseUrl / initHeaders for the upgrade-request tests
 import ./support      # hexToBytes
 import ./support_ws   # shared WebSocket test servers (WsSrv / startWs*)
 
@@ -55,6 +56,82 @@ suite "websocket handshake response validation (RFC 6455 4.1)":
     check not validate101("HTTP/1.1 200 OK\r\nUpgrade: websocket\r\n" &
       "Connection: Upgrade\r\nSec-WebSocket-Accept: " & acceptFor(clientKey) &
       "\r\n\r\n", clientKey)
+
+suite "websocket upgrade request (h1)":
+  const nonce = "dGhlIHNhbXBsZSBub25jZQ=="
+  let u = parseUrl("http://example.test/chat")
+
+  test "upgradeRequest should emit the mandatory handshake fields":
+    let req = upgradeRequest(u, nonce, initHeaders())
+    check req.startsWith("GET /chat HTTP/1.1\r\n")
+    check "Host: example.test\r\n" in req
+    check "Upgrade: websocket\r\n" in req
+    check "Connection: Upgrade\r\n" in req
+    check "Sec-WebSocket-Key: " & nonce & "\r\n" in req
+    check "Sec-WebSocket-Version: 13\r\n" in req
+    check req.endsWith("\r\n\r\n")
+
+  test "upgradeRequest should carry an unrelated caller header through":
+    let req = upgradeRequest(u, nonce, initHeaders({"X-Trace": "abc"}))
+    check "X-Trace: abc\r\n" in req
+
+  test "upgradeRequest should reject CRLF in a caller header value (#288)":
+    expect ValueError:
+      discard upgradeRequest(u, nonce,
+        initHeaders({"X-Evil": "a\r\nX-Injected: 1"}))
+
+  test "upgradeRequest should reject CRLF in a caller header name (#288)":
+    expect ValueError:
+      discard upgradeRequest(u, nonce,
+        initHeaders({"X-Evil\r\nX-Injected": "1"}))
+
+  test "upgradeRequest should reject a bare LF in a caller header value (#288)":
+    expect ValueError:
+      discard upgradeRequest(u, nonce, initHeaders({"X-Evil": "a\nX-Injected: 1"}))
+
+  test "upgradeRequest should reject NUL in a caller header value (#288)":
+    expect ValueError:
+      discard upgradeRequest(u, nonce, initHeaders({"X-Evil": "a\x00b"}))
+
+  test "upgradeRequest should reject CRLF in the request target (#288)":
+    # std/uri passes control characters through verbatim, so a crafted ws:// URL
+    # reaches the request line intact.
+    var bad = parseUrl("http://example.test/chat")
+    bad.raw.path = "/chat\r\nX-Injected: 1"
+    expect ValueError:
+      discard upgradeRequest(bad, nonce, initHeaders())
+
+  test "upgradeRequest should reject CRLF in the Host (#288)":
+    var bad = parseUrl("http://example.test/chat")
+    bad.raw.hostname = "example.test\r\nX-Injected: 1"
+    expect ValueError:
+      discard upgradeRequest(bad, nonce, initHeaders())
+
+  test "upgradeRequest should drop caller fields that collide with the handshake (#288)":
+    let req = upgradeRequest(u, nonce, initHeaders({
+      "Host": "evil.test",
+      "Connection": "close",
+      "Upgrade": "h2c",
+      "Sec-WebSocket-Key": "AAAAAAAAAAAAAAAAAAAAAA==",
+      "Sec-WebSocket-Version": "8",
+      "Sec-WebSocket-Accept": "spoofed",
+      "X-Keep": "yes"}))
+    check req.count("Host: ") == 1
+    check "Host: example.test\r\n" in req
+    check req.count("Connection: ") == 1
+    check "Connection: Upgrade\r\n" in req
+    check req.count("Upgrade: ") == 1
+    check req.count("Sec-WebSocket-Key: ") == 1
+    check "Sec-WebSocket-Key: " & nonce & "\r\n" in req
+    check req.count("Sec-WebSocket-Version: ") == 1
+    check "Sec-WebSocket-Version: 13\r\n" in req
+    check "spoofed" notin req
+    check "X-Keep: yes\r\n" in req
+
+  test "upgradeRequest should match the collision list case-insensitively (#288)":
+    let req = upgradeRequest(u, nonce, initHeaders({"CONNECTION": "close"}))
+    check req.count("Connection: ") == 1
+    check "close" notin req
 
 suite "websocket frame codec":
   test "the frame codec should encode the masked Hello example (RFC 6455 5.7)":

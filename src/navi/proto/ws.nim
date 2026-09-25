@@ -388,14 +388,37 @@ proc hostHeader(u: Url): string =
   if not ((u.isTls and p == 443) or (not u.isTls and p == 80)):
     result.add(":" & $p)
 
+const wsHandshakeFields = ["host", "connection", "upgrade", "sec-websocket-key",
+                           "sec-websocket-version", "sec-websocket-accept"]
+  ## Fields `upgradeRequest` writes itself (plus the response-only accept). A
+  ## caller-supplied copy is dropped rather than appended: a second Host or
+  ## Connection line is a request-smuggling primitive, and a second
+  ## Sec-WebSocket-Key would leave the server answering an accept the client
+  ## cannot verify. This mirrors what `wsExtraFields` drops for h2/h3.
+
 proc upgradeRequest*(u: Url, key: string, extra: Headers): string =
   ## The client's HTTP/1.1 Upgrade request for `u` with Sec-WebSocket-Key `key`.
+  ##
+  ## The WebSocket path never builds a `Request`, so the engine's
+  ## `validateRequest` never sees these fields: a CR, LF, or NUL in a
+  ## caller-supplied name or value (or in the URL's target or host) would splice
+  ## extra headers -- or a whole second request -- into the connection. Reject
+  ## them here instead, and drop any caller field that collides with the
+  ## handshake fields this builder emits.
+  if hasCtlChars(u.requestTarget) or hasCtlChars(hostHeader(u)):
+    raise newException(ValueError,
+      "navi: invalid WebSocket URL (target or host contains CR, LF, or NUL)")
   result = "GET " & u.requestTarget & " HTTP/1.1\r\n" &
            "Host: " & hostHeader(u) & "\r\n" &
            "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
            "Sec-WebSocket-Key: " & key & "\r\n" &
            "Sec-WebSocket-Version: " & wsVersion & "\r\n"
-  for (k, v) in extra.pairs: result.add(k & ": " & v & "\r\n")
+  for (k, v) in extra.pairs:
+    if hasCtlChars(k) or hasCtlChars(v):
+      raise newException(ValueError,
+        "navi: invalid WebSocket header (name or value contains CR, LF, or NUL)")
+    if k.toLowerAscii in wsHandshakeFields: continue
+    result.add(k & ": " & v & "\r\n")
   result.add("\r\n")
 
 proc hasToken(value, token: string): bool =
