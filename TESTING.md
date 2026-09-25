@@ -46,6 +46,7 @@ nimble httpbin            # full httpbin breadth, 4 clients (needs Docker + open
 nimble chronosCafile      # chronos custom-CA verify (needs openssl + chronos)
 nimble wsjs               # navi/js WebSocket under Node
 nimble jsCookieJar        # navi/js cookie jar under Node
+nimble jsWsCodec          # proto/ws frame codec under Node (32-bit `int` target)
 nimble badssl             # cert-verification conformance vs badssl.com (network)
 nimble live               # real public servers/CDNs (network; nightly)
 
@@ -177,6 +178,7 @@ way its consumers will build it. These jobs are compile-only unless noted.
 | `nim js src/navi/js.nim` | **yes** (`compile navi/js`) | The js entry compiles under the JavaScript backend (the only job that builds it) |
 | `tests/js_fallback_{async,chronos}.nim` | **yes** (`compile navi/js`) | A library written on navi/asyncdispatch or navi/chronos also builds under `nim js`, where the entry falls back to navi/js (portable middleware/config/params) |
 | `tests/interop/jsws.sh` | **yes** (`compile navi/js`) | navi/js WebSocket client runs under Node 22+ (global WebSocket) against a native echo server |
+| `tests/js_ws_codec.nim` | **yes** (`compile navi/js`) | The sans-io WebSocket codec compiles under `nim js` and its RFC 6455 vectors pass under Node. navi/js does not use `proto/ws` at runtime, but js is navi's only 32-bit-`int` target, so this is where the 64-bit frame-length guards (#285) meet an `int` that can actually truncate |
 | `tests/interop/js_cookiejar.sh` | **yes** (`compile navi/js`) | navi/js opt-in cookie jar replays a cookie across requests under Node (undici has no cookie store), and the default does not |
 
 ---

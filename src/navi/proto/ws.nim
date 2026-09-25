@@ -5,28 +5,48 @@
 ## Client frames MUST be masked (RFC 6455 5.3); server frames MUST NOT be. The
 ## decoder handles both directions, so the same core drives a client and (in
 ## tests) a server.
+##
+## The module also builds under `nim js`. navi/js does not use it at runtime (the
+## browser or Node does the handshake and framing behind its own `WebSocket`, see
+## backend/jsws.nim), but the codec is portable Nim, and js is the one target
+## where `int` is 32 bits: `tests/js_ws_codec.nim` runs the vectors there so the
+## 64-bit length guard is exercised on a real 32-bit `int` and not only on the
+## 64-bit hosts the unit suite runs on.
 
 import std/[strutils, base64]
-import checksums/sha1
 import ../core/[url, headers]
 
 # SHA-1 for the accept hash: prefer OpenSSL EVP (hardware SHA) when TLS is linked
-# and libcrypto loads (Linux), else the pure-Nim `checksums` above (also the `nim
-# js` path). One hash per handshake, so this is for consistency, not throughput.
-when defined(ssl) and not defined(js):
-  import ../backend/evpdigest
+# and libcrypto loads (Linux), else the pure-Nim `checksums`. One hash per
+# handshake, so this is for consistency, not throughput. `checksums/sha1` reaches
+# std/endians, which is native-only, so the js target uses navi's own small SHA-1.
+when defined(js):
+  import ../private/sha1js
+else:
+  import checksums/sha1
+  when defined(ssl):
+    import ../backend/evpdigest
 
 # The masking key (RFC 6455 5.3) and the handshake nonce (4.1) must come from a
-# strong entropy source, so draw them from the OS CSPRNG via std/sysrand. sysrand
-# has no JavaScript target, but this module is native-only (the js backend uses the
-# runtime's WebSocket); the `js` branch is a dead-path fallback that only keeps a
-# `nim js` build compiling.
+# strong entropy source, so draw them from the OS CSPRNG via std/sysrand, or from
+# the Web Crypto CSPRNG on js (std/sysrand has no JavaScript target). A guessable
+# masking key defeats RFC 6455 5.3, so a JavaScript runtime without Web Crypto
+# (pre-19 Node) raises instead of falling back to a seeded PRNG.
 when defined(js):
-  import std/random
-  var jsRng = initRand(0x6a09e667)
+  proc hasWebCrypto(): bool {.importjs:
+    "(typeof globalThis.crypto !== 'undefined' && " &
+    "typeof globalThis.crypto.getRandomValues === 'function')".}
+  proc webCryptoBytes(n: int): seq[int] {.importjs:
+    "Array.from(globalThis.crypto.getRandomValues(new Uint8Array(#)))".}
   proc randomBytes(n: int): string =
+    ## `n` cryptographically-random bytes from the runtime's Web Crypto CSPRNG.
+    if n <= 0: return ""
+    if not hasWebCrypto():
+      raise newException(IOError,
+        "navi: no Web Crypto getRandomValues for WebSocket entropy")
+    let bytes = webCryptoBytes(n)
     result = newString(n)
-    for i in 0 ..< n: result[i] = char(jsRng.rand(255))
+    for i in 0 ..< n: result[i] = char(bytes[i])
 else:
   import std/sysrand
   proc randomBytes(n: int): string =
@@ -78,12 +98,16 @@ proc genKey*(): string =
   base64.encode(randomBytes(16))
 
 proc sha1Bytes(s: string): string =
-  ## Raw 20-byte SHA-1 of `s`, from EVP (hardware) or the checksums fallback.
-  when defined(ssl) and not defined(js):
-    if evpAvailable(): return evpSha1Raw(s)
-  let digest = Sha1Digest(secureHash(s))
-  result = newString(digest.len)
-  for i in 0 ..< digest.len: result[i] = char(digest[i])
+  ## Raw 20-byte SHA-1 of `s`, from EVP (hardware), the checksums fallback, or
+  ## navi's own pure-Nim SHA-1 on js.
+  when defined(js):
+    sha1Raw(s)
+  else:
+    when defined(ssl):
+      if evpAvailable(): return evpSha1Raw(s)
+    let digest = Sha1Digest(secureHash(s))
+    result = newString(digest.len)
+    for i in 0 ..< digest.len: result[i] = char(digest[i])
 
 proc acceptFor*(key: string): string =
   ## The Sec-WebSocket-Accept value for `key`: base64(SHA1(key + GUID)). Used by
@@ -122,18 +146,21 @@ proc applyMask(dst: var string, dstStart: int, src: string, srcStart, n: int,
   ## XORed word-wise; because each chunk starts at a multiple of 8 (a multiple of the
   ## 4-byte key period) the alignment holds, and copyMem keeps byte order so the
   ## result is endianness-independent. A scalar tail finishes the last <8 bytes.
+  ## js has no copyMem (and no pointers), so that target runs the scalar loop over
+  ## the whole payload; it is the compile-only target, never navi/js's hot path.
   if n <= 0: return
-  var mask8: array[8, byte]
-  for i in 0 ..< 8: mask8[i] = key[i and 3]
-  var m64: uint64
-  copyMem(addr m64, addr mask8[0], 8)
   var i = 0
-  while i + 8 <= n:
-    var w: uint64
-    copyMem(addr w, unsafeAddr src[srcStart + i], 8)
-    w = w xor m64
-    copyMem(addr dst[dstStart + i], addr w, 8)
-    i += 8
+  when not defined(js):
+    var mask8: array[8, byte]
+    for j in 0 ..< 8: mask8[j] = key[j and 3]
+    var m64: uint64
+    copyMem(addr m64, addr mask8[0], 8)
+    while i + 8 <= n:
+      var w: uint64
+      copyMem(addr w, unsafeAddr src[srcStart + i], 8)
+      w = w xor m64
+      copyMem(addr dst[dstStart + i], addr w, 8)
+      i += 8
   while i < n:
     dst[dstStart + i] = char(byte(src[srcStart + i]) xor key[i and 3])
     inc i
@@ -155,8 +182,11 @@ proc encodeFrame*(opcode: Opcode, payload: string, masked = true,
     result.add char(n and 0xFF)
   else:
     result.add char(maskBit or 127)
+    # Emit the 8 length bytes out of a uint64: `int` is 32 bits on js (and on
+    # 32-bit natives), where a shift past 31 is undefined rather than zero.
+    let n64 = uint64(n)
     for shift in countdown(56, 0, 8):
-      result.add char((n shr shift) and 0xFF)
+      result.add char(uint8((n64 shr uint64(shift)) and 0xFF'u64))
   if masked:
     var keyStr = maskKey
     if keyStr.len != 4:
@@ -235,7 +265,10 @@ proc next*(d: var WsDecoder, f: var Frame): bool =
   if masked:
     applyMask(f.payload, 0, d.buf, pos, length, key)
   elif length > 0:
-    copyMem(addr f.payload[0], unsafeAddr d.buf[pos], length)
+    when defined(js):                             # no copyMem on the js target
+      for i in 0 ..< length: f.payload[i] = d.buf[pos + i]
+    else:
+      copyMem(addr f.payload[0], unsafeAddr d.buf[pos], length)
   d.buf.delete(0 ..< pos + length)
   true
 

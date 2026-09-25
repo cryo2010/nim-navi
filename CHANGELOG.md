@@ -87,6 +87,20 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **`navi/proto/ws` compiles under `nim js` again.** The module's `js` branch was
+  documented as a fallback that keeps a `nim js` build compiling, but the build
+  failed: `checksums/sha1` reaches `std/endians`, which is native-only (`copyMem`),
+  and the frame codec's word-wise masking and unmasked-payload copy call `copyMem`
+  too. The js target now hashes the handshake accept with a small pure-Nim SHA-1
+  (cross-checked against `checksums` in the unit suite), masks and copies byte-wise,
+  and draws its masking keys and handshake nonces from the Web Crypto CSPRNG
+  (`globalThis.crypto.getRandomValues`) instead of a fixed-seed `std/random`, raising
+  rather than falling back to a predictable PRNG on a runtime without it. The 8-byte
+  frame length is also emitted out of a `uint64` now, since a shift past 31 is
+  undefined on a 32-bit `int`. navi/js still does not use this module at runtime (the
+  runtime's `WebSocket` does the framing), but js is navi's only 32-bit-`int` target,
+  so `tests/js_ws_codec.nim` now runs the RFC 6455 vectors and the #285 frame-length
+  guard under Node in CI, where a truncating `int` is real (#394).
 - **A closing TLS connection no longer breaks the other live TLS connections on the
   same thread.** OpenSSL's error queue is per THREAD, not per `SSL`, and
   `SSL_get_error` is documented to be reliable only when that queue was empty before

@@ -3,6 +3,8 @@
 import unittest
 import std/[base64, strutils]
 import navi/proto/ws
+import navi/private/sha1js       # the pure-Nim SHA-1 the js target hashes accepts with
+import checksums/sha1            # ... cross-checked against the native implementation
 import navi/core/[url, headers]   # parseUrl / initHeaders for the upgrade-request tests
 import ./support      # hexToBytes
 import ./support_ws   # shared WebSocket test servers (WsSrv / startWs*)
@@ -14,6 +16,24 @@ suite "websocket handshake":
   test "the handshake should generate a fresh 16-byte base64 nonce key":
     check base64.decode(genKey()).len == 16
     check genKey() != genKey()
+
+  test "the js SHA-1 should match checksums across the padding block boundaries (#394)":
+    # `checksums/sha1` reaches std/endians, which has no js target, so acceptFor
+    # hashes with navi's own SHA-1 under `nim js`. The js build cannot run in the
+    # unit suite, but the implementation is plain uint32 Nim, so check it here:
+    # the lengths around 56 and 64 are where FIPS 180-4 padding spills into an
+    # extra block, and 0 is the empty-message case.
+    proc hex(s: string): string =
+      for c in s: result.add toHex(ord(c), 2)
+    for n in [0, 1, 3, 55, 56, 57, 63, 64, 65, 119, 120, 121, 1000]:
+      let msg = repeat("a", n)
+      check hex(sha1Raw(msg)) == $secureHash(msg)
+    check hex(sha1Raw("abc")) == "A9993E364706816ABA3E25717850C26C9CD0D89D"
+
+  test "acceptFor should agree with the js SHA-1 on the RFC 6455 vector (#394)":
+    const guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    check acceptFor("dGhlIHNhbXBsZSBub25jZQ==") ==
+      base64.encode(sha1Raw("dGhlIHNhbXBsZSBub25jZQ==" & guid))
 
 suite "websocket handshake response validation (RFC 6455 4.1)":
   const clientKey = "dGhlIHNhbXBsZSBub25jZQ=="

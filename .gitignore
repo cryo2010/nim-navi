@@ -54,6 +54,7 @@ tests/test_ws_async
 tests/test_ws_chronos
 tests/interop/jsws_server
 tests/interop/jsws_client.js
+tests/js_ws_codec.js
 navi_js.js
 # Compiled example binaries (sources are .nim)
 examples/basics/https_get

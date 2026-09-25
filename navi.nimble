@@ -260,6 +260,13 @@ task jsSink, "navi/js response-sink runtime test (Node)":
   # the void form, the delivery rule, and throw-on-non-2xx never calling the sink.
   exec "bash tests/interop/js_sink.sh"
 
+task jsWsCodec, "navi/proto/ws frame codec under Node (js is the 32-bit `int` target)":
+  # proto/ws is not used by navi/js at runtime, but the sans-io codec must keep
+  # building for js -- and js is navi's only target where `int` is 32 bits, so the
+  # RFC 6455 frame-length guards (#285) are only really exercised here.
+  exec "nim js --path:src --hints:off -o:tests/js_ws_codec.js tests/js_ws_codec.nim"
+  exec "node tests/js_ws_codec.js"
+
 task demoWssBrowser, "Browser wss demo: mkcert cert + wss server + page (needs mkcert, python3)":
   # Generates a browser-trusted cert (mkcert), serves the navi/js page over a
   # wss echo server, and prints the URL to open.
