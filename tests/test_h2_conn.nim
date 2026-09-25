@@ -613,6 +613,59 @@ suite "h2 streaming request body":
     check c.sendDrained(sid)
     check lastFrameEndsStream(out3)                  # END_STREAM rides the tail
 
+suite "h2 streamed upload framing":
+  # `queueSend` frames each streamed chunk itself. The bytes it puts on the wire
+  # must stay identical to what a staging buffer would have produced, whatever the
+  # send window and the peer's max frame size do to the split.
+  let head = @[(":method", "POST"), (":scheme", "https"),
+               (":path", "/"), (":authority", "x")]
+
+  proc dataFrames(sid: uint32, payload: string, mfs = defaultMaxFrameSize,
+                  endStream = false): string =
+    ## The DATA frames a conforming sender emits for `payload`: split at the peer's
+    ## max frame size, END_STREAM on the last one when asked. Built independently of
+    ## the connection's own framing path, so comparing against it is a real check.
+    if payload.len == 0:
+      return encodeData(sid, "", endStream = endStream)
+    var off = 0
+    while off < payload.len:
+      let n = min(mfs, payload.len - off)
+      off += n
+      result.add encodeData(sid, payload[off - n ..< off],
+                            endStream = endStream and off >= payload.len)
+
+  test "many streamed chunks under an open window should frame every chunk verbatim":
+    let c = newServerConn()
+    let sid = c.openStream()
+    discard c.encodeRequestHead(sid, head)
+    var wire, expected = ""
+    for i in 0 ..< 32:                               # 32 KiB total: fits the window
+      let chunk = repeat(chr(ord('a') + (i mod 26)), 1000)
+      wire.add c.queueSend(sid, chunk)
+      expected.add dataFrames(sid, chunk)
+      check c.sendDrained(sid)                       # window open: nothing parked
+    wire.add c.finishSend(sid)
+    expected.add encodeData(sid, "", endStream = true)
+    check wire == expected
+
+  test "a window-blocked remainder should stay ordered and framed across a WINDOW_UPDATE":
+    let c = newServerConn()
+    let sid = c.openStream()
+    discard c.encodeRequestHead(sid, head)
+    let first = repeat("a", 70_000)                  # > the 65535 default send window
+    let out1 = c.queueSend(sid, first)
+    check out1 == dataFrames(sid, first[0 ..< 65535])
+    check not c.sendDrained(sid)                     # the tail is parked
+    let out2 = c.queueSend(sid, repeat("b", 2_000))  # queued behind the block
+    check out2 == ""
+    check c.finishSend(sid) == ""                    # windowed out: nothing to emit
+    let rest = first[65535 .. ^1] & repeat("b", 2_000)
+    let out3 = c.feed(encodeWindowUpdate(sid, 1_000_000) &
+                      encodeWindowUpdate(0, 1_000_000))
+    check out3 == dataFrames(sid, rest, endStream = true)
+    check c.sendDrained(sid)
+    check endStreamCount(out1 & out3) == 1
+
 suite "h2 incremental response body":
   # The engine drains the body per feed via takeBody (bounded memory) instead of
   # buffering the whole response, decoding content-encoding as chunks arrive.

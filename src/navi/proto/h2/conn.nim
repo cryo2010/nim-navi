@@ -260,7 +260,12 @@ proc queueSend*(c: H2Conn, streamId: uint32, data: string): string =
   let s = c.streams.getOrDefault(streamId)
   if s == nil or data.len == 0 or s.endSent: return
   if s.sendOff > 0:                            # drop the sent prefix
-    s.sendBuf = s.sendBuf[s.sendOff .. ^1]
+    if s.sendOff >= s.sendBuf.len:
+      s.sendBuf.setLen(0)                      # fully drained: keep the capacity
+    else:                                      # a window-blocked prefix remains: slide
+      let rem = s.sendBuf.len - s.sendOff      # it down in place, capacity intact
+      moveMem(addr s.sendBuf[0], addr s.sendBuf[s.sendOff], rem)
+      s.sendBuf.setLen(rem)
     s.sendOff = 0
   s.sendBuf.add data
   c.flushSend(streamId, s, result)
