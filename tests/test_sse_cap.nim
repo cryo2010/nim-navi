@@ -11,7 +11,14 @@ import navi/proto/sse   # maxSseEventBytes
 # unbounded single event: `data:` lines with no terminating blank line, so the
 # parser accumulates them until the cap trips. It never stops on its own; the
 # client is expected to tear the connection down, which surfaces here as a failing
-# send (swallowed, so the worker thread exits cleanly either way).
+# send (caught, so the worker thread exits cleanly either way).
+#
+# The flood is sent with `flags = {}`: std/net's default `SafeDisconn` swallows a
+# peer reset inside `send` WITHOUT advancing its write offset, so the send loop
+# spins forever once the client has closed. macOS and Linux never hit that here
+# (their loopback buffers absorb the whole flood before the cap trips), but the
+# Windows loopback holds far less, so the reset lands mid-flood and the thread
+# never returns for joinThread. With no flags the reset raises and ends the loop.
 var portChan: Channel[int]
 
 const
@@ -40,7 +47,7 @@ proc runFloodSse() {.thread.} =
                 "Connection: close\r\n\r\n")
     let dataLine = "data: " & repeat('x', LinePayload) & "\n"
     for _ in 0 ..< LineCount:
-      client.send(dataLine)         # no blank line: one ever-growing event
+      client.send(dataLine, flags = {})   # no blank line: one ever-growing event
   except CatchableError:
     discard                         # the client tore the connection down: expected
   try: client.close() except CatchableError: discard
