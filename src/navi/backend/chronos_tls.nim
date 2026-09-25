@@ -83,6 +83,7 @@ when defined(ssl):
     ## exchange or a protocol/verification error); the caller runs `verifyPeer`
     ## afterwards. Wrap the whole call in a timeout at the connect site.
     while true:
+      ErrClearError()   # see `readSome`: SSL_get_error needs an empty error queue
       let rc = sslDoHandshake(t.sslp)
       if rc == 1:
         await t.flushOut()          # e.g. the client's final Finished
@@ -106,6 +107,7 @@ when defined(ssl):
     try:
       var off = 0
       while off < data.len:
+        ErrClearError()   # see `readSome`: SSL_get_error needs an empty error queue
         let n = SSL_write(t.sslp, cast[cstring](addr data[off]), data.len - off)
         if n > 0:
           off += n
@@ -129,6 +131,12 @@ when defined(ssl):
     ## (close_notify or peer EOF). Raises on a genuine protocol error.
     var buf = newString(tlsBufSize)
     while true:
+      # OpenSSL's error queue is per THREAD, not per SSL, and `SSL_get_error` is
+      # documented to be reliable only when that queue was empty before the I/O call:
+      # one event loop drives every connection, so a stale entry from another
+      # connection's teardown would otherwise report SSL_ERROR_SSL for what is really
+      # a would-block and kill a healthy read. Clear it before every SSL_* call.
+      ErrClearError()
       let n = SSL_read(t.sslp, addr buf[0], buf.len)
       if n > 0:
         buf.setLen(n)

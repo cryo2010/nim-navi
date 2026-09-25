@@ -124,6 +124,7 @@ when defined(ssl):
   proc driveHandshake(ssl: SslPtr, fd: AsyncFD, host: string) {.async.} =
     ## Non-blocking SSL_connect, awaiting readiness only when OpenSSL asks.
     while true:
+      ErrClearError()   # see `sslRead`: SSL_get_error is only reliable on an empty queue
       let r = SSL_connect(ssl)
       if r == 1: return
       case SSL_get_error(ssl, r)
@@ -136,6 +137,7 @@ when defined(ssl):
     while off < data.len:
       # OpenSSL requires the same buffer+len when retrying after WANT_WRITE; `data`
       # is captured by this async proc, so the pointer stays valid across awaits.
+      ErrClearError()   # see `sslRead`: SSL_get_error is only reliable on an empty queue
       let n = SSL_write(c.ssl, cast[cstring](unsafeAddr data[off]),
                         (data.len - off).cint).int
       if n > 0:
@@ -157,6 +159,17 @@ when defined(ssl):
       # treats this as a drop.
       if not c.state.isNil and c.state[] == csClosed:
         raise newException(IOError, "navi: connection closed")
+      # OpenSSL's error queue is per THREAD, not per SSL, and `SSL_get_error` is
+      # documented to be reliable only when that queue was empty before the I/O
+      # call: a stale entry left by ANY earlier OpenSSL call makes it report
+      # SSL_ERROR_SSL for what is really a would-block. One event loop drives every
+      # connection here, and a teardown leaves entries behind -- the decrypt error
+      # on the truncated final record after `shutdownConn`'s SHUT_RDWR (swallowed as
+      # teardown noise below), and `SSL_shutdown` in `freeConn`. Without this clear,
+      # closing ONE connection made the next read on every other live connection
+      # raise "TLS read failed": a WebSocket soak lost 7 of 8 healthy h2 muxes the
+      # moment the first socket closed. Clear the queue before every SSL_* call.
+      ErrClearError()
       let n = SSL_read(c.ssl, addr result[0], result.len.cint).int
       if n > 0:
         result.setLen(n); return

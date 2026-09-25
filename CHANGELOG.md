@@ -83,6 +83,18 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **A closing TLS connection no longer breaks the other live TLS connections on the
+  same thread.** OpenSSL's error queue is per THREAD, not per `SSL`, and
+  `SSL_get_error` is documented to be reliable only when that queue was empty before
+  the I/O call. navi never cleared it, so the entries a teardown leaves behind (the
+  decrypt error on the truncated final record after `shutdownConn`'s SHUT_RDWR, which
+  the read path swallows as teardown noise, and `SSL_shutdown` in the close path) made
+  the NEXT read on an unrelated, healthy connection report `SSL_ERROR_SSL` and raise
+  "navi: TLS read failed" -- tearing down its h2 mux and failing every stream on it
+  with "navi: http/2 connection closed". A WebSocket-over-h2 soak lost 7 of 8 live
+  sockets the moment the first one closed. Every `SSL_connect` / `SSL_read` /
+  `SSL_write` now clears the queue first, on all three OpenSSL-driving backends
+  (sync, asyncdispatch, chronos).
 - **A response `sink` now receives the body of a surfaced 301/302 redirect.** The
   delivery gate still used the old "a non-replayable 307/308 is surfaced" rule, so a
   GET with a body producer that took a 301/302 -- which `followRedirects` surfaces,
