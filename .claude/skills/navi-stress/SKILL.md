@@ -2,7 +2,7 @@
 name: navi-stress
 description: >-
   Start and monitor a navi Dockerized stress soak from a plain-English prompt.
-  prompt (string): stress run deatils. Understood hints:
+  prompt (string): stress run details. Understood hints:
   workload = websockets|requests|sse|stream upload|stream download;
   protocol = h1|h2|h3|all; client = sync|asyncdispatch|chronos|js|all;
   duration = e.g. "8 hours", "30m", "90s"; plus optional clients/concurrency/servers/recycle.
