@@ -4,11 +4,18 @@ import std/strutils
 import ./headers, ./url, ./request, ./response
 import ../proto/h2/[conn, hpack]
 
-proc appendMappedHeaders(result: var seq[HeaderPair], headers: Headers) =
+proc appendMappedHeaders(result: var seq[HeaderPair], headers: Headers,
+                         dropContentLength = false) =
   ## Append user headers lowercased, dropping everything that must not cross to h2
   ## (RFC 9113 8.2.2): the connection-specific fields, any field a `Connection` header
   ## nominates, a user pseudo-header (name starting ':', which would land after the
   ## regular fields and be malformed), and a `TE` that is not exactly "trailers".
+  ##
+  ## `dropContentLength` additionally strips a caller-supplied `content-length`: on a
+  ## streamed upload the DATA frames are produced chunk by chunk and their total is
+  ## unknown, so forwarding the caller's length would make the message malformed when
+  ## it disagrees with the bytes sent (RFC 9113 8.1.2.6). Stripping matches h3, which
+  ## drops it via h3SkipHeaders, and h1, which drops it on the chunked path (#294).
   var nominated: seq[string]
   for (name, value) in headers.pairs:
     if name.toLowerAscii == "connection":
@@ -23,6 +30,7 @@ proc appendMappedHeaders(result: var seq[HeaderPair], headers: Headers) =
       continue
     if lower in nominated: continue
     if lower == "te" and value.strip.toLowerAscii != "trailers": continue
+    if dropContentLength and lower == "content-length": continue
     result.add((lower, value))
 
 proc h2HeaderList*(req: Request): seq[HeaderPair] =
@@ -36,7 +44,12 @@ proc h2HeaderList*(req: Request): seq[HeaderPair] =
   if not ((req.url.isTls and p == 443) or (not req.url.isTls and p == 80)):
     authority.add(":" & $p)
   result.add((":authority", authority))
-  result.appendMappedHeaders(req.headers)
+  # A streamed body (`bodyStream`, or an async producer flagged by `hasStreamedBody`)
+  # is framed as DATA the sender produces chunk by chunk, so a caller-supplied
+  # content-length cannot be trusted and is dropped (#294). A buffered body keeps
+  # whatever the caller set.
+  result.appendMappedHeaders(req.headers,
+    dropContentLength = req.bodyStream != nil or req.hasStreamedBody)
 
 proc h2ConnectHeaderList*(url: Url, protocol: string, extra: Headers): seq[HeaderPair] =
   ## Pseudo-headers for an Extended CONNECT (RFC 8441): `:method` is CONNECT with a

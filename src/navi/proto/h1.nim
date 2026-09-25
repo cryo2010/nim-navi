@@ -22,6 +22,12 @@ proc serializeHead*(req: Request, chunked = false): string =
     raise newException(ValueError,
       "navi: use a streaming body (bodyStream) for chunked transfer; " &
       "do not set a Transfer-Encoding request header manually")
+  # navi owns the length too: on the chunked path a caller-supplied Content-Length is
+  # dropped rather than emitted next to Transfer-Encoding: chunked. Both framing
+  # headers on one request is the CL.TE smuggling ambiguity (RFC 9112 6.1 tells a
+  # recipient to ignore the length, but intermediaries disagree in practice), and the
+  # length is wrong anyway: the real body is the producer's, whose size is unknown
+  # here. Stripping matches h3, which already drops it via h3SkipHeaders (#294).
   let target = if req.absoluteForm: req.url.absoluteTarget else: req.url.requestTarget
   result = $req.verb & " " & target & " HTTP/1.1\r\n"
   if not req.headers.contains("host"):
@@ -31,6 +37,7 @@ proc serializeHead*(req: Request, chunked = false): string =
       hostLine.add(":" & $p)
     result.add("Host: " & hostLine & "\r\n")
   for (k, v) in req.headers.pairs:
+    if chunked and cmpIgnoreCase(k, "content-length") == 0: continue
     result.add(k & ": " & v & "\r\n")
   if chunked:
     if not req.headers.contains("transfer-encoding"):
