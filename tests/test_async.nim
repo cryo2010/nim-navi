@@ -431,6 +431,52 @@ suite "asyncdispatch entry end to end":
     joinThread(srcTh)
     joinThread(dstTh)
 
+  test "a 303 that drops a streamed upload should send the next hop bodiless (#395)":
+    # The rewrite makes the hop a plain GET, so the async producer must be dropped
+    # with the body: the hop goes out with no Transfer-Encoding, no Content-Length
+    # and no bytes, not as a chunked GET with an already-empty producer.
+    const port = 9225
+    var th: Thread[ServerCtx]
+    startUploadRedirect(th, port, 303)
+    proc run(): Future[Response] {.async.} =
+      let parts = @["alpha ", "beta ", "gamma"]
+      var i = 0
+      proc getChunks(): Future[string] {.async.} =
+        if i >= parts.len: return ""
+        let p = parts[i]
+        inc i
+        return p
+      return await newNavi().put("http://127.0.0.1:" & $port & "/", body = getChunks)
+    let res = waitFor run()
+    check res.status == 200
+    check res.body == "arrived"
+    check res.headers.get("x-echo-hop1-body") == "alpha beta gamma"
+    check res.headers.get("x-echo-method") == "GET"
+    check res.headers.get("x-echo-transfer-encoding") == ""
+    check res.headers.get("x-echo-content-length") == ""
+    check res.headers.get("x-echo-hop2-bytes") == "0"
+    joinThread(th)
+
+  test "a 307 must not replay a streamed upload: the 3xx is surfaced (#295)":
+    const port = 9226
+    var th: Thread[ServerCtx]
+    startUploadRedirect(th, port, 307)
+    proc run(): Future[Response] {.async.} =
+      let parts = @["alpha ", "beta ", "gamma"]
+      var i = 0
+      proc getChunks(): Future[string] {.async.} =
+        if i >= parts.len: return ""
+        let p = parts[i]
+        inc i
+        return p
+      var cfg = initNaviConfig()
+      cfg.throwHttpErrors = false
+      return await newNavi(cfg).put("http://127.0.0.1:" & $port & "/", body = getChunks)
+    let res = waitFor run()
+    check res.status == 307             # preserved body + spent producer: not followed
+    check res.headers.get("location") == "/final"
+    joinThread(th)
+
   test "an async producer PUT should not be retried (non-replayable body)":
     var port = 0
     var count = 0

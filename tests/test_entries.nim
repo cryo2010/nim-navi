@@ -458,6 +458,49 @@ suite "sync entry end to end":
     check res.body == "hello streaming world"
     joinThread(th)
 
+  test "a 303 that drops a streamed upload should send the next hop bodiless (#395)":
+    # The sync analog of the async producer case: once the rewrite drops the body,
+    # the hop is a plain GET with no Transfer-Encoding, no Content-Length and no bytes.
+    const port = 8960
+    var th: Thread[ServerCtx]
+    startUploadRedirect(th, port, 303)
+
+    let api = newNavi()
+    let parts = @["alpha ", "beta ", "gamma"]
+    var i = 0
+    let res = api.request(POST, "http://127.0.0.1:" & $port & "/",
+      body = BodyProducer(proc(): string =
+        if i < parts.len:
+          result = parts[i]
+          inc i))
+    check res.status == 200
+    check res.body == "arrived"
+    check res.headers.get("x-echo-hop1-body") == "alpha beta gamma"
+    check res.headers.get("x-echo-method") == "GET"
+    check res.headers.get("x-echo-transfer-encoding") == ""
+    check res.headers.get("x-echo-content-length") == ""
+    check res.headers.get("x-echo-hop2-bytes") == "0"
+    joinThread(th)
+
+  test "a 307 must not replay a streamed upload: the 3xx is surfaced (#295)":
+    const port = 8961
+    var th: Thread[ServerCtx]
+    startUploadRedirect(th, port, 307)
+
+    var cfg = initNaviConfig()
+    cfg.throwHttpErrors = false
+    let api = newNavi(cfg)
+    let parts = @["alpha ", "beta ", "gamma"]
+    var i = 0
+    let res = api.request(PUT, "http://127.0.0.1:" & $port & "/",
+      body = BodyProducer(proc(): string =
+        if i < parts.len:
+          result = parts[i]
+          inc i))
+    check res.status == 307           # preserved body + spent producer: not followed
+    check res.headers.get("location") == "/final"
+    joinThread(th)
+
   test "a streamed upload of many tiny chunks should coalesce into few wire chunks (#299)":
     const port = 8957
     var th: Thread[ServerCtx]

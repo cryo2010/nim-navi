@@ -789,7 +789,9 @@ template followRedirects*(client, startReq, resp: typed; asyncStream: typed = ni
   ## `await`s run in the caller's async proc. `asyncStream` (async only) is the
   ## awaited upload producer for the initial send; a streamed request is
   ## non-replayable, so it breaks before any redirect rewrite that would carry its
-  ## body forward (below) and the producer is never pulled a second time.
+  ## body forward (below) and the producer is never pulled a second time. A rewrite
+  ## that DROPS the body takes the producer with it (`bodyDropped`), so the next hop
+  ## goes out bodiless rather than as a chunked request with an empty producer (#395).
   ## `userSink`/`gate` (when set) stream the FINAL body: this loop refreshes the
   ## gate's per-hop fields (hops, limit, whether this hop is replayable, its verb,
   ## and whether digest is still armed) before each `run`, so the drain site can tell
@@ -799,6 +801,13 @@ template followRedirects*(client, startReq, resp: typed; asyncStream: typed = ni
   let digestOrigin = originKey(startReq.url)   # digest creds only for this origin
   var hops = 0
   let limit = client.config.redirectLimit
+  # Set once a rewrite drops the body (303, or 301/302 off a non-GET/HEAD method).
+  # `redirectRequest` clears the Request's own body/`bodyStream`/trailers, but the
+  # async producer lives outside the Request, so it has to be dropped here too: a
+  # bodiless GET must not go out as `Transfer-Encoding: chunked` with a producer that
+  # is immediately at EOF (a lone `0\r\n\r\n` body), which several intermediaries log
+  # or reject. Sticky: once dropped, no later hop has a body to send either (#395).
+  var bodyDropped = false
   while true:
     if gate != nil:
       gate.hops = hops
@@ -810,7 +819,10 @@ template followRedirects*(client, startReq, resp: typed; asyncStream: typed = ni
       gate.digestReady = client.config.auth.kind == akDigest and
         not rreq.headers.contains("authorization") and
         originKey(rreq.url) == digestOrigin
-    resp = run(client, rreq, BodySink(nil), asyncStream, userSink, gate)
+    if bodyDropped:      # a rewrite dropped the body: send no body, chunked or not
+      resp = run(client, rreq, BodySink(nil), nil, userSink, gate)
+    else:
+      resp = run(client, rreq, BodySink(nil), asyncStream, userSink, gate)
     maybeDigest(client, rreq, resp, digestOrigin, userSink, gate)
     decodeBody(resp, client.config)
     let location = resp.headers.get("location")
@@ -825,6 +837,8 @@ template followRedirects*(client, startReq, resp: typed; asyncStream: typed = ni
       # replay and is followed as usual.
       if not isReplayable(rreq) and preservesBody(resp.status, rreq.verb):
         break
+      if not preservesBody(resp.status, rreq.verb):
+        bodyDropped = true            # the producer goes with the body (#395)
       rreq = redirectRequest(rreq, resp.status, location)
       inc hops
     else:

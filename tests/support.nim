@@ -599,6 +599,72 @@ proc startUploadEcho*(th: var Thread[ServerCtx], port: int, chunks: ptr int = ni
                          maxChunk: maxChunk))
   while not ready: sleep(1)
 
+proc serveUploadRedirect(ctx: ServerCtx) {.thread.} =
+  ## A streamed upload that gets redirected (#395). Hop 1 reads the chunked body and
+  ## answers `failures` (the redirect status) with `Location: /final`. When that status
+  ## DROPS the body (303, or 301/302 off a non-GET/HEAD method) the connection is kept
+  ## alive and hop 2 is answered with a report of how the redirected request framed
+  ## itself on the wire: `x-echo-method`, `x-echo-transfer-encoding`,
+  ## `x-echo-content-length`, `x-echo-hop2-bytes` (body bytes that actually arrived)
+  ## and `x-echo-hop1-body` (what the upload delivered on hop 1). When the status
+  ## PRESERVES the body the hop is never followed, so the 3xx closes the connection.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(ctx.port), "127.0.0.1")
+  server.listen()
+  ctx.ready[] = true
+  var client = acceptClient(server)
+  let head1 = client.recvUntil("\r\n\r\n")
+  let verb1 = head1.split(' ')[0]
+  var hop1 = ""
+  if cmpIgnoreCase(headerValue(head1, "transfer-encoding"), "chunked") == 0:
+    hop1 = readChunkedBody(client)
+  else:
+    let cl = headerValue(head1, "content-length")
+    let n = if cl.len > 0: parseInt(cl) else: 0
+    while hop1.len < n:
+      let part = client.recv(n - hop1.len)
+      if part.len == 0: break
+      hop1.add part
+  # Mirrors `preservesBody`: only a body-dropping hop is auto-followed.
+  let drops = ctx.failures == 303 or
+              (ctx.failures in [301, 302] and verb1 notin ["GET", "HEAD"])
+  client.send("HTTP/1.1 " & $ctx.failures & " Redirect\r\nLocation: /final\r\n" &
+              "Content-Length: 0\r\nConnection: " &
+              (if drops: "keep-alive" else: "close") & "\r\n\r\n")
+  if drops:
+    let head2 = client.recvUntil("\r\n\r\n")
+    if head2.len > 0:
+      let te2 = headerValue(head2, "transfer-encoding")
+      let cl2 = headerValue(head2, "content-length")
+      var hop2 = ""
+      if cmpIgnoreCase(te2, "chunked") == 0:
+        hop2 = readChunkedBody(client)        # drain the (buggy) empty chunked body
+      elif cl2.len > 0 and parseInt(cl2) > 0:
+        let n = parseInt(cl2)
+        while hop2.len < n:
+          let part = client.recv(n - hop2.len)
+          if part.len == 0: break
+          hop2.add part
+      let body = "arrived"
+      client.send("HTTP/1.1 200 OK\r\n" &
+                  "x-echo-method: " & head2.split(' ')[0] & "\r\n" &
+                  "x-echo-transfer-encoding: " & te2 & "\r\n" &
+                  "x-echo-content-length: " & cl2 & "\r\n" &
+                  "x-echo-hop2-bytes: " & $hop2.len & "\r\n" &
+                  "x-echo-hop1-body: " & hop1 & "\r\n" &
+                  "Content-Length: " & $body.len & "\r\n" &
+                  "Connection: close\r\n\r\n" & body)
+  client.close()
+  server.close()
+
+proc startUploadRedirect*(th: var Thread[ServerCtx], port, status: int) =
+  ## Redirect a streamed upload with `status` (see serveUploadRedirect).
+  var ready = false
+  createThread(th, serveUploadRedirect,
+               ServerCtx(port: port, ready: addr ready, failures: status))
+  while not ready: sleep(1)
+
 proc serveTruncated(ctx: ServerCtx) {.thread.} =
   ## Send response headers declaring `Content-Length: 100` but only `failures` body
   ## bytes, then close the connection mid-body (premature close). Used to prove the

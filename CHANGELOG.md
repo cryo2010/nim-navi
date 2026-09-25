@@ -87,6 +87,16 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **A redirect hop that drops a streamed upload no longer sends an empty chunked
+  body.** `followRedirects` threaded the async body producer into every hop, so after
+  a rewrite that drops the body (303 on any verb, 301/302 off a non-GET/HEAD method)
+  the next hop went out as a GET with `Transfer-Encoding: chunked` and a producer that
+  was already at EOF, i.e. a lone `0\r\n\r\n` body. Harmless on the wire for a
+  conformant server, but a GET with a chunked body is something intermediaries log or
+  reject, and it disagreed with the sync path, which sends nothing once `bodyStream`
+  is nil. The producer is now dropped with the body, so such a hop is a plain bodiless
+  request on every client and over h1 and h2 alike. A 307/308 hop is unaffected: a
+  non-replayable body is still never followed there, the 3xx is surfaced (#395, #295).
 - **`navi/proto/ws` compiles under `nim js` again.** The module's `js` branch was
   documented as a fallback that keeps a `nim js` build compiling, but the build
   failed: `checksums/sha1` reaches `std/endians`, which is native-only (`copyMem`),
