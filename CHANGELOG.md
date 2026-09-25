@@ -83,12 +83,29 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **A response `sink` now receives the body of a surfaced 301/302 redirect.** The
+  delivery gate still used the old "a non-replayable 307/308 is surfaced" rule, so a
+  GET with a body producer that took a 301/302 -- which `followRedirects` surfaces,
+  because the hop would replay a spent producer -- had its body withheld from the
+  sink. The gate now asks `redirect.preservesBody` with the hop's own verb, the exact
+  condition the redirect loop breaks on (#369, #295).
+- **The streamed-upload write buffer no longer exceeds `h1CoalesceSize`.** It was
+  flushed only after an append pushed it past 16 KiB, so a framed chunk could reach
+  almost 32 KiB and spill into a second TLS record. The send loop now flushes before
+  an append that would overflow the buffer, and a producer chunk large enough to be
+  framed on its own is packed into the same write as the pending bytes instead of
+  costing a second one (#299).
 - **HTTP/3 fallback no longer replays a request that may already have run.** A
   `QuicError` raised after the request was submitted on the h3 stream now surfaces as
   `QuicSubmittedError`; the h2/h1 fallback only fires for that case when the request
   is idempotent and replayable (no spent body producer), mirroring the h1/h2
   keep-alive-race rule. Pre-submit failures (no connection, connect failure, submit
-  rejected) still fall back freely for any method (#378, #293).
+  rejected) still fall back freely for any method. This covers the streaming-response
+  paths (`stream` / SSE over h3) as well as the buffered ones: `awaitHeaders` and the
+  incremental body readers are only ever reached with the stream already on the wire,
+  so every failure they raise is now a `QuicSubmittedError`, and the sync and async
+  `stream` legs gate their fall-through to h2/h1 on the same rule instead of retrying
+  a submitted-then-reset POST (#378, #293).
 - **A streamed body is no longer replayed through a 301/302 redirect.** A GET/HEAD
   carrying a body producer used to be re-issued to the redirect target with an already
   drained producer; `followRedirects` now returns the 3xx to the caller for a streamed
@@ -132,11 +149,23 @@ onward (pre-1.0, minor versions may include breaking changes).
   on a boundary; a failure fails the connection like any other protocol error (#282).
 - **WebSocket: h2/h3 Extended CONNECT accepts any 2xx**, not only 200 (RFC 8441 /
   RFC 9220) (#287).
+- **WebSocket: the streaming reader validates the peer's close frame.**
+  `stream()`/`readChunk` took the close frame on trust: a 1-byte body, a code that
+  may never appear on the wire (1005/1006/1015, 1004, anything outside
+  1000-1014/3000-4999), or a non-UTF-8 reason surfaced as a clean `wmClose` and was
+  echoed back to the peer verbatim. They now run the same checks `receive` does --
+  one shared `ws.parseClose` -- and fail the connection with 1002 before raising.
+  A synthetic EOF (no close frame at all) is still reported as 1006, never
+  validated or echoed.
 - **WebSocket driver hygiene:** `send`/`ping` on a closed socket raise a clear
   `IOError` instead of poking a torn-down transport; `close(code)` rejects the
   reserved codes 1005/1006/1015; the keepalive-death path drops its stale pending
   read; and a bodiless transport EOF reports 1006 (`closeAbnormal`) consistently on
-  the buffered and streaming paths (#289).
+  the buffered and streaming paths (#289). `WsWriter.write` (and the fin frame sent
+  on block exit) raise the same `IOError` on a closed socket, and `close(code)`
+  rejects a reserved code only while a close frame would actually be sent, so
+  mirroring a received `m.closeCode` back on teardown stays the promised idempotent
+  no-op.
 - **Keep-alive race: a request dropped before any response is now retried, following
   the same rule as Go `net/http` (RFC 9110 9.2.2).** A connection can be torn down by
   the server at any time -- an idle recycle, a GOAWAY-less close, or a freshly-opened
