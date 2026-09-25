@@ -153,6 +153,11 @@ jobs:
       - name: navi/js response sink runtime test
         run: bash tests/interop/js_sink.sh
 
+      # SSE reconnect delay under Node: a `retry: 0` server and one that answers
+      # 200 then closes with no events must not spin the reconnect loop (#291).
+      - name: navi/js SSE reconnect delay runtime test
+        run: bash tests/interop/js_sse_retry.sh
+
   sanitize:
     runs-on: ubuntu-latest
     name: sanitizers (asan + ubsan)

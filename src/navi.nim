@@ -23,7 +23,7 @@ from std/strutils import startsWith, find, splitLines, strip, cmpIgnoreCase,
 when defined(naviHttp3):
   import navi/core/altsvc
   import navi/backend/quic
-export sse.SseEvent
+export sse.SseEvent, sse.defaultSseMinRetryMs
 
 claimEntry("navi")
 export public

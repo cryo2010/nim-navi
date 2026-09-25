@@ -148,6 +148,32 @@ proc retryMs*(p: SseParser): int = p.retry
 proc lastEventId*(p: SseParser): string = p.lastId
   ## The persistent last event id, to resend as Last-Event-ID on reconnect.
 
+# --- reconnect delay policy (shared by every client's reconnect loop) ---
+
+const defaultSseMinRetryMs* = 100
+  ## Default floor, in milliseconds, under every SSE reconnect delay. Without one a
+  ## server that sends `retry: 0`, or that answers 200 and closes with no events,
+  ## turns the reconnect loop into a busy loop hammering it (#291). The floor is
+  ## itself capped by `maxRetryMs`, so lowering the ceiling still lowers the floor.
+
+proc sseRetryDelay*(retryMs, minRetryMs, maxRetryMs: int): int =
+  ## `retryMs` clamped into the floor/ceiling the stream was opened with. Used for
+  ## the configured base, for a `retry:` the server sent, and for the delay actually
+  ## slept, so no path can produce a sub-floor (or over-ceiling) reconnect.
+  let hi = max(maxRetryMs, 0)
+  let lo = max(min(minRetryMs, hi), 0)
+  result = max(min(retryMs, hi), lo)
+
+proc sseBackoff*(retryMs, baseRetryMs, minRetryMs, maxRetryMs: int): int =
+  ## The next delay after a connect that failed, or that closed without delivering
+  ## a single event: double the current delay (never below the base or the floor),
+  ## saturating at the ceiling. The halfway test also keeps the doubling from
+  ## overflowing on an extreme ceiling.
+  let hi = max(maxRetryMs, 0)
+  let lo = max(min(minRetryMs, hi), 0)
+  let cur = max(max(retryMs, baseRetryMs), lo)
+  result = if cur >= hi div 2: hi else: max(min(cur * 2, hi), lo)
+
 proc reset*(p: var SseParser) =
   ## Drop per-connection parse state before a reconnect, keeping the resume id and
   ## retry. A partially-received event at disconnect is discarded (not dispatched),

@@ -267,6 +267,12 @@ task jsWsCodec, "navi/proto/ws frame codec under Node (js is the 32-bit `int` ta
   exec "nim js --path:src --hints:off -o:tests/js_ws_codec.js tests/js_ws_codec.nim"
   exec "node tests/js_ws_codec.js"
 
+task jsSseRetry, "navi/js SSE reconnect-delay runtime test (Node)":
+  # Verifies the floor under the SSE reconnect delay and the empty-connect backoff
+  # on js: a `retry: 0` server, and one that answers 200 and closes with no events,
+  # must not spin the reconnect loop (#291).
+  exec "bash tests/interop/js_sse_retry.sh"
+
 task demoWssBrowser, "Browser wss demo: mkcert cert + wss server + page (needs mkcert, python3)":
   # Generates a browser-trusted cert (mkcert), serves the navi/js page over a
   # wss echo server, and prints the URL to open.

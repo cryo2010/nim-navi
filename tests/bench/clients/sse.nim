@@ -47,7 +47,8 @@ proc sseThread(a: ptr BenchThread) {.thread, nimcall.} =
     let api = mkClient(cfg)
     var streams: seq[SseStream]
     for _ in 0 ..< a.concurrency:
-      streams.add waitFor api.sse(pool.pick() & "/events", retryMs = 20, maxRetryMs = 100)
+      streams.add waitFor api.sse(pool.pick() & "/events", retryMs = 20, maxRetryMs = 100,
+                                  minRetryMs = 20)
     let rec = newBenchRecorder()
     var gate = initVersionGate(cfg)
     var futs: seq[Future[void]]

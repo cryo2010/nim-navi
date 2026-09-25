@@ -101,6 +101,16 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **A misbehaving SSE server can no longer spin the reconnect loop.** The reconnect
+  delay had no lower bound, so a server that sent `retry: 0` reduced it to
+  `sleep(0)`, and a server that answered 200 and closed with no events reset the
+  backoff on every connect (the reset was tied to a successful connect, not to a
+  delivered event) -- either one reconnected as fast as the loop could run, hammering
+  the server. Every client (sync, asyncdispatch, chronos, js) now floors every delay
+  at the new `minRetryMs` (default 100 ms, itself capped by `maxRetryMs`), including
+  a delay the server asked for with `retry:`, and doubles the delay after any connect
+  that closed without delivering an event; only a connect that delivered at least one
+  event resets it to the base (#291).
 - **A redirect hop that drops a streamed upload no longer sends an empty chunked
   body.** `followRedirects` threaded the async body producer into every hop, so after
   a rewrite that drops the body (303 on any verb, 301/302 off a non-GET/HEAD method)

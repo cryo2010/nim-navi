@@ -8,7 +8,7 @@ when defined(windows):
   from std/winlean import accept   # selectively: winlean's AF_* ints would
                                    # shadow nativesockets' Domain enum values
 
-  proc acceptClient(server: Socket): Socket =
+  proc acceptClient*(server: Socket): Socket =
     ## std/net's accept hands Winsock a 16-byte SockAddr, but an inbound IPv6
     ## peer address needs 28: Windows fails that call with WSAEFAULT where POSIX
     ## just truncates. (nativesockets then closes the invalid handle, so the code
@@ -20,7 +20,7 @@ when defined(windows):
     if fd == osInvalidSocket: raiseOSError(osLastError())
     newSocket(fd, getSockDomain(fd), SOCK_STREAM, IPPROTO_TCP)
 else:
-  proc acceptClient(server: Socket): Socket =
+  proc acceptClient*(server: Socket): Socket =
     server.accept(result)
 
 type ServerCtx* = object

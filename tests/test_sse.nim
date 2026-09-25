@@ -189,3 +189,35 @@ suite "sse parser DoS hardening":
     except ValueError:
       raised = true
     check raised
+
+suite "sse reconnect delay policy (#291)":
+  # The floor and the empty-connect backoff are shared by every client's reconnect
+  # loop, so the arithmetic is pinned here; the socket-level behaviour lives in
+  # test_sse_retry*.nim.
+  test "a retry: 0 is lifted to the floor instead of reconnecting instantly":
+    check sseRetryDelay(0, defaultSseMinRetryMs, 30_000) == 100
+
+  test "the floor is itself capped by the ceiling":
+    check sseRetryDelay(0, 500, 200) == 200          # a floor cannot exceed the max
+    check sseRetryDelay(50, 0, 30_000) == 50         # floor off: the value stands
+
+  test "a delay between the floor and the ceiling is left alone, above it is capped":
+    check sseRetryDelay(3000, 100, 30_000) == 3000
+    check sseRetryDelay(60_000, 100, 30_000) == 30_000
+
+  test "a nonsense (negative) delay lands on the floor, never below zero":
+    check sseRetryDelay(-5, 100, 30_000) == 100
+    check sseRetryDelay(-5, 0, 30_000) == 0
+
+  test "the backoff doubles and saturates at the ceiling":
+    check sseBackoff(100, 100, 100, 30_000) == 200
+    check sseBackoff(200, 100, 100, 30_000) == 400
+    check sseBackoff(20_000, 100, 100, 30_000) == 30_000
+    check sseBackoff(30_000, 100, 100, 30_000) == 30_000
+
+  test "the backoff starts from the floor even when the base is zero":
+    check sseBackoff(0, 0, 100, 30_000) == 200       # a retry: 0 server still backs off
+    check sseBackoff(100, 100, 100, 100) == 100      # floor == ceiling: nowhere to go
+
+  test "the backoff cannot overflow on an extreme ceiling":
+    check sseBackoff(int.high div 2 + 10, 0, 0, int.high) == int.high

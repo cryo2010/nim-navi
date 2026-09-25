@@ -18,7 +18,9 @@ type
     reconnect: bool
     baseRetryMs: int          ## reconnect base delay (the server's retry: overrides)
     retryMs: int              ## current delay (backs off on repeated failures)
+    minRetryMs: int           ## floor under every delay (a retry: 0 cannot spin us)
     maxRetryMs: int
+    sawEvent: bool            ## the current connection delivered at least one event
     idleTimeoutMs: int        ## bound on a single read / (re)open wait; 0 = unbounded
     handle: StreamResponse    ## current underlying stream, nil between reconnects
     parser: SseParser
@@ -48,7 +50,8 @@ proc sse*(client: Navi, target: string, verb = GET,
           headers = initHeaders(), body = "",
           params: seq[(string, string)] = @[],
           lastEventId = "", reconnect = true,
-          retryMs = 3000, maxRetryMs = 30_000, idleTimeoutMs = 45_000,
+          retryMs = 3000, maxRetryMs = 30_000,
+          minRetryMs = defaultSseMinRetryMs, idleTimeoutMs = 45_000,
           cancel: CancelToken = nil): SseStream =
   ## Open a Server-Sent Events stream. The initial response is validated up front:
   ## a non-200 or non `text/event-stream` response raises. Consume events with
@@ -68,6 +71,12 @@ proc sse*(client: Navi, target: string, verb = GET,
   ## comment -- resets it and a live-but-quiet stream is not disturbed; set 0 to
   ## disable (only for a server known to go silent for long stretches without
   ## sending keep-alives).
+  ##
+  ## `minRetryMs` floors every reconnect delay, including one the server asked for
+  ## with `retry:`, so a `retry: 0` (or a server that answers 200 and closes with no
+  ## events) cannot spin the reconnect loop. It is capped by `maxRetryMs`. A connect
+  ## that closes without delivering an event also doubles the delay; only a connect
+  ## that delivered at least one event resets it to the base.
   var cfg = client.config
   cfg.maxResponseBytes = 0
   # Bound each read (and each (re)open's header read / connect) by idleTimeoutMs so a
@@ -89,8 +98,11 @@ proc sse*(client: Navi, target: string, verb = GET,
   result = SseStream(
     client: sc,
     verb: verb, target: target, headers: h, params: params, cancel: cancel,
-    reconnect: reconnect, baseRetryMs: retryMs, retryMs: retryMs,
-    maxRetryMs: maxRetryMs, idleTimeoutMs: idleTimeoutMs, parser: initSseParser(lastEventId))
+    reconnect: reconnect,
+    baseRetryMs: sseRetryDelay(retryMs, minRetryMs, maxRetryMs),
+    retryMs: sseRetryDelay(retryMs, minRetryMs, maxRetryMs),
+    minRetryMs: minRetryMs, maxRetryMs: maxRetryMs,
+    idleTimeoutMs: idleTimeoutMs, parser: initSseParser(lastEventId))
   result.openConn()            # eager: validate the initial response, fail fast
   result.started = true
 
@@ -113,6 +125,16 @@ proc httpVersion*(s: SseStream): string =
   ## upgrades to h3 only on a reconnect (once Alt-Svc has been learned).
   if s.handle != nil: s.handle.httpVersion else: ""
 
+proc dropConn(s: SseStream) =
+  ## Release the current connection and fold it into the reconnect delay: a connect
+  ## that delivered at least one event resets the delay to the base, one that
+  ## delivered none steps it up, so a server that accepts and immediately closes
+  ## backs off instead of being hammered (#291).
+  s.handle = nil
+  if s.sawEvent: s.retryMs = s.baseRetryMs
+  else: s.retryMs = sseBackoff(s.retryMs, s.baseRetryMs, s.minRetryMs, s.maxRetryMs)
+  s.sawEvent = false
+
 proc next*(s: SseStream): Option[SseEvent] =
   ## The next event, or none once the stream ends (the server closed it and
   ## reconnection is off, or the handle was closed). Reconnects transparently on a
@@ -122,27 +144,27 @@ proc next*(s: SseStream): Option[SseEvent] =
     let ev = s.parser.next()
     if ev.isSome:
       if s.parser.retryMs() >= 0:            # server set/updated the reconnect base
-        s.baseRetryMs = min(s.parser.retryMs(), s.maxRetryMs)
+        s.baseRetryMs = sseRetryDelay(s.parser.retryMs(), s.minRetryMs, s.maxRetryMs)
+      s.sawEvent = true                      # this connect earned a base-delay reset
       return ev
     if s.handle == nil:                      # need a (re)connection
       if not s.reconnect: return none(SseEvent)
-      sleep(min(s.retryMs, s.maxRetryMs))
+      sleep(sseRetryDelay(s.retryMs, s.minRetryMs, s.maxRetryMs))
       try:
         s.openConn()
-        s.retryMs = s.baseRetryMs            # reset backoff after a good connect
       except CatchableError:
         if s.closed: return none(SseEvent)
-        s.retryMs = min(max(s.retryMs, s.baseRetryMs) * 2, s.maxRetryMs)
+        s.retryMs = sseBackoff(s.retryMs, s.baseRetryMs, s.minRetryMs, s.maxRetryMs)
         continue
     var chunk = ""
     try:
       chunk = s.handle.readChunk()
     except CatchableError:                   # dropped mid-stream
-      s.handle = nil
+      s.dropConn()
       if not s.reconnect: raise
       continue
     if chunk.len == 0:                        # server closed the stream cleanly
-      s.handle = nil
+      s.dropConn()
       if not s.reconnect: return none(SseEvent)
       continue
     try:

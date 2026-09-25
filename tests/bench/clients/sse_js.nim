@@ -13,7 +13,8 @@ proc main() {.async.} =
 
   var streams: seq[SseStream]
   for _ in 0 ..< cfg.clients * cfg.concurrency:
-    streams.add await api.sse(pool.pick() & "/events", retryMs = 20, maxRetryMs = 100)
+    streams.add await api.sse(pool.pick() & "/events", retryMs = 20, maxRetryMs = 100,
+                              minRetryMs = 20)
 
   let startMs = nowMs()
   let measureStartMs = startMs + cfg.warmupSeconds * 1000.0

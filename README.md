@@ -885,8 +885,16 @@ s.close()
 Because `next()` is a pull (it returns `none` at end), `each` is a real loop, so
 `break`/`continue`/`return` work inside it. Parameters: `verb`/`body`/`headers`/
 `params` (POST-SSE, auth), `lastEventId` (resume a prior stream), `reconnect`
-(default true), and `retryMs`/`maxRetryMs` (reconnect backoff). The initial response
-must be `200 text/event-stream`, or `sse()` raises.
+(default true), and `retryMs`/`minRetryMs`/`maxRetryMs` (reconnect backoff). The
+initial response must be `200 text/event-stream`, or `sse()` raises.
+
+`minRetryMs` (default 100, capped by `maxRetryMs`) is a **floor under every
+reconnect delay**, including one the server asked for with `retry:`, so a `retry: 0`
+cannot turn the reconnect loop into a busy loop. A connect that closes **without
+delivering an event** doubles the delay up to `maxRetryMs`; only a connect that
+delivered at least one event resets it to the base. Together those bound a
+misbehaving server (200 then instant close) to backing off instead of being
+hammered.
 
 The stream runs with the size cap and read/total timeouts off (SSE is long-lived)
 and shares the client's cookie jar. **Call `close()` when done** so the connection

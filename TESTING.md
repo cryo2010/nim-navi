@@ -47,6 +47,7 @@ nimble chronosCafile      # chronos custom-CA verify (needs openssl + chronos)
 nimble wsjs               # navi/js WebSocket under Node
 nimble jsCookieJar        # navi/js cookie jar under Node
 nimble jsWsCodec          # proto/ws frame codec under Node (32-bit `int` target)
+nimble jsSseRetry         # navi/js SSE reconnect delay floor + backoff under Node
 nimble badssl             # cert-verification conformance vs badssl.com (network)
 nimble live               # real public servers/CDNs (network; nightly)
 

@@ -76,10 +76,14 @@ proc main() {.async.} =
   let api = newNavi(c)
 
   # Low retry so reconnects are fast under load (the server ends the stream often);
-  # also bounds how long a worker parked in the backoff lags the deadline.
+  # also bounds how long a worker parked in the backoff lags the deadline. The
+  # stream always delivers events before the server drops it, so the empty-connect
+  # backoff never engages; minRetryMs lowers the default 100 ms floor so the 20 ms
+  # base stands.
   var streams: seq[SseStream]
   for _ in 0 ..< cfg.concurrency:
-    streams.add await api.sse(pool.pick() & "/events", retryMs = 20, maxRetryMs = 100)
+    streams.add await api.sse(pool.pick() & "/events", retryMs = 20, maxRetryMs = 100,
+                              minRetryMs = 20)
 
   let start = epochTime()
   let deadline = start + cfg.seconds
