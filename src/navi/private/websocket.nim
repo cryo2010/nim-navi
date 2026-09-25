@@ -205,7 +205,7 @@ proc websocketH2(client: Navi, u: Url, headers: Headers,
   ## WebSocket over HTTP/2 Extended CONNECT (RFC 8441). Dials a dedicated h2
   ## connection (ALPN "h2"), confirms the peer advertised ENABLE_CONNECT_PROTOCOL,
   ## opens a CONNECT `:protocol=websocket` stream, and tunnels frames as DATA. No
-  ## Sec-WebSocket-Key/Accept over h2; a `:status 200` accepts the tunnel. The
+  ## Sec-WebSocket-Key/Accept over h2; any 2xx `:status` accepts the tunnel. The
   ## connection is dedicated to this WebSocket (not pooled), so the single blocking
   ## socket drives one full-duplex stream without contending with other requests.
   let conn = connect(u.host, u.port, u.isTls, client.config.tls,
@@ -251,14 +251,14 @@ proc websocketH2(client: Navi, u: Url, headers: Headers,
     if toSend.len > 0: conn.sendAll(toSend)
     if h2.streamReset(sid):
       raise newException(IOError, "navi: websocket h2 tunnel reset before it opened")
-    if h2.streamDone(sid):               # fatal conn error or GOAWAY before the 200
+    if h2.streamDone(sid):               # fatal conn error or GOAWAY before the 2xx
       raise newException(IOError, "navi: websocket h2 tunnel closed before it opened")
   let status = h2.respSnapshot(sid).status
-  if status != 200:                      # RFC 8441: a 200 accepts the tunnel
+  if status < 200 or status >= 300:      # RFC 8441 5: any 2xx accepts the tunnel
     raise newException(IOError,
       "navi: WebSocket over h2 rejected with :status " & $status)
   let w = WsH2(sock: conn, h2: h2, sid: sid)
-  w.inbuf.add h2.takeBody(sid)           # any DATA already buffered behind the 200
+  w.inbuf.add h2.takeBody(sid)           # any DATA already buffered behind the 2xx
   result = WebSocket(tr: WsTransport(kind: wkH2, h2c: w), open: true,
                      maxMessageBytes: maxMessageBytes, keepAlive: keepAlive)
   handshakeOk = true
@@ -279,7 +279,7 @@ when defined(naviHttp3):
                                     client.config.tls.verify, u.requestTarget,
                                     wsExtraFields(headers), client.config.connectMs,
                                     client.config.readMs, client.config.totalMs)
-      if status != 200:            # RFC 9220 / 8441: a 200 accepts the tunnel
+      if status < 200 or status >= 300:  # RFC 9220 / 8441 5: any 2xx accepts it
         wsClose(pump)
         raise newException(IOError,
           "navi: WebSocket over h3 rejected with :status " & $status)

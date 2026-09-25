@@ -132,7 +132,7 @@ proc doWebsocketH2(client: Navi, u: Url, headers: Headers,
     reqHeaders["sec-websocket-version"] = wsVersion
     let sid = await mux.openConnect(h2ConnectHeaderList(u, "websocket", reqHeaders))
     let status = mux.respSnapshot(sid).status
-    if status != 200:            # RFC 8441: a 2xx (200) accepts the tunnel
+    if status < 200 or status >= 300:   # RFC 8441 5: any 2xx accepts the tunnel
       raise newException(IOError,
         "navi: WebSocket over h2 rejected with :status " & $status)
     result = WebSocket(tr: WsTransport(kind: wkH2, mux: mux, sid: sid), open: true,
@@ -152,7 +152,7 @@ when defined(naviHttp3):
     try:
       let (sid, status) = await qc.openConnect(u.requestTarget,
                                                wsExtraFields(headers), "websocket")
-      if status != 200:            # RFC 9220 / 8441: a 200 accepts the tunnel
+      if status < 200 or status >= 300:  # RFC 9220 / 8441 5: any 2xx accepts it
         raise newException(IOError,
           "navi: WebSocket over h3 rejected with :status " & $status)
       result = WebSocket(tr: WsTransport(kind: wkH3, qc: qc, h3sid: sid), open: true,
