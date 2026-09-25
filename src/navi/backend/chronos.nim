@@ -52,6 +52,12 @@ type
     ## Not replayable, like `bodyStream`.
 
 type
+  ParkedRead = object
+    ## One-slot holder for an in-flight read abandoned by an expired `recvWithin`
+    ## (see `Conn.parked`). At most one read is ever outstanding per connection, so
+    ## a single slot is the whole bookkeeping.
+    fut: Future[string]
+
   Conn* = object
     transport: StreamTransport
     reader: AsyncStreamReader  ## plaintext only; nil for TLS
@@ -62,6 +68,14 @@ type
       ownsCtx: bool            ## true only for an unshared ctx `close` must destroy
     protocol*: string    ## negotiated ALPN protocol ("h2" / "http/1.1" / "")
     readMs: int          ## per-read stall timeout in ms; 0 blocks indefinitely
+    parked: ref ParkedRead
+                         ## the read a `recvWithin` started and abandoned when its
+                         ## bound expired. chronos CAN cancel a read, but a cancelled
+                         ## `readOnce` gives no way to recover bytes it had already
+                         ## taken off the transport, so the read is parked and resumed
+                         ## instead -- the same contract as the asyncdispatch backend,
+                         ## which has no cancellation at all. A `ref` so every value
+                         ## copy of the Conn shares the one slot.
 
 when defined(ssl):
   # openssl_ctx builds contexts through std/net, whose procs are declared
@@ -205,6 +219,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   discard totalMs
   var conn: Conn
   conn.readMs = readMs
+  conn.parked = new(ParkedRead)   # empty; filled only by an expired `recvWithin`
 
   proc establish() {.async.} =
     if proxy.kind == pkUnix:
@@ -350,21 +365,61 @@ proc rearm*(c: var Conn, readMs = 0, totalMs = 0) =
   discard totalMs
   c.readMs = readMs
 
-proc recvSome*(c: Conn): Future[string] {.async.} =
-  ## One chunk; "" means the peer closed. Bounded by `readMs` (the per-read stall
-  ## timeout) when set; on expiry the read is cancelled and TimeoutError is raised.
-  var readFut: Future[string]
+proc startRead(c: Conn): Future[string] =
+  ## Begin one read, resuming the one a previous `recvWithin` parked rather than
+  ## starting a second read on the same transport (which would race it for the bytes).
+  if not c.parked.isNil and not c.parked.fut.isNil:
+    result = c.parked.fut
+    c.parked.fut = nil
+    return
   when defined(ssl):
     if not c.tls.isNil:
-      readFut = c.tls.readSome()
-  if readFut.isNil:
-    readFut = plaintextRead(c)
+      return c.tls.readSome()
+  plaintextRead(c)
+
+proc recvSome*(c: Conn): Future[string] {.async.} =
+  ## One chunk; "" means the peer closed. Bounded by `readMs` (the per-read stall
+  ## timeout) when set; on expiry the read is cancelled and TimeoutError is raised
+  ## (terminal: the caller tears the connection down). A read parked by an earlier
+  ## `recvWithin` is resumed here, so its bytes reach this caller instead of being lost.
+  let readFut = c.startRead()
   if c.readMs > 0:
     if not await withTimeout(readFut, c.readMs.milliseconds):
       raise newException(response.TimeoutError, readTimeoutMsg(c.readMs))
   result = await readFut
 
+proc recvWithin*(c: Conn, ms: int): Future[tuple[timedOut: bool, data: string]] {.async.} =
+  ## A bounded read that leaves the connection usable when it expires: waits at most
+  ## `ms` for a chunk, otherwise reports `timedOut` with the read PARKED rather than
+  ## cancelled. The `Expect: 100-continue` gate uses it to wait for the interim
+  ## response and then keep reading the same connection, which a plain `recvSome` +
+  ## read timeout cannot do (that one is terminal).
+  ##
+  ## `withTimeout` is deliberately not used: it cancels the loser, and a cancelled
+  ## `readOnce` (or a cancelled OpenSSL pump mid-`feedIn`) can drop bytes it had
+  ## already taken off the transport, desyncing the response that follows. `race`
+  ## leaves both futures alone, so the unfinished read is parked intact and the next
+  ## read resumes it.
+  if ms <= 0: return (true, "")
+  let readFut = c.startRead()
+  let timer = sleepAsync(ms.milliseconds)
+  discard await race(readFut, timer)
+  if not readFut.finished():
+    if not c.parked.isNil: c.parked.fut = readFut
+    return (true, "")
+  timer.cancelSoon()               # the loser: drop it from the timer heap
+  return (false, await readFut)
+
+proc discardParked(c: Conn) =
+  ## Retire a parked read on teardown: nobody will await it, so cancel it rather
+  ## than leave an in-flight future on a transport that is about to be freed.
+  if c.parked.isNil or c.parked.fut.isNil: return
+  let fut = c.parked.fut
+  c.parked.fut = nil
+  if not fut.finished(): fut.cancelSoon()
+
 proc close*(c: Conn): Future[void] {.async.} =
+  c.discardParked()
   when defined(ssl):
     if not c.tls.isNil:
       await c.tls.close()   # frees the SSL (and its BIOs) and the transport
@@ -378,6 +433,7 @@ proc closeSync*(c: Conn) =
   ## Synchronous close, for a destructor that cannot `await` (an abandoned
   ## streaming handle reclaimed by GC). chronos's non-`Wait` `close` initiates
   ## teardown and returns; the event loop frees the resources afterwards.
+  c.discardParked()
   when defined(ssl):
     if not c.tls.isNil:
       c.tls.closeSync()

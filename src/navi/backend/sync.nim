@@ -554,6 +554,43 @@ proc recvSome*(c: Conn): string =
   else:
     result.setLen(n)
 
+proc recvWithin*(c: Conn, ms: int): tuple[timedOut: bool, data: string] =
+  ## A bounded read that leaves the connection usable when it expires: waits at most
+  ## `ms` for the peer to say something and reads one chunk if it does, otherwise
+  ## reports `timedOut` having consumed nothing. The `Expect: 100-continue` gate uses
+  ## it to wait for the interim response and then carry on reading the same
+  ## connection, which a plain `recvSome` + read timeout cannot do (that is terminal).
+  ##
+  ## Nothing is abandoned here: `waitReadable` only polls readiness, so on expiry not
+  ## a byte has left the socket. The read that follows a ready poll is bounded the
+  ## same way, so a readable socket carrying only TLS bookkeeping (a session ticket,
+  ## a partial record) cannot park past the wait either.
+  ##
+  ## `ms` is the CALLER'S bound, and it never outranks the request's own: the wait is
+  ## clamped to whatever is left of the total deadline, exactly as `readBudgetMs`
+  ## clamps an ordinary read. Without that, a gate longer than the deadline (say
+  ## `expectContinueMs = 5000` under `timeouts.total = 1000`) would park the thread for
+  ## the full 5 s against a silent server and overshoot the deadline by 4 s. An expiry
+  ## of the caller's own bound is reported (`timedOut`, the caller carries on); an
+  ## expiry of the deadline is terminal and raises navi's TimeoutError, the same one
+  ## `recvSome` raises when a read runs the budget out.
+  if ms <= 0: return (true, "")
+  var waitMs = ms
+  if c.bounded:
+    let remaining = remainingMs(c.deadline)
+    if remaining <= 0: c.readTimedOut()      # no budget left: never start the wait
+    waitMs = min(waitMs, remaining)
+  if not c.waitReadable(waitMs):
+    if c.bounded and remainingMs(c.deadline) <= 0: c.readTimedOut()   # the clamp, not `ms`
+    return (true, "")
+  var bounded = c                   # a value copy: the caller's timeouts are untouched
+  bounded.readMs = if c.readMs <= 0: waitMs else: min(c.readMs, waitMs)
+  try:
+    result = (false, bounded.recvSome())
+  except response.TimeoutError:
+    if c.bounded and remainingMs(c.deadline) <= 0: raise   # the whole-request deadline
+    result = (true, "")
+
 proc close*(c: Conn) =
   when defined(ssl):
     if not c.ssl.isNil:

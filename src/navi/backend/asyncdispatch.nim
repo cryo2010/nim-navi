@@ -80,10 +80,23 @@ type
     csOpen
     csShutdown
     csClosed
+  ParkedRead = object
+    ## One-slot holder for an in-flight read abandoned by an expired `recvWithin`
+    ## (see `Conn.parked`). At most one read is ever outstanding per connection, so
+    ## a single slot is the whole bookkeeping.
+    fut: Future[string]
+
   Conn* = object
     fd: AsyncFD
     protocol*: string   ## ALPN-negotiated protocol ("h2" or "", meaning http/1.1)
     readMs: int         ## per-read stall timeout in ms; 0 blocks indefinitely
+    parked: ref ParkedRead
+                        ## the read a `recvWithin` started and abandoned when its bound
+                        ## expired. asyncdispatch cannot cancel, so an abandoned read
+                        ## stays registered on the socket and WILL consume the bytes the
+                        ## next read needs; handing it to the next read instead is what
+                        ## makes a bounded read non-destructive here. A `ref` so every
+                        ## value copy of the Conn shares the one slot, like `state`.
     state: ref ConnectionState
                         ## shared across value copies: set to csClosed by `close`,
                         ## checked by a parked `sslRead` so closing under an in-flight
@@ -370,6 +383,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   conn.fd = invalidFd
   conn.readMs = readMs
   conn.state = new(ConnectionState)   # csOpen; shared teardown state (see Conn.state)
+  conn.parked = new(ParkedRead)       # empty; filled only by an expired `recvWithin`
 
   proc establish() {.async.} =
     if proxy.kind == pkUnix:
@@ -479,18 +493,54 @@ proc rearm*(c: var Conn, readMs = 0, totalMs = 0) =
   discard totalMs
   c.readMs = readMs
 
+proc startRead(c: Conn): Future[string] =
+  ## Begin one read, resuming the one a previous `recvWithin` parked rather than
+  ## starting a second read on the same socket (which would race it for the bytes).
+  if not c.parked.isNil and not c.parked.fut.isNil:
+    result = c.parked.fut
+    c.parked.fut = nil
+    return
+  when defined(ssl):
+    if not c.ssl.isNil: return sslRead(c)
+  recv(c.fd, naviReadBufSize)
+
 proc recvSome*(c: Conn): Future[string] {.async.} =
   ## One chunk of up to `naviReadBufSize` bytes; "" means the peer closed. Bounded by
   ## `readMs` (the per-read stall timeout) when set; on expiry the pending read is
-  ## abandoned and TimeoutError is raised.
-  var readFut: Future[string]
-  when defined(ssl):
-    readFut = if not c.ssl.isNil: sslRead(c) else: recv(c.fd, naviReadBufSize)
-  else:
-    readFut = recv(c.fd, naviReadBufSize)
+  ## abandoned and TimeoutError is raised (terminal: the caller tears the connection
+  ## down). A read parked by an earlier `recvWithin` is resumed here, so its bytes are
+  ## delivered to this caller instead of being lost.
+  let readFut = c.startRead()
   if c.readMs > 0 and not await withTimeout(readFut, c.readMs):
     raise newException(response.TimeoutError, readTimeoutMsg(c.readMs))
   return await readFut
+
+proc recvWithin*(c: Conn, ms: int): Future[tuple[timedOut: bool, data: string]] {.async.} =
+  ## A bounded read that leaves the connection usable when it expires: waits at most
+  ## `ms` for a chunk, otherwise reports `timedOut` with the read PARKED rather than
+  ## dropped. The `Expect: 100-continue` gate uses it to wait for the interim response
+  ## and then keep reading the same connection, which a plain `recvSome` + read
+  ## timeout cannot do (that one is terminal).
+  ##
+  ## asyncdispatch has no cancellation, so the abandoned `recvSome`/`sslRead` stays
+  ## parked on the socket and would swallow the bytes the real response read then
+  ## needs. Parking it in `Conn.parked` hands those bytes to the next read instead.
+  if ms <= 0: return (true, "")
+  let readFut = c.startRead()
+  if not await withTimeout(readFut, ms):
+    if not c.parked.isNil: c.parked.fut = readFut
+    return (true, "")
+  return (false, await readFut)
+
+proc discardParked(c: Conn) =
+  ## Retire a parked read on teardown. Nobody will await it, and an asyncdispatch
+  ## future that fails unobserved orphans its injected stack trace at process exit
+  ## (a valgrind-visible leak), so observe the outcome from a callback and drop it.
+  if c.parked.isNil or c.parked.fut.isNil: return
+  let fut = c.parked.fut
+  c.parked.fut = nil
+  fut.addCallback(proc() {.gcsafe.} =
+    if fut.failed: discard fut.error)
 
 proc shutdownConn*(c: Conn) =
   ## Shut the socket down in both directions so a pending read or write unblocks
@@ -528,6 +578,7 @@ proc closeSync*(c: Conn) =
   if not c.state.isNil:
     if c.state[] == csClosed: return    # idempotent; stops a double-free
     c.state[] = csClosed
+  c.discardParked()
   freeConn(c)
 
 proc close*(c: Conn): Future[void] {.async.} =
@@ -541,6 +592,7 @@ proc close*(c: Conn): Future[void] {.async.} =
     c.state[] = csClosed
     shutdownConn(c)
     await sleepAsync(0)
+  c.discardParked()
   freeConn(c)
 
 proc sleep*(ms: int): Future[void] = sleepAsync(ms)
