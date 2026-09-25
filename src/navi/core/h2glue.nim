@@ -71,14 +71,11 @@ proc h2ConnectHeaderList*(url: Url, protocol: string, extra: Headers): seq[Heade
 proc h2TrailerList*(req: Request): seq[HeaderPair] =
   ## Request trailer fields as HPACK pairs (lowercased names). Pseudo-headers and
   ## fields that are meaningless or forbidden in a trailer section (framing,
-  ## routing, and `Trailer` itself, RFC 9110 6.5.1) are dropped.
+  ## routing, and `Trailer` itself, RFC 9110 6.5.1) are dropped -- through the shared
+  ## `isForbiddenTrailer`, which h1 and h3 filter with too (#296).
   for (name, value) in req.trailers.pairs:
-    let lower = name.toLowerAscii
-    if lower.len == 0 or lower[0] == ':': continue
-    if lower in ["host", "connection", "keep-alive", "proxy-connection",
-                 "transfer-encoding", "upgrade", "content-length", "te", "trailer"]:
-      continue
-    result.add((lower, value))
+    if isForbiddenTrailer(name): continue
+    result.add((name.toLowerAscii, value))
 
 proc toResponse*(r: H2Response): Response =
   var headers: Headers

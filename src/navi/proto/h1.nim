@@ -44,10 +44,15 @@ proc serializeHead*(req: Request, chunked = false): string =
       result.add("Transfer-Encoding: chunked\r\n")
     # Advertise which fields arrive as trailers (RFC 9110 6.6.2). Recommended so an
     # intermediary keeps them; only added when the caller did not set it themselves.
+    # Only the names `finalChunk` will actually emit are listed: a forbidden trailer
+    # name is filtered there (#296), so advertising it would promise a field that
+    # never arrives.
     if req.trailers.len > 0 and not req.headers.contains("trailer"):
       var names: seq[string]
-      for (k, _) in req.trailers.pairs: names.add(k)
-      result.add("Trailer: " & names.join(", ") & "\r\n")
+      for (k, _) in req.trailers.pairs:
+        if not isForbiddenTrailer(k): names.add(k)
+      if names.len > 0:
+        result.add("Trailer: " & names.join(", ") & "\r\n")
   elif not req.headers.contains("content-length"):
     if req.body.len > 0:
       result.add("Content-Length: " & $req.body.len & "\r\n")
@@ -81,8 +86,15 @@ proc encodeChunk*(data: string): string =
 proc finalChunk*(req: Request): string =
   ## The terminating zero-length chunk plus any request trailer fields (RFC 9110
   ## 7.1.2). With no trailers this is exactly `chunkTerminator` ("0\r\n\r\n").
+  ##
+  ## Fields that must not appear in a trailer section (framing and routing fields,
+  ## pseudo-headers, `Trailer` itself) are dropped through the shared
+  ## `isForbiddenTrailer`, the same filter h2 and h3 apply. Without it a
+  ## `Content-Length` or `Transfer-Encoding` smuggled in as a trailer would be written
+  ## straight after the zero chunk, where a lenient intermediary may act on it (#296).
   result = "0\r\n"
   for (k, v) in req.trailers.pairs:
+    if isForbiddenTrailer(k): continue
     result.add(k & ": " & v & "\r\n")
   result.add("\r\n")
 

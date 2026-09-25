@@ -168,7 +168,7 @@ when defined(naviHttp3):
     var fwdTrl: seq[(string, string)]
     for k, v in req.trailers:
       let lk = k.toLowerAscii
-      if lk.len > 0 and lk[0] != ':' and lk notin h3SkipHeaders and lk notin ["te", "trailer"]:
+      if not isForbiddenTrailer(lk):     # the shared h1/h2/h3 trailer filter (#296)
         fwdTrl.add((lk, v))
     let conn = h3Open(ep.host, ep.port, sni = req.url.host,
                       caFile = client.config.tls.caFile,
