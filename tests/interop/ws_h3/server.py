@@ -1,14 +1,42 @@
-# HTTP/3 server (aioquic) that advertises SETTINGS_ENABLE_CONNECT_PROTOCOL and
-# accepts a WebSocket Extended CONNECT (RFC 9220), echoing WebSocket frames back.
-# Client frames are masked; server frames are unmasked (RFC 6455). aioquic handles
-# QUIC/h3; we do RFC 6455 framing over the CONNECT stream's DATA.
+# HTTP/3 server (aioquic) that accepts a WebSocket Extended CONNECT (RFC 9220) and
+# echoes WebSocket frames back. Client frames are masked; server frames are unmasked
+# (RFC 6455). aioquic handles QUIC/h3; we do RFC 6455 framing over the CONNECT
+# stream's DATA.
+#
+# WS_ENABLE_CONNECT=0 flips the server into the "no Extended CONNECT" mode used by
+# the RFC 9220 gate test: its SETTINGS carries ENABLE_CONNECT_PROTOCOL=0, so a
+# conforming client must refuse to send the CONNECT at all. It still answers one
+# with 200 if it arrives, so a client that ignores the setting is caught by the test
+# rather than masked by a server-side rejection.
 import asyncio, os, struct
 from aioquic.asyncio import serve
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import ProtocolNegotiated
-from aioquic.h3.connection import H3Connection
+from aioquic.h3.connection import H3Connection, Setting
 from aioquic.h3.events import HeadersReceived, DataReceived
+
+ENABLE_CONNECT = os.environ.get("WS_ENABLE_CONNECT", "1") != "0"
+
+# aioquic advertises SETTINGS_ENABLE_CONNECT_PROTOCOL=1 unconditionally, so a server
+# without Extended CONNECT support has to override the local settings. Fail loudly if
+# a future aioquic renames the hook, rather than silently testing nothing.
+if not hasattr(H3Connection, "_get_local_settings"):
+    raise RuntimeError("aioquic: no _get_local_settings hook to disable "
+                       "SETTINGS_ENABLE_CONNECT_PROTOCOL")
+
+
+class NoConnectProtocolH3(H3Connection):
+    """An h3 connection whose SETTINGS says Extended CONNECT is NOT available.
+
+    RFC 8441 3 (which RFC 9220 carries into h3) treats any value other than 1 as
+    unsupported, so 0 is equivalent to omitting the setting.
+    """
+
+    def _get_local_settings(self):
+        settings = dict(super()._get_local_settings())
+        settings[Setting.ENABLE_CONNECT_PROTOCOL] = 0
+        return settings
 
 
 def parse_frames(buf):
@@ -61,9 +89,11 @@ class WsH3Protocol(QuicConnectionProtocol):
 
     def quic_event_received(self, event):
         if isinstance(event, ProtocolNegotiated):
-            # enable_webtransport advertises SETTINGS_ENABLE_CONNECT_PROTOCOL=1,
-            # which is what an Extended CONNECT (WebSocket) client requires.
-            self._http = H3Connection(self._quic, enable_webtransport=True)
+            # An Extended CONNECT (WebSocket) client requires
+            # SETTINGS_ENABLE_CONNECT_PROTOCOL=1, which aioquic always advertises;
+            # NoConnectProtocolH3 is the opposite, for the gate test.
+            cls = H3Connection if ENABLE_CONNECT else NoConnectProtocolH3
+            self._http = cls(self._quic, enable_webtransport=ENABLE_CONNECT)
         if self._http is not None:
             for e in self._http.handle_event(event):
                 self._h3_event(e)
@@ -95,7 +125,7 @@ async def main():
     cfg.idle_timeout = float(os.environ.get("WS_IDLE_TIMEOUT", "60"))
     cfg.load_cert_chain(os.environ["WS_CERT"], os.environ["WS_KEY"])
     await serve(host, port, configuration=cfg, create_protocol=WsH3Protocol)
-    print("WS_H3_SERVER_READY", flush=True)
+    print("WS_H3_SERVER_READY connect_protocol=%d" % int(ENABLE_CONNECT), flush=True)
     await asyncio.Future()
 
 

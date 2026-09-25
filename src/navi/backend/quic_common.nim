@@ -227,11 +227,37 @@ proc freeStream*(qc: QuicConn, sid: int64) =
 # tunnelSend/tunnelRecv move frame bytes, tunnelClose half-closes. The background
 # reader drives the socket, so these just queue work and wake it.
 
+const settingsWaitId = -1'i64
+  ## Synthetic `recvReady` key for the peer-SETTINGS park below. Real stream ids are
+  ## never negative, so it cannot collide with one (and a WebSocket owns a dedicated
+  ## connection, so there is only ever one waiter).
+
+proc awaitPeerSettings(qc: QuicConn) {.async.} =
+  ## Park until the peer's SETTINGS frame has been received (RFC 9114 7.2.4). The
+  ## reader completes every parked progress future each cycle, so this re-checks the
+  ## C-side flag once per cycle, exactly like a parked header/body pull. Returns
+  ## early if the connection dies; the caller re-checks `alive`.
+  while qc.alive and navi_h3_peer_settings_seen(qc.c) == 0:
+    await waitProgress(qc, settingsWaitId)
+
 proc openConnect*(qc: QuicConn, path: string, headers: seq[(string, string)],
                   protocol: string): Future[tuple[sid: int64, status: int]] {.async.} =
   ## Open an Extended CONNECT tunnel with `:protocol` and await its :status. The
   ## stream is left open for tunnelSend/tunnelRecv.
+  ##
+  ## Waits for the peer's SETTINGS and requires SETTINGS_ENABLE_CONNECT_PROTOCOL
+  ## first (RFC 9220 / RFC 8441 3): a server that does not support Extended CONNECT
+  ## then fails fast with a clear `ProtocolError` instead of late via a stream reset
+  ## (#393). The h2 mux gates the same way (h2mux_common.openConnect), with the same
+  ## error type and wording. The whole open is bounded by the caller's timeout guard
+  ## (`config.totalMs`), as on h2.
   if not qc.alive: raise newException(QuicError, "navi HTTP/3 connection closed")
+  await qc.awaitPeerSettings()
+  if not qc.alive:
+    raise newException(QuicError,
+      "navi HTTP/3 connection closed before the server's SETTINGS")
+  if navi_h3_peer_allows_connect(qc.c) == 0:
+    raise newException(response.ProtocolError, h3NoConnectProtocolErr)
   let reqHdr = encodeH3Fields(headers)
   let sid = navi_h3_open_connect(qc.c, path.cstring, reqHdr.cstring, protocol.cstring)
   if sid < 0: raise newException(QuicError, "navi: HTTP/3 Extended CONNECT failed to open")

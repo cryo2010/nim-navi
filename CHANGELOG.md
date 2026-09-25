@@ -101,6 +101,26 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **WebSocket over HTTP/3 now gates its Extended CONNECT on the server's
+  `SETTINGS_ENABLE_CONNECT_PROTOCOL`.** The h3 path opened the CONNECT stream as soon
+  as the QUIC handshake finished, without waiting for the peer's SETTINGS or checking
+  that it allowed the extended CONNECT protocol, contrary to RFC 9220 / RFC 8441 3
+  (navi advertised the setting to the server, which says nothing about the server).
+  An origin that does not support WebSocket over h3 therefore failed late and
+  obscurely, via a stream reset or an h3 error, where the h2 path fails immediately
+  with a clear diagnostic. All three h3 clients (sync, asyncdispatch, chronos) now
+  drive the connection until the peer's SETTINGS frame lands, bounded by the same
+  connect/handshake deadline, and then raise the h2 path's `ProtocolError` -- "navi:
+  server does not support WebSocket over HTTP/3 (no SETTINGS_ENABLE_CONNECT_PROTOCOL);
+  use an h1 WebSocket" -- before anything is submitted (#393).
+- **The h3 driver no longer drops stream data that arrives before its nghttp3 session
+  is bound.** The session is created once the QUIC handshake completes, but the
+  server's control stream (carrying its SETTINGS) can ride in the very datagram that
+  completes the handshake, and ngtcp2 never re-delivers what the receive callback
+  consumed, so those bytes were lost. They are now parked (bounded) and replayed into
+  nghttp3 at bind time, with their flow-control offsets extended then. Found while
+  adding the Extended CONNECT gate above, which otherwise waited forever for a
+  SETTINGS frame that had already been thrown away (#393).
 - **A misbehaving SSE server can no longer spin the reconnect loop.** The reconnect
   delay had no lower bound, so a server that sent `retry: 0` reduced it to
   `sleep(0)`, and a server that answered 200 and closed with no events reset the
