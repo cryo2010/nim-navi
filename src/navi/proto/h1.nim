@@ -70,12 +70,13 @@ proc serializeRequest*(req: Request): string =
 const chunkTerminator* = "0\r\n\r\n"
 
 const h1CoalesceSize* = 16 * 1024
-  ## Target size for the streamed-upload write buffer (#299). A producer that yields
-  ## many tiny chunks would otherwise cost one socket write -- and, under TLS, one
-  ## record with its own header and MAC -- per chunk. The send loop buffers raw body
-  ## bytes until it holds this much, then frames the buffer as a single chunk and
-  ## writes it; a producer chunk already this large is framed and written on its own.
-  ## 16 KiB is the maximum TLS record payload, so a full buffer still fits one record.
+  ## Cap on the streamed-upload write buffer (#299). A producer that yields many tiny
+  ## chunks would otherwise cost one socket write -- and, under TLS, one record with
+  ## its own header and MAC -- per chunk. The send loop buffers raw body bytes and
+  ## flushes what it holds as a single chunk BEFORE an append would take the buffer
+  ## past this size, so a framed buffer never exceeds it; a producer chunk already
+  ## this large is framed and written on its own. 16 KiB is the maximum TLS record
+  ## payload, so a full buffer always fits one record.
 
 proc addChunk*(buf: var string, data: string) =
   ## Append one HTTP/1.1 chunked-transfer frame for `data` to `buf`. Lets the send

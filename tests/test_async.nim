@@ -7,6 +7,7 @@ import navi/core/pool      # for pool.idleCount in the streaming lifecycle tests
 import navi/core/response as naviresp  # navi's TimeoutError (std/net also defines one)
 import std/[monotimes, times]
 import ./support
+from navi/proto/h1 import h1CoalesceSize  # the streamed-upload write-buffer cap
 
 suite "asyncdispatch entry end to end":
   test "the async client should return a parsed response for a GET to localhost":
@@ -384,6 +385,30 @@ suite "asyncdispatch entry end to end":
     check res.body == "0123456789".repeat(1000)
     joinThread(th)
     check chunks == 1     # 10 KB of tiny chunks -> one buffered write
+
+  test "the coalescing buffer should never be framed above h1CoalesceSize (#299)":
+    const port = 9224
+    var th: Thread[ServerCtx]
+    var chunks = 0
+    var biggest = 0
+    startUploadEcho(th, port, addr chunks, addr biggest)
+    let half = "y".repeat(h1CoalesceSize - 1)
+    proc run(): Future[Response] {.async.} =
+      let left = new int
+      left[] = 2
+      proc getChunks(): Future[string] {.async.} =
+        if left[] <= 0: return ""
+        dec left[]
+        return half
+      return await newNavi().put("http://127.0.0.1:" & $port & "/", body = getChunks)
+    let res = waitFor run()
+    check res.status == 200
+    check res.body == half & half
+    joinThread(th)
+    # The second chunk flushes the first BEFORE appending, so neither frame exceeds
+    # the cap (one frame of 2 * (16 KiB - 1) would).
+    check chunks == 2
+    check biggest == h1CoalesceSize - 1
 
   test "an async producer should pipe a streaming download into an upload":
     # The flagship pipe: stream() a body from one server and feed it, chunk by chunk,

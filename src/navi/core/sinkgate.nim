@@ -40,7 +40,12 @@ type
     hops*: int                 ## redirect hops taken so far (followRedirects)
     redirectLimit*: int        ## the configured redirect limit
     hopReplayable*: bool       ## the current hop's request body may be replayed
-                               ## (so a non-replayable 307/308 IS surfaced)
+                               ## (so a non-replayable body-preserving hop IS
+                               ## surfaced -- see `hopVerb`)
+    hopVerb*: HttpVerb         ## the current hop's request method, which decides
+                               ## whether the hop would carry the body forward
+                               ## (`preservesBody`: 307/308 always, 301/302 on a
+                               ## GET/HEAD that is never rewritten)
     digestReady*: bool         ## a digest 401 challenge could still be answered on
                                ## this hop (so its 401 body must not be delivered)
     wantsThrow*: bool          ## throwHttpErrors is on (a non-2xx will be thrown)
@@ -60,8 +65,9 @@ proc wantsDelivery*(g: SinkGate, httpVersion: string, status: int,
   ## `false` (do not deliver) whenever the policy layer will instead follow, retry,
   ## digest-replay, or throw it:
   ##   * the protocol is not allowed (enforceProtocol will throw);
-  ##   * it is a redirect that will be followed (a NON-replayable 307/308 is the
-  ##     exception: it is surfaced, so it IS delivered);
+  ##   * it is a redirect that will be followed (a redirect that would carry a
+  ##     NON-replayable body forward is the exception: `followRedirects` breaks on
+  ##     it, so it is surfaced and IS delivered);
   ##   * a digest challenge that will be answered (401 with a usable challenge while
   ##     digest is still armed for this hop);
   ##   * a retryable status with attempts remaining;
@@ -70,10 +76,12 @@ proc wantsDelivery*(g: SinkGate, httpVersion: string, status: int,
     return false
   let location = headers.get("location")
   if shouldFollowRedirect(status, g.hops, g.redirectLimit, location):
-    # A redirect that would be followed. The one carve-out is a non-replayable
-    # 307/308: followRedirects breaks rather than replay it, so it is surfaced and
-    # must be delivered. Everything else is not the final response.
-    if not (not g.hopReplayable and (status == 307 or status == 308)):
+    # A redirect that would be followed. The one carve-out mirrors the break in
+    # `followRedirects` exactly: a hop that would carry the body forward
+    # (`preservesBody`) while this hop's request is NOT replayable cannot be
+    # followed, so that response is surfaced and must be delivered. Everything else
+    # is not the final response.
+    if g.hopReplayable or not preservesBody(status, g.hopVerb):
       return false
   when not defined(js):
     if g.digestReady and status == 401:

@@ -31,6 +31,7 @@ type ServerCtx* = object
   payload: string
   failures: int
   count: ptr int        ## when set, count the requests the server answered
+  maxChunk: ptr int     ## when set, record the largest chunk frame received
 
 proc waitFlag*(flag: ptr bool) =
   ## Poll a cross-thread bool (a server thread's readiness/closed signal), yielding
@@ -555,7 +556,9 @@ proc serveUploadEcho(ctx: ServerCtx) {.thread.} =
   ## Read a chunked request body and echo the decoded bytes back as the
   ## response body. Used to verify streaming uploads. When `count` is set, report
   ## how many non-final chunk frames arrived on the wire (the write-coalescing test
-  ## checks that many small producer chunks become few wire chunks).
+  ## checks that many small producer chunks become few wire chunks). When `maxChunk`
+  ## is set, report the largest frame size too (the coalescing buffer must never be
+  ## framed above `h1CoalesceSize`).
   var server = newSocket()
   server.setSockOpt(OptReuseAddr, true)
   server.bindAddr(Port(ctx.port), "127.0.0.1")
@@ -572,6 +575,7 @@ proc serveUploadEcho(ctx: ServerCtx) {.thread.} =
       discard client.recv(2) # final CRLF
       break
     if ctx.count != nil: inc ctx.count[]
+    if ctx.maxChunk != nil and n > ctx.maxChunk[]: ctx.maxChunk[] = n
     var chunk = ""
     while chunk.len < n:
       let part = client.recv(n - chunk.len)
@@ -585,11 +589,14 @@ proc serveUploadEcho(ctx: ServerCtx) {.thread.} =
   client.close()
   server.close()
 
-proc startUploadEcho*(th: var Thread[ServerCtx], port: int, chunks: ptr int = nil) =
-  ## `chunks`, when given, receives the number of wire chunk frames the body arrived in.
+proc startUploadEcho*(th: var Thread[ServerCtx], port: int, chunks: ptr int = nil,
+                      maxChunk: ptr int = nil) =
+  ## `chunks`, when given, receives the number of wire chunk frames the body arrived in;
+  ## `maxChunk`, when given, receives the size of the largest of those frames.
   var ready = false
   createThread(th, serveUploadEcho,
-               ServerCtx(port: port, ready: addr ready, count: chunks))
+               ServerCtx(port: port, ready: addr ready, count: chunks,
+                         maxChunk: maxChunk))
   while not ready: sleep(1)
 
 proc serveTruncated(ctx: ServerCtx) {.thread.} =

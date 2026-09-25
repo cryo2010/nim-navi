@@ -29,6 +29,37 @@ proc raiseHttpError(req: Request, resp: Response) =
     msg: $req.verb & " " & $req.url & " -> " & $resp.status & " " & resp.reason,
     response: resp)
 
+template coalesceChunk(conn, pending, chunk: typed) =
+  ## Hand one producer chunk to the streamed-upload write buffer (#299). Shared by
+  ## the async-producer and sync `bodyStream` branches of `sendRequest`, which
+  ## differ only in how they pull a chunk.
+  ##
+  ## A producer yielding many tiny chunks would otherwise cost one socket write --
+  ## and, under TLS, one record with its own header and MAC -- per chunk, so small
+  ## chunks accumulate in `pending` and leave as ONE wire chunk: chunk boundaries
+  ## need not match producer boundaries (RFC 9112 7.1), only the framing must stay
+  ## valid. The buffer is flushed BEFORE an append that would take it past
+  ## `h1CoalesceSize`, so a framed buffer never exceeds one TLS record.
+  ##
+  ## Expanded inside `sendRequest`, itself expanded in an `{.async.}` proc on the
+  ## async backends and in a plain proc on the sync one (where `await` is the
+  ## identity template), so the `await`s below are correct in both.
+  mixin await, sendAll
+  if chunk.len >= h1CoalesceSize:
+    # Already fills a write on its own: frame it directly instead of copying it
+    # through the buffer. Anything still buffered is packed into the SAME write, so
+    # making way for it costs no extra syscall or TLS record.
+    var framed = newStringOfCap(pending.len + chunk.len + 40)
+    framed.addChunk(pending)             # a no-op when nothing is buffered
+    framed.addChunk(chunk)
+    pending.setLen(0)
+    await sendAll(conn, framed)
+  else:
+    if pending.len + chunk.len > h1CoalesceSize:
+      await sendAll(conn, encodeChunk(pending))
+      pending.setLen(0)
+    pending.add(chunk)
+
 template sendRequest(conn, req: typed; asyncStream: typed = nil) =
   ## Write the request, streaming the body as chunked transfer-encoding when a
   ## producer is set. A buffered body with trailers is also sent chunked (trailers
@@ -46,11 +77,7 @@ template sendRequest(conn, req: typed; asyncStream: typed = nil) =
   if asyncBody:
     when compiles(await asyncStream()):
       await sendAll(conn, serializeHead(req, chunked = true))
-      # Coalesce small producer chunks into one write (#299): a producer yielding
-      # many tiny chunks would otherwise cost a socket write -- and a TLS record,
-      # with its own header and MAC -- each. The buffer holds raw body bytes and is
-      # framed as ONE chunk when it is flushed: wire chunk boundaries need not match
-      # producer boundaries (RFC 9112 7.1), only the framing must stay valid.
+      # Small producer chunks are coalesced into one write (see coalesceChunk, #299).
       var pending = newStringOfCap(h1CoalesceSize)
       while true:
         # The producer is a bare closure (portable spelling, no chronos raises
@@ -61,18 +88,7 @@ template sendRequest(conn, req: typed; asyncStream: typed = nil) =
           {.cast(raises: [CatchableError]).}:
             chunk = await asyncStream()
         if chunk.len == 0: break
-        if chunk.len >= h1CoalesceSize:
-          # Already big enough to fill a write on its own: frame it directly instead
-          # of copying it through the buffer.
-          if pending.len > 0:
-            await sendAll(conn, encodeChunk(pending))
-            pending.setLen(0)
-          await sendAll(conn, encodeChunk(chunk))
-        else:
-          pending.add(chunk)
-          if pending.len >= h1CoalesceSize:
-            await sendAll(conn, encodeChunk(pending))
-            pending.setLen(0)
+        coalesceChunk(conn, pending, chunk)
       # Producer EOF: the terminator (plus any trailers) rides along with whatever is
       # still buffered, so a small streamed upload costs one body write in total.
       var tail = newStringOfCap(pending.len + 64)
@@ -81,23 +97,14 @@ template sendRequest(conn, req: typed; asyncStream: typed = nil) =
       await sendAll(conn, tail)
   elif req.bodyStream != nil:
     await sendAll(conn, serializeHead(req, chunked = true))
-    var pending = newStringOfCap(h1CoalesceSize)   # see the coalescing note above
+    var pending = newStringOfCap(h1CoalesceSize)   # see coalesceChunk above
     while true:
       # single-threaded client; the producer need not be gcsafe (see h1.emitBody)
       var chunk: string
       {.cast(gcsafe).}:
         chunk = req.bodyStream()
       if chunk.len == 0: break
-      if chunk.len >= h1CoalesceSize:
-        if pending.len > 0:
-          await sendAll(conn, encodeChunk(pending))
-          pending.setLen(0)
-        await sendAll(conn, encodeChunk(chunk))
-      else:
-        pending.add(chunk)
-        if pending.len >= h1CoalesceSize:
-          await sendAll(conn, encodeChunk(pending))
-          pending.setLen(0)
+      coalesceChunk(conn, pending, chunk)
     var tail = newStringOfCap(pending.len + 64)
     tail.addChunk(pending)
     tail.add(finalChunk(req))
@@ -782,10 +789,11 @@ template followRedirects*(client, startReq, resp: typed; asyncStream: typed = ni
   ## `await`s run in the caller's async proc. `asyncStream` (async only) is the
   ## awaited upload producer for the initial send; a streamed request is
   ## non-replayable, so it breaks before any redirect rewrite that would carry its
-  ## body forward (below) and the producer is never pulled a second time. `userSink`/`gate` (when set) stream the
-  ## FINAL body: this loop refreshes the gate's per-hop fields (hops, limit, whether
-  ## this hop is replayable, and whether digest is still armed) before each `run`, so
-  ## the drain site can tell whether the response is the surfaced one.
+  ## body forward (below) and the producer is never pulled a second time.
+  ## `userSink`/`gate` (when set) stream the FINAL body: this loop refreshes the
+  ## gate's per-hop fields (hops, limit, whether this hop is replayable, its verb,
+  ## and whether digest is still armed) before each `run`, so the drain site can tell
+  ## whether the response is the surfaced one.
   mixin BodySink
   var rreq = startReq
   let digestOrigin = originKey(startReq.url)   # digest creds only for this origin
@@ -796,6 +804,7 @@ template followRedirects*(client, startReq, resp: typed; asyncStream: typed = ni
       gate.hops = hops
       gate.redirectLimit = limit
       gate.hopReplayable = isReplayable(rreq)
+      gate.hopVerb = rreq.verb          # with hopReplayable: does this hop break?
       # Digest is only in play on the original origin, before an Authorization is set
       # (mirrors maybeDigest's own guard); off any other hop the 401 is surfaced.
       gate.digestReady = client.config.auth.kind == akDigest and

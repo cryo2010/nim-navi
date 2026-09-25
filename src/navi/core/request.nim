@@ -293,26 +293,23 @@ proc validateRequest*(req: Request) =
   ## crafted redirect Location whose host carries CRLF) split the request into
   ## extra headers or a smuggled request; on h2/h3 the field is simply invalid.
   ## Called on every dispatch, so both the initial request and each redirect hop
-  ## are checked.
-  proc hasCtl(s: string): bool =
-    for c in s:
-      if c in {'\r', '\n', '\0'}: return true
-    false
-  if hasCtl(req.url.host):
+  ## are checked. The byte test itself is the shared `hasCtlChars` (headers.nim),
+  ## which the WebSocket handshake applies to its own field set.
+  if hasCtlChars(req.url.host):
     raise newException(ValueError,
       "navi: invalid request host (contains CR, LF, or NUL)")
   # The path/query are written raw onto the HTTP/1.1 request line (h1.serializeHead),
   # so a CR/LF there splits the request line and injects headers just like a header
   # value does. std/uri passes these through verbatim, so guard them here too (#274).
-  if hasCtl(req.url.requestTarget):
+  if hasCtlChars(req.url.requestTarget):
     raise newException(ValueError,
       "navi: invalid request target (path or query contains CR, LF, or NUL)")
   for (k, v) in req.headers.pairs:
-    if hasCtl(k) or hasCtl(v):
+    if hasCtlChars(k) or hasCtlChars(v):
       raise newException(ValueError,
         "navi: invalid header '" & k & "' (name or value contains CR, LF, or NUL)")
   for (k, v) in req.trailers.pairs:
-    if hasCtl(k) or hasCtl(v):
+    if hasCtlChars(k) or hasCtlChars(v):
       raise newException(ValueError,
         "navi: invalid trailer '" & k & "' (name or value contains CR, LF, or NUL)")
 

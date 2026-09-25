@@ -1,6 +1,6 @@
 ## Redirect request rewriting: method changes and credential stripping.
 import unittest
-import navi/core/[headers, url, request, redirect]
+import navi/core/[headers, url, request, redirect, sinkgate]
 
 proc req(verb: HttpVerb, target: string): Request =
   var h = initHeaders()
@@ -90,3 +90,53 @@ suite "streamed bodies across a redirect (#295)":
     check hop.bodyStream == nil
     check not hop.hasStreamedBody
     check not preservesBody(302, r.verb)
+
+suite "sink gate redirect delivery":
+  # The gate must mirror followRedirects exactly: a hop is surfaced (so its body IS
+  # delivered to the caller's sink) only when the hop would carry a non-replayable
+  # body forward, which is `preservesBody` -- not 307/308 alone.
+  proc gateFor(verb: HttpVerb, replayable: bool): SinkGate =
+    result = newSinkGate()
+    result.hops = 0
+    result.redirectLimit = 5
+    result.hopReplayable = replayable
+    result.hopVerb = verb
+    result.http = {H1, H2}
+
+  proc redirectHeaders(): Headers =
+    result = initHeaders()
+    result.add("location", "https://b.test/y")
+
+  test "a non-replayable GET taking a 301 is surfaced, so its body is delivered":
+    # followRedirects breaks here (301 keeps a GET's body), so the 301 IS the final
+    # response and its body belongs to the sink.
+    let g = gateFor(GET, replayable = false)
+    check g.wantsDelivery("HTTP/1.1", 301, redirectHeaders())
+    check g.wantsDelivery("HTTP/1.1", 302, redirectHeaders())
+
+  test "a non-replayable POST taking a 301 is followed, so nothing is delivered":
+    # 301 rewrites the POST to a bodyless GET: no stream to replay, the hop is
+    # followed, and the redirect body must never reach the sink.
+    let g = gateFor(POST, replayable = false)
+    check not g.wantsDelivery("HTTP/1.1", 301, redirectHeaders())
+    check not g.wantsDelivery("HTTP/1.1", 302, redirectHeaders())
+    check not g.wantsDelivery("HTTP/1.1", 303, redirectHeaders())
+
+  test "a non-replayable POST taking a 307 is surfaced, so its body is delivered":
+    let g = gateFor(POST, replayable = false)
+    check g.wantsDelivery("HTTP/1.1", 307, redirectHeaders())
+    check g.wantsDelivery("HTTP/1.1", 308, redirectHeaders())
+
+  test "a replayable GET taking a 301 is followed, so nothing is delivered":
+    let g = gateFor(GET, replayable = true)
+    check not g.wantsDelivery("HTTP/1.1", 301, redirectHeaders())
+    check not g.wantsDelivery("HTTP/1.1", 307, redirectHeaders())
+
+  test "a redirect past the limit is surfaced whatever the hop looks like":
+    let g = gateFor(POST, replayable = true)
+    g.hops = 5                     # the limit is spent: nothing more is followed
+    check g.wantsDelivery("HTTP/1.1", 302, redirectHeaders())
+
+  test "a 3xx without a Location is not a followable redirect":
+    let g = gateFor(GET, replayable = true)
+    check g.wantsDelivery("HTTP/1.1", 302, initHeaders())
