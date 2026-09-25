@@ -44,6 +44,27 @@ suite "incremental decoder across chunk boundaries":
     check feedSliced("gzip", member & member & member, 7) ==
       """{"ok":true}{"ok":true}{"ok":true}"""
 
+  test "the incremental decoder should decode a multi-frame zstd body (#244)":
+    # RFC 8878 4: a zstd body may be several concatenated frames, and libzstd starts
+    # the next one on the same DStream. The streaming decoder used to latch `done` at
+    # the first frame end and silently drop the rest (the buffered path did not).
+    let frame = hexToBytes("28b52ffd04585900007b226f6b223a747275657d6abe13c7")
+    check feedSliced("zstd", frame & frame, frame.len * 2) ==
+      """{"ok":true}{"ok":true}"""                  # both frames in one feed
+    check feedSliced("zstd", frame & frame, 1) == """{"ok":true}{"ok":true}"""
+    check feedSliced("zstd", frame & frame & frame, 7) ==
+      """{"ok":true}{"ok":true}{"ok":true}"""
+
+  test "the incremental decoder should reject trailing garbage after the last member":
+    # Trailing bytes that cannot start another member are a malformed body, not a
+    # silently ignored tail (at least as strict as curl).
+    let member = hexToBytes("1f8b0800000000000003ab56cacf56b22a292a4dad0500905fd4a70b000000")
+    expect ValueError:
+      discard feedSliced("gzip", member & "not-a-gzip-member", 64)
+    let frame = hexToBytes("28b52ffd04585900007b226f6b223a747275657d6abe13c7")
+    expect ValueError:
+      discard feedSliced("zstd", frame & "not-a-zstd-frame", 64)
+
 suite "CappedDecoder (the shared decode-and-cap helper)":
   let gz = hexToBytes("1f8b0800000000000003ab56cacf56b22a292a4dad0500905fd4a70b000000")
 
@@ -129,6 +150,24 @@ suite "multi-member gzip (RFC 1952)":
     let member = hexToBytes("1f8b0800000000000003ab56cacf56b22a292a4dad0500905fd4a70b000000")
     let body = member & member
     let payload = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n" &
+                  "Content-Length: " & $body.len & "\r\nConnection: close\r\n\r\n" & body
+    var th: Thread[ServerCtx]
+    startRaw(th, port, payload)
+
+    let res = newNavi().get("http://127.0.0.1:" & $port & "/")
+    check res.status == 200
+    check res.body == """{"ok":true}{"ok":true}"""
+    joinThread(th)
+
+
+suite "multi-frame zstd (RFC 8878)":
+  test "a buffered get should decode all concatenated zstd frames (#244)":
+    const port = 9234
+    # Two independent zstd frames of {"ok":true} concatenated: a valid zstd body, the
+    # zstd counterpart of a multi-member gzip body.
+    let frame = hexToBytes("28b52ffd04585900007b226f6b223a747275657d6abe13c7")
+    let body = frame & frame
+    let payload = "HTTP/1.1 200 OK\r\nContent-Encoding: zstd\r\n" &
                   "Content-Length: " & $body.len & "\r\nConnection: close\r\n\r\n" & body
     var th: Thread[ServerCtx]
     startRaw(th, port, payload)

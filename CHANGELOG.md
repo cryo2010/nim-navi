@@ -101,6 +101,14 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **A streamed `zstd` body made of several concatenated frames is decoded whole.**
+  RFC 8878 allows a zstd body to be a run of frames back to back, the way RFC 1952
+  allows a gzip body to be several members. The buffered path already decoded them
+  all, but the incremental decoder marked itself done at the first frame end, so a
+  streamed (or h2-muxed) multi-frame body was silently truncated to its first frame.
+  A completed frame is now treated as a clean boundary and decoding continues while
+  input remains, exactly as the gzip member path does. Trailing bytes after the last
+  member/frame are still rejected rather than ignored (#244).
 - **WebSocket over HTTP/3 now gates its Extended CONNECT on the server's
   `SETTINGS_ENABLE_CONNECT_PROTOCOL`.** The h3 path opened the CONNECT stream as soon
   as the QUIC handshake finished, without waiting for the peer's SETTINGS or checking

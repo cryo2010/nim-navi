@@ -252,6 +252,16 @@ proc decodeZstd(src: string, limit: int): string =
 # is decoded as it arrives instead of only once fully buffered. The C resources
 # are released by `=destroy` (there is no end-of-stream callback on a BodySink),
 # so a truncated stream still frees cleanly.
+#
+# Concatenation policy. gzip (RFC 1952) and zstd (RFC 8878 4) bodies may be several
+# members/frames back to back, and every one of them is part of the body: the decoder
+# resets at each boundary and keeps going while input remains, as curl and Go do.
+# brotli has no such framing, so a `br` body is exactly one stream and anything after
+# it is trailing data. Trailing bytes after the last member are never silently
+# dropped: bytes that cannot start another member fail the decode with "malformed
+# compressed body", and a trailing fragment that ends mid-member leaves the decoder
+# in `dsMidMember`, which `streamComplete` reports as a truncated body. That is at
+# least as strict as curl, which rejects trailing non-gzip bytes.
 
 type
   DecoderKind = enum dkZlib, dkBrotli, dkZstd
@@ -264,11 +274,12 @@ type
     dsMidMember  ## the last update stopped mid-member (more input expected); a
                  ## stream ending here is truncated
     dsAtBoundary ## the last update ended exactly at a clean stream boundary
-                 ## (Z_STREAM_END at a gzip member edge). More members may follow;
-                 ## a stream ending here is complete
-    dsDone       ## a terminal stream boundary was reached (brotli success / a
-                 ## completed zstd frame); no more input is decoded. Also a clean
-                 ## end, so a stream ending here is complete
+                 ## (Z_STREAM_END at a gzip member edge, or a completed zstd
+                 ## frame). More members/frames may follow; a stream ending here
+                 ## is complete
+    dsDone       ## a terminal stream boundary was reached (brotli success); no more
+                 ## input is decoded. Also a clean end, so a stream ending here is
+                 ## complete
   StreamDecoderObj = object
     state: DecoderState      ## lifecycle position (see DecoderState)
     scratch: string          ## reused decode-output buffer (grown once, not per chunk)
@@ -389,14 +400,30 @@ proc updateZstd(d: StreamDecoder, input: openArray[byte], capRemaining: int): st
     inb = ZstdBuffer(buf: cast[typeof(ZstdBuffer().buf)](unsafeAddr input[0]),
                      size: csize_t(input.len), pos: 0)
   decodeLoop(d, input, capRemaining):
-    if inb.pos >= inb.size: break              # input drained
+    if inb.pos >= inb.size: break              # input drained (the last step set the state)
+    d.state = dsMidMember                      # inside a frame until this step completes it
+    let wasAt = inb.pos                        # to prove the call made progress
     var outb = ZstdBuffer(buf: cast[typeof(ZstdBuffer().buf)](addr d.scratch[0]),
                           size: csize_t(d.scratch.len), pos: 0)
     let r = zstdStream(d.zds, outb, inb)
     if zstdIsError(r) != 0:
       raise newException(ValueError, "navi: malformed zstd body")
     emitScratch(d, result, int(outb.pos), capRemaining)
-    if r == 0: d.state = dsDone; break   # a full frame completed
+    if r == 0:
+      # A zstd body may be several concatenated frames (RFC 8878 4), exactly like a
+      # multi-member gzip body. A completed frame is a clean boundary, not the end of
+      # the body: libzstd starts the next frame on the same DStream, so keep decoding
+      # while input remains instead of latching `done` and dropping every later frame.
+      #
+      # `continue` is the one branch here that loops without an exit condition of its
+      # own, so it must never run on a call that did nothing. A frame end that consumed
+      # no input and produced no output cannot happen with a working libzstd (starting
+      # the next frame reads its magic at least), but a peer must not be able to spin
+      # the decode loop forever if one ever did. Stop instead, leaving the state at
+      # dsMidMember so the body is reported as truncated rather than silently short.
+      if inb.pos == wasAt and outb.pos == 0: break
+      d.state = dsAtBoundary
+      continue                                  # the loop top breaks once input drains
     if outb.pos == 0: break                     # no progress: needs more input
 
 proc update*(d: StreamDecoder, input: openArray[byte], capRemaining = -1): string =
