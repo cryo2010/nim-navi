@@ -202,6 +202,16 @@ proc serveWsMisbehave(ctx: WsSrv) {.thread.} =
       of "splitok":       # U+1F4A9 split across two frames: valid, must be accepted
         c.send(encodeFrame(opText, "\xf0\x9f", masked = false, fin = false))
         c.send(encodeFrame(opContinuation, "\x92\xa9", masked = false, fin = true))
+      of "closebad":      # RFC 6455 7.4: a close code that must never be sent (1006)
+        c.send(encodeFrame(opClose, closePayload(closeAbnormal), masked = false))
+      of "closeshort":    # RFC 6455 5.5.1: a close body is empty or >= 2 bytes
+        c.send(encodeFrame(opClose, "\x03", masked = false))
+      of "midclosebad":   # a close with a reserved code interrupts a streamed message
+        c.send(encodeFrame(opText, "aa", masked = false, fin = false))
+        c.send(encodeFrame(opClose, closePayload(closeAbnormal), masked = false))
+      of "midcloseok":    # a valid close interrupts a streamed message
+        c.send(encodeFrame(opText, "aa", masked = false, fin = false))
+        c.send(encodeFrame(opClose, closePayload(closeGoingAway, "later"), masked = false))
       of "eofnow":        # drop the transport with no close frame (abnormal closure)
         discard           # wsAcceptOne closes the socket on the way out
       else: discard

@@ -488,6 +488,23 @@ suite "websocket lifecycle guards (#289)":
     ws.close()                                 # a valid code still works
     joinThread(th)
 
+  test "close should accept a reserved code once the socket is already closed":
+    # `receive` reports 1006 on an abrupt EOF and 1005 for a codeless close, so a
+    # caller mirroring `m.closeCode` back on teardown must not blow up: the codes
+    # are rejected only while a close frame would actually go out.
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("eofnow")                          # dropped with no close frame
+    let m = ws.receive()
+    check m.closeCode == closeAbnormal
+    ws.close(m.closeCode)                      # idempotent teardown, not a raise
+    joinThread(th)
+
   test "a transport EOF should surface as 1006 on both read paths":
     var th: Thread[WsSrv]
     var port: int
@@ -605,6 +622,102 @@ suite "websocket streaming desync teardown (#284)":
     joinThread(th)
     check sawEof
     ws.close()
+
+suite "websocket streaming close validation (RFC 6455 5.5.1 / 7.4)":
+  # The streaming reader used to take the peer's close frame on trust: an invalid
+  # body surfaced as a clean `wmClose` and was echoed back verbatim. It now runs
+  # the same checks `receive` does, and a bad frame fails the connection (1002).
+  test "stream() should fail the connection on a close code that may not be sent":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("closebad")                        # close frame carrying 1006
+    expect ValueError:
+      discard ws.stream()
+    joinThread(th)
+    check sawEof                               # torn down, not leaked
+    ws.close()
+
+  test "stream() should fail the connection on a 1-byte close payload":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("closeshort")
+    expect ValueError:
+      discard ws.stream()
+    joinThread(th)
+    check sawEof
+    ws.close()
+
+  test "readChunk should fail the connection on an invalid close mid-message":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("midclosebad")
+    let r = ws.stream()
+    check r.readChunk() == "aa"                # the opening fragment
+    expect ValueError:
+      discard r.readChunk()                    # close with a reserved code
+    joinThread(th)
+    check sawEof
+    ws.close()
+
+  test "a valid close mid-message should still end the stream with its code":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("midcloseok")
+    let r = ws.stream()
+    check r.readChunk() == "aa"
+    check r.readChunk() == ""                  # the close truncates the message
+    check r.closeCode == closeGoingAway
+    joinThread(th)
+    ws.close()
+
+suite "websocket streamed-write guards":
+  # `write`/`finishWrite` used to poke a torn-down transport and fail with whatever
+  # the socket layer said; they now raise navi's IOError like `send`/`ping`.
+  test "write should raise on a closed WebSocket":
+    var th: Thread[WsSrv]
+    var port: int
+    startWsEcho(th, port)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.close()
+    expect IOError:
+      ws.stream(writer):
+        writer.write("too late")
+    joinThread(th)
+
+  test "finishWrite should raise on a closed WebSocket":
+    var th: Thread[WsSrv]
+    var port: int
+    startWsEcho(th, port)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.close()
+    expect IOError:
+      ws.stream(writer):                       # no writes: the fin frame alone
+        if writer == nil: discard
+    joinThread(th)
 
 suite "websocket keepalive":
   test "receive should raise TimeoutError when keepalive gets no response":
@@ -745,6 +858,23 @@ suite "websocket frame validation (RFC 6455)":
     check not a.offer(Frame(fin: false, opcode: opText, payload: "ok")).ready
     expect ValueError:
       discard a.offer(Frame(fin: true, opcode: opContinuation, payload: "\xff"))
+
+  test "parseClose should split a close frame into its code and reason":
+    let (code, reason) = parseClose(Frame(fin: true, opcode: opClose,
+                                          payload: closePayload(closeGoingAway, "later")))
+    check code == closeGoingAway
+    check reason == "later"
+
+  test "parseClose should report an absent code as 1005 and reject an invalid frame":
+    template closeFrame(body: string): Frame =
+      Frame(fin: true, opcode: opClose, payload: body)
+    check parseClose(closeFrame("")).code == closeNoStatus
+    expect ValueError:
+      discard parseClose(closeFrame("\x03"))               # a 1-byte body
+    expect ValueError:
+      discard parseClose(closeFrame(closePayload(closeAbnormal)))   # never on the wire
+    expect ValueError:
+      discard parseClose(closeFrame(closePayload(closeNormal) & "\xff"))  # bad UTF-8
 
   test "the assembler should reject invalid UTF-8 in a close reason":
     var a: WsAssembler

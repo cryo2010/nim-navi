@@ -323,6 +323,27 @@ proc validCloseCode(code: uint16): bool =
   (code >= 1000'u16 and code <= 1014'u16 and code notin [1004'u16, 1005'u16, 1006'u16]) or
   (code >= 3000'u16 and code <= 4999'u16)
 
+proc parseClose*(f: Frame): tuple[code: uint16, reason: string] =
+  ## Validate a received close frame and split it into code and reason. A 1-byte
+  ## body (RFC 6455 5.5.1), a code that must never appear on the wire (7.4), and a
+  ## reason that is not valid UTF-8 (8.1) are protocol errors and raise
+  ## `ValueError`; the caller fails the connection with 1002.
+  ##
+  ## RFC 6455 7.1.5: an absent status code surfaces as 1005 ("no status
+  ## received"), not 1000, so a codeless close is distinguishable from an explicit
+  ## normal closure. Shared by `offer` and the backends' streaming readers, so a
+  ## close frame is read by the same rules whichever way you receive it.
+  if f.payload.len == 1:
+    raise newException(ValueError, "navi: WebSocket close frame with a 1-byte payload")
+  result.code = closeNoStatus
+  if f.payload.len >= 2:
+    result.code = uint16((ord(f.payload[0]) shl 8) or ord(f.payload[1]))
+    if not validCloseCode(result.code):
+      raise newException(ValueError, "navi: invalid WebSocket close code " & $result.code)
+  result.reason = if f.payload.len > 2: f.payload[2 .. ^1] else: ""
+  if not isValidUtf8(result.reason):     # RFC 6455 8.1: the close reason must be valid UTF-8
+    raise newException(ValueError, "navi: invalid UTF-8 in a WebSocket close reason")
+
 proc offer*(a: var WsAssembler, f: Frame, maxMessageBytes = 0,
             rejectMasked = false): WsOutcome =
   ## Feed one decoded frame. Handles fragmentation (text/binary + continuation)
@@ -355,19 +376,7 @@ proc offer*(a: var WsAssembler, f: Frame, maxMessageBytes = 0,
   of opPong:
     discard
   of opClose:
-    if f.payload.len == 1:          # RFC 6455 5.5.1: a close body is empty or >= 2 bytes
-      raise newException(ValueError, "navi: WebSocket close frame with a 1-byte payload")
-    # RFC 6455 7.1.5: an absent status code surfaces as 1005 ("no status
-    # received"), not 1000, so a codeless close is distinguishable from an
-    # explicit normal closure.
-    var code = closeNoStatus
-    if f.payload.len >= 2:
-      code = uint16((ord(f.payload[0]) shl 8) or ord(f.payload[1]))
-      if not validCloseCode(code):
-        raise newException(ValueError, "navi: invalid WebSocket close code " & $code)
-    let reason = if f.payload.len > 2: f.payload[2 .. ^1] else: ""
-    if not isValidUtf8(reason):     # RFC 6455 8.1: the close reason must be valid UTF-8
-      raise newException(ValueError, "navi: invalid UTF-8 in a WebSocket close reason")
+    let (code, reason) = parseClose(f)   # 1-byte body, bad code, bad UTF-8: ValueError
     result.reply = wrCloseEcho
     result.replyPayload = f.payload
     result.ready = true

@@ -285,11 +285,14 @@ proc close*(ws: WebSocket, code = closeNormal, reason = ""): Future[void] {.asyn
   ## teardown still runs (once) so an already-closed h2/h3 connection is not leaked.
   ##
   ## `code` must be one that may appear on the wire: 1005, 1006 and 1015 are
-  ## reserved for local use (RFC 6455 7.4.1) and raise `ValueError`.
-  if code == closeNoStatus or code == closeAbnormal or code == 1015'u16:
-    raise newException(ValueError, "navi: WebSocket close code " & $code &
-      " is reserved and must never be sent (RFC 6455 7.4.1)")
+  ## reserved for local use (RFC 6455 7.4.1) and raise `ValueError` -- but only
+  ## while a close frame would actually be sent. Once the socket is closed there is
+  ## nothing to send, so mirroring a code `receive` reported (`ws.close(m.closeCode)`,
+  ## which is 1005 or 1006 after a codeless close or an abrupt EOF) is a safe no-op.
   if ws.open:
+    if code == closeNoStatus or code == closeAbnormal or code == 1015'u16:
+      raise newException(ValueError, "navi: WebSocket close code " & $code &
+        " is reserved and must never be sent (RFC 6455 7.4.1)")
     ws.open = false
     try: await ws.sendRaw(encodeFrame(opClose, closePayload(code, reason)))
     except CatchableError: discard
@@ -315,15 +318,11 @@ type
     binary: bool
     started: bool
 
-proc frameCloseCode(f: Frame): uint16 =
-  ## The code a close frame carries: RFC 6455 7.1.5 surfaces an absent one as 1005,
-  ## and the EOF frame `readDataFrame` synthesizes carries 1006.
-  if f.payload.len >= 2: uint16((ord(f.payload[0]) shl 8) or ord(f.payload[1]))
-  else: closeNoStatus
-
-proc readDataFrame(ws: WebSocket): Future[Frame] {.async.} =
+proc readDataFrame(ws: WebSocket): Future[tuple[f: Frame, eof: bool]] {.async.} =
   ## Next non-control frame (data/continuation/close), answering pings; keepalive
-  ## applies via `kaRecv`. A transport EOF yields a close frame.
+  ## applies via `kaRecv`. A transport EOF yields a synthetic close frame with `eof`
+  ## set, which the close paths report as 1006 without validating or echoing it (it
+  ## never came from the peer).
   while true:
     var f: Frame
     var got = false
@@ -339,25 +338,43 @@ proc readDataFrame(ws: WebSocket): Future[Frame] {.async.} =
         ws.open = false
         await ws.closeRaw()                    # tear down on EOF (see receive)
         # 1006 in the synthetic frame, so the reader reports the same code as
-        # `receive` does for a bodiless EOF. It is never echoed to the peer: the
-        # close handlers below only send while `open`, which EOF just cleared.
-        return Frame(fin: true, opcode: opClose, payload: closePayload(closeAbnormal))
+        # `receive` does for a bodiless EOF. The `eof` flag keeps it out of the
+        # peer-close checks: it is neither validated nor echoed back (and the
+        # close handlers only send while `open`, which EOF just cleared).
+        return (Frame(fin: true, opcode: opClose, payload: closePayload(closeAbnormal)), true)
       ws.dec.feed(chunk)
     case f.opcode
     of opPing: await ws.sendRaw(encodeFrame(opPong, f.payload)); continue
     of opPong: continue
-    else: return f
+    else: return (f, false)
 
 proc closeOnFrame(ws: WebSocket, f: Frame): Future[void] {.async.} =
+  ## Echo a peer close and drop the transport (used when a close interrupts a stream).
   if ws.open:
     try: await ws.sendRaw(encodeFrame(opClose, f.payload))
     except CatchableError: discard
     ws.open = false
     await ws.closeRaw()
 
+proc closeFromPeer(ws: WebSocket, f: Frame, eof: bool): Future[uint16] {.async.} =
+  ## Handle a close that ended a streamed read, and report its code. A synthetic
+  ## EOF frame is 1006, with nothing to validate or echo. A real close frame is
+  ## checked exactly as `receive` does (`parseClose`): a 1-byte body, a code that
+  ## must never appear on the wire, or a non-UTF-8 reason is a protocol error, so
+  ## fail the connection with 1002 and raise rather than echo the bad frame back.
+  if eof: return closeAbnormal
+  var code: uint16
+  try:
+    code = parseClose(f).code
+  except ValueError:
+    await ws.failClose(closeProtocolError)
+    raise
+  await ws.closeOnFrame(f)
+  return code
+
 proc openStreamReader(ws: WebSocket): Future[WsReader] {.async.} =
   result = WsReader(ws: ws)
-  let f = await ws.readDataFrame()
+  let (f, eof) = await ws.readDataFrame()
   case f.opcode
   of opText, opBinary:
     result.kind = if f.opcode == opText: wmText else: wmBinary
@@ -366,9 +383,8 @@ proc openStreamReader(ws: WebSocket): Future[WsReader] {.async.} =
     result.done = f.fin
   of opClose:
     result.kind = wmClose
-    result.closeCode = frameCloseCode(f)
     result.done = true
-    await ws.closeOnFrame(f)
+    result.closeCode = await ws.closeFromPeer(f, eof)   # validated as in `receive`
   else:
     # A desync is a protocol error like any other: fail the connection (1002)
     # rather than leaving the transport open behind the raise (#284).
@@ -393,16 +409,15 @@ proc readChunk*(r: WsReader): Future[string] {.async.} =
     await r.checkTextUtf8(r.first)
     return r.first
   if r.done: return ""
-  let f = await r.ws.readDataFrame()
+  let (f, eof) = await r.ws.readDataFrame()
   case f.opcode
   of opContinuation:
     r.done = f.fin
     await r.checkTextUtf8(f.payload)
     return f.payload
-  of opClose:
+  of opClose:                # a close interrupted the message: truncate and drop
     r.done = true
-    r.closeCode = frameCloseCode(f)            # 1005/1006 as in `receive`
-    await r.ws.closeOnFrame(f)
+    r.closeCode = await r.ws.closeFromPeer(f, eof)  # validated, 1005/1006 as in `receive`
     return ""
   else:
     await r.ws.failClose(closeProtocolError)   # tear down, don't just raise (#284)
@@ -440,7 +455,10 @@ template stream*(ws: WebSocket): untyped =
   openStreamReader(ws)
 
 proc write*(w: WsWriter, data: string): Future[void] {.async.} =
-  ## Append a fragment to the message being streamed out.
+  ## Append a fragment to the message being streamed out. Raises `IOError` once the
+  ## WebSocket is closed (or closing), like `send`, rather than writing a fragment
+  ## into a torn-down transport and failing with whatever the socket layer says.
+  if not w.ws.open: raise newException(IOError, "navi: write on a closed WebSocket")
   if not w.started:
     await w.ws.sendRaw(encodeFrame(if w.binary: opBinary else: opText, data, fin = false))
     w.started = true
@@ -448,6 +466,10 @@ proc write*(w: WsWriter, data: string): Future[void] {.async.} =
     await w.ws.sendRaw(encodeFrame(opContinuation, data, fin = false))
 
 proc finishWrite(w: WsWriter): Future[void] {.async.} =
+  ## Send the terminating fin frame (an empty continuation, or an empty text/binary
+  ## frame for a message with no `write`s). Raises `IOError` on a closed WebSocket
+  ## (see `write`); `streamOut`'s handler then runs its (idempotent) teardown.
+  if not w.ws.open: raise newException(IOError, "navi: write on a closed WebSocket")
   if not w.started:
     await w.ws.sendRaw(encodeFrame(if w.binary: opBinary else: opText, "", fin = true))
   else:
