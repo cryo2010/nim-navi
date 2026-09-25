@@ -47,7 +47,16 @@ type
 
   QuicError* = object of CatchableError
     ## QUIC/h3 transport failure (handshake, stream reset, timeout). The engine
-    ## will treat it as a signal to fall back to h2/h1 for the origin.
+    ## treats a bare `QuicError` as PROVABLY pre-submit -- the connection was never
+    ## established, was found closed, or the stream could not be opened -- so nothing
+    ## reached the server and any method may fall back to h2/h1 for the origin.
+
+  QuicSubmittedError* = object of QuicError
+    ## A QUIC/h3 failure raised AFTER the request was submitted on a stream: the
+    ## server may already have processed it, and a streamed body producer may
+    ## already have been pulled. Indeterminate, so the fall-through to h2/h1 is
+    ## only allowed for a replayable, idempotent request (see `mayFallBackFromH3`
+    ## in core/retry). Mirrors the h1/h2 `KeepAliveRaceError` classification.
 
   Http3Response* = object
     status*: int
@@ -252,13 +261,14 @@ proc request*(c: QuicConn, verb: string, path = "/",
         "navi: HTTP/3 request timed out after " & $deadlineMs & " ms")
     if navi_h3_pump(c.handle) != 0:
       navi_h3_stream_free(c.handle, sid)
-      raise newException(QuicError, "navi HTTP/3 pump failed")
+      raise newException(QuicSubmittedError, "navi HTTP/3 pump failed")
   if navi_h3_stream_done(c.handle, sid) == 0:      # connection drained before the response
     navi_h3_stream_free(c.handle, sid)
-    raise newException(QuicError, "navi HTTP/3 connection closed before response")
+    raise newException(QuicSubmittedError, "navi HTTP/3 connection closed before response")
   if navi_h3_stream_reset(c.handle, sid) != 0:
     navi_h3_stream_free(c.handle, sid)
-    raise newException(QuicError, "navi HTTP/3 " & verb & " " & path & " was reset")
+    raise newException(QuicSubmittedError,
+                       "navi HTTP/3 " & verb & " " & path & " was reset")
   if navi_h3_stream_too_large(c.handle, sid) != 0:
     navi_h3_stream_free(c.handle, sid)
     raise newException(ResponseTooLargeError, "navi: response exceeded maxResponseBytes")
@@ -279,7 +289,7 @@ proc request*(c: QuicConn, verb: string, path = "/",
         cast[ptr char](addr hbuf[0]), csize_t(hbuf.len), addr hlen,
         cast[ptr char](addr tbuf[0]), csize_t(tbuf.len), addr tlen) != 0:
       navi_h3_stream_free(c.handle, sid)
-      raise newException(QuicError, "navi HTTP/3 take_response failed")
+      raise newException(QuicSubmittedError, "navi HTTP/3 take_response failed")
     if int(blen) <= rbody.len and int(hlen) <= hbuf.len and int(tlen) <= tbuf.len:
       break
     if int(blen) > rbody.len: rbody = newString(int(blen))
@@ -321,7 +331,15 @@ proc awaitHeaders*(c: QuicConn, sid: int64):
     tuple[status: int, headers: seq[(string, string)]] =
   ## Drive the connection until `sid`'s response headers are in, then return status +
   ## headers (the stream stays open for the body). Raises on reset / transport error.
-  if c.handle == nil: raise newException(QuicError, "navi HTTP/3: connection is closed")
+  ##
+  ## Only ever reached with `sid` already submitted, so EVERY failure here is
+  ## post-submit and raises `QuicSubmittedError` (issue #378): the request is on the
+  ## wire and the server may have processed it, so the caller may only fall back to
+  ## h2/h1 when `mayFallBackFromH3` allows. That includes the closed-handle check
+  ## below -- the handle was open at submit time, so finding it closed here says
+  ## nothing about whether the request was processed.
+  if c.handle == nil:
+    raise newException(QuicSubmittedError, "navi HTTP/3: connection is closed")
   var status: clong
   var hbuf = newString(16 * 1024)
   var ready: cint
@@ -330,7 +348,7 @@ proc awaitHeaders*(c: QuicConn, sid: int64):
     if navi_h3_response_headers(c.handle, sid, addr status,
                                cast[ptr char](addr hbuf[0]), csize_t(hbuf.len),
                                addr hlen, addr ready) != 0:
-      raise newException(QuicError, "navi HTTP/3 stream gone")
+      raise newException(QuicSubmittedError, "navi HTTP/3 stream gone")
     if ready != 0:
       if int(hlen) > hbuf.len:          # header block did not fit: grow and re-read (#276)
         hbuf = newString(int(hlen))
@@ -342,28 +360,32 @@ proc awaitHeaders*(c: QuicConn, sid: int64):
       while i + 1 < parts.len: hs.add((parts[i], parts[i + 1])); i += 2
       return (int(status), hs)
     if navi_h3_stream_done(c.handle, sid) != 0:   # ended before any headers => reset
-      raise newException(QuicError, "navi HTTP/3 stream ended before headers")
+      raise newException(QuicSubmittedError, "navi HTTP/3 stream ended before headers")
     if navi_h3_draining(c.handle) != 0:           # peer closed gracefully (#278)
-      raise newException(QuicError, "navi HTTP/3 connection closed before headers")
+      raise newException(QuicSubmittedError,
+                         "navi HTTP/3 connection closed before headers")
     if navi_h3_pump(c.handle) != 0:
-      raise newException(QuicError, "navi HTTP/3 pump failed")
+      raise newException(QuicSubmittedError, "navi HTTP/3 pump failed")
 
 proc readStreamBody*(c: QuicConn, sid: int64): string =
   ## The next body chunk of `sid`, or "" at end of body (driving the connection until
-  ## a chunk lands or the stream ends). Raises on a transport error.
-  if c.handle == nil: raise newException(QuicError, "navi HTTP/3: connection is closed")
+  ## a chunk lands or the stream ends). Raises on a transport error. Like
+  ## `awaitHeaders`, every failure here is post-submit, so it raises
+  ## `QuicSubmittedError` (#378).
+  if c.handle == nil:
+    raise newException(QuicSubmittedError, "navi HTTP/3: connection is closed")
   var buf = newString(64 * 1024)
   var eof: cint
   while true:
     let n = navi_h3_read_body(c.handle, sid, cast[ptr char](addr buf[0]),
                               csize_t(buf.len), addr eof)
-    if n < 0: raise newException(QuicError, "navi HTTP/3 stream gone")
+    if n < 0: raise newException(QuicSubmittedError, "navi HTTP/3 stream gone")
     if n > 0: buf.setLen(int(n)); return buf
     if eof != 0: return ""
     if navi_h3_draining(c.handle) != 0:           # peer closed gracefully mid-stream (#278)
-      raise newException(QuicError, "navi HTTP/3 connection closed mid-stream")
+      raise newException(QuicSubmittedError, "navi HTTP/3 connection closed mid-stream")
     if navi_h3_pump(c.handle) != 0:
-      raise newException(QuicError, "navi HTTP/3 pump failed")
+      raise newException(QuicSubmittedError, "navi HTTP/3 pump failed")
 
 proc streamTrailers*(c: QuicConn, sid: int64): seq[(string, string)] =
   ## The response trailer fields of `sid` (they land after the body EOF); "" if none.

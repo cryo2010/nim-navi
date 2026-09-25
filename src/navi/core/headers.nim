@@ -35,6 +35,17 @@ proc `[]=`*(h: var Headers, name, value: string) =
   if not written:
     h.fields.add((name, value))
 
+proc hasCtlChars*(s: string): bool =
+  ## True when `s` carries a CR, LF, or NUL. Such a character in a header name or
+  ## value (or in the request target or Host) splits an HTTP/1.1 message: the peer
+  ## reads the bytes after the CRLF as further header lines, or as a whole
+  ## smuggled request. `validateRequest` applies this to every request the engine
+  ## dispatches; the WebSocket opening handshake never builds a `Request`, so it
+  ## calls this directly on its own field set.
+  for c in s:
+    if c in {'\r', '\n', '\0'}: return true
+  false
+
 proc parseHeaderLine*(line: string): tuple[name, value: string, ok: bool] =
   ## Split one HTTP/1.x field line ("Name: value") at the first colon, stripping
   ## surrounding whitespace from both sides. `ok` is false when there is no colon
@@ -111,3 +122,22 @@ proc merge*(base: Headers, overrides: Headers): Headers =
   result = base
   for (k, v) in overrides.fields:
     result[k] = v
+
+const forbiddenTrailerNames* = ["connection", "content-length", "host", "keep-alive",
+                                "proxy-connection", "te", "trailer",
+                                "transfer-encoding", "upgrade"]
+  ## Field names that must never appear in a trailer section: framing and routing
+  ## fields, and `Trailer` itself (RFC 9110 6.5.1). A trailer is processed after the
+  ## message body, so a framing or routing field there is at best ignored and at worst
+  ## a request-smuggling vector. The single place this set lives: h1 (`finalChunk` and
+  ## the `Trailer:` advertisement), h2 (`h2TrailerList`) and h3 all filter through
+  ## `isForbiddenTrailer`, so the protocols cannot drift apart (#296).
+
+proc isForbiddenTrailer*(name: string): bool =
+  ## Whether `name` must be dropped from a trailer section: an empty name, a
+  ## pseudo-header (which may only appear in a header section), or one of
+  ## `forbiddenTrailerNames`. Case-insensitive.
+  let lower = name.toLowerAscii
+  if lower.len == 0: return true
+  if lower[0] == ':': return true
+  lower in forbiddenTrailerNames

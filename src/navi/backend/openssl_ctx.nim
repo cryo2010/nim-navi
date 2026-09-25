@@ -579,6 +579,8 @@ when defined(ssl):
     var ok = false
     defer:
       if not ok: SSL_free(result)
+    ErrClearError()   # SSL_get_error / the error text below are only reliable on an
+                      # empty per-thread queue (see the backends' read loops)
     if SSL_connect(result) != 1:
       fail("TLS handshake failed for " & host)
     verifyPeer(result, host, verify)

@@ -68,6 +68,8 @@ const
     ## Reject a single incoming frame larger than this (64 MiB). A 64-bit length
     ## with its high bit set (RFC 6455 5.2 forbids it) would otherwise become a
     ## negative `int` that slips past the bounds check and crashes `newString`.
+  frameLenError = "navi: WebSocket frame length is invalid or exceeds the " &
+    $maxFramePayload & "-byte limit"
 
 # --- opening handshake ---
 
@@ -91,12 +93,22 @@ proc acceptFor*(key: string): string =
 proc wsExtraFields*(headers: Headers): seq[(string, string)] =
   ## The user headers to carry on an Extended CONNECT (h2 RFC 8441 / h3 RFC 9220):
   ## connection-specific / hop-by-hop fields dropped (the pseudo-headers are added by
-  ## the backend), plus sec-websocket-version. Shared by all backends so the policy
+  ## the backend), plus sec-websocket-version. Shared by all clients so the policy
   ## stays in one place.
+  ##
+  ## The h1-only handshake fields go too. RFC 8441 3 drops the key/accept exchange
+  ## over Extended CONNECT, so a caller's copy is at best noise and at worst a
+  ## field the origin answers instead of the real handshake; `http2-settings`
+  ## belongs to the h2c upgrade (RFC 7540 3.2) and is meaningless here. And
+  ## sec-websocket-version is appended below, so a caller's copy is dropped rather
+  ## than emitted twice: duplicate fields are concatenated into "13, 8" by the
+  ## receiver (RFC 9110 5.2) and fail version negotiation.
   for (k, v) in headers.pairs:
     let lk = k.toLowerAscii
     if lk in ["host", "connection", "keep-alive", "proxy-connection",
-              "transfer-encoding", "upgrade"]: continue
+              "transfer-encoding", "upgrade", "http2-settings",
+              "sec-websocket-key", "sec-websocket-accept",
+              "sec-websocket-version"]: continue
     result.add((lk, v))
   result.add(("sec-websocket-version", wsVersion))
 
@@ -178,15 +190,22 @@ proc next*(d: var WsDecoder, f: var Frame): bool =
     pos = 4
   elif length == 127:
     if d.buf.len < 10: return false
-    length = 0
-    for i in 2 ..< 10: length = (length shl 8) or ord(d.buf[i])
+    # Accumulate the 64-bit length into an explicit uint64 and cap it before
+    # narrowing. `int` is only 32 bits on some targets (32-bit natives, and the
+    # js backend), where shifting the eight bytes into an `int` silently drops
+    # the high word: 0x0000_0001_0000_0005 would arrive as 5 and let the peer
+    # under-declare a frame. uint64 also keeps a high-bit-set length (RFC 6455
+    # 5.2 forbids it) from turning into a negative `int`.
+    var len64 = 0'u64
+    for i in 2 ..< 10: len64 = (len64 shl 8) or uint64(ord(d.buf[i]))
+    if len64 > uint64(maxFramePayload):
+      raise newException(ValueError, frameLenError)
+    length = int(len64)
     pos = 10
-  # A negative length (64-bit high bit set) or an oversized one must fail the
-  # connection, not reach `newString(length)` (a RangeDefect / huge allocation).
+  # An oversized length must fail the connection, not reach `newString(length)`
+  # (a RangeDefect / huge allocation).
   if length < 0 or length > maxFramePayload:
-    raise newException(ValueError,
-      "navi: WebSocket frame length is invalid or exceeds the " &
-      $maxFramePayload & "-byte limit")
+    raise newException(ValueError, frameLenError)
   var key: array[4, byte]
   if masked:
     if d.buf.len < pos + 4: return false
@@ -304,6 +323,27 @@ proc validCloseCode(code: uint16): bool =
   (code >= 1000'u16 and code <= 1014'u16 and code notin [1004'u16, 1005'u16, 1006'u16]) or
   (code >= 3000'u16 and code <= 4999'u16)
 
+proc parseClose*(f: Frame): tuple[code: uint16, reason: string] =
+  ## Validate a received close frame and split it into code and reason. A 1-byte
+  ## body (RFC 6455 5.5.1), a code that must never appear on the wire (7.4), and a
+  ## reason that is not valid UTF-8 (8.1) are protocol errors and raise
+  ## `ValueError`; the caller fails the connection with 1002.
+  ##
+  ## RFC 6455 7.1.5: an absent status code surfaces as 1005 ("no status
+  ## received"), not 1000, so a codeless close is distinguishable from an explicit
+  ## normal closure. Shared by `offer` and the backends' streaming readers, so a
+  ## close frame is read by the same rules whichever way you receive it.
+  if f.payload.len == 1:
+    raise newException(ValueError, "navi: WebSocket close frame with a 1-byte payload")
+  result.code = closeNoStatus
+  if f.payload.len >= 2:
+    result.code = uint16((ord(f.payload[0]) shl 8) or ord(f.payload[1]))
+    if not validCloseCode(result.code):
+      raise newException(ValueError, "navi: invalid WebSocket close code " & $result.code)
+  result.reason = if f.payload.len > 2: f.payload[2 .. ^1] else: ""
+  if not isValidUtf8(result.reason):     # RFC 6455 8.1: the close reason must be valid UTF-8
+    raise newException(ValueError, "navi: invalid UTF-8 in a WebSocket close reason")
+
 proc offer*(a: var WsAssembler, f: Frame, maxMessageBytes = 0,
             rejectMasked = false): WsOutcome =
   ## Feed one decoded frame. Handles fragmentation (text/binary + continuation)
@@ -336,19 +376,7 @@ proc offer*(a: var WsAssembler, f: Frame, maxMessageBytes = 0,
   of opPong:
     discard
   of opClose:
-    if f.payload.len == 1:          # RFC 6455 5.5.1: a close body is empty or >= 2 bytes
-      raise newException(ValueError, "navi: WebSocket close frame with a 1-byte payload")
-    # RFC 6455 7.1.5: an absent status code surfaces as 1005 ("no status
-    # received"), not 1000, so a codeless close is distinguishable from an
-    # explicit normal closure.
-    var code = closeNoStatus
-    if f.payload.len >= 2:
-      code = uint16((ord(f.payload[0]) shl 8) or ord(f.payload[1]))
-      if not validCloseCode(code):
-        raise newException(ValueError, "navi: invalid WebSocket close code " & $code)
-    let reason = if f.payload.len > 2: f.payload[2 .. ^1] else: ""
-    if not isValidUtf8(reason):     # RFC 6455 8.1: the close reason must be valid UTF-8
-      raise newException(ValueError, "navi: invalid UTF-8 in a WebSocket close reason")
+    let (code, reason) = parseClose(f)   # 1-byte body, bad code, bad UTF-8: ValueError
     result.reply = wrCloseEcho
     result.replyPayload = f.payload
     result.ready = true
@@ -379,23 +407,121 @@ proc hostHeader(u: Url): string =
   if not ((u.isTls and p == 443) or (not u.isTls and p == 80)):
     result.add(":" & $p)
 
+const wsHandshakeFields = ["host", "connection", "upgrade", "sec-websocket-key",
+                           "sec-websocket-version", "sec-websocket-accept"]
+  ## Fields `upgradeRequest` writes itself (plus the response-only accept). A
+  ## caller-supplied copy is dropped rather than appended: a second Host or
+  ## Connection line is a request-smuggling primitive, and a second
+  ## Sec-WebSocket-Key would leave the server answering an accept the client
+  ## cannot verify. This mirrors what `wsExtraFields` drops for h2/h3.
+
 proc upgradeRequest*(u: Url, key: string, extra: Headers): string =
   ## The client's HTTP/1.1 Upgrade request for `u` with Sec-WebSocket-Key `key`.
+  ##
+  ## The WebSocket path never builds a `Request`, so the engine's
+  ## `validateRequest` never sees these fields: a CR, LF, or NUL in a
+  ## caller-supplied name or value (or in the URL's target or host) would splice
+  ## extra headers -- or a whole second request -- into the connection. Reject
+  ## them here instead, and drop any caller field that collides with the
+  ## handshake fields this builder emits.
+  if hasCtlChars(u.requestTarget) or hasCtlChars(hostHeader(u)):
+    raise newException(ValueError,
+      "navi: invalid WebSocket URL (target or host contains CR, LF, or NUL)")
   result = "GET " & u.requestTarget & " HTTP/1.1\r\n" &
            "Host: " & hostHeader(u) & "\r\n" &
            "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
            "Sec-WebSocket-Key: " & key & "\r\n" &
            "Sec-WebSocket-Version: " & wsVersion & "\r\n"
-  for (k, v) in extra.pairs: result.add(k & ": " & v & "\r\n")
+  for (k, v) in extra.pairs:
+    if hasCtlChars(k) or hasCtlChars(v):
+      raise newException(ValueError,
+        "navi: invalid WebSocket header (name or value contains CR, LF, or NUL)")
+    if k.toLowerAscii in wsHandshakeFields: continue
+    result.add(k & ": " & v & "\r\n")
   result.add("\r\n")
 
+proc hasToken(value, token: string): bool =
+  ## True when the comma-separated list `value` carries `token` (case-insensitive,
+  ## surrounding whitespace ignored). RFC 9110 5.6.1 list syntax, as used by the
+  ## `Upgrade` and `Connection` fields of the opening handshake.
+  for part in value.split(','):
+    if cmpIgnoreCase(part.strip(), token) == 0: return true
+  false
+
 proc validate101*(responseHead, key: string): bool =
-  ## True when `responseHead` (the status line + headers) is a 101 whose
-  ## Sec-WebSocket-Accept matches `key`.
+  ## True when `responseHead` (the status line + headers) completes the opening
+  ## handshake (RFC 6455 4.1): a 101 status, a Sec-WebSocket-Accept matching
+  ## `key` (exactly one such field), an `Upgrade` field carrying the `websocket`
+  ## token, and a `Connection` field carrying the `upgrade` token. All three
+  ## field checks are case-insensitive.
+  ##
+  ## The Upgrade/Connection tokens are not decoration: without them a proxy or
+  ## origin that answers 101 for some other protocol (or replays a cached
+  ## response) would hand the client a stream it then parses as WebSocket frames.
   let lines = responseHead.splitLines
   if lines.len == 0 or not lines[0].startsWith("HTTP/1.1 101"): return false
+  var accepts = 0
+  var acceptOk = false
+  var upgradeOk = false
+  var connectionOk = false
   for line in lines[1 .. ^1]:
     let (name, value, ok) = parseHeaderLine(line)
-    if ok and cmpIgnoreCase(name, "sec-websocket-accept") == 0:
-      return value == acceptFor(key)
-  false
+    if not ok: continue
+    if cmpIgnoreCase(name, "sec-websocket-accept") == 0:
+      # More than one accept field is a response-splitting tell: an intermediary
+      # (or a header-injecting origin) can prepend a matching copy to a response
+      # it did not compute. Fail the handshake even when one copy matches.
+      inc accepts
+      if accepts > 1: return false
+      acceptOk = value == acceptFor(key)
+    elif cmpIgnoreCase(name, "upgrade") == 0:
+      if value.hasToken("websocket"): upgradeOk = true
+    elif cmpIgnoreCase(name, "connection") == 0:
+      if value.hasToken("upgrade"): connectionOk = true
+  acceptOk and upgradeOk and connectionOk
+
+const
+  closeAbnormal* = 1006'u16
+    ## RFC 6455 7.4.1: reserved, never sent on the wire. Surfaced locally when the
+    ## transport ends without a close frame, so an abrupt EOF is distinguishable
+    ## from a clean closure.
+
+# --- incremental UTF-8 validation (for the streaming read path) ---
+
+type
+  WsUtf8Scanner* = object
+    ## Validates a text message's UTF-8 as it arrives, chunk by chunk (RFC 6455
+    ## 8.1), for a streaming reader that never holds the whole message. A code
+    ## point split across two frames is carried here (at most 3 bytes) and checked
+    ## once the rest lands; `midCodePoint` must be false when the message ends.
+    carry: string
+
+proc midCodePoint*(v: WsUtf8Scanner): bool =
+  ## True while the bytes seen so far end part-way through a code point.
+  v.carry.len > 0
+
+proc utf8SeqLen(b: uint8): int =
+  ## How many bytes the code point started by lead byte `b` occupies. A byte that
+  ## cannot lead (a continuation byte, or 0xC0/0xC1/0xF5-0xFF) reports 1, so it is
+  ## validated -- and rejected -- immediately instead of being carried.
+  if b < 0x80'u8: 1
+  elif b >= 0xC2'u8 and b <= 0xDF'u8: 2
+  elif b >= 0xE0'u8 and b <= 0xEF'u8: 3
+  elif b >= 0xF0'u8 and b <= 0xF4'u8: 4
+  else: 1
+
+proc scanUtf8*(v: var WsUtf8Scanner, chunk: string): bool =
+  ## Validate `chunk` as the continuation of a UTF-8 byte stream, holding back a
+  ## trailing code point whose bytes have not all arrived. False once the stream is
+  ## malformed (the caller must then fail the connection).
+  var s = v.carry & chunk
+  v.carry = ""
+  # Find the last sequence's lead byte by walking back over at most three
+  # continuation bytes (10xxxxxx), and hold that sequence if it is still short.
+  var j = s.len
+  while j > 0 and s.len - j < 3 and (uint8(s[j - 1]) and 0xC0'u8) == 0x80'u8:
+    dec j
+  if j > 0 and utf8SeqLen(uint8(s[j - 1])) > s.len - (j - 1):
+    v.carry = s[j - 1 .. ^1]
+    s.setLen(j - 1)
+  isValidUtf8(s)

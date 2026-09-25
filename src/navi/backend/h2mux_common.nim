@@ -661,7 +661,7 @@ proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: strin
 proc openConnect*(mux: H2Mux, headers: seq[(string, string)]): Future[uint32] {.async.} =
   ## Open an Extended CONNECT (RFC 8441) tunnel stream and return its id once the
   ## response headers arrive (send side left open). The caller checks
-  ## `respSnapshot(sid).status == 200`, then uses `tunnelSend` / `tunnelRecv`.
+  ## that `respSnapshot(sid).status` is 2xx, then uses `tunnelSend` / `tunnelRecv`.
   ## Waits for the peer's SETTINGS and requires ENABLE_CONNECT_PROTOCOL first
   ## (RFC 8441), so an origin that does not support it fails fast and clearly.
   await mux.settingsSeen

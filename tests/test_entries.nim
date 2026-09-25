@@ -6,6 +6,7 @@ import navi
 import navi/core/pool
 import navi/core/response  # for the `response.TimeoutError` qualifier
 from std/asyncfutures import Future  # only the type, for the async-producer rejection test
+from navi/proto/h1 import h1CoalesceSize  # the streamed-upload write-buffer cap
 import ./support
 
 var serverReady: bool
@@ -456,6 +457,72 @@ suite "sync entry end to end":
     check res.status == 200
     check res.body == "hello streaming world"
     joinThread(th)
+
+  test "a streamed upload of many tiny chunks should coalesce into few wire chunks (#299)":
+    const port = 8957
+    var th: Thread[ServerCtx]
+    var chunks = 0
+    startUploadEcho(th, port, addr chunks)
+
+    let api = newNavi()
+    var left = 1000
+    let res = api.request(POST, "http://127.0.0.1:" & $port & "/",
+      body = BodyProducer(proc(): string =
+        if left > 0:
+          result = "0123456789"
+          dec left))
+    check res.status == 200
+    check res.body == "0123456789".repeat(1000)   # every byte, in order
+    joinThread(th)
+    # 10 KB of body fits one 16 KiB buffer, so the 1000 producer chunks leave as a
+    # single chunk frame in a single write instead of 1000 of each.
+    check chunks == 1
+
+  test "a streamed upload should send a large producer chunk unbuffered (#299)":
+    const port = 8958
+    var th: Thread[ServerCtx]
+    var chunks = 0
+    startUploadEcho(th, port, addr chunks)
+
+    let big = "x".repeat(20 * 1024)               # over the coalescing target
+    let parts = @["head", big, "tail"]
+    let api = newNavi()
+    var i = 0
+    let res = api.request(POST, "http://127.0.0.1:" & $port & "/",
+      body = BodyProducer(proc(): string =
+        if i < parts.len:
+          result = parts[i]
+          inc i))
+    check res.status == 200
+    check res.body == "head" & big & "tail"
+    joinThread(th)
+    # "head" is flushed to make way for the big chunk, which is framed on its own;
+    # "tail" rides with the terminator.
+    check chunks == 3
+
+  test "the coalescing buffer should never be framed above h1CoalesceSize (#299)":
+    const port = 8959
+    var th: Thread[ServerCtx]
+    var chunks = 0
+    var biggest = 0
+    startUploadEcho(th, port, addr chunks, addr biggest)
+
+    # Two chunks that each fit the buffer but together overflow it: the second
+    # must flush the first BEFORE appending, so neither frame exceeds the cap.
+    let half = "y".repeat(h1CoalesceSize - 1)
+    let parts = @[half, half]
+    let api = newNavi()
+    var i = 0
+    let res = api.request(POST, "http://127.0.0.1:" & $port & "/",
+      body = BodyProducer(proc(): string =
+        if i < parts.len:
+          result = parts[i]
+          inc i))
+    check res.status == 200
+    check res.body == half & half
+    joinThread(th)
+    check chunks == 2                    # not one frame of 2 * (16 KiB - 1)
+    check biggest == h1CoalesceSize - 1  # a framed buffer stays inside one record
 
   test "the client should connect over IPv6 loopback":
     const port = 8977

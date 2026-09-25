@@ -8,6 +8,10 @@ onward (pre-1.0, minor versions may include breaking changes).
 ## [Unreleased]
 
 ### Added
+- **`WsReader.closeCode`** on the native clients: the peer's close code once a
+  streamed message ends in a close frame (1005 when the peer sent none, 1006 on a
+  bodiless EOF). `closeAbnormal`, `closeProtocolError` and `closeNoStatus` are now
+  re-exported by the drivers (#289).
 - **A `stream` namespace view: `api.stream.get(url)` opens a streaming download.**
   Streaming downloads now have the same two-layer shape as the rest of navi: a
   verb-named sugar over a full-control layer. `api.stream` returns a zero-cost view
@@ -51,6 +55,15 @@ onward (pre-1.0, minor versions may include breaking changes).
   `BodySink`), since the `Future` type differs per backend (#367).
 
 ### Changed
+- **HTTP/2 streamed uploads frame each chunk straight from the producer's buffer.**
+  A chunk that fits the send window goes into DATA frames without staging through
+  the per-stream send buffer, and the buffer keeps its capacity across chunks instead
+  of being reallocated per chunk (#297, #298).
+- **HTTP/1.1 streamed uploads coalesce small producer chunks.** Body bytes are
+  buffered up to 16 KiB (one TLS record) before each write, and the final chunk plus
+  trailers ride the last write, so a chatty producer no longer costs one write and
+  one TLS record per chunk. Chunks at or above the threshold are written directly
+  (#299).
 - **BREAKING: the request `body` is now type-dispatched, and the `json`,
   `multipart`, and `bodyStream` parameters are removed (no deprecation).** The
   `body` argument of `request`/`post`/`put`/`patch` dispatches on its type: a
@@ -70,6 +83,101 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **A closing TLS connection no longer breaks the other live TLS connections on the
+  same thread.** OpenSSL's error queue is per THREAD, not per `SSL`, and
+  `SSL_get_error` is documented to be reliable only when that queue was empty before
+  the I/O call. navi never cleared it, so the entries a teardown leaves behind (the
+  decrypt error on the truncated final record after `shutdownConn`'s SHUT_RDWR, which
+  the read path swallows as teardown noise, and `SSL_shutdown` in the close path) made
+  the NEXT read on an unrelated, healthy connection report `SSL_ERROR_SSL` and raise
+  "navi: TLS read failed" -- tearing down its h2 mux and failing every stream on it
+  with "navi: http/2 connection closed". A WebSocket-over-h2 soak lost 7 of 8 live
+  sockets the moment the first one closed. Every `SSL_connect` / `SSL_read` /
+  `SSL_write` now clears the queue first, on all three OpenSSL-driving backends
+  (sync, asyncdispatch, chronos).
+- **A response `sink` now receives the body of a surfaced 301/302 redirect.** The
+  delivery gate still used the old "a non-replayable 307/308 is surfaced" rule, so a
+  GET with a body producer that took a 301/302 -- which `followRedirects` surfaces,
+  because the hop would replay a spent producer -- had its body withheld from the
+  sink. The gate now asks `redirect.preservesBody` with the hop's own verb, the exact
+  condition the redirect loop breaks on (#369, #295).
+- **The streamed-upload write buffer no longer exceeds `h1CoalesceSize`.** It was
+  flushed only after an append pushed it past 16 KiB, so a framed chunk could reach
+  almost 32 KiB and spill into a second TLS record. The send loop now flushes before
+  an append that would overflow the buffer, and a producer chunk large enough to be
+  framed on its own is packed into the same write as the pending bytes instead of
+  costing a second one (#299).
+- **HTTP/3 fallback no longer replays a request that may already have run.** A
+  `QuicError` raised after the request was submitted on the h3 stream now surfaces as
+  `QuicSubmittedError`; the h2/h1 fallback only fires for that case when the request
+  is idempotent and replayable (no spent body producer), mirroring the h1/h2
+  keep-alive-race rule. Pre-submit failures (no connection, connect failure, submit
+  rejected) still fall back freely for any method. This covers the streaming-response
+  paths (`stream` / SSE over h3) as well as the buffered ones: `awaitHeaders` and the
+  incremental body readers are only ever reached with the stream already on the wire,
+  so every failure they raise is now a `QuicSubmittedError`, and the sync and async
+  `stream` legs gate their fall-through to h2/h1 on the same rule instead of retrying
+  a submitted-then-reset POST (#378, #293).
+- **A streamed body is no longer replayed through a 301/302 redirect.** A GET/HEAD
+  carrying a body producer used to be re-issued to the redirect target with an already
+  drained producer; `followRedirects` now returns the 3xx to the caller for a streamed
+  body on any hop that would preserve it (301/302 for GET/HEAD, 307/308 for every
+  verb), stated once in `redirect.preservesBody` (#295).
+- **A caller-supplied `Content-Length` is dropped on the streamed-upload path.** h1
+  emitted it next to `Transfer-Encoding: chunked` (a CL.TE smuggling ambiguity) and h2
+  forwarded a `content-length` that disagreed with the DATA frames; both now strip it,
+  as h3 already did (#294).
+- **HTTP/1.1 request trailers are filtered like h2/h3.** `finalChunk` and the
+  `Trailer:` advertisement drop forbidden names (`content-length`,
+  `transfer-encoding`, `te`, `trailer`, ...); the list now lives in one place
+  (`headers.isForbiddenTrailer`) shared by every transport (#296).
+- **SSE: the resume id is promoted at dispatch, not at parse.** An `id:` line of an
+  event that never completed (the connection dropped mid-event) no longer leaks into
+  `Last-Event-ID`, which made the server resume *past* an event the app never saw. A
+  bodiless `id:` event still updates the id, per WHATWG (#290).
+- **SSE: a `maxSseEventBytes` breach closes the stream handle.** `feed()` raised out
+  of `next()` with the connection still open on every client; the handle is now torn
+  down before the error surfaces (#292).
+- **WebSocket: the 64-bit frame-length guard is no longer bypassable on 32-bit
+  builds.** The extended length is accumulated in `uint64` and checked before
+  narrowing to `int` (#285).
+- **WebSocket: `validate101` enforces the mandatory handshake tokens.** A 101 now
+  needs `Upgrade: websocket`, a `Connection` field containing `upgrade`, and exactly
+  one `Sec-WebSocket-Accept` (RFC 6455 4.1) (#286, #289).
+- **WebSocket: the h1 upgrade request rejects CR/LF/NUL and colliding fields.** Caller
+  headers (and the request target / Host) are validated, and fields that collide with
+  the built-in handshake headers are dropped; the Extended CONNECT path also strips a
+  stray `sec-websocket-key`/`-accept`/`http2-settings` and no longer duplicates
+  `sec-websocket-version` (#288, #289).
+- **WebSocket: any protocol error fails the connection.** `receive` caught only
+  `WsMessageTooLarge`; a masked server frame, a bad close body or code, invalid UTF-8,
+  a bad fragmentation sequence, or a decoder error (RSV bits, reserved opcode,
+  oversized control frame) now sends a 1002 close, flips `open`, and tears the
+  transport down before re-raising, on every client. The same teardown covers the
+  two streaming-reader desync paths (`openStreamReader` / `readChunk`), so a direct
+  `readChunk` caller no longer leaks the h2/h3 connection (#281, #284).
+- **WebSocket: the streaming read path validates text messages as UTF-8** (RFC 6455
+  8.1), carrying a code point split across frames and requiring the message to end
+  on a boundary; a failure fails the connection like any other protocol error (#282).
+- **WebSocket: h2/h3 Extended CONNECT accepts any 2xx**, not only 200 (RFC 8441 /
+  RFC 9220) (#287).
+- **WebSocket: the streaming reader validates the peer's close frame.**
+  `stream()`/`readChunk` took the close frame on trust: a 1-byte body, a code that
+  may never appear on the wire (1005/1006/1015, 1004, anything outside
+  1000-1014/3000-4999), or a non-UTF-8 reason surfaced as a clean `wmClose` and was
+  echoed back to the peer verbatim. They now run the same checks `receive` does --
+  one shared `ws.parseClose` -- and fail the connection with 1002 before raising.
+  A synthetic EOF (no close frame at all) is still reported as 1006, never
+  validated or echoed.
+- **WebSocket driver hygiene:** `send`/`ping` on a closed socket raise a clear
+  `IOError` instead of poking a torn-down transport; `close(code)` rejects the
+  reserved codes 1005/1006/1015; the keepalive-death path drops its stale pending
+  read; and a bodiless transport EOF reports 1006 (`closeAbnormal`) consistently on
+  the buffered and streaming paths (#289). `WsWriter.write` (and the fin frame sent
+  on block exit) raise the same `IOError` on a closed socket, and `close(code)`
+  rejects a reserved code only while a close frame would actually be sent, so
+  mirroring a received `m.closeCode` back on teardown stays the promised idempotent
+  no-op.
 - **Keep-alive race: a request dropped before any response is now retried, following
   the same rule as Go `net/http` (RFC 9110 9.2.2).** A connection can be torn down by
   the server at any time -- an idle recycle, a GOAWAY-less close, or a freshly-opened

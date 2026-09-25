@@ -145,7 +145,17 @@ proc next*(s: SseStream): Option[SseEvent] =
       s.handle = nil
       if not s.reconnect: return none(SseEvent)
       continue
-    s.parser.feed(chunk)
+    try:
+      s.parser.feed(chunk)
+    except CatchableError:
+      # A maxSseEventBytes breach raises straight out of `next`. Dispose the handle
+      # first: the parse state is unusable and the caller is left holding a stream
+      # it cannot resume, so leaving the connection open just leaks a socket.
+      if s.handle != nil:
+        try: s.handle.close()
+        except CatchableError: discard
+        s.handle = nil
+      raise
 
 template each*(s: SseStream; ev, body: untyped): untyped =
   ## Consume events until the stream ends, binding `ev` to each `SseEvent`. Unlike

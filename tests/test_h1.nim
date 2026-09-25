@@ -24,6 +24,26 @@ suite "h1 serialize":
     var req = Request(verb: GET, url: parseUrl("http://h:8080/"))
     check "Host: h:8080\r\n" in serializeRequest(req)
 
+  test "a caller-supplied Content-Length should be dropped on the chunked path (#294)":
+    # Emitting it next to Transfer-Encoding: chunked is the CL.TE smuggling ambiguity,
+    # and the length is wrong anyway (the real body is the producer's). navi strips it,
+    # matching h3 (h3SkipHeaders) and h2.
+    var req = Request(verb: POST, url: parseUrl("http://h/"))
+    req.headers = initHeaders()
+    req.headers["Content-Length"] = "5"
+    req.bodyStream = proc(): string = ""
+    let head = serializeHead(req, chunked = true)
+    check "Transfer-Encoding: chunked\r\n" in head
+    check "content-length" notin head.toLowerAscii
+
+  test "a caller-supplied Content-Length should survive on the buffered path":
+    var req = Request(verb: POST, url: parseUrl("http://h/"), body: "hello")
+    req.headers = initHeaders()
+    req.headers["Content-Length"] = "5"
+    let wire = serializeRequest(req)
+    check "Content-Length: 5\r\n" in wire
+    check "Transfer-Encoding" notin wire
+
   test "the request serializer should reject a manually-set Transfer-Encoding on a buffered body (#273)":
     var req = Request(verb: POST, url: parseUrl("http://h/"), body: "hello")
     req.headers = initHeaders()

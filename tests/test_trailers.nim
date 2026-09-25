@@ -1,7 +1,7 @@
 ## Trailer surfacing (response) and emission (request) for HTTP/1.1 and HTTP/2.
 import unittest
 import std/strutils
-import navi/core/[headers, response, request, url]
+import navi/core/[headers, response, request, url, h2glue]
 import navi/proto/h1
 import navi/proto/h2/[conn, frame, hpack]
 
@@ -55,6 +55,47 @@ suite "HTTP/1.1 request trailers":
     var req = trailerRequest()
     req.trailers = initHeaders()
     check finalChunk(req) == chunkTerminator
+
+suite "forbidden request trailer names (#296)":
+  proc withTrailers(pairs: openArray[(string, string)]): Request =
+    result = trailerRequest()
+    result.trailers = initHeaders(pairs)
+
+  test "framing and routing fields should never be emitted as h1 trailers":
+    # A Content-Length or Transfer-Encoding written after the zero chunk is a
+    # smuggling vector with a lenient intermediary; h2 and h3 already dropped them.
+    let req = withTrailers({"Content-Length": "5", "Transfer-Encoding": "chunked",
+                            "Host": "evil.test", "Connection": "close",
+                            "Keep-Alive": "timeout=5", "Proxy-Connection": "keep-alive",
+                            "Upgrade": "h2c", "TE": "trailers", "Trailer": "X-A",
+                            ":method": "GET", "X-Checksum": "abc123"})
+    check finalChunk(req) == "0\r\nX-Checksum: abc123\r\n\r\n"
+
+  test "the Trailer advertisement should list only the fields that are emitted":
+    let head = serializeHead(withTrailers({"Content-Length": "5",
+                                           "X-Checksum": "abc123"}), chunked = true)
+    check "Trailer: X-Checksum\r\n" in head
+    check "content-length" notin head.toLowerAscii
+
+  test "no Trailer header when every trailer name is filtered out":
+    let head = serializeHead(withTrailers({"Content-Length": "5", "Trailer": "X-A"}),
+                             chunked = true)
+    check "Trailer:" notin head
+    check finalChunk(withTrailers({"Content-Length": "5"})) == chunkTerminator
+
+  test "h1 and h2 should drop exactly the same trailer names":
+    let req = withTrailers({"Content-Length": "5", "Transfer-Encoding": "chunked",
+                            "Host": "evil.test", "Connection": "close",
+                            "TE": "trailers", "Trailer": "X-A", ":method": "GET",
+                            "X-Checksum": "abc123", "X-Rows": "7"})
+    var h1Names: seq[string]
+    for line in finalChunk(req).split("\r\n"):
+      let (name, _, ok) = parseHeaderLine(line)
+      if ok: h1Names.add(name.toLowerAscii)
+    var h2Names: seq[string]
+    for (name, _) in h2TrailerList(req): h2Names.add(name)
+    check h1Names == h2Names
+    check h1Names == @["x-checksum", "x-rows"]
 
 proc newServerConn(): H2Conn =
   result = initH2Conn(0)

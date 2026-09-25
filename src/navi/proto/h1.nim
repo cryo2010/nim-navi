@@ -22,6 +22,12 @@ proc serializeHead*(req: Request, chunked = false): string =
     raise newException(ValueError,
       "navi: use a streaming body (bodyStream) for chunked transfer; " &
       "do not set a Transfer-Encoding request header manually")
+  # navi owns the length too: on the chunked path a caller-supplied Content-Length is
+  # dropped rather than emitted next to Transfer-Encoding: chunked. Both framing
+  # headers on one request is the CL.TE smuggling ambiguity (RFC 9112 6.1 tells a
+  # recipient to ignore the length, but intermediaries disagree in practice), and the
+  # length is wrong anyway: the real body is the producer's, whose size is unknown
+  # here. Stripping matches h3, which already drops it via h3SkipHeaders (#294).
   let target = if req.absoluteForm: req.url.absoluteTarget else: req.url.requestTarget
   result = $req.verb & " " & target & " HTTP/1.1\r\n"
   if not req.headers.contains("host"):
@@ -31,16 +37,22 @@ proc serializeHead*(req: Request, chunked = false): string =
       hostLine.add(":" & $p)
     result.add("Host: " & hostLine & "\r\n")
   for (k, v) in req.headers.pairs:
+    if chunked and cmpIgnoreCase(k, "content-length") == 0: continue
     result.add(k & ": " & v & "\r\n")
   if chunked:
     if not req.headers.contains("transfer-encoding"):
       result.add("Transfer-Encoding: chunked\r\n")
     # Advertise which fields arrive as trailers (RFC 9110 6.6.2). Recommended so an
     # intermediary keeps them; only added when the caller did not set it themselves.
+    # Only the names `finalChunk` will actually emit are listed: a forbidden trailer
+    # name is filtered there (#296), so advertising it would promise a field that
+    # never arrives.
     if req.trailers.len > 0 and not req.headers.contains("trailer"):
       var names: seq[string]
-      for (k, _) in req.trailers.pairs: names.add(k)
-      result.add("Trailer: " & names.join(", ") & "\r\n")
+      for (k, _) in req.trailers.pairs:
+        if not isForbiddenTrailer(k): names.add(k)
+      if names.len > 0:
+        result.add("Trailer: " & names.join(", ") & "\r\n")
   elif not req.headers.contains("content-length"):
     if req.body.len > 0:
       result.add("Content-Length: " & $req.body.len & "\r\n")
@@ -57,25 +69,48 @@ proc serializeRequest*(req: Request): string =
 
 const chunkTerminator* = "0\r\n\r\n"
 
+const h1CoalesceSize* = 16 * 1024
+  ## Cap on the streamed-upload write buffer (#299). A producer that yields many tiny
+  ## chunks would otherwise cost one socket write -- and, under TLS, one record with
+  ## its own header and MAC -- per chunk. The send loop buffers raw body bytes and
+  ## flushes what it holds as a single chunk BEFORE an append would take the buffer
+  ## past this size, so a framed buffer never exceeds it; a producer chunk already
+  ## this large is framed and written on its own. 16 KiB is the maximum TLS record
+  ## payload, so a full buffer always fits one record.
+
+proc addChunk*(buf: var string, data: string) =
+  ## Append one HTTP/1.1 chunked-transfer frame for `data` to `buf`. Lets the send
+  ## loop pack the last chunk and the terminator into a single write without an
+  ## intermediate per-chunk string. An empty `data` appends nothing: an empty chunk
+  ## would encode as "0\r\n\r\n", a premature body terminator (#274).
+  if data.len == 0: return
+  let hex = fmt"{data.len:X}"
+  buf.add hex
+  buf.add "\r\n"
+  buf.add data
+  buf.add "\r\n"
+
 proc encodeChunk*(data: string): string =
   ## One HTTP/1.1 chunked-transfer frame: `<hex-size>\r\n<data>\r\n`. `data` must be
   ## non-empty. Built into a single preallocated buffer (the payload is copied once)
   ## rather than chained `&` temporaries, since this runs per chunk of a streamed
   ## upload.
-  if data.len == 0: return ""   # an empty chunk would encode as "0\r\n\r\n", a premature
-                                # body terminator; never emit one mid-stream (#274)
-  let hex = fmt"{data.len:X}"
-  result = newStringOfCap(hex.len + data.len + 4)
-  result.add hex
-  result.add "\r\n"
-  result.add data
-  result.add "\r\n"
+  if data.len == 0: return ""
+  result = newStringOfCap(data.len + 20)
+  result.addChunk(data)
 
 proc finalChunk*(req: Request): string =
   ## The terminating zero-length chunk plus any request trailer fields (RFC 9110
   ## 7.1.2). With no trailers this is exactly `chunkTerminator` ("0\r\n\r\n").
+  ##
+  ## Fields that must not appear in a trailer section (framing and routing fields,
+  ## pseudo-headers, `Trailer` itself) are dropped through the shared
+  ## `isForbiddenTrailer`, the same filter h2 and h3 apply. Without it a
+  ## `Content-Length` or `Transfer-Encoding` smuggled in as a trailer would be written
+  ## straight after the zero chunk, where a lenient intermediary may act on it (#296).
   result = "0\r\n"
   for (k, v) in req.trailers.pairs:
+    if isForbiddenTrailer(k): continue
     result.add(k & ": " & v & "\r\n")
   result.add("\r\n")
 

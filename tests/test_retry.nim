@@ -60,3 +60,55 @@ suite "idempotency key (keep-alive-race replay opt-in)":
 
   test "the X-Idempotency-Key variant is also accepted (matches Go)":
     check hasIdempotencyKey(reqWith("X-Idempotency-Key"))
+
+suite "HTTP/3 fall-back discipline (#378)":
+  proc plain(verb: HttpVerb): Request =
+    Request(verb: verb, headers: initHeaders())
+
+  test "a pre-submit QUIC failure falls back for any method":
+    # Nothing reached the server (never connected / stream never opened), so even a
+    # POST may be sent again over h2/h1.
+    check mayFallBackFromH3(plain(POST), submitted = false)
+    check mayFallBackFromH3(plain(PATCH), submitted = false)
+    check mayFallBackFromH3(plain(GET), submitted = false)
+
+  test "a submitted-then-failed request only falls back when idempotent":
+    check mayFallBackFromH3(plain(GET), submitted = true)
+    check mayFallBackFromH3(plain(PUT), submitted = true)
+    check mayFallBackFromH3(plain(DELETE), submitted = true)
+    check not mayFallBackFromH3(plain(POST), submitted = true)
+    check not mayFallBackFromH3(plain(PATCH), submitted = true)
+
+  test "the streaming-response leg is gated by the verb, not by a request body":
+    # `stream`/SSE over h3 submits without a request body, so `isReplayable` is
+    # always true there; the gate that matters is the verb. A POST whose h3 stream
+    # was reset after `awaitHeaders` must NOT be re-sent over h2/h1, while a GET may.
+    var bodyless = plain(POST)
+    bodyless.body = ""
+    check not mayFallBackFromH3(bodyless, submitted = true)
+    check mayFallBackFromH3(bodyless, submitted = false)
+    check mayFallBackFromH3(plain(GET), submitted = true)
+
+suite "HTTP/3 fall-back with a streamed upload (#293)":
+  proc streamed(verb: HttpVerb): Request =
+    var r = Request(verb: verb, headers: initHeaders())
+    r.bodyStream = proc(): string = ""
+    r.hasStreamedBody = true
+    r
+
+  test "a pre-submit failure may still fall back: the producer was never pulled":
+    check mayFallBackFromH3(streamed(PUT), submitted = false)
+    check mayFallBackFromH3(streamed(POST), submitted = false)
+
+  test "a submitted streamed upload never falls back, even when idempotent":
+    # The h3 data reader pulls `bodyStream` as soon as the stream is submitted, so
+    # the producer may be spent; replaying it over h2/h1 would upload a truncated
+    # body. Matches the retry loop / digest / redirect guards.
+    check not mayFallBackFromH3(streamed(PUT), submitted = true)
+    check not mayFallBackFromH3(streamed(GET), submitted = true)
+
+  test "an async producer (hasStreamedBody, no bodyStream) is guarded too":
+    var r = Request(verb: PUT, headers: initHeaders())
+    r.hasStreamedBody = true
+    check not mayFallBackFromH3(r, submitted = true)
+    check mayFallBackFromH3(r, submitted = false)

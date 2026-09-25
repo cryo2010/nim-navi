@@ -430,6 +430,7 @@ proc sendAll*(c: Conn, data: string) =
     if not c.ssl.isNil:
       var off = 0
       while off < data.len:
+        ErrClearError()   # see `sslReadSome`: SSL_get_error needs an empty error queue
         let n = SSL_write(c.ssl, cast[cstring](unsafeAddr data[off]), data.len - off).int
         if n <= 0: raise newException(IOError, "navi: SSL_write failed")
         off += n
@@ -496,6 +497,12 @@ when defined(ssl):
       # Bound the blocking recv OpenSSL runs under SSL_read: without this a readable
       # fd carrying only ticket/partial-record bytes wedges the thread here forever.
       if waitMs > 0: setIoTimeout(c.fd, waitMs)
+      # OpenSSL's error queue is per THREAD, not per SSL, and `SSL_get_error` is
+      # documented to be reliable only when that queue was empty before the I/O call:
+      # a stale entry (another pooled connection's teardown, a failed handshake)
+      # otherwise reports SSL_ERROR_SSL for what is really a would-block and fails a
+      # healthy read. Clear it before every SSL_* call.
+      ErrClearError()
       let n = SSL_read(c.ssl, addr buf[0], buf.len).int
       if waitMs > 0: setIoTimeout(c.fd, 0)   # clear; the next read re-arms its own budget
       if n > 0: return n

@@ -106,6 +106,375 @@ suite "async websocket client end to end":
     joinThread(th)
     check outcome == "timeout"
 
+suite "async websocket lifecycle guards (#289)":
+  test "send and ping should raise on a closed WebSocket":
+    var th: Thread[WsSrv]
+    var port: int
+    startWsEcho(th, port)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.close()
+      try:
+        await ws.send("too late")
+        result = "sent"
+      except IOError: result = "send raised"
+      try:
+        await ws.ping()
+        result.add "|pinged"
+      except IOError: result.add "|ping raised"
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == "send raised|ping raised"
+
+  test "close should reject the close codes reserved for local use":
+    var th: Thread[WsSrv]
+    var port: int
+    startWsEcho(th, port)
+
+    proc run(): Future[int] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      for code in [closeNoStatus, closeAbnormal, 1015'u16]:
+        try: await ws.close(code)
+        except ValueError: inc result
+      await ws.close()                         # a valid code still works
+
+    let rejected = waitFor run()
+    joinThread(th)
+    check rejected == 3
+
+  test "close should accept a reserved code once the socket is already closed":
+    # `receive` reports 1006 on an abrupt EOF and 1005 for a codeless close, so a
+    # caller mirroring `m.closeCode` back on teardown must not blow up: the codes
+    # are rejected only while a close frame would actually go out.
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("eofnow")                  # dropped with no close frame
+      let m = await ws.receive()
+      try:
+        await ws.close(m.closeCode)            # idempotent teardown, not a raise
+        result = "closed:" & $m.closeCode
+      except ValueError as e:
+        result = "raised:" & $e.name
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == "closed:" & $closeAbnormal
+
+  test "a transport EOF should surface as 1006 on both read paths":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    proc run(): Future[uint16] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("eofnow")                  # dropped with no close frame
+      let m = await ws.receive()
+      result = m.closeCode
+
+    let code = waitFor run()
+    joinThread(th)
+    check code == closeAbnormal
+
+    var th2: Thread[WsSrv]
+    var port2: int
+    var sawEof2 = false
+    startWsMisbehave(th2, port2, sawEof2)
+
+    proc run2(): Future[uint16] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port2 & "/chat")
+      await ws.send("eofnow")
+      let r = await ws.stream()                # the streaming path reports the same
+      result = r.closeCode
+
+    let code2 = waitFor run2()
+    joinThread(th2)
+    check code2 == closeAbnormal
+
+suite "async websocket protocol-error teardown (#281)":
+  # A protocol error from the peer must fail the connection (RFC 6455 7.1.7), not
+  # just raise: the transport has to be torn down, else it leaks and the decoder
+  # stays desynced. The server reports whether the client actually dropped it.
+  test "receive should fail the connection when the server sends a masked frame":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    # The outcome travels back as a string, matching the chronos file: strict
+    # exception tracking there rejects unittest's check/expect inside an async proc.
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("masked")
+      try:
+        discard await ws.receive()
+        result = "no error"
+      except ValueError as e:
+        result = "raised:" & $e.name
+      # deliberately no close(): the driver must have torn the transport down
+      # itself, which is exactly what `sawEof` below proves.
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == "raised:ValueError"
+    check sawEof                               # torn down, not leaked
+
+  test "receive should fail the connection on invalid UTF-8 in a text message":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("badutf8")
+      try:
+        discard await ws.receive()
+        result = "no error"
+      except ValueError as e:
+        result = "raised:" & $e.name
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == "raised:ValueError"
+    check sawEof
+
+suite "async websocket streaming text validation (#282)":
+  # The streaming read path never buffers the whole message, so it validates each
+  # chunk as it arrives instead of relying on the assembler's whole-message check.
+  test "a streamed text message should be rejected when a code point is invalid across frames":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("splitbad")
+      let r = await ws.stream()
+      try:
+        while (await r.readChunk()).len > 0: discard
+        result = "no error"
+      except ValueError as e:
+        result = "raised:" & $e.name
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == "raised:ValueError"
+    check sawEof
+
+  test "a streamed text message should accept a code point split across frames":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false                         # not asserted here: nothing failed
+    startWsMisbehave(th, port, sawEof)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("splitok")
+      let r = await ws.stream()
+      while true:
+        let chunk = await r.readChunk()
+        if chunk.len == 0: break
+        result.add chunk
+      await ws.close()
+
+    let msg = waitFor run()
+    joinThread(th)
+    check msg == "\xf0\x9f\x92\xa9"            # U+1F4A9, whole again
+
+suite "async websocket streaming desync teardown (#284)":
+  # The streaming read path desyncs on the same protocol errors, and only `drain`
+  # used to tear down: a direct readChunk/stream() left the transport alive.
+  test "stream() should fail the connection when a message starts with a continuation":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("orphan")
+      try:
+        discard await ws.stream()
+        result = "no error"
+      except IOError as e:
+        result = "raised:" & $e.name
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == "raised:IOError"
+    check sawEof
+
+  test "readChunk should fail the connection on a data frame where a continuation is due":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("datamid")
+      let r = await ws.stream()
+      result = await r.readChunk()             # the opening fragment
+      try:
+        discard await r.readChunk()            # a new text frame, not a continuation
+        result.add "|no error"
+      except IOError as e:
+        result.add "|raised:" & $e.name
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == "aa|raised:IOError"
+    check sawEof
+
+suite "async websocket streaming close validation (RFC 6455 5.5.1 / 7.4)":
+  # The streaming reader used to take the peer's close frame on trust: an invalid
+  # body surfaced as a clean `wmClose` and was echoed back verbatim. It now runs
+  # the same checks `receive` does, and a bad frame fails the connection (1002).
+  test "stream() should fail the connection on a close code that may not be sent":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("closebad")                # close frame carrying 1006
+      try:
+        discard await ws.stream()
+        result = "no error"
+      except ValueError as e:
+        result = "raised:" & $e.name
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == "raised:ValueError"
+    check sawEof                               # torn down, not leaked
+
+  test "stream() should fail the connection on a 1-byte close payload":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("closeshort")
+      try:
+        discard await ws.stream()
+        result = "no error"
+      except ValueError as e:
+        result = "raised:" & $e.name
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == "raised:ValueError"
+    check sawEof
+
+  test "readChunk should fail the connection on an invalid close mid-message":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("midclosebad")
+      let r = await ws.stream()
+      result = await r.readChunk()             # the opening fragment
+      try:
+        discard await r.readChunk()            # close with a reserved code
+        result.add "|no error"
+      except ValueError as e:
+        result.add "|raised:" & $e.name
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == "aa|raised:ValueError"
+    check sawEof
+
+  test "a valid close mid-message should still end the stream with its code":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false                         # not asserted here: nothing failed
+    startWsMisbehave(th, port, sawEof)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("midcloseok")
+      let r = await ws.stream()
+      result = await r.readChunk()
+      result.add "|" & $(await r.readChunk()).len    # the close truncates the message
+      result.add "|" & $r.closeCode
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == "aa|0|" & $closeGoingAway
+
+suite "async websocket streamed-write guards":
+  # `write`/`finishWrite` used to poke a torn-down transport and fail with whatever
+  # the socket layer said; they now raise navi's IOError like `send`/`ping`.
+  test "write should raise on a closed WebSocket":
+    var th: Thread[WsSrv]
+    var port: int
+    startWsEcho(th, port)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.close()
+      try:
+        ws.stream(writer):
+          await writer.write("too late")
+        result = "wrote"
+      except IOError: result = "write raised"
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == "write raised"
+
+  test "finishWrite should raise on a closed WebSocket":
+    var th: Thread[WsSrv]
+    var port: int
+    startWsEcho(th, port)
+
+    proc run(): Future[string] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.close()
+      try:
+        ws.stream(writer):                     # no writes: the fin frame alone
+          if writer == nil: discard
+        result = "finished"
+      except IOError: result = "finish raised"
+
+    let outcome = waitFor run()
+    joinThread(th)
+    check outcome == "finish raised"
+
 suite "WebSocket transport selection (asyncdispatch)":
   test "websocket over {H2} on a non-TLS URL should raise ProtocolError":
     # {H2} excludes h1; h2 needs TLS, so a ws:// (plaintext) target has no usable

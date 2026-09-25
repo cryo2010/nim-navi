@@ -159,6 +159,27 @@ proc encodeHeaderFrames(c: H2Conn, streamId: uint32, headers: openArray[HeaderPa
                                     endHeaders = i + n >= headerBlock.len)
       i += n
 
+proc emitData(c: H2Conn, streamId: uint32, s: Stream, src: string, srcOff: int,
+              outbuf: var string): int =
+  ## Frame `src[srcOff ..< src.len]` into DATA frames for as long as the stream and
+  ## connection send windows allow, splitting at the peer's max frame size, and
+  ## return the offset reached (`src.len` when all of it went out). END_STREAM rides
+  ## the last frame only when the body is closed and no trailers follow, exactly as
+  ## `flushSend` needs it. Whatever is left over belongs to the caller: `flushSend`
+  ## leaves it in `sendBuf`, `queueSend` stages it there.
+  result = srcOff
+  while result < src.len:
+    let avail = min(s.sendWindow, c.connSendWindow)
+    if avail <= 0: return                      # windowed out; wait for a WINDOW_UPDATE
+    let n = min(min(avail, c.maxFrameSize), src.len - result)
+    # END_STREAM rides the last DATA frame only when no trailers follow.
+    let last = s.sendClosed and result + n >= src.len and s.trailers.len == 0
+    encodeDataInto(outbuf, streamId, src, result, n, endStream = last)
+    result += n
+    s.sendWindow -= n
+    c.connSendWindow -= n
+    if last: s.endSent = true
+
 proc flushSend(c: H2Conn, streamId: uint32, s: Stream, outbuf: var string) =
   ## Emit as many DATA frames as the stream and connection send windows allow. Once
   ## the body is closed (`sendClosed`) and fully on the wire, close the stream:
@@ -171,17 +192,7 @@ proc flushSend(c: H2Conn, streamId: uint32, s: Stream, outbuf: var string) =
   ## This guard keeps a window-released tail from slipping out anyway -- the conn-level
   ## WINDOW_UPDATE path flushes EVERY stream, finished ones included.
   if s.endSent or s.ended: return
-  while s.sendOff < s.sendBuf.len:
-    let avail = min(s.sendWindow, c.connSendWindow)
-    if avail <= 0: return                      # windowed out; wait for a WINDOW_UPDATE
-    let n = min(min(avail, c.maxFrameSize), s.sendBuf.len - s.sendOff)
-    # END_STREAM rides the last DATA frame only when no trailers follow.
-    let last = s.sendClosed and s.sendOff + n >= s.sendBuf.len and s.trailers.len == 0
-    encodeDataInto(outbuf, streamId, s.sendBuf, s.sendOff, n, endStream = last)
-    s.sendOff += n
-    s.sendWindow -= n
-    c.connSendWindow -= n
-    if last: s.endSent = true
+  s.sendOff = c.emitData(streamId, s, s.sendBuf, s.sendOff, outbuf)
   if s.sendClosed and not s.endSent and s.sendOff >= s.sendBuf.len:
     # Body fully on the wire: close the stream with the trailing HEADERS block if the
     # request carries trailers, else an empty END_STREAM DATA frame.
@@ -252,17 +263,37 @@ proc sendDrained*(c: H2Conn, streamId: uint32): bool =
   s == nil or s.sendOff >= s.sendBuf.len
 
 proc queueSend*(c: H2Conn, streamId: uint32, data: string): string =
-  ## Append a streamed request-body chunk and emit as much as the send window
-  ## allows now; the remainder is released by `feed` on WINDOW_UPDATE. Compacts
-  ## the already-sent prefix so buffered memory stays bounded. A stream whose send
+  ## Emit a streamed request-body chunk, as much of it as the send window allows
+  ## now; the remainder is queued and released by `feed` on WINDOW_UPDATE. When
+  ## nothing is parked (the usual case -- the caller only pulls the next chunk once
+  ## `sendDrained` says so) the chunk is framed straight into the returned wire
+  ## bytes, so a streamed upload copies each byte once instead of staging it in
+  ## `sendBuf` first. Only a window-blocked remainder is staged. A stream whose send
   ## side is already closed (END_STREAM out, or `closeSendSide` aborted it) takes
   ## nothing: buffering into it would just pin dead memory until the stream drops.
   let s = c.streams.getOrDefault(streamId)
   if s == nil or data.len == 0 or s.endSent: return
-  if s.sendOff > 0:                            # drop the sent prefix
-    s.sendBuf = s.sendBuf[s.sendOff .. ^1]
-    s.sendOff = 0
-  s.sendBuf.add data
+  if s.sendOff >= s.sendBuf.len and not s.ended:
+    # Nothing parked: frame from the caller's chunk, no staging copy. The drained
+    # buffer is emptied (keeping its capacity) so a remainder can go in front-first.
+    if s.sendBuf.len > 0:
+      s.sendBuf.setLen(0)
+      s.sendOff = 0
+    let sent = c.emitData(streamId, s, data, 0, result)
+    if sent < data.len:                        # windowed out: stage what is left
+      let rem = data.len - sent
+      s.sendBuf.setLen(rem)
+      copyMem(addr s.sendBuf[0], unsafeAddr data[sent], rem)
+  else:
+    if s.sendOff > 0:                          # drop the sent prefix
+      if s.sendOff >= s.sendBuf.len:
+        s.sendBuf.setLen(0)                    # fully drained: keep the capacity
+      else:                                    # a window-blocked prefix remains: slide
+        let rem = s.sendBuf.len - s.sendOff    # it down in place, capacity intact
+        moveMem(addr s.sendBuf[0], addr s.sendBuf[s.sendOff], rem)
+        s.sendBuf.setLen(rem)
+      s.sendOff = 0
+    s.sendBuf.add data
   c.flushSend(streamId, s, result)
 
 proc finishSend*(c: H2Conn, streamId: uint32,

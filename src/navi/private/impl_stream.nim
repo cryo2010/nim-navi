@@ -78,8 +78,12 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
   when defined(naviHttp3):
     # Stream over HTTP/3 when the origin has advertised h3 (Alt-Svc). Mirrors the
     # buffered h3Transport path: submit on the shared connection, read headers,
-    # return a handle whose readChunk pulls the body incrementally. Any QUIC failure
-    # falls through to h2/h1.
+    # return a handle whose readChunk pulls the body incrementally. A QUIC failure
+    # falls through to h2/h1 under the same discipline as the buffered leg (#378):
+    # a bare `QuicError` is provably pre-submit and may fall back for any method,
+    # while a `QuicSubmittedError` (raised by `awaitHeaders` once the stream is on
+    # the wire) only falls back when the request is replayable and idempotent --
+    # otherwise a submitted-then-reset POST would be silently re-sent over h2/h1.
     if client.config.wantsH3 and req.url.isTls and req.bodyStream == nil:
       let ep = client.altSvc.h3Endpoint("https", req.url.host, req.url.port)
       if ep.isSome:
@@ -99,10 +103,14 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
             except CatchableError:                 # header wait failed or was cancelled
               qc.freeStream(sid)                   # (e.g. timeout): free the submitted
               raise                                # stream so it isn't left on the wire
-        except QuicError:
+        except QuicError as e:
           if client.h3conns.getOrDefault(origin, nil) != nil and
              not client.h3conns[origin].alive:
-            client.h3conns.del(origin)     # drop a dead connection; fall back below
+            client.h3conns.del(origin)     # drop a dead connection either way
+          # Only then decide whether this request may be replayed on h2/h1: the
+          # eviction above is connection hygiene and has to happen even when the
+          # error propagates.
+          if not mayFallBackFromH3(req, e of QuicSubmittedError): raise
 
   if wantH2:
     # A reused mux can be torn down before headers arrive (keep-alive race /

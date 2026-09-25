@@ -5,7 +5,8 @@
 # --- WebSocket (RFC 6455) ---
 
 export ws.WsMessage, ws.WsMessageKind, ws.closeNormal, ws.closeGoingAway,
-       ws.closeMessageTooBig, ws.WsMessageTooLarge
+       ws.closeProtocolError, ws.closeMessageTooBig, ws.closeNoStatus,
+       ws.closeAbnormal, ws.WsMessageTooLarge
 
 type
   WsKind = enum wkH1, wkH2, wkH3
@@ -205,7 +206,7 @@ proc websocketH2(client: Navi, u: Url, headers: Headers,
   ## WebSocket over HTTP/2 Extended CONNECT (RFC 8441). Dials a dedicated h2
   ## connection (ALPN "h2"), confirms the peer advertised ENABLE_CONNECT_PROTOCOL,
   ## opens a CONNECT `:protocol=websocket` stream, and tunnels frames as DATA. No
-  ## Sec-WebSocket-Key/Accept over h2; a `:status 200` accepts the tunnel. The
+  ## Sec-WebSocket-Key/Accept over h2; any 2xx `:status` accepts the tunnel. The
   ## connection is dedicated to this WebSocket (not pooled), so the single blocking
   ## socket drives one full-duplex stream without contending with other requests.
   let conn = connect(u.host, u.port, u.isTls, client.config.tls,
@@ -239,8 +240,10 @@ proc websocketH2(client: Navi, u: Url, headers: Headers,
     raise newException(ProtocolError,
       "navi: server does not support WebSocket over HTTP/2 " &
       "(no SETTINGS_ENABLE_CONNECT_PROTOCOL); use an h1 WebSocket")
-  var extra = headers
-  extra["sec-websocket-version"] = wsVersion
+  # One field policy for every Extended CONNECT (h2 and h3): wsExtraFields drops
+  # the h1-only handshake fields and the hop-by-hop ones, and adds
+  # sec-websocket-version. h2ConnectHeaderList then applies the h2 rules.
+  let extra = initHeaders(wsExtraFields(headers))
   let sid = h2.openStream()
   conn.sendAll(h2.encodeRequestHead(sid, h2ConnectHeaderList(u, "websocket", extra)))
   while not h2.headersReady(sid):        # await the CONNECT response headers
@@ -251,14 +254,14 @@ proc websocketH2(client: Navi, u: Url, headers: Headers,
     if toSend.len > 0: conn.sendAll(toSend)
     if h2.streamReset(sid):
       raise newException(IOError, "navi: websocket h2 tunnel reset before it opened")
-    if h2.streamDone(sid):               # fatal conn error or GOAWAY before the 200
+    if h2.streamDone(sid):               # fatal conn error or GOAWAY before the 2xx
       raise newException(IOError, "navi: websocket h2 tunnel closed before it opened")
   let status = h2.respSnapshot(sid).status
-  if status != 200:                      # RFC 8441: a 200 accepts the tunnel
+  if status < 200 or status >= 300:      # RFC 8441 5: any 2xx accepts the tunnel
     raise newException(IOError,
       "navi: WebSocket over h2 rejected with :status " & $status)
   let w = WsH2(sock: conn, h2: h2, sid: sid)
-  w.inbuf.add h2.takeBody(sid)           # any DATA already buffered behind the 200
+  w.inbuf.add h2.takeBody(sid)           # any DATA already buffered behind the 2xx
   result = WebSocket(tr: WsTransport(kind: wkH2, h2c: w), open: true,
                      maxMessageBytes: maxMessageBytes, keepAlive: keepAlive)
   handshakeOk = true
@@ -279,7 +282,7 @@ when defined(naviHttp3):
                                     client.config.tls.verify, u.requestTarget,
                                     wsExtraFields(headers), client.config.connectMs,
                                     client.config.readMs, client.config.totalMs)
-      if status != 200:            # RFC 9220 / 8441: a 200 accepts the tunnel
+      if status < 200 or status >= 300:  # RFC 9220 / 8441 5: any 2xx accepts it
         wsClose(pump)
         raise newException(IOError,
           "navi: WebSocket over h3 rejected with :status " & $status)
@@ -321,10 +324,15 @@ proc websocket*(client: Navi, url: string, headers = initHeaders(),
       "the sync client (h2/h3 need TLS; h3 also needs {H3} + -d:naviHttp3)")
 
 proc send*(ws: WebSocket, data: string, binary = false) =
-  ## Send a text (default) or binary message. Client frames are masked.
+  ## Send a text (default) or binary message. Client frames are masked. Raises
+  ## `IOError` once the WebSocket is closed (or closing), rather than writing into
+  ## a torn-down transport and failing with whatever the socket layer says.
+  if not ws.open: raise newException(IOError, "navi: send on a closed WebSocket")
   ws.sendRaw(encodeFrame(if binary: opBinary else: opText, data))
 
 proc ping*(ws: WebSocket, data = "") =
+  ## Send a ping. Raises `IOError` on a closed WebSocket (see `send`).
+  if not ws.open: raise newException(IOError, "navi: ping on a closed WebSocket")
   ws.sendRaw(encodeFrame(opPing, data))
 
 proc kaRecv(ws: WebSocket): string =
@@ -343,27 +351,55 @@ proc kaRecv(ws: WebSocket): string =
     ws.sendRaw(encodeFrame(opPing, ""))
     ws.pingOutstanding = true
 
+proc failClose(ws: WebSocket, code: uint16) =
+  ## Fail the connection after a protocol error (RFC 6455 7.1.7): tell the peer why
+  ## (best effort), then tear the transport down. Idempotent, and it never raises
+  ## over the error that triggered it, so a caller can `raise` straight after.
+  if ws.open:
+    ws.open = false
+    try: ws.sendRaw(encodeFrame(opClose, closePayload(code)))
+    except CatchableError: discard
+  try: ws.closeRaw()
+  except CatchableError: discard
+
 proc receive*(ws: WebSocket): WsMessage =
   ## Block until a full message arrives, answering pings and reassembling
-  ## fragments. A close returns `wmClose` (and the connection is then closed).
+  ## fragments. A close returns `wmClose` (and the connection is then closed). A
+  ## protocol error from the peer fails the connection (close 1002) and raises.
   while true:
     var f: Frame
-    while not ws.dec.next(f):
+    var got = false
+    while not got:
+      # A malformed frame header (RSV set, reserved opcode, oversized control
+      # frame, bad length) is a protocol error like any other: fail the connection
+      # instead of leaving the transport open with a desynced decoder.
+      try:
+        got = ws.dec.next(f)
+      except ValueError:
+        ws.failClose(closeProtocolError)
+        raise
+      if got: break
       let chunk = ws.kaRecv()
       if chunk.len == 0:                       # peer closed: tear the transport down
         ws.open = false                        # now (h3: join the pump) so it is not
         ws.closeRaw()                          # leaked when the caller's close() no-ops
-        return WsMessage(kind: wmClose, closeCode: closeGoingAway)
+        # RFC 6455 7.4.1: a transport that ends without a close frame is 1006, a
+        # code that only ever surfaces locally. The streaming path reports the
+        # same, so an abrupt EOF looks identical whichever way you read.
+        return WsMessage(kind: wmClose, closeCode: closeAbnormal)
       ws.dec.feed(chunk)
     var o: WsOutcome
     try:
       o = ws.asmb.offer(f, ws.maxMessageBytes, rejectMasked = true)
     except WsMessageTooLarge:
-      if ws.open:      # tell the peer why (1009), then drop the connection
-        try: ws.sendRaw(encodeFrame(opClose, closePayload(closeMessageTooBig)))
-        except CatchableError: discard
-        ws.open = false
-        ws.closeRaw()
+      ws.failClose(closeMessageTooBig)         # tell the peer why (1009), then drop
+      raise
+    except ValueError:
+      # Every other `offer` rejection is a protocol error (a masked server frame, a
+      # bad close body or code, invalid UTF-8, broken fragmentation): close with
+      # 1002 and tear the transport down, else it leaks and the assembler stays
+      # desynced for the next receive.
+      ws.failClose(closeProtocolError)
       raise
     case o.reply
     of wrPong:
@@ -381,7 +417,16 @@ proc close*(ws: WebSocket, code = closeNormal, reason = "") =
   ## Send a close frame (if still open) and tear the transport down. Idempotent: safe
   ## to call after a peer-close, which already set open=false and tore down -- the
   ## transport teardown still runs (once) so an already-closed h3 pump is not leaked.
+  ##
+  ## `code` must be one that may appear on the wire: 1005, 1006 and 1015 are
+  ## reserved for local use (RFC 6455 7.4.1) and raise `ValueError` -- but only
+  ## while a close frame would actually be sent. Once the socket is closed there is
+  ## nothing to send, so mirroring a code `receive` reported (`ws.close(m.closeCode)`,
+  ## which is 1005 or 1006 after a codeless close or an abrupt EOF) is a safe no-op.
   if ws.open:
+    if code == closeNoStatus or code == closeAbnormal or code == 1015'u16:
+      raise newException(ValueError, "navi: WebSocket close code " & $code &
+        " is reserved and must never be sent (RFC 6455 7.4.1)")
     ws.open = false
     try: ws.sendRaw(encodeFrame(opClose, closePayload(code, reason)))
     except CatchableError: discard
@@ -395,9 +440,13 @@ type
     ## `wmClose` if a close arrived instead). Consume with `each`/`readChunk`.
     ws: WebSocket
     kind*: WsMessageKind
+    closeCode*: uint16       ## set when `kind` is wmClose, or when a close ends the
+                             ## stream early: the peer's code, 1005 when it sent none,
+                             ## 1006 when the transport just ended (as `receive`)
     first: string            ## the first data frame's payload, buffered by `stream`
     hasFirst: bool
     done: bool               ## the fin frame has been consumed
+    utf8: WsUtf8Scanner      ## running UTF-8 check for a text message (RFC 6455 8.1)
   WsWriter* = ref object
     ## A message being sent incrementally. `write` each fragment; the final frame is
     ## sent by the `stream` block on exit.
@@ -405,22 +454,35 @@ type
     binary: bool
     started: bool
 
-proc readDataFrame(ws: WebSocket): Frame =
+proc readDataFrame(ws: WebSocket): tuple[f: Frame, eof: bool] =
   ## The next non-control frame (data / continuation / close), answering pings along
-  ## the way; keepalive applies (via `kaRecv`). A transport EOF yields a close frame.
+  ## the way; keepalive applies (via `kaRecv`). A transport EOF yields a synthetic
+  ## close frame with `eof` set, which the close paths report as 1006 without
+  ## validating or echoing it (it never came from the peer).
   while true:
     var f: Frame
-    while not ws.dec.next(f):
+    var got = false
+    while not got:
+      try:                                     # a malformed frame fails the
+        got = ws.dec.next(f)                   # connection (see receive)
+      except ValueError:
+        ws.failClose(closeProtocolError)
+        raise
+      if got: break
       let chunk = ws.kaRecv()
       if chunk.len == 0:
         ws.open = false
         ws.closeRaw()                          # tear down on EOF (see receive)
-        return Frame(fin: true, opcode: opClose, payload: "")
+        # 1006 in the synthetic frame, so the reader reports the same code as
+        # `receive` does for a bodiless EOF. The `eof` flag keeps it out of the
+        # peer-close checks: it is neither validated nor echoed back (and the
+        # close handlers only send while `open`, which EOF just cleared).
+        return (Frame(fin: true, opcode: opClose, payload: closePayload(closeAbnormal)), true)
       ws.dec.feed(chunk)
     case f.opcode
     of opPing: ws.sendRaw(encodeFrame(opPong, f.payload)); continue
     of opPong: continue
-    else: return f
+    else: return (f, false)
 
 proc closeOnFrame(ws: WebSocket, f: Frame) =
   ## Echo a peer close and drop the transport (used when a close interrupts a stream).
@@ -430,12 +492,28 @@ proc closeOnFrame(ws: WebSocket, f: Frame) =
     ws.open = false
     ws.closeRaw()
 
+proc closeFromPeer(ws: WebSocket, f: Frame, eof: bool): uint16 =
+  ## Handle a close that ended a streamed read, and report its code. A synthetic
+  ## EOF frame is 1006, with nothing to validate or echo. A real close frame is
+  ## checked exactly as `receive` does (`parseClose`): a 1-byte body, a code that
+  ## must never appear on the wire, or a non-UTF-8 reason is a protocol error, so
+  ## fail the connection with 1002 and raise rather than echo the bad frame back.
+  if eof: return closeAbnormal
+  var code: uint16
+  try:
+    code = parseClose(f).code
+  except ValueError:
+    ws.failClose(closeProtocolError)
+    raise
+  ws.closeOnFrame(f)
+  return code
+
 proc openStreamReader(ws: WebSocket): WsReader =
   ## Impl of the no-arg `ws.stream()`; kept a proc so the public `stream` is a
   ## template (a proc + template overload would force early symbol resolution of the
   ## `stream(writer)` block's injected identifier).
   result = WsReader(ws: ws)
-  let f = ws.readDataFrame()
+  let (f, eof) = ws.readDataFrame()
   case f.opcode
   of opText, opBinary:
     result.kind = if f.opcode == opText: wmText else: wmBinary
@@ -445,26 +523,43 @@ proc openStreamReader(ws: WebSocket): WsReader =
   of opClose:
     result.kind = wmClose
     result.done = true
-    ws.closeOnFrame(f)
+    result.closeCode = ws.closeFromPeer(f, eof)   # validated as in `receive`
   else:
+    # A desync is a protocol error like any other: fail the connection (1002)
+    # rather than leaving the transport open behind the raise (#284).
+    ws.failClose(closeProtocolError)
     raise newException(IOError, "navi: WebSocket message started with a continuation frame")
+
+proc checkTextUtf8(r: WsReader, chunk: string) =
+  ## Validate a streamed text message's UTF-8 as it arrives (RFC 6455 8.1). The
+  ## whole message is never buffered here, so each chunk is checked on arrival,
+  ## with a code point split across frames carried into the next chunk and
+  ## required to be complete once the message ends. A failure is a protocol
+  ## error: fail the connection, then raise.
+  if r.kind != wmText: return
+  if not r.utf8.scanUtf8(chunk) or (r.done and r.utf8.midCodePoint):
+    r.ws.failClose(closeProtocolError)
+    raise newException(ValueError, "navi: invalid UTF-8 in a WebSocket text message")
 
 proc readChunk*(r: WsReader): string =
   ## The next chunk of the streamed message (one frame's payload), or "" at its end.
   if r.hasFirst:
     r.hasFirst = false
+    r.checkTextUtf8(r.first)
     return r.first
   if r.done: return ""
-  let f = r.ws.readDataFrame()
+  let (f, eof) = r.ws.readDataFrame()
   case f.opcode
   of opContinuation:
     r.done = f.fin
+    r.checkTextUtf8(f.payload)
     return f.payload
   of opClose:                # a close interrupted the message: truncate and drop
     r.done = true
-    r.ws.closeOnFrame(f)
+    r.closeCode = r.ws.closeFromPeer(f, eof)   # validated, 1005/1006 as in `receive`
     return ""
   else:
+    r.ws.failClose(closeProtocolError)         # tear down, don't just raise (#284)
     raise newException(IOError, "navi: expected a continuation frame mid-message")
 
 proc drain*(r: WsReader, sink: BodySink) =
@@ -489,7 +584,10 @@ template each*(r: WsReader; chunk, body: untyped): untyped =
   r.drain(proc(chunk: string) {.raises: [CatchableError].} = body)
 
 proc write*(w: WsWriter, data: string) =
-  ## Append a fragment to the message being streamed out.
+  ## Append a fragment to the message being streamed out. Raises `IOError` once the
+  ## WebSocket is closed (or closing), like `send`, rather than writing a fragment
+  ## into a torn-down transport and failing with whatever the socket layer says.
+  if not w.ws.open: raise newException(IOError, "navi: write on a closed WebSocket")
   if not w.started:
     w.ws.sendRaw(encodeFrame(if w.binary: opBinary else: opText, data, fin = false))
     w.started = true
@@ -498,7 +596,9 @@ proc write*(w: WsWriter, data: string) =
 
 proc finishWrite(w: WsWriter) =
   ## Send the terminating fin frame (an empty continuation, or an empty text/binary
-  ## frame for a message with no `write`s).
+  ## frame for a message with no `write`s). Raises `IOError` on a closed WebSocket
+  ## (see `write`); `streamOut`'s handler then runs its (idempotent) teardown.
+  if not w.ws.open: raise newException(IOError, "navi: write on a closed WebSocket")
   if not w.started:
     w.ws.sendRaw(encodeFrame(if w.binary: opBinary else: opText, "", fin = true))
   else:

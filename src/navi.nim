@@ -168,7 +168,7 @@ when defined(naviHttp3):
     var fwdTrl: seq[(string, string)]
     for k, v in req.trailers:
       let lk = k.toLowerAscii
-      if lk.len > 0 and lk[0] != ':' and lk notin h3SkipHeaders and lk notin ["te", "trailer"]:
+      if not isForbiddenTrailer(lk):     # the shared h1/h2/h3 trailer filter (#296)
         fwdTrl.add((lk, v))
     let conn = h3Open(ep.host, ep.port, sni = req.url.host,
                       caFile = client.config.tls.caFile,
@@ -197,7 +197,9 @@ proc transport(client: Navi, req: Request, sink: BodySink,
                userSink: BodySink = nil, gate: SinkGate = nil): Response =
   ## Pool-based transport (one request per connection at a time). In a
   ## `-d:naviHttp3` build, a GET to an origin that has advertised h3 (Alt-Svc) is
-  ## sent over HTTP/3; any QUIC failure falls back to h2/h1. The h3 endpoint is
+  ## sent over HTTP/3; a pre-submit QUIC failure falls back to h2/h1, while one
+  ## raised after the request was submitted only falls back when it is safe to
+  ## re-send (see `mayFallBackFromH3`). The h3 endpoint is
   ## learned from the `alt-svc` header captured on prior h2/h1 responses.
   ##
   ## `asyncStream` is accepted for signature parity with the async backends' wider
@@ -213,7 +215,16 @@ proc transport(client: Navi, req: Request, sink: BodySink,
       let ep = client.altSvc.h3Endpoint("https", req.url.host, req.url.port)
       if ep.isSome:
         try: return h3Transport(client, req, ep.get)
-        except QuicError: discard   # fall back to the h2/h1 transport below
+        except QuicError as e:
+          # Same fall-back discipline as the h1/h2 fall-through (#378): a bare
+          # `QuicError` is provably pre-submit (nothing reached the server) and may
+          # fall back for any method, while a `QuicSubmittedError` (the request was
+          # already on the wire) may only be re-sent when the method is idempotent.
+          # A streamed body (`bodyStream`) narrows the submitted case further (#293):
+          # its producer may already have been pulled, so only a replayable (buffered)
+          # body may be handed to h2/h1.
+          if not mayFallBackFromH3(req, e of QuicSubmittedError): raise
+          # fall through to the h2/h1 transport below
   result = poolTransport(client, req, sink, nil, userSink, gate)
   when defined(naviHttp3):
     let alt = result.headers.get("alt-svc")

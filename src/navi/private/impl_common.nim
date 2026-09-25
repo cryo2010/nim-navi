@@ -558,7 +558,7 @@ when defined(naviHttp3):
     var fwdTrl: seq[(string, string)]
     for k, v in req.trailers:
       let lk = k.toLowerAscii
-      if lk.len > 0 and lk[0] != ':' and lk notin h3SkipHeaders and lk notin ["te", "trailer"]:
+      if not isForbiddenTrailer(lk):     # the shared h1/h2/h3 trailer filter (#296)
         fwdTrl.add((lk, v))
     let origin = originKey(req.url)
     let qc = await client.getH3Conn(origin, ep, req)
@@ -591,8 +591,9 @@ proc transport(client: Navi, req: Request, sink: BodySink,
                asyncStream: AsyncBodyProducer = nil,
                userSink: BodySink = nil, gate: SinkGate = nil): Future[Response] {.async.} =
   ## The wire transport `run` calls. In a `-d:naviHttp3` build, a buffered-body
-  ## request to an origin that has advertised h3 (Alt-Svc) goes over HTTP/3, with
-  ## any QUIC failure falling back to h2/h1; `alt-svc` on h2/h1 responses is
+  ## request to an origin that has advertised h3 (Alt-Svc) goes over HTTP/3, with a
+  ## pre-submit QUIC failure falling back to h2/h1 (a failure after the request was
+  ## submitted only falls back when it is safe to re-send); `alt-svc` on h2/h1 responses is
   ## captured for later upgrades. `asyncStream` (when set) is an awaited upload
   ## producer streamed up in place of a buffered body. `userSink`/`gate` (when set)
   ## stream the FINAL response body to the caller's gated sink; the h3 leg stays
@@ -627,7 +628,17 @@ proc transport(client: Navi, req: Request, sink: BodySink,
           producer = nil   # already drained: the fallback sends h3rq's buffered body
           rq = h3rq
         try: return await h3Transport(client, h3rq, ep.get)
-        except QuicError: discard   # fall back to h2/h1 below (rq now buffered)
+        except QuicError as e:
+          # A QUIC failure only falls back to h2/h1 under the same discipline the
+          # h1/h2 fall-through uses (#378). A bare `QuicError` is provably pre-submit
+          # (never connected / stream never opened), so nothing reached the server and
+          # any method may fall back; a `QuicSubmittedError` means the request was on
+          # the wire when it failed, so the server may have processed it and only an
+          # idempotent method may be re-sent. A streamed body narrows that further
+          # (#293): once the stream is submitted the producer may have been pulled, so
+          # only a replayable (buffered) body may go to h2/h1. Anything else propagates.
+          if not mayFallBackFromH3(rq, e of QuicSubmittedError): raise
+          # fall through to h2/h1 below (rq is buffered by now)
   result = await transportInner(client, rq, sink, producer, userSink, gate)
   when defined(naviHttp3):
     client.recordAltSvc(rq, result)

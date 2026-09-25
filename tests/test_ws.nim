@@ -3,6 +3,7 @@
 import unittest
 import std/[base64, strutils]
 import navi/proto/ws
+import navi/core/[url, headers]   # parseUrl / initHeaders for the upgrade-request tests
 import ./support      # hexToBytes
 import ./support_ws   # shared WebSocket test servers (WsSrv / startWs*)
 
@@ -13,6 +14,168 @@ suite "websocket handshake":
   test "the handshake should generate a fresh 16-byte base64 nonce key":
     check base64.decode(genKey()).len == 16
     check genKey() != genKey()
+
+suite "websocket handshake response validation (RFC 6455 4.1)":
+  const clientKey = "dGhlIHNhbXBsZSBub25jZQ=="
+
+  proc head101(fields: string): string =
+    ## A 101 head whose fields are exactly `fields` (each line CRLF-terminated).
+    "HTTP/1.1 101 Switching Protocols\r\n" & fields & "\r\n"
+
+  test "validate101 should accept a 101 with the accept, Upgrade and Connection fields":
+    check validate101(head101(
+      "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
+      "Sec-WebSocket-Accept: " & acceptFor(clientKey) & "\r\n"), clientKey)
+
+  test "validate101 should reject a 101 with a correct accept but no Upgrade (#286)":
+    check not validate101(head101(
+      "Connection: Upgrade\r\n" &
+      "Sec-WebSocket-Accept: " & acceptFor(clientKey) & "\r\n"), clientKey)
+
+  test "validate101 should reject a 101 with a correct accept but no Connection (#286)":
+    check not validate101(head101(
+      "Upgrade: websocket\r\n" &
+      "Sec-WebSocket-Accept: " & acceptFor(clientKey) & "\r\n"), clientKey)
+
+  test "validate101 should accept Connection: keep-alive, Upgrade (#286)":
+    check validate101(head101(
+      "Upgrade: WebSocket\r\nConnection: keep-alive, Upgrade\r\n" &
+      "Sec-WebSocket-Accept: " & acceptFor(clientKey) & "\r\n"), clientKey)
+
+  test "validate101 should reject an Upgrade naming another protocol (#286)":
+    check not validate101(head101(
+      "Upgrade: h2c\r\nConnection: Upgrade\r\n" &
+      "Sec-WebSocket-Accept: " & acceptFor(clientKey) & "\r\n"), clientKey)
+
+  test "validate101 should reject a mismatched Sec-WebSocket-Accept":
+    check not validate101(head101(
+      "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
+      "Sec-WebSocket-Accept: " & acceptFor("other") & "\r\n"), clientKey)
+
+  test "validate101 should reject two Sec-WebSocket-Accept fields (#289)":
+    # One copy matches, so an accept-only check would let a split/injected
+    # response through.
+    check not validate101(head101(
+      "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
+      "Sec-WebSocket-Accept: " & acceptFor(clientKey) & "\r\n" &
+      "Sec-WebSocket-Accept: " & acceptFor("other") & "\r\n"), clientKey)
+
+  test "validate101 should reject two identical Sec-WebSocket-Accept fields (#289)":
+    check not validate101(head101(
+      "Upgrade: websocket\r\nConnection: Upgrade\r\n" &
+      "Sec-WebSocket-Accept: " & acceptFor(clientKey) & "\r\n" &
+      "sec-websocket-accept: " & acceptFor(clientKey) & "\r\n"), clientKey)
+
+  test "validate101 should reject a non-101 status":
+    check not validate101("HTTP/1.1 200 OK\r\nUpgrade: websocket\r\n" &
+      "Connection: Upgrade\r\nSec-WebSocket-Accept: " & acceptFor(clientKey) &
+      "\r\n\r\n", clientKey)
+
+suite "websocket upgrade request (h1)":
+  const nonce = "dGhlIHNhbXBsZSBub25jZQ=="
+  let u = parseUrl("http://example.test/chat")
+
+  test "upgradeRequest should emit the mandatory handshake fields":
+    let req = upgradeRequest(u, nonce, initHeaders())
+    check req.startsWith("GET /chat HTTP/1.1\r\n")
+    check "Host: example.test\r\n" in req
+    check "Upgrade: websocket\r\n" in req
+    check "Connection: Upgrade\r\n" in req
+    check "Sec-WebSocket-Key: " & nonce & "\r\n" in req
+    check "Sec-WebSocket-Version: 13\r\n" in req
+    check req.endsWith("\r\n\r\n")
+
+  test "upgradeRequest should carry an unrelated caller header through":
+    let req = upgradeRequest(u, nonce, initHeaders({"X-Trace": "abc"}))
+    check "X-Trace: abc\r\n" in req
+
+  test "upgradeRequest should reject CRLF in a caller header value (#288)":
+    expect ValueError:
+      discard upgradeRequest(u, nonce,
+        initHeaders({"X-Evil": "a\r\nX-Injected: 1"}))
+
+  test "upgradeRequest should reject CRLF in a caller header name (#288)":
+    expect ValueError:
+      discard upgradeRequest(u, nonce,
+        initHeaders({"X-Evil\r\nX-Injected": "1"}))
+
+  test "upgradeRequest should reject a bare LF in a caller header value (#288)":
+    expect ValueError:
+      discard upgradeRequest(u, nonce, initHeaders({"X-Evil": "a\nX-Injected: 1"}))
+
+  test "upgradeRequest should reject NUL in a caller header value (#288)":
+    expect ValueError:
+      discard upgradeRequest(u, nonce, initHeaders({"X-Evil": "a\x00b"}))
+
+  test "upgradeRequest should reject CRLF in the request target (#288)":
+    # std/uri passes control characters through verbatim, so a crafted ws:// URL
+    # reaches the request line intact.
+    var bad = parseUrl("http://example.test/chat")
+    bad.raw.path = "/chat\r\nX-Injected: 1"
+    expect ValueError:
+      discard upgradeRequest(bad, nonce, initHeaders())
+
+  test "upgradeRequest should reject CRLF in the Host (#288)":
+    var bad = parseUrl("http://example.test/chat")
+    bad.raw.hostname = "example.test\r\nX-Injected: 1"
+    expect ValueError:
+      discard upgradeRequest(bad, nonce, initHeaders())
+
+  test "upgradeRequest should drop caller fields that collide with the handshake (#288)":
+    let req = upgradeRequest(u, nonce, initHeaders({
+      "Host": "evil.test",
+      "Connection": "close",
+      "Upgrade": "h2c",
+      "Sec-WebSocket-Key": "AAAAAAAAAAAAAAAAAAAAAA==",
+      "Sec-WebSocket-Version": "8",
+      "Sec-WebSocket-Accept": "spoofed",
+      "X-Keep": "yes"}))
+    check req.count("Host: ") == 1
+    check "Host: example.test\r\n" in req
+    check req.count("Connection: ") == 1
+    check "Connection: Upgrade\r\n" in req
+    check req.count("Upgrade: ") == 1
+    check req.count("Sec-WebSocket-Key: ") == 1
+    check "Sec-WebSocket-Key: " & nonce & "\r\n" in req
+    check req.count("Sec-WebSocket-Version: ") == 1
+    check "Sec-WebSocket-Version: 13\r\n" in req
+    check "spoofed" notin req
+    check "X-Keep: yes\r\n" in req
+
+  test "upgradeRequest should match the collision list case-insensitively (#288)":
+    let req = upgradeRequest(u, nonce, initHeaders({"CONNECTION": "close"}))
+    check req.count("Connection: ") == 1
+    check "close" notin req
+
+suite "Extended CONNECT handshake fields (RFC 8441 / 9220)":
+  test "wsExtraFields should lowercase names and keep unrelated caller headers":
+    let f = wsExtraFields(initHeaders({"X-Trace": "abc"}))
+    check ("x-trace", "abc") in f
+
+  test "wsExtraFields should drop hop-by-hop and h1 upgrade fields":
+    let f = wsExtraFields(initHeaders({
+      "Host": "evil.test", "Connection": "Upgrade", "Upgrade": "websocket",
+      "Keep-Alive": "timeout=5", "Proxy-Connection": "keep-alive",
+      "Transfer-Encoding": "chunked"}))
+    for (k, _) in f:
+      check k notin ["host", "connection", "upgrade", "keep-alive",
+                     "proxy-connection", "transfer-encoding"]
+
+  test "wsExtraFields should drop a stray key, accept and http2-settings (#289)":
+    let f = wsExtraFields(initHeaders({
+      "Sec-WebSocket-Key": "AAAAAAAAAAAAAAAAAAAAAA==",
+      "Sec-WebSocket-Accept": "spoofed",
+      "HTTP2-Settings": "AAMAAABkAARAAAAAAAIAAAAA"}))
+    for (k, _) in f:
+      check k notin ["sec-websocket-key", "sec-websocket-accept", "http2-settings"]
+
+  test "wsExtraFields should emit exactly one sec-websocket-version (#289)":
+    var seen = 0
+    for (k, v) in wsExtraFields(initHeaders({"Sec-WebSocket-Version": "8"})):
+      if k == "sec-websocket-version":
+        inc seen
+        check v == "13"
+    check seen == 1
 
 suite "websocket frame codec":
   test "the frame codec should encode the masked Hello example (RFC 6455 5.7)":
@@ -82,6 +245,20 @@ suite "websocket frame codec":
     # newString; it must now raise instead.
     var d: WsDecoder
     d.feed("\x82\x7f\x80\x00\x00\x00\x00\x00\x00\x00")
+    var f: Frame
+    var msg = ""
+    try:
+      discard d.next(f)
+    except ValueError as e: msg = e.msg
+    check "invalid or exceeds" in msg
+
+  test "the frame codec should reject a 64-bit length whose high word is set (#285)":
+    # 0x0000_0001_0000_0005: well under the 63-bit limit, so the high-bit guard
+    # never sees it, but the low 32 bits are a plausible 5. Accumulating into a
+    # 32-bit `int` truncated it to 5 and let a 4 GiB frame through as a 5-byte
+    # one; the length must be carried in a uint64 and rejected against the cap.
+    var d: WsDecoder
+    d.feed("\x82\x7f\x00\x00\x00\x01\x00\x00\x00\x05" & "hello")
     var f: Frame
     var msg = ""
     try:
@@ -246,6 +423,302 @@ suite "websocket client end to end":
     ws.close()                                 # idempotent no-op: already dropped on 1009
     joinThread(th)
 
+suite "websocket protocol-error teardown (#281)":
+  # A protocol error from the peer must fail the connection (RFC 6455 7.1.7), not
+  # just raise: the transport has to be torn down, else it leaks and the decoder
+  # stays desynced. The server reports whether the client actually dropped it.
+  test "receive should fail the connection when the server sends a masked frame":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("masked")
+    expect ValueError:
+      discard ws.receive()
+    joinThread(th)
+    check sawEof                               # torn down, not leaked
+    ws.close()                                 # idempotent no-op
+
+  test "receive should fail the connection on invalid UTF-8 in a text message":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("badutf8")
+    expect ValueError:
+      discard ws.receive()
+    joinThread(th)
+    check sawEof
+    ws.close()
+
+suite "websocket lifecycle guards (#289)":
+  test "send and ping should raise on a closed WebSocket":
+    var th: Thread[WsSrv]
+    var port: int
+    startWsEcho(th, port)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.close()
+    expect IOError:
+      ws.send("too late")
+    expect IOError:
+      ws.ping()
+    joinThread(th)
+
+  test "close should reject the close codes reserved for local use":
+    var th: Thread[WsSrv]
+    var port: int
+    startWsEcho(th, port)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    expect ValueError:
+      ws.close(closeNoStatus)                  # 1005: no status received
+    expect ValueError:
+      ws.close(closeAbnormal)                  # 1006: abnormal closure
+    expect ValueError:
+      ws.close(1015'u16)                       # 1015: TLS handshake failure
+    ws.close()                                 # a valid code still works
+    joinThread(th)
+
+  test "close should accept a reserved code once the socket is already closed":
+    # `receive` reports 1006 on an abrupt EOF and 1005 for a codeless close, so a
+    # caller mirroring `m.closeCode` back on teardown must not blow up: the codes
+    # are rejected only while a close frame would actually go out.
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("eofnow")                          # dropped with no close frame
+    let m = ws.receive()
+    check m.closeCode == closeAbnormal
+    ws.close(m.closeCode)                      # idempotent teardown, not a raise
+    joinThread(th)
+
+  test "a transport EOF should surface as 1006 on both read paths":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("eofnow")                          # server drops us with no close frame
+    let m = ws.receive()
+    check m.kind == wmClose
+    check m.closeCode == closeAbnormal
+    joinThread(th)
+
+    var th2: Thread[WsSrv]
+    var port2: int
+    var sawEof2 = false
+    startWsMisbehave(th2, port2, sawEof2)
+    let ws2 = api.websocket("ws://127.0.0.1:" & $port2 & "/chat")
+    ws2.send("eofnow")
+    let r = ws2.stream()                       # the streaming path reports the same
+    check r.kind == wmClose
+    check r.closeCode == closeAbnormal
+    joinThread(th2)
+
+suite "websocket incremental UTF-8 validation (#282)":
+  test "the scanner should accept a code point split across chunks":
+    var v: WsUtf8Scanner
+    check v.scanUtf8("\xf0\x9f")               # first half of U+1F4A9
+    check v.midCodePoint
+    check v.scanUtf8("\x92\xa9")
+    check not v.midCodePoint
+
+  test "the scanner should reject a surrogate split across chunks":
+    var v: WsUtf8Scanner
+    check v.scanUtf8("\xed\xa0")               # nothing complete yet
+    check not v.scanUtf8("\x80")               # U+D800: a surrogate, not a code point
+
+  test "the scanner should reject an invalid byte as soon as it lands":
+    var v: WsUtf8Scanner
+    check not v.scanUtf8("abc\xff")
+
+  test "the scanner should report a truncated tail when the message ends":
+    var v: WsUtf8Scanner
+    check v.scanUtf8("ok \xc3")                # a 2-byte sequence, one byte short
+    check v.midCodePoint
+
+suite "websocket streaming text validation (#282)":
+  # The streaming read path never buffers the whole message, so it validates each
+  # chunk as it arrives instead of relying on the assembler's whole-message check.
+  test "a streamed text message should be rejected when a code point is invalid across frames":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("splitbad")
+    let r = ws.stream()
+    expect ValueError:
+      while r.readChunk().len > 0: discard
+    joinThread(th)
+    check sawEof
+    ws.close()
+
+  test "a streamed text message should accept a code point split across frames":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("splitok")
+    let r = ws.stream()
+    var msg = ""
+    r.each(chunk):
+      msg.add chunk
+    check msg == "\xf0\x9f\x92\xa9"            # U+1F4A9, whole again
+    ws.close()
+    joinThread(th)
+
+suite "websocket streaming desync teardown (#284)":
+  # The streaming read path desyncs on the same protocol errors, and only `drain`
+  # used to tear down: a direct readChunk/stream() left the transport alive.
+  test "stream() should fail the connection when a message starts with a continuation":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("orphan")
+    expect IOError:
+      discard ws.stream()
+    joinThread(th)
+    check sawEof
+    ws.close()
+
+  test "readChunk should fail the connection on a data frame where a continuation is due":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("datamid")
+    let r = ws.stream()
+    check r.readChunk() == "aa"                # the opening fragment
+    expect IOError:
+      discard r.readChunk()                    # a new text frame, not a continuation
+    joinThread(th)
+    check sawEof
+    ws.close()
+
+suite "websocket streaming close validation (RFC 6455 5.5.1 / 7.4)":
+  # The streaming reader used to take the peer's close frame on trust: an invalid
+  # body surfaced as a clean `wmClose` and was echoed back verbatim. It now runs
+  # the same checks `receive` does, and a bad frame fails the connection (1002).
+  test "stream() should fail the connection on a close code that may not be sent":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("closebad")                        # close frame carrying 1006
+    expect ValueError:
+      discard ws.stream()
+    joinThread(th)
+    check sawEof                               # torn down, not leaked
+    ws.close()
+
+  test "stream() should fail the connection on a 1-byte close payload":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("closeshort")
+    expect ValueError:
+      discard ws.stream()
+    joinThread(th)
+    check sawEof
+    ws.close()
+
+  test "readChunk should fail the connection on an invalid close mid-message":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("midclosebad")
+    let r = ws.stream()
+    check r.readChunk() == "aa"                # the opening fragment
+    expect ValueError:
+      discard r.readChunk()                    # close with a reserved code
+    joinThread(th)
+    check sawEof
+    ws.close()
+
+  test "a valid close mid-message should still end the stream with its code":
+    var th: Thread[WsSrv]
+    var port: int
+    var sawEof = false
+    startWsMisbehave(th, port, sawEof)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("midcloseok")
+    let r = ws.stream()
+    check r.readChunk() == "aa"
+    check r.readChunk() == ""                  # the close truncates the message
+    check r.closeCode == closeGoingAway
+    joinThread(th)
+    ws.close()
+
+suite "websocket streamed-write guards":
+  # `write`/`finishWrite` used to poke a torn-down transport and fail with whatever
+  # the socket layer said; they now raise navi's IOError like `send`/`ping`.
+  test "write should raise on a closed WebSocket":
+    var th: Thread[WsSrv]
+    var port: int
+    startWsEcho(th, port)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.close()
+    expect IOError:
+      ws.stream(writer):
+        writer.write("too late")
+    joinThread(th)
+
+  test "finishWrite should raise on a closed WebSocket":
+    var th: Thread[WsSrv]
+    var port: int
+    startWsEcho(th, port)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.close()
+    expect IOError:
+      ws.stream(writer):                       # no writes: the fin frame alone
+        if writer == nil: discard
+    joinThread(th)
+
 suite "websocket keepalive":
   test "receive should raise TimeoutError when keepalive gets no response":
     var th: Thread[WsSrv]
@@ -385,6 +858,23 @@ suite "websocket frame validation (RFC 6455)":
     check not a.offer(Frame(fin: false, opcode: opText, payload: "ok")).ready
     expect ValueError:
       discard a.offer(Frame(fin: true, opcode: opContinuation, payload: "\xff"))
+
+  test "parseClose should split a close frame into its code and reason":
+    let (code, reason) = parseClose(Frame(fin: true, opcode: opClose,
+                                          payload: closePayload(closeGoingAway, "later")))
+    check code == closeGoingAway
+    check reason == "later"
+
+  test "parseClose should report an absent code as 1005 and reject an invalid frame":
+    template closeFrame(body: string): Frame =
+      Frame(fin: true, opcode: opClose, payload: body)
+    check parseClose(closeFrame("")).code == closeNoStatus
+    expect ValueError:
+      discard parseClose(closeFrame("\x03"))               # a 1-byte body
+    expect ValueError:
+      discard parseClose(closeFrame(closePayload(closeAbnormal)))   # never on the wire
+    expect ValueError:
+      discard parseClose(closeFrame(closePayload(closeNormal) & "\xff"))  # bad UTF-8
 
   test "the assembler should reject invalid UTF-8 in a close reason":
     var a: WsAssembler

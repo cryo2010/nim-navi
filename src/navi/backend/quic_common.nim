@@ -19,6 +19,13 @@ proc requestOnConn*(qc: QuicConn, verb, path: string,
   ## Run one buffered HTTP/3 request on the shared connection, concurrently with
   ## others. Awaits the whole response. The request body is buffered (`body`) or
   ## streamed from `producer` (navi bodyStream); `trailers` are sent after the body.
+  ##
+  ## Failure classification (issue #378): everything up to and including the submit
+  ## raises a bare `QuicError` -- the request provably never reached the server and
+  ## `producer` was never pulled, so the caller may fall back to h2/h1 for any method.
+  ## Anything that fails once the stream is submitted raises `QuicSubmittedError`: the
+  ## server may have processed the request and the producer may have been drained, so
+  ## the caller must only fall back when the request is replayable and idempotent.
   if not qc.alive:
     raise newException(QuicError, "navi HTTP/3 connection is closed")
   let reqHdr = encodeH3Fields(headers)
@@ -48,12 +55,24 @@ proc requestOnConn*(qc: QuicConn, verb, path: string,
     if not consumed and qc.c != nil:       # cancelled, reset, or take failed: free the
       navi_h3_stream_free(qc.c, sid)       # C stream so an abandoned request isn't left
   wake(qc)
-  await fut
+  # Submitted: from here a QUIC failure is indeterminate (the server may have
+  # processed the request), so reclassify anything the reader fails this stream
+  # with -- a connection teardown, a transport error -- as `QuicSubmittedError`.
+  # The background reader fails every surviving waiter with a bare `QuicError`
+  # ("connection closed"), and it cannot know which of them were submitted, so the
+  # reclassification belongs here, where the submit is in scope. Chain the original
+  # as the parent so its message, subtype and stack trace are not lost.
+  try:
+    await fut
+  except QuicSubmittedError:
+    raise
+  except QuicError as e:
+    raise newException(QuicSubmittedError, e.msg, e)
 
   if navi_h3_stream_reset(qc.c, sid) != 0:
     # The stream was reset/aborted, not answered. The defer frees its C-side entry;
     # raise so the engine falls back to h2/h1 instead of a bogus empty response.
-    raise newException(QuicError, "navi HTTP/3 stream was reset")
+    raise newException(QuicSubmittedError, "navi HTTP/3 stream was reset")
   if navi_h3_stream_too_large(qc.c, sid) != 0:
     # Body exceeded maxResponseBytes: the driver stopped buffering. A real (received)
     # response, so raise the same error the h1/h2 paths do rather than fall back.
@@ -77,7 +96,7 @@ proc requestOnConn*(qc: QuicConn, verb, path: string,
                              cast[ptr char](addr hbuf[0]), csize_t(hbuf.len), addr hlen,
                              cast[ptr char](addr tbuf[0]), csize_t(tbuf.len),
                              addr tlen) != 0:
-      raise newException(QuicError, "navi HTTP/3 take_response failed")
+      raise newException(QuicSubmittedError, "navi HTTP/3 take_response failed")
     if int(blen) <= rbody.len and int(hlen) <= hbuf.len and int(tlen) <= tbuf.len:
       break
     if int(blen) > rbody.len: rbody = newString(int(blen))
@@ -117,15 +136,23 @@ proc submitStream*(qc: QuicConn, verb, path: string,
 proc awaitHeaders*(qc: QuicConn, sid: int64):
     Future[tuple[status: int, headers: seq[(string, string)]]] {.async.} =
   ## Await the response status + headers for `sid` (they arrive before any body).
+  ##
+  ## Only ever reached with `sid` already submitted (`submitStream` / `openConnect`),
+  ## so EVERY failure here is post-submit and raises `QuicSubmittedError` (issue
+  ## #378): the request is on the wire, the server may have processed it, and the
+  ## caller may only fall back to h2/h1 when `mayFallBackFromH3` allows. That
+  ## includes the connection-death check below -- the connection died AFTER the
+  ## submit, which says nothing about whether the request was processed.
   var status: clong
   var hbuf = newString(16 * 1024)
   var ready: cint
   while true:
-    if not qc.alive: raise newException(QuicError, "navi HTTP/3 connection closed")
+    if not qc.alive:
+      raise newException(QuicSubmittedError, "navi HTTP/3 connection closed")
     var hlen: csize_t
     if navi_h3_response_headers(qc.c, sid, addr status, cast[ptr char](addr hbuf[0]),
                                 csize_t(hbuf.len), addr hlen, addr ready) != 0:
-      raise newException(QuicError, "navi HTTP/3 stream gone")
+      raise newException(QuicSubmittedError, "navi HTTP/3 stream gone")
     if ready != 0:
       if int(hlen) > hbuf.len:          # header block did not fit: grow and re-read
         hbuf = newString(int(hlen))      # (never truncate a header block, #276)
@@ -142,18 +169,21 @@ proc awaitHeaders*(qc: QuicConn, sid: int64):
     # the reader only fails on whole-connection death) -- the streaming/tunnel hang of
     # #277. Mirror the sync awaitHeaders and raise; the caller frees the stream.
     if navi_h3_stream_done(qc.c, sid) != 0:
-      raise newException(QuicError, "navi HTTP/3 stream ended before headers")
+      raise newException(QuicSubmittedError, "navi HTTP/3 stream ended before headers")
     await waitProgress(qc, sid)
 
 proc readStreamBody*(qc: QuicConn, sid: int64): Future[string] {.async.} =
   ## The next body chunk of `sid`, or "" at end of body. Parks until data lands.
+  ## Like `awaitHeaders`, every failure here is post-submit, so it raises
+  ## `QuicSubmittedError` (#378).
   var buf = newString(64 * 1024)
   var eof: cint
   while true:
-    if not qc.alive: raise newException(QuicError, "navi HTTP/3 connection closed")
+    if not qc.alive:
+      raise newException(QuicSubmittedError, "navi HTTP/3 connection closed")
     let n = navi_h3_read_body(qc.c, sid, cast[ptr char](addr buf[0]),
                               csize_t(buf.len), addr eof)
-    if n < 0: raise newException(QuicError, "navi HTTP/3 stream gone")
+    if n < 0: raise newException(QuicSubmittedError, "navi HTTP/3 stream gone")
     if n > 0:
       buf.setLen(int(n)); return buf
     if eof != 0: return ""
