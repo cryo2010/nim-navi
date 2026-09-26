@@ -7,12 +7,18 @@ import ../common/[config, reporter, servers]
 
 const verbs = [HttpGet, HttpPost, HttpPut]
 
-proc mkClient(): AsyncHttpClient =
-  newAsyncHttpClient(sslContext = newContext(verifyMode = CVerifyNone))
+proc mkClient(cfg: Config): AsyncHttpClient =
+  ## Verify the origin's certificate, exactly as navi does (its TlsConfig.verify
+  ## defaults on): CVerifyNone would skip X.509 chain building and the hostname match,
+  ## so this row would pay less TLS work per connection than navi's for free. cfg.cert
+  ## is NAVI_CERT, the harness's self-signed CA; an empty caFile falls back to the
+  ## platform trust store, never to an unverified handshake -- a handshake failure must
+  ## surface as a FAIL below, not as a cheap number.
+  newAsyncHttpClient(sslContext = newContext(verifyMode = CVerifyPeer, caFile = cfg.cert))
 
 proc worker(cfg: Config, pool: ptr ServerPool, rec: BenchRecorder,
             measureStart, deadline: float, i: int) {.async.} =
-  var client = mkClient()
+  var client = mkClient(cfg)
   var n = i
   while epochTime() < deadline:
     let v = verbs[n mod verbs.len]; inc n
@@ -26,7 +32,7 @@ proc worker(cfg: Config, pool: ptr ServerPool, rec: BenchRecorder,
       if epochTime() >= measureStart:
         rec.record((getMonoTime() - t0).inMicroseconds)
       if cfg.cold:
-        client.close(); client = mkClient()
+        client.close(); client = mkClient(cfg)
     except CatchableError as e:
       rec.fail()
       stderr.writeLine "[std-async] FAIL: " & e.msg
@@ -47,6 +53,11 @@ proc main() {.async.} =
   for i in 0 ..< cfg.clients * cfg.concurrency:
     futs.add worker(cfg, addr pool, rec, measureStart, deadline, i)
   for f in futs: await f
-  emitResult("std-async", rec, cfg.seconds)
+  # Divide by the REAL measured window, not the nominal cfg.seconds: the loop only
+  # exits after the request that crossed the deadline has finished, so cfg.seconds
+  # would flatter this row's req/s. Matches go's time.Since(measureStart) and the
+  # native runner; cfg.seconds stays as the fallback if the delta is non-positive.
+  let elapsed = epochTime() - measureStart
+  emitResult("std-async", rec, if elapsed > 0: elapsed else: cfg.seconds)
 
 waitFor main()
