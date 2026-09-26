@@ -38,7 +38,7 @@ proc main() {.async.} =
       if cfg.cold: h["connection"] = "close"
       var body = ""
       if v in {POST, PUT}:
-        body = "payload-" & $v
+        body = "payload-x"            # byte-identical to every reference client
         h["content-type"] = "text/plain"
       let t0 = nowUs()
       try:
@@ -56,6 +56,6 @@ proc main() {.async.} =
       futs.add worker(api, i)
   for f in futs: await f
 
-  rec.emitResult("navi-js", cfg.seconds)
+  rec.emitResult("navi-js", measureStartMs, cfg.seconds)
 
 discard main()

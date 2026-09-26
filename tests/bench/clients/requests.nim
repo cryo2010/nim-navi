@@ -46,7 +46,9 @@ proc worker(api: Navi, cfg: Config, pool: ptr ServerPool, rec: BenchRecorder,
     if cfg.cold: h["connection"] = "close"   # fresh connection per request (h1)
     var body = ""
     if v in {POST, PUT}:
-      body = "payload-" & $v
+      # The 9-byte body every reference client sends (go/rust/node/python/std), so
+      # the request is byte-identical across every row of the table.
+      body = "payload-x"
       h["content-type"] = "text/plain"
       if cfg.reqCompression != "none":
         body = zcompress(body, cfg.reqCompression)

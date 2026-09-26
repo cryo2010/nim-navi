@@ -172,8 +172,37 @@ async fn run(proto: String, workload: String) {
     );
 }
 
+// --- TLS trust ------------------------------------------------------------
+
+/// The harness CA (`NAVI_CERT`): this run's only trust anchor.
+///
+/// navi verifies the origin's certificate, so the reference clients must too. With
+/// verification off this client alone would skip X.509 chain building, hostname
+/// matching and the CertificateVerify signature check, i.e. the table would compare a
+/// cheaper handshake. run.sh signs the servers' leaf with this CA, so an ordinary
+/// verifier is all it takes. `None` (NAVI_CERT unset or empty) means "fall back to the
+/// built-in roots" -- verification is never disabled. An unreadable NAVI_CERT is fatal
+/// rather than a silent downgrade.
+fn harness_cert() -> Option<Vec<u8>> {
+    let path = std::env::var("NAVI_CERT").ok().filter(|p| !p.is_empty())?;
+    match std::fs::read(&path) {
+        Ok(pem) => Some(pem),
+        Err(e) => fail(format!("cannot read NAVI_CERT {}: {}", path, e)),
+    }
+}
+
 fn build_client(cfg: &Config) -> reqwest::Client {
-    let mut b = reqwest::Client::builder().danger_accept_invalid_certs(true);
+    let mut b = reqwest::Client::builder();
+    // Verify the origin against the harness CA (see harness_cert); the bases are
+    // https://127.0.0.1:<port>, covered by the leaf's IP SAN. NAVI_CERT unset leaves
+    // reqwest on its built-in roots -- there is no unverified path. reqwest keeps
+    // deriving ALPN from the version preference below (http/1.1 only for http1_only,
+    // h2 + http/1.1 otherwise), which is what the first-response gate checks.
+    if let Some(pem) = harness_cert() {
+        b = b.add_root_certificate(
+            reqwest::Certificate::from_pem(&pem).unwrap_or_else(|e| fail(e)),
+        );
+    }
     if cfg.proto == "h1" {
         // Force HTTP/1.1 only.
         b = b.http1_only();
@@ -262,7 +291,7 @@ async fn worker(
     hist
 }
 
-/// One buffered request; returns bytes read.
+/// One buffered request; drains the body and returns 0 bytes (see below).
 async fn requests_one(
     client: &reqwest::Client,
     cfg: &Config,
@@ -281,9 +310,13 @@ async fn requests_one(
     }
     let resp = req.send().await.unwrap_or_else(|e| fail(e));
     check_version(cfg, &resp, checked);
-    // Read the full body (gzip auto-decompressed by reqwest).
-    let body = resp.bytes().await.unwrap_or_else(|e| fail(e));
-    body.len() as u64
+    // Read the full body (gzip auto-decompressed by reqwest), then report 0 bytes: the
+    // requests cell ranks on req/s, and every other client (Go, navi's four, Node,
+    // Python, std) leaves the RESULT's MB/s field at 0 there. Counting the body here
+    // made only the rust row print a throughput, which is not comparable to a column
+    // of zeros. The streaming/sse/ws cells still account their bytes.
+    resp.bytes().await.unwrap_or_else(|e| fail(e));
+    0
 }
 
 /// Streamed download of STREAM_BYTES; sha1-verified against x-sha1 header.
@@ -322,7 +355,7 @@ async fn stream_download(
     got
 }
 
-/// Streamed upload of STREAM_BYTES from a reused 1 MiB block; constant memory.
+/// Streamed chunked upload of STREAM_BYTES from a reused 1 MiB block; constant memory.
 /// The server echoes {"sha1","size"} which is verified. Returns bytes sent.
 async fn stream_upload(
     client: &reqwest::Client,
@@ -359,11 +392,15 @@ async fn stream_upload(
         Poll::Ready(Some(Ok::<Vec<u8>, std::io::Error>(chunk)))
     });
 
+    // No content-length header: hyper then frames this unknown-length body as
+    // Transfer-Encoding: chunked over h1, like navi and Python. Setting it made hyper
+    // emit a length-delimited body instead, so the h1 upload cell compared two wire
+    // formats and the origin got the cheaper read. (navi cannot opt out: its h1 writer
+    // always chunks a producer body and drops a caller-supplied content-length.)
     let url = format!("{}/upload", base);
     let resp = client
         .post(&url)
         .header("content-type", "application/octet-stream")
-        .header("content-length", total)
         .body(reqwest::Body::wrap_stream(body_stream))
         .send()
         .await
@@ -451,45 +488,33 @@ fn sse_data_len(frame: &[u8]) -> usize {
 
 // --- WebSocket workload ----------------------------------------------------
 
-/// A rustls certificate verifier that accepts any server certificate. This is
-/// intentionally insecure and used only to talk to the benchmark server's
-/// self-signed cert, mirroring reqwest's danger_accept_invalid_certs above.
-#[derive(Debug)]
-struct NoVerify(Arc<rustls::crypto::CryptoProvider>);
+/// TLS connector for the tungstenite WebSocket path: the same trust anchor as the
+/// reqwest client, wired by hand because there is no builder to hand it to. No ALPN (a
+/// WebSocket is a plain HTTP/1.1 upgrade). `None` means NAVI_CERT is unset, which lets
+/// tokio-tungstenite build its own default connector (built-in webpki roots,
+/// verification on); it never means "accept anything".
+fn ws_connector() -> Option<tokio_tungstenite::Connector> {
+    use rustls::pki_types::pem::PemObject;
 
-impl rustls::client::danger::ServerCertVerifier for NoVerify {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    let pem = harness_cert()?;
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls::pki_types::CertificateDer::pem_slice_iter(&pem) {
+        let cert = cert.unwrap_or_else(|e| fail(format!("NAVI_CERT is not a PEM chain: {}", e)));
+        roots
+            .add(cert)
+            .unwrap_or_else(|e| fail(format!("NAVI_CERT is not a usable root: {}", e)));
     }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    if roots.is_empty() {
+        fail("NAVI_CERT holds no PEM certificate");
     }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap_or_else(|e| fail(e))
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Some(tokio_tungstenite::Connector::Rustls(Arc::new(config)))
 }
 
 /// WebSocket text-echo round-trips over wss (an HTTP/1.1 upgrade; no version
@@ -508,21 +533,11 @@ async fn ws(
     // wss URL from the https base.
     let url = format!("{}/ws", base.replacen("https://", "wss://", 1));
 
-    // rustls config that trusts the self-signed server cert.
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .unwrap_or_else(|e| fail(e))
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
-        .with_no_client_auth();
-    let connector = tokio_tungstenite::Connector::Rustls(Arc::new(config));
-
     let (mut socket, _resp) = tokio_tungstenite::connect_async_tls_with_config(
         &url,
         None,
         false,
-        Some(connector),
+        ws_connector(),
     )
     .await
     .unwrap_or_else(|e| fail(e));

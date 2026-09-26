@@ -6,7 +6,11 @@
 import std/[strutils, math]
 
 proc envJs*(name, dflt: cstring): cstring {.importjs: "(process.env[#] ?? #)".}
-proc nowMs*(): float {.importjs: "Date.now()".}
+# performance.now(), not Date.now(): monotonic, sub-millisecond, and the same clock
+# nowUs (and node_client.js) uses, so the measured window and the per-op latencies
+# cannot drift apart and a sub-millisecond overshoot past the deadline still lands in
+# the reported window. Date.now()'s whole-millisecond truncation used to hide it.
+proc nowMs*(): float {.importjs: "performance.now()".}
 proc nowUs*(): float {.importjs: "(performance.now() * 1000)".}
 proc rssMb*(): int {.importjs: "Math.round(process.memoryUsage().rss / 1048576)".}
 proc heapUsedMb*(): int {.importjs: "Math.round(process.memoryUsage().heapUsed / 1048576)".}
@@ -85,7 +89,17 @@ proc percentileMs(b: JsBench, p: float): float =
       return pow(2.0, (float(i) + 0.5) / bucketsPerDoubling) / 1000.0
   0
 
-proc emitResult*(b: JsBench, name: string, secs: float) =
+proc emitResult*(b: JsBench, name: string, measureStartMs, nominalSecs: float) =
+  ## Print the RESULT line, dividing ops/bytes by the REAL measured window
+  ## (now - measureStartMs), not the nominal `nominalSecs`. Every worker records
+  ## a unit that started before the deadline and finished after it, so that
+  ## overshoot belongs in the denominator; using the nominal window inflates
+  ## req/s and MB/s. Matches every reference client (go: time.Since(measureStart),
+  ## rust: start.elapsed() - measure_start, node: performance.now() -
+  ## measureStartMs, python: perf_counter() - measure_start). `nominalSecs` is
+  ## only a fallback for a non-positive elapsed (clock jump / zero-length run).
+  var secs = (nowMs() - measureStartMs) / 1000.0
+  if secs <= 0: secs = nominalSecs
   let rps = (if secs > 0: b.ops.float / secs else: 0.0)
   let mbps = (if secs > 0: b.bytes / secs / 1e6 else: 0.0)
   echo "RESULT\t", name, "\t", b.ops, "\t", formatFloat(secs, ffDecimal, 3),

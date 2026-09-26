@@ -20,6 +20,7 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -413,6 +414,32 @@ func readFrame(br *bufio.Reader) (opcode byte, payload []byte, err error) {
 	return opcode, payload, nil
 }
 
+// tlsConfig builds the client TLS config with certificate verification ON, so this
+// client pays the same X.509 chain build + hostname match as navi (which verifies
+// against the harness cert by default) -- skipping it would make Go's handshake
+// cheaper than its peers' and tilt the table. NAVI_CERT is the harness CA that signed
+// the servers' leaf (whose SANs cover localhost / 127.0.0.1), used here as this run's
+// only trust anchor. Unset or empty falls back to the platform trust store, never to
+// an unverified handshake; an unreadable/garbage NAVI_CERT is fatal rather than a
+// silent downgrade.
+func tlsConfig() *tls.Config {
+	path := os.Getenv("NAVI_CERT")
+	if path == "" {
+		return &tls.Config{} // platform roots
+	}
+	pem, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FAIL: cannot read NAVI_CERT %s -> %v\n", path, err)
+		os.Exit(1)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		fmt.Fprintf(os.Stderr, "FAIL: NAVI_CERT %s holds no PEM certificate\n", path)
+		os.Exit(1)
+	}
+	return &tls.Config{RootCAs: pool}
+}
+
 func main() {
 	proto := envStr("NAVI_PROTO", "h2")
 	if proto == "h3" {
@@ -436,7 +463,7 @@ func main() {
 	seconds := envFloat("NAVI_SECONDS", 20)
 	warmup := envFloat("NAVI_WARMUP_SECONDS", 2)
 
-	tlsCfg := &tls.Config{InsecureSkipVerify: true}
+	tlsCfg := tlsConfig()
 	tr := &http.Transport{TLSClientConfig: tlsCfg}
 	expect := "HTTP/2.0"
 	if proto == "h1" {
@@ -542,8 +569,8 @@ func (c *config) doDownload(_ int) int64 {
 
 const uploadBlock = 1 << 20 // 1 MiB block reused for constant-memory upload
 
-// doUpload: POST /upload with a streamed body of exactly streamBytes, hashed as
-// it is written; server echoes {"sha1","size"} which must match. Returns bytes sent.
+// doUpload: POST /upload with a chunked streamed body of exactly streamBytes, hashed
+// as it is written; server echoes {"sha1","size"} which must match. Returns bytes sent.
 func (c *config) doUpload(_ int) int64 {
 	url := c.nextBase() + "/upload"
 	total := c.streamBytes
@@ -576,7 +603,11 @@ func (c *config) doUpload(_ int) int64 {
 		fail("POST", url, err)
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
-	req.ContentLength = total
+	// No req.ContentLength: an io.Pipe body has unknown length, so Go frames it as
+	// Transfer-Encoding: chunked -- the same framing navi, Rust and Python send. Setting
+	// it made Go the only h1 client sending a length-delimited body, which the origin
+	// reads more cheaply than a chunked one, so the cell compared two different wire
+	// formats. (navi cannot opt out: its h1 writer always chunks a producer body.)
 	if c.cold {
 		req.Close = true
 	}

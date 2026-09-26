@@ -37,6 +37,6 @@ proc main() {.async.} =
   for s in streams: futs.add worker(s)
   for f in futs: await f
 
-  rec.emitResult("navi-js", cfg.seconds)
+  rec.emitResult("navi-js", measureStartMs, cfg.seconds)
 
 discard main()
