@@ -31,18 +31,39 @@ command -v openssl >/dev/null || { echo "openssl required"; exit 127; }
 command -v go >/dev/null || { echo "go required"; exit 127; }
 
 work="$(mktemp -d)"
+ca="$work/ca.pem"; cakey="$work/ca.key"
 cert="$work/cert.pem"; key="$work/key.pem"
 pids=()
 cleanup() { for p in "${pids[@]:-}"; do kill -9 -- -"$p" 2>/dev/null || true; done; rm -rf "$work"; }
 trap cleanup EXIT
 
-# Self-signed cert (DNS:127.0.0.1 SAN so chronos's dNSName match accepts the loopback
-# IP). env -u LD_LIBRARY_PATH: the h3 image points it at the custom OpenSSL 3.5, which
-# breaks the system openssl CLI's config lookup.
-env -u LD_LIBRARY_PATH openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-  -keyout "$key" -out "$cert" -subj "/CN=localhost" \
-  -addext "subjectAltName=DNS:localhost,DNS:127.0.0.1,IP:127.0.0.1" >/dev/null 2>&1 \
-  || { echo "cert generation failed"; exit 1; }
+# A throwaway CA plus a server leaf signed by it: the servers present the leaf and
+# every client trusts the CA as NAVI_CERT. A single self-signed cert acting as both
+# anchor and leaf would be cheaper, but rustls/webpki refuses a CA:TRUE certificate as
+# an end entity (CaUsedAsEndEntity), so the Rust client would need a pinning exception
+# while OpenSSL (navi, Node, Python) and Go's crypto/x509 accepted it: a real chain
+# keeps every client on one plain verification path. The leaf carries the DNS:127.0.0.1
+# SAN (chronos matches dNSName, not iPAddress) and the IP SAN (rustls and CPython match
+# the literal IP). env -u LD_LIBRARY_PATH: the h3 image points it at the custom OpenSSL
+# 3.5, which breaks the system openssl CLI's config lookup.
+gen_certs() {
+  local ext="$work/leaf.ext" csr="$work/leaf.csr"
+  cat >"$ext" <<-EOF
+	subjectAltName=DNS:localhost,DNS:127.0.0.1,IP:127.0.0.1
+	basicConstraints=critical,CA:FALSE
+	keyUsage=critical,digitalSignature,keyEncipherment
+	extendedKeyUsage=serverAuth
+	EOF
+  env -u LD_LIBRARY_PATH openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+    -keyout "$cakey" -out "$ca" -subj "/CN=navi-bench CA" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" || return 1
+  env -u LD_LIBRARY_PATH openssl req -new -newkey rsa:2048 -nodes \
+    -keyout "$key" -out "$csr" -subj "/CN=localhost" || return 1
+  env -u LD_LIBRARY_PATH openssl x509 -req -in "$csr" -CA "$ca" -CAkey "$cakey" \
+    -CAcreateserial -days 1 -extfile "$ext" -out "$cert" || return 1
+}
+gen_certs >/dev/null 2>&1 || { echo "cert generation failed"; exit 1; }
 
 echo "building the Go bench server..."
 (cd "$here/server" && go build -o "$work/server" .) || { echo "server build failed"; exit 1; }
@@ -135,7 +156,7 @@ case "$workload" in
   *) echo "unknown NAVI_WORKLOAD: $workload"; exit 2 ;;
 esac
 
-export NAVI_CERT="$cert" NAVI_HOST="$host" NAVI_BASE_PORT="$base_port"
+export NAVI_CERT="$ca" NAVI_HOST="$host" NAVI_BASE_PORT="$base_port"
 export NAVI_WORKLOAD="$workload" NAVI_SERVER_COUNT="$servers" NAVI_THREADS="$threads"
 
 # The native clients run one navi client per thread in one process. navi's shared
@@ -254,7 +275,7 @@ run_cell() {   # <proto>: run every applicable client for this protocol, print t
     if [ "$be" = js ]; then
       [ -n "$js_src" ] || { echo "  [$dn]: skip (no js client for $workload)"; continue; }
       [ "$pr" = h3 ] && { echo "  [$dn $pr]: skip js/undici has no HTTP/3"; continue; }
-      run_client "$dn" "$cell" env NODE_EXTRA_CA_CERTS="$cert" node "$work/${js_src}.js"
+      run_client "$dn" "$cell" env NODE_EXTRA_CA_CERTS="$ca" node "$work/${js_src}.js"
     else
       # Native clients thread internally (NAVI_THREADS clients, one per thread) and
       # emit a single merged RESULT, so this is just one process per client.
@@ -266,7 +287,7 @@ run_cell() {   # <proto>: run every applicable client for this protocol, print t
   if [ "$pr" != h3 ]; then
     [ -n "$GO_BIN" ]    && run_client "go/net-http"   "$cell" "$GO_BIN"
     [ -n "$RUST_BIN" ]  && run_client "rust/reqwest"  "$cell" "$RUST_BIN"
-    want_lang node   && [ -f "$here/clients/node_client.js" ]  && run_client "js/node"      "$cell" env NODE_EXTRA_CA_CERTS="$cert" node "$here/clients/node_client.js"
+    want_lang node   && [ -f "$here/clients/node_client.js" ]  && run_client "js/node"      "$cell" env NODE_EXTRA_CA_CERTS="$ca" node "$here/clients/node_client.js"
     want_lang python && [ -f "$here/clients/python_client.py" ] && run_client "python/httpx" "$cell" python3 "$here/clients/python_client.py"
     [ -n "$STD_SYNC" ]  && run_client "nim/std-sync"  "$cell" "$STD_SYNC"
     [ -n "$STD_ASYNC" ] && run_client "nim/std-async" "$cell" "$STD_ASYNC"
