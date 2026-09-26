@@ -480,31 +480,36 @@ proc handleSettings(c: H2Conn, f: Frame, outbuf: var string) =
         c.flushSend(sid, s, outbuf)
   outbuf.add encodeSettingsAck()
 
-proc handleData(c: H2Conn, f: Frame, outbuf: var string) =
+proc handleData(c: H2Conn, h: FrameHeader, outbuf: var string) =
   ## RFC 9113 6.1: accept DATA on a live stream (appending to the body, enforcing
   ## the size cap and per-stream/connection flow-control windows) or account for
   ## and discard it on a reset/ended/unknown stream so the windows stay in sync.
-  if f.streamId == 0:                          # RFC 9113 6.1: DATA is never on stream 0
+  ##
+  ## Takes the peeked frame HEADER, not a `Frame`: the payload is still in the
+  ## decoder buffer and is copied straight into the response body (issue #400).
+  ## The caller (`feed`) consumes the frame afterwards, including on every early
+  ## return here, so a rejected frame still leaves the decoder advanced.
+  if h.streamId == 0:                          # RFC 9113 6.1: DATA is never on stream 0
     c.connFail(errProtocolError, "DATA on stream 0", outbuf); return
   # Every DATA payload -- pad length byte and padding included (RFC 9113 6.9.1)
   # -- counts against the connection flow-control window, even on a stream we
   # have reset or never opened. Skipping that leaks the window and eventually
   # stalls a long-lived pooled/mux connection. Debit the window we granted and
   # fail the connection if the peer overran it (a peer that ignores flow control).
-  c.connRecvWindow -= f.payload.len
+  c.connRecvWindow -= h.length
   if c.connRecvWindow < 0:
     c.connFail(errFlowControlError, "connection flow-control window exceeded", outbuf)
     return
-  let s = c.streams.getOrDefault(f.streamId)
+  let s = c.streams.getOrDefault(h.streamId)
   if s != nil and s.ended and not s.reset:
     # DATA after END_STREAM: STREAM_CLOSED (RFC 9113 5.1). The response already
     # completed, so drop the stray bytes -- appending would grow memory without
     # bound when maxBodyBytes==0, or corrupt the delivered body when the extra DATA
     # rides the same feed batch -- and RST the stream; keep the conn window in sync.
-    outbuf.add encodeRstStream(f.streamId, errStreamClosed)
-    if f.payload.len > 0: c.replenishConn(f.payload.len, outbuf)
+    outbuf.add encodeRstStream(h.streamId, errStreamClosed)
+    if h.length > 0: c.replenishConn(h.length, outbuf)
   elif s != nil and not s.reset:
-    s.recvWindow -= f.payload.len
+    s.recvWindow -= h.length
     if s.recvWindow < 0:
       # Peer sent more than the per-stream receive window we advertised: a stream
       # FLOW_CONTROL_ERROR (RFC 9113 6.9.1). RST it; the connection survives (its
@@ -513,32 +518,41 @@ proc handleData(c: H2Conn, f: Frame, outbuf: var string) =
       # connection window back here -- otherwise this frame's payload leaks from the
       # connection window and a long-lived mux slowly stalls at conn-window 0. The
       # STREAM window is not replenished: the stream is dead, so its window is moot.
-      outbuf.add encodeRstStream(f.streamId, errFlowControlError)
+      outbuf.add encodeRstStream(h.streamId, errFlowControlError)
       s.reset = true; s.ended = true
-      closeSendSide(f.streamId, s, outbuf)     # drop any queued body; no DATA after RST
-      if f.payload.len > 0: c.replenishConn(f.payload.len, outbuf)
+      closeSendSide(h.streamId, s, outbuf)     # drop any queued body; no DATA after RST
+      if h.length > 0: c.replenishConn(h.length, outbuf)
     else:
-      # Unpadded is the common case: append the frame payload straight into the body
-      # with no intermediate copy. Only a padded frame needs a stripped buffer (via
-      # `unpad`, which slices the content out).
-      let padded = (f.flags and flagPadded) != 0
-      var contentLen: int
-      if padded:
-        var data = f.payload
-        if not c.unpad(f, data, outbuf): return
-        contentLen = data.len
-        s.resp.body.add data
-      else:
-        contentLen = f.payload.len
-        s.resp.body.add f.payload
+      # Locate the content inside the payload (RFC 9113 6.1: a padded frame leads
+      # with the pad-length octet and trails that many bytes), then copy it out of
+      # the decoder buffer into the body in one pass -- no slice, no temporary.
+      # The validation matches `unpad`, which still serves the HEADERS path.
+      var contentOff = 0
+      var contentLen = h.length
+      if (h.flags and flagPadded) != 0:
+        if h.length < 1:                       # too short to hold the pad-length octet:
+          c.connFail(errFrameSizeError, "padded frame with no pad length", outbuf)  # RFC 9113 4.2
+          return
+        let padLen = int(c.frames.payloadByte(0))
+        if padLen > h.length - 1:
+          c.connFail(errProtocolError, "padding exceeds frame payload", outbuf)
+          return
+        contentOff = 1
+        contentLen = h.length - 1 - padLen
+      if contentLen > 0 and s.resp.body.len == 0:
+        # `takeBody` drains the body once per feed batch, so it restarts empty with
+        # every batch and would regrow frame by frame. Size it once for what is
+        # still buffered (or for this frame, whichever is larger).
+        s.resp.body = newStringOfCap(max(contentLen, c.frames.remaining))
+      c.frames.appendPayload(s.resp.body, contentOff, contentLen)
       s.bodyTotal += contentLen
       if c.maxBodyBytes > 0 and s.bodyTotal > c.maxBodyBytes:  # over the size cap: RST
-        outbuf.add encodeRstStream(f.streamId, errCancel)
+        outbuf.add encodeRstStream(h.streamId, errCancel)
         s.reset = true; s.ended = true; s.tooLarge = true
-        closeSendSide(f.streamId, s, outbuf)   # drop any queued body; no DATA after RST
-        c.replenishConn(f.payload.len, outbuf)   # still owe the connection window
+        closeSendSide(h.streamId, s, outbuf)   # drop any queued body; no DATA after RST
+        c.replenishConn(h.length, outbuf)      # still owe the connection window
       else:
-        if f.payload.len > 0:
+        if h.length > 0:
           if s.sinkMode:
             # Hold the stream window for the BODY bytes until the sink consumes
             # them (via ackRecv); still replenish the shared connection window so
@@ -547,16 +561,16 @@ proc handleData(c: H2Conn, f: Frame, outbuf: var string) =
             # is never delivered to the sink, so ackRecv would never return it --
             # return it to the stream window now, or the window leaks (1 + padLen)
             # per padded frame and the download eventually stalls at window 0.
-            let padOverhead = f.payload.len - contentLen
-            if padOverhead > 0: c.replenishStream(f.streamId, s, padOverhead, outbuf)
-            c.replenishConn(f.payload.len, outbuf)
+            let padOverhead = h.length - contentLen
+            if padOverhead > 0: c.replenishStream(h.streamId, s, padOverhead, outbuf)
+            c.replenishConn(h.length, outbuf)
           else:
-            c.replenishRecv(f.streamId, s, f.payload.len, outbuf)
-        if (f.flags and flagEndStream) != 0:
+            c.replenishRecv(h.streamId, s, h.length, outbuf)
+        if (h.flags and flagEndStream) != 0:
           s.ended = true
-          closeSendSide(f.streamId, s, outbuf) # complete response: abort an unsent body (8.1)
-  elif f.payload.len > 0:
-    c.replenishConn(f.payload.len, outbuf)     # reset/unknown stream: keep the conn window in sync
+          closeSendSide(h.streamId, s, outbuf) # complete response: abort an unsent body (8.1)
+  elif h.length > 0:
+    c.replenishConn(h.length, outbuf)          # reset/unknown stream: keep the conn window in sync
 
 proc handleWindowUpdate(c: H2Conn, f: Frame, outbuf: var string) =
   ## RFC 9113 6.9: grow the connection or a stream's send window (rejecting a bad
@@ -716,27 +730,37 @@ proc handleRstStream(c: H2Conn, f: Frame, outbuf: var string) =
     s.ended = true
     closeSendSide(f.streamId, s, outbuf)     # drop any queued body; no DATA after RST
 
-proc handle(c: H2Conn, f: Frame, outbuf: var string) =
-  if c.fatal.len > 0: return
+proc admit(c: H2Conn, typ: uint8, streamId: uint32, outbuf: var string): bool =
+  ## The connection-level gates every incoming frame must pass before its handler
+  ## runs, in RFC order. Shared by the `Frame` path and the DATA fast path, which
+  ## reads its payload straight out of the decoder, so both are gated identically.
+  ## False means the frame must be dropped (and still consumed from the decoder).
+  if c.fatal.len > 0: return false
     # A fatal connection error already sent GOAWAY. RFC 9113 5.4.1: stop processing --
     # do not ACK/apply later frames in the same feed batch, and in particular do not
     # decode further header blocks against a known-corrupt HPACK table after a
     # COMPRESSION_ERROR. The driver observes `connError` and unwinds.
   if not c.sawFirstFrame:                     # RFC 9113 3.4: server preface is SETTINGS
     c.sawFirstFrame = true
-    if f.typ != uint8(ftSettings):
+    if typ != uint8(ftSettings):
       c.connFail(errProtocolError, "server preface: first frame not SETTINGS", outbuf)
-      return
+      return false
   # RFC 9113 6.10: once a HEADERS lacks END_HEADERS, ONLY a CONTINUATION on that
   # same stream may follow until END_HEADERS -- any other frame (or one on another
   # stream) is a connection error. A CONTINUATION with no open block is likewise.
   if c.contHeaderStream != 0:
-    if f.typ != uint8(ftContinuation) or f.streamId != c.contHeaderStream:
+    if typ != uint8(ftContinuation) or streamId != c.contHeaderStream:
       c.connFail(errProtocolError, "expected CONTINUATION on the open header block", outbuf)
-      return
-  elif f.typ == uint8(ftContinuation):
+      return false
+  elif typ == uint8(ftContinuation):
     c.connFail(errProtocolError, "CONTINUATION with no open header block", outbuf)
-    return
+    return false
+  true
+
+proc handle(c: H2Conn, f: Frame, outbuf: var string) =
+  ## Dispatch a decoded frame. DATA never arrives here: `feed` routes it to the
+  ## zero-copy `handleData` off the decoder buffer instead.
+  if not c.admit(f.typ, f.streamId, outbuf): return
   case f.typ
   of uint8(ftSettings):
     c.handleSettings(f, outbuf)
@@ -746,8 +770,6 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
     c.handleGoAway(f, outbuf)
   of uint8(ftHeaders), uint8(ftContinuation):
     c.handleHeadersOrContinuation(f, outbuf)
-  of uint8(ftData):
-    c.handleData(f, outbuf)
   of uint8(ftRstStream):
     c.handleRstStream(f, outbuf)
   of uint8(ftWindowUpdate):
@@ -756,14 +778,25 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
     # We advertised SETTINGS_ENABLE_PUSH=0, so a PUSH_PROMISE is a PROTOCOL_ERROR.
     c.connFail(errProtocolError, "unexpected PUSH_PROMISE (push disabled)", outbuf)
   else:
-    discard # PRIORITY, unknown types: ignore
+    discard # PRIORITY, DATA (handled in `feed`), unknown types: ignore
 
 proc feed*(c: H2Conn, data: string): string =
   ## Consume received bytes; return control bytes (ACKs, window updates) to send.
   c.frames.feed(data)
+  var h: FrameHeader
   var f: Frame
-  while c.frames.next(f):
-    c.handle(f, result)
+  while c.frames.peek(h):
+    if h.typ == uint8(ftData):
+      # The download hot path: hand the DATA handler the header and let it copy
+      # the payload out of the decoder buffer into the response body directly
+      # (issue #400). A frame the gates reject is still consumed, exactly as
+      # `next` would have, so the loop always makes progress.
+      if c.admit(h.typ, h.streamId, result):
+        c.handleData(h, result)
+      c.frames.consume()
+    else:
+      discard c.frames.next(f)      # peek proved a complete frame is buffered
+      c.handle(f, result)
   if c.frames.frameSizeError:                 # a peer frame exceeded the max frame size
     c.connFail(errFrameSizeError, "frame size error", result)
 

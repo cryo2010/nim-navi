@@ -84,6 +84,15 @@ onward (pre-1.0, minor versions may include breaking changes).
   `BodySink`), since the `Future` type differs per backend (#367).
 
 ### Changed
+- **HTTP/2 downloads decode DATA straight into the response body.** The frame
+  decoder gained a peek/consume API, so a DATA payload is copied once from the
+  decode buffer into the stream body instead of being sliced out into a `Frame`
+  first, and the decoder now compacts its buffer in place (moveMem, capacity kept)
+  rather than reslicing the leftover partial frame after every read. Nim's string
+  slice is an allocation plus a byte-at-a-time loop, which made it ~80% of the
+  sans-io h2 receive path; a one-core `feed` + `takeBody` + `ackRecv` microbench
+  goes from ~1.6 GB/s to ~17 GB/s. Flow control, size caps and frame validation are
+  unchanged (#400).
 - **HTTP/2 streamed uploads frame each chunk straight from the producer's buffer.**
   A chunk that fits the send window goes into DATA frames without staging through
   the per-stream send buffer, and the buffer keeps its capacity across chunks instead

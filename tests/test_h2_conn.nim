@@ -1108,3 +1108,169 @@ suite "h2 frame validation (RFC 9113)":
                                  endStream = true, endHeaders = true))
     check c.connError.len == 0
     check c.respHeader(id2, "x-trace") == "abc"
+
+suite "h2 DATA decoded straight off the frame buffer (#400)":
+  # The DATA payload is copied from the decoder buffer into the response body with
+  # no intermediate string, and the decoder compacts its buffer in place instead of
+  # reslicing it. Transport reads land wherever they land, so the frame boundaries
+  # in these tests deliberately never align with the chunk boundaries.
+  proc bodyOf(streamId: uint32, chunks: seq[string], sink: bool): (string, H2Conn) =
+    ## Drive `chunks` through `feed` on a fresh connection whose stream is already
+    ## responding 200, draining with takeBody (and acking, in sink mode) like the
+    ## streamed-download driver does. Returns the reassembled body.
+    let c = newServerConn()
+    let sid = c.openStream()
+    discard c.encodeRequest(sid, @[(":method", "GET"), (":scheme", "https"),
+                                   (":path", "/"), (":authority", "x")], "")
+    if sink: c.setSinkMode(sid)
+    discard c.feed(headForStream(sid))
+    var body = ""
+    for chunk in chunks:
+      discard c.feed(chunk)
+      let got = c.takeBody(sid)
+      if got.len > 0:
+        body.add got
+        if sink: discard c.ackRecv(sid, got.len)
+    (body, c)
+
+  proc split(s: string, size: int): seq[string] =
+    var off = 0
+    while off < s.len:
+      let n = min(size, s.len - off)
+      result.add s[off ..< off + n]
+      off += n
+
+  proc dataRun(sid: uint32, frameLen, frames: int): (string, string) =
+    ## `frames` DATA frames of `frameLen` bytes with distinguishable content, plus
+    ## the body they should reassemble to.
+    for i in 0 ..< frames:
+      let payload = repeat(char(ord('a') + i mod 26), frameLen)
+      result[0].add encodeData(sid, payload, endStream = i == frames - 1)
+      result[1].add payload
+
+  test "a 1 MiB body of 16 KiB DATA frames should survive 64 KiB reads byte-exactly":
+    # 64 KiB reads never align with 16393-byte frames, so almost every read ends
+    # mid-frame and exercises the buffer compaction.
+    let (wire, want) = dataRun(1'u32, 16384, 64)
+    let (body, c) = bodyOf(1'u32, split(wire, 65536), sink = true)
+    check body == want
+    check body.len == 1024 * 1024
+    check c.streamEnded(1'u32)
+    check c.connError.len == 0
+
+  test "the same body should survive 1-byte and 7-byte reads":
+    let (wire, want) = dataRun(1'u32, 300, 40)
+    for size in [1, 7]:
+      let (body, c) = bodyOf(1'u32, split(wire, size), sink = false)
+      check body == want
+      check c.connError.len == 0
+
+  test "the size cap should count the body delivered through the zero-copy path":
+    # bodyTotal is accumulated per frame, independent of the drained buffer.
+    let (wire, _) = dataRun(1'u32, 16384, 8)
+    let c = newServerConn(maxBody = 16384 * 4)
+    let sid = c.openStream()
+    discard c.encodeRequest(sid, @[(":method", "GET"), (":scheme", "https"),
+                                   (":path", "/"), (":authority", "x")], "")
+    discard c.feed(headForStream(sid))
+    for chunk in split(wire, 4096):
+      discard c.feed(chunk)
+      discard c.takeBody(sid)
+    check c.streamTooLarge(sid)
+
+  test "padded DATA split across reads should still be unpadded":
+    var wire = ""
+    var want = ""
+    for i in 0 ..< 8:
+      let payload = repeat(char(ord('A') + i), 1000)
+      wire.add paddedData(1'u32, payload, padLen = 13, endStream = i == 7)
+      want.add payload
+    for size in [1, 37, 512]:
+      let (body, c) = bodyOf(1'u32, split(wire, size), sink = false)
+      check body == want
+      check c.connError.len == 0
+
+  test "DATA in the same read as its HEADERS should be delivered":
+    let c = newServerConn()
+    let sid = c.openStream()
+    discard c.encodeRequest(sid, @[(":method", "GET"), (":scheme", "https"),
+                                   (":path", "/"), (":authority", "x")], "")
+    var srv = headForStream(sid)
+    srv.add encodeData(sid, "one", endStream = false)
+    srv.add encodeData(sid, "two", endStream = true)
+    discard c.feed(srv)
+    check c.takeBody(sid) == "onetwo"       # both frames of one read, in order
+    check c.streamEnded(sid)
+
+  test "a body larger than one read should replenish both windows exactly once per batch":
+    # Flow-control accounting must not shift with the decoding change: the control
+    # bytes the connection emits are compared against the pre-#400 accounting, which
+    # is one connection WINDOW_UPDATE per connReplenish (4 MiB) of DATA.
+    const total = 8 * 1024 * 1024
+    let (wire, want) = dataRun(1'u32, 16384, total div 16384)
+    let c = newServerConn()
+    let sid = c.openStream()
+    discard c.encodeRequest(sid, @[(":method", "GET"), (":scheme", "https"),
+                                   (":path", "/"), (":authority", "x")], "")
+    discard c.feed(headForStream(sid))
+    var ctrl = ""
+    var body = ""
+    for chunk in split(wire, 65536):
+      ctrl.add c.feed(chunk)
+      body.add c.takeBody(sid)
+    check body == want
+    var connUpdates = 0
+    var credited = 0
+    for f in allFrames(ctrl):
+      if f.typ == uint8(ftWindowUpdate) and f.streamId == 0'u32:
+        inc connUpdates
+        credited += int(readU32(f.payload, 0))
+    check connUpdates == 2                  # 8 MiB of DATA over a 4 MiB batch threshold
+    check credited == total
+
+  test "DATA on stream 0 split across reads should still fail the connection":
+    let c = newServerConn()
+    let wire = encodeData(0'u32, "boom", endStream = false)
+    var toSend = ""
+    for chunk in split(wire, 3): toSend.add c.feed(chunk)
+    check c.connError.len > 0
+    check firstFrameOfType(toSend, ftGoAway)
+
+  test "DATA after END_STREAM should still RST with STREAM_CLOSED":
+    let c = newServerConn()
+    let sid = c.openStream()
+    discard c.encodeRequest(sid, @[(":method", "GET"), (":scheme", "https"),
+                                   (":path", "/"), (":authority", "x")], "")
+    var srv = headForStream(sid)
+    srv.add encodeData(sid, "done", endStream = true)
+    discard c.feed(srv)
+    check c.takeBody(sid) == "done"
+    let toSend = c.feed(encodeData(sid, "stray", endStream = false))
+    check c.takeBody(sid) == ""             # the stray bytes never reach the body
+    check firstFrameOfType(toSend, ftRstStream)
+    check c.connError.len == 0              # a stream error, not a connection one
+
+  test "DATA before the server SETTINGS preface should still fail the connection":
+    let c = initH2Conn()                    # deliberately NOT pre-fed a preface
+    let toSend = c.feed(encodeData(1'u32, "early", endStream = false))
+    check c.connError.len > 0
+    check firstFrameOfType(toSend, ftGoAway)
+
+  test "DATA inside an open CONTINUATION block should still fail the connection":
+    let c = newServerConn()
+    let sid = c.openStream()
+    var toSend = c.feed(encodeHeaders(sid, "partial", endStream = false,
+                                      endHeaders = false))
+    toSend.add c.feed(encodeData(sid, "x", endStream = false))
+    check c.connError.len > 0
+    check firstFrameOfType(toSend, ftGoAway)
+
+  test "a rejected DATA frame should still be consumed from the decoder":
+    # Everything after the fatal frame is dropped, but the decoder must keep
+    # advancing or `feed` would spin on the same frame forever.
+    let c = initH2Conn()
+    var srv = encodeData(1'u32, "early", endStream = false)   # fails the preface gate
+    srv.add encodeData(1'u32, "more", endStream = false)
+    srv.add encodePing("01234567")
+    discard c.feed(srv)                     # must terminate
+    check c.connError.len > 0
