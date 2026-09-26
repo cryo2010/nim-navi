@@ -24,11 +24,22 @@ type
     streamId*: uint32
     payload*: string
 
+  FrameHeader* = object
+    ## The header of a frame reported by `peek`, whose payload is still sitting in
+    ## the decoder buffer. Lets the connection layer copy a DATA payload straight
+    ## to its destination instead of materializing `Frame.payload` first.
+    typ*: uint8
+    flags*: uint8
+    streamId*: uint32
+    length*: int       ## payload length, header excluded
+
   FrameDecoder* = object
     buf: string
     pos: int               ## read offset into `buf`; consumed frames sit before it
-                           ## and are dropped on the next `feed` (so popping N frames
-                           ## is O(total), not O(n^2) from front-deleting each)
+                           ## and are compacted away on the next `feed` (so popping N
+                           ## frames is O(total), not O(n^2) from front-deleting each)
+    peekLen: int           ## payload length of the frame `peek` last reported, so
+                           ## `payloadByte` / `appendPayload` / `consume` can address it
     frameSizeError: bool   ## a peer frame declared a length over the max frame size
 
 const
@@ -84,9 +95,20 @@ proc encodeFrame*(typ: FrameType, flags: uint8, streamId: uint32, payload = ""):
 
 proc feed*(d: var FrameDecoder, data: openArray[char]) =
   if d.pos > 0:                         # drop already-consumed frames in one shift
-    if d.pos >= d.buf.len: d.buf.setLen(0)
-    else: d.buf = d.buf[d.pos .. ^1]
+    let rem = d.buf.len - d.pos
+    if rem <= 0:
+      d.buf.setLen(0)
+    else:
+      # Compact in place. A transport read almost never ends on a frame boundary,
+      # so this runs on nearly every `feed` with a partial frame left over; slicing
+      # the remainder out reallocated the buffer and copied it byte by byte (Nim's
+      # string slice is `newString` + a scalar loop), which showed up as a large
+      # share of the h2 receive path (issue #400). moveMem + a shrinking setLen
+      # keeps the existing capacity, so the steady state allocates nothing.
+      moveMem(addr d.buf[0], addr d.buf[d.pos], rem)
+      d.buf.setLen(rem)
     d.pos = 0
+  d.peekLen = 0
   let start = d.buf.len
   d.buf.setLen(start + data.len)
   if data.len > 0:
@@ -95,22 +117,61 @@ proc feed*(d: var FrameDecoder, data: openArray[char]) =
 proc frameSizeError*(d: FrameDecoder): bool = d.frameSizeError
   ## A peer frame declared a length over `defaultMaxFrameSize` (FRAME_SIZE_ERROR).
 
-proc next*(d: var FrameDecoder, frame: var Frame): bool =
-  ## Pop the next complete frame, if one is fully buffered. Advances a read offset
-  ## rather than deleting from the front, so popping many frames stays linear.
+proc remaining*(d: FrameDecoder): int = d.buf.len - d.pos
+  ## Bytes buffered but not yet consumed, including any peeked frame. A capacity
+  ## hint for a destination the buffered frames are about to be copied into.
+
+proc peek*(d: var FrameDecoder, h: var FrameHeader): bool =
+  ## Report the next complete frame's header, if one is fully buffered, WITHOUT
+  ## consuming it: the payload stays in the decoder buffer, readable through
+  ## `payloadByte` / `appendPayload` until `consume` advances past the frame.
+  ## Rejects an oversized length exactly as `next` does.
   let avail = d.buf.len - d.pos
   if avail < 9: return false
   let length = readU24(d.buf, d.pos)
   if length > defaultMaxFrameSize:      # reject before buffering the oversized payload
     d.frameSizeError = true
     return false
-  let total = 9 + length
-  if avail < total: return false
-  frame.typ = uint8(d.buf[d.pos + 3])
-  frame.flags = uint8(d.buf[d.pos + 4])
-  frame.streamId = readU32(d.buf, d.pos + 5) and 0x7fffffff'u32
-  frame.payload = d.buf[d.pos + 9 ..< d.pos + total]
-  d.pos += total
+  if avail < 9 + length: return false
+  h.typ = uint8(d.buf[d.pos + 3])
+  h.flags = uint8(d.buf[d.pos + 4])
+  h.streamId = readU32(d.buf, d.pos + 5) and 0x7fffffff'u32
+  h.length = length
+  d.peekLen = length
+  true
+
+proc payloadByte*(d: FrameDecoder, i: int): uint8 =
+  ## Byte `i` of the peeked frame's payload (the pad-length octet, in practice).
+  uint8(d.buf[d.pos + 9 + i])
+
+proc appendPayload*(d: FrameDecoder, dst: var string, off, n: int) =
+  ## Append `payload[off ..< off + n]` of the peeked frame to `dst` with a single
+  ## copy (setLen + copyMem, the same shape as the h1 parser's `addRange`). This is
+  ## how a DATA payload reaches the response body: no intermediate string, so the
+  ## bytes are copied once instead of sliced out and appended.
+  if n <= 0: return
+  let start = dst.len
+  dst.setLen(start + n)
+  copyMem(addr dst[start], unsafeAddr d.buf[d.pos + 9 + off], n)
+
+proc consume*(d: var FrameDecoder) =
+  ## Advance past the frame `peek` reported. Like `next`, this only moves a read
+  ## offset; the bytes are dropped by the next `feed`.
+  d.pos += 9 + d.peekLen
+  d.peekLen = 0
+
+proc next*(d: var FrameDecoder, frame: var Frame): bool =
+  ## Pop the next complete frame, if one is fully buffered. Advances a read offset
+  ## rather than deleting from the front, so popping many frames stays linear.
+  ## Materializes the payload; the DATA path uses `peek`/`appendPayload` instead.
+  var h: FrameHeader
+  if not d.peek(h): return false
+  frame.typ = h.typ
+  frame.flags = h.flags
+  frame.streamId = h.streamId
+  frame.payload.setLen(0)
+  d.appendPayload(frame.payload, 0, h.length)
+  d.consume()
   true
 
 # --- Payload builders for the frames a client sends ---
