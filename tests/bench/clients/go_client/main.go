@@ -417,11 +417,11 @@ func readFrame(br *bufio.Reader) (opcode byte, payload []byte, err error) {
 // tlsConfig builds the client TLS config with certificate verification ON, so this
 // client pays the same X.509 chain build + hostname match as navi (which verifies
 // against the harness cert by default) -- skipping it would make Go's handshake
-// cheaper than its peers' and tilt the table. NAVI_CERT is the harness's freshly
-// generated self-signed PEM (CA:TRUE, SANs localhost / 127.0.0.1), used here as this
-// run's only trust anchor. Unset or empty falls back to the platform trust store,
-// never to an unverified handshake; an unreadable/garbage NAVI_CERT is fatal rather
-// than a silent downgrade.
+// cheaper than its peers' and tilt the table. NAVI_CERT is the harness CA that signed
+// the servers' leaf (whose SANs cover localhost / 127.0.0.1), used here as this run's
+// only trust anchor. Unset or empty falls back to the platform trust store, never to
+// an unverified handshake; an unreadable/garbage NAVI_CERT is fatal rather than a
+// silent downgrade.
 func tlsConfig() *tls.Config {
 	path := os.Getenv("NAVI_CERT")
 	if path == "" {
