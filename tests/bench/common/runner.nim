@@ -16,8 +16,10 @@ type BenchThread* = object
   cfg*: Config
   id*: int                          ## 0-based thread index
   concurrency*: int                 ## in-flight workers this thread drives (>= 1;
-                                    ## a blocking sync client just ignores it and
-                                    ## runs one sequential loop)
+                                    ## this thread's share of the cell's total
+                                    ## offered load, so the widths sum to exactly
+                                    ## clients * concurrency; a blocking sync client
+                                    ## just ignores it and runs one sequential loop)
   measureStart*, deadline*: float   ## the shared measured window (absolute epochTime)
   rec*: BenchRecorder               ## result, allocated inside the thread
 
@@ -40,14 +42,24 @@ proc runThreaded*(cfg: Config, name: string,
   ## once here so every thread times the same wall-clock interval.
   let n = benchThreads(cfg)
   let total = max(1, cfg.clients * cfg.concurrency)
-  let per = max(1, (total + n - 1) div n)     # per-thread in-flight (ceil)
+  # Split the cell's offered load so the per-thread widths sum to EXACTLY `total`:
+  # `total div n` each, and the first `total mod n` threads take one extra worker.
+  # Every reference client drives exactly clients * concurrency in-flight ops (go:
+  # clients*concurrency histograms; rust: n_workers), so a per-thread ceil would
+  # hand navi up to n-1 extra workers whenever n does not divide total -- 30 on 10
+  # cores, 32 on 16, 40 on 20 against the default 24 -- i.e. more offered load than
+  # the peers, inflating navi's throughput and worsening its p99 on the same origin.
+  # `benchThreads` clamps n to total, so `per + extra` still gives every thread >= 1.
+  let per = total div n
+  let extra = total mod n
   let now = epochTime()
   let measureStart = now + cfg.warmupSeconds
   let deadline = measureStart + cfg.seconds
   var args = newSeq[BenchThread](n)
   var ths = newSeq[Thread[ptr BenchThread]](n)
   for i in 0 ..< n:
-    args[i] = BenchThread(cfg: cfg, id: i, concurrency: per,
+    args[i] = BenchThread(cfg: cfg, id: i,
+                          concurrency: per + (if i < extra: 1 else: 0),
                           measureStart: measureStart, deadline: deadline)
   for i in 0 ..< n:
     createThread(ths[i], body, addr args[i])
@@ -56,4 +68,14 @@ proc runThreaded*(cfg: Config, name: string,
   let merged = newBenchRecorder()
   for i in 0 ..< n:
     if args[i].rec != nil: merged.merge(args[i].rec)
-  emitResult(name, merged, cfg.seconds)
+  # Divide by the REAL window, not the nominal cfg.seconds. Every client -- navi and
+  # every reference client alike -- records a unit that started before the deadline
+  # and completed after it, and each reference client puts that overshoot in its own
+  # denominator (go: time.Since(measureStart); rust/node/python likewise). Charging
+  # navi only the nominal window would inflate its req/s and MB/s: negligible for
+  # requests/sse/ws, large for streaming, where one transfer (1 GiB by default) can
+  # outlast the window on its own. Fall back to the nominal window only if the run
+  # never reached measureStart (elapsed <= 0), which would make the rate meaningless.
+  var elapsed = epochTime() - measureStart
+  if elapsed <= 0: elapsed = cfg.seconds
+  emitResult(name, merged, elapsed)
