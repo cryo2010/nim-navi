@@ -149,6 +149,21 @@ onward (pre-1.0, minor versions may include breaking changes).
   `max_idle_timeout` now, which bounds peer retention even when the close datagram
   never arrives (a crash, a killed process, a lost packet); the existing 15 s
   keep-alive PING sits comfortably below it, so a pooled idle connection is unaffected.
+- **The sync client pools HTTP/3 connections per origin instead of opening and
+  closing one per request.** Only the async backends kept live h3 connections; the
+  sync `h3Transport` did a full QUIC handshake for every request and tore it down in a
+  `finally`, so a client talking h3 to one origin paid a handshake per request and
+  left the server a dead connection behind each time. It now keeps one connection per
+  origin (the QUIC twin of the h1/h2 pool), reusing it for the next request on a fresh
+  stream, and drains the whole table in `close` and in the destructor leak-guard. A
+  connection is dropped and closed on any transport failure, and, because the sync
+  backend runs no background pump (nothing emits keep-alive PINGs between requests), a
+  connection idle for more than 20 s is retired pre-emptively rather than probed -- a
+  cold connect is provably pre-submit, so every method stays safe to send. If a pooled
+  connection turns out to be dead anyway, the request is retried once on a fresh
+  connection under the same replay rules the h1/h2 pool applies to a stale keep-alive
+  socket. The sync streaming download/upload paths still use a connection per stream
+  (one blocking drive loop owns the connection while the body is pulled).
 - **The chronos client shuts a socket down before closing it, so the last write is
   delivered.** chronos's `closeWait` calls `closesocket` straight away, with no
   `shutdown` first; on Windows that could drop the bytes written just before the

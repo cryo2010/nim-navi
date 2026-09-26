@@ -207,6 +207,15 @@ proc h3Open*(host: string, port: int, sni = "", caFile = "",
       "navi HTTP/3 connect to " & host & ":" & $port & " failed")
   QuicConn(handle: h)
 
+proc alive*(c: QuicConn): bool =
+  ## Whether the connection is still usable: the handle is open and the peer has not
+  ## started draining (a server CONNECTION_CLOSE / GOAWAY). Cheap and non-blocking,
+  ## so a pool can check it before handing the connection to the next request. It
+  ## cannot see a connection the peer dropped silently -- the sync backend runs no
+  ## background pump, so nothing observes that until the next request drives the
+  ## connection; callers re-open on the resulting `QuicError`.
+  c.handle != nil and navi_h3_draining(c.handle) == 0
+
 proc encodeH3Fields*(fields: openArray[(string, string)]): string =
   ## Serialize name/value pairs to the "name\nvalue\n..." wire form the C driver reads
   ## (request headers and request trailers). "" when there are none. `\n` is the field
