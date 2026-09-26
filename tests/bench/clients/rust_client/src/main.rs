@@ -172,8 +172,165 @@ async fn run(proto: String, workload: String) {
     );
 }
 
+// --- TLS trust ------------------------------------------------------------
+
+/// The harness's self-signed PEM (`NAVI_CERT`): this run's only trust anchor.
+///
+/// navi verifies the origin's certificate, so the reference clients must too. With
+/// verification off this client alone would skip X.509 chain building, hostname
+/// matching and the CertificateVerify signature check, i.e. the table would compare a
+/// cheaper handshake. `None` (NAVI_CERT unset or empty) means "fall back to the
+/// built-in roots" -- verification is never disabled. An unreadable NAVI_CERT is fatal
+/// rather than a silent downgrade.
+fn harness_cert() -> Option<Vec<u8>> {
+    let path = std::env::var("NAVI_CERT").ok().filter(|p| !p.is_empty())?;
+    match std::fs::read(&path) {
+        Ok(pem) => Some(pem),
+        Err(e) => fail(format!("cannot read NAVI_CERT {}: {}", path, e)),
+    }
+}
+
+/// NAVI_CERT parsed to DER. Empty only when NAVI_CERT is unset; a PEM that parses to
+/// zero certificates is a configuration error, not a reason to stop verifying.
+fn harness_ders() -> Vec<rustls::pki_types::CertificateDer<'static>> {
+    use rustls::pki_types::pem::PemObject;
+
+    let Some(pem) = harness_cert() else { return Vec::new() };
+    let mut ders = Vec::new();
+    for cert in rustls::pki_types::CertificateDer::pem_slice_iter(&pem) {
+        ders.push(cert.unwrap_or_else(|e| fail(format!("NAVI_CERT is not a PEM chain: {}", e))));
+    }
+    if ders.is_empty() {
+        fail("NAVI_CERT holds no PEM certificate");
+    }
+    ders
+}
+
+/// Server-certificate verifier for the harness cert, used by both the reqwest and the
+/// tungstenite path (rustls is the TLS backend for both).
+///
+/// It runs the real webpki verifier -- chain, hostname, CertificateVerify signature --
+/// and tolerates exactly one of its failures: run.sh's cert is a single self-signed
+/// `CA:TRUE` certificate acting as trust anchor AND server leaf, which OpenSSL (navi,
+/// Node, Python) and Go's crypto/x509 accept but webpki rejects on principle
+/// (`CaUsedAsEndEntity`). For that error only, and only when the presented leaf is
+/// byte-identical to a pinned NAVI_CERT certificate, the chain is accepted. Everything
+/// else -- unknown issuer, wrong host, expired, bad signature -- still aborts the
+/// handshake, and the handshake signatures below are always verified for real (the old
+/// accept-anything verifier asserted them, skipping two RSA verifies per connection
+/// that every other client pays). A proper CA -> leaf NAVI_CERT needs no exception and
+/// gets the full webpki verification.
+#[derive(Debug)]
+struct HarnessVerifier {
+    inner: Arc<rustls::client::WebPkiServerVerifier>,
+    pinned: Vec<rustls::pki_types::CertificateDer<'static>>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for HarnessVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        use rustls::client::danger::ServerCertVerified;
+        use rustls::{CertificateError, Error};
+
+        match self
+            .inner
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp, now)
+        {
+            Ok(v) => Ok(v),
+            // webpki reports CaUsedAsEndEntity as CertificateError::Other; the pin is an
+            // exact DER match against NAVI_CERT, so accepting it trusts nothing new.
+            Err(Error::InvalidCertificate(CertificateError::Other(_)))
+                if self.pinned.iter().any(|c| c == end_entity) =>
+            {
+                Ok(ServerCertVerified::assertion())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// rustls config trusting the harness cert, with `alpn` offered. `None` when NAVI_CERT
+/// is unset, which leaves reqwest/tungstenite on their built-in roots -- still
+/// verifying, just against the public trust store.
+fn harness_tls_config(alpn: &[&str]) -> Option<rustls::ClientConfig> {
+    let pinned = harness_ders();
+    if pinned.is_empty() {
+        return None;
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in pinned.iter().cloned() {
+        roots
+            .add(cert)
+            .unwrap_or_else(|e| fail(format!("NAVI_CERT is not a usable root: {}", e)));
+    }
+    let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots),
+        provider.clone(),
+    )
+    .build()
+    .unwrap_or_else(|e| fail(e));
+
+    let mut config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap_or_else(|e| fail(e))
+        .dangerous() // a custom verifier, but a verifying one -- see HarnessVerifier
+        .with_custom_certificate_verifier(Arc::new(HarnessVerifier { inner, pinned, provider }))
+        .with_no_client_auth();
+    config.alpn_protocols = alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
+    Some(config)
+}
+
 fn build_client(cfg: &Config) -> reqwest::Client {
-    let mut b = reqwest::Client::builder().danger_accept_invalid_certs(true);
+    let mut b = reqwest::Client::builder();
+    // Verify the origin against the harness cert (see harness_tls_config). reqwest's
+    // add_root_certificate is not enough on its own here: the cert is its own leaf,
+    // which the stock webpki verifier refuses, so the config is built by hand and
+    // handed over whole. The bases are https://127.0.0.1:<port>, covered by the cert's
+    // IP SAN. NAVI_CERT unset leaves reqwest on its built-in roots.
+    let alpn: &[&str] = if cfg.proto == "h1" { &["http/1.1"] } else { &["h2", "http/1.1"] };
+    if let Some(tls) = harness_tls_config(alpn) {
+        b = b.use_preconfigured_tls(tls);
+    }
     if cfg.proto == "h1" {
         // Force HTTP/1.1 only.
         b = b.http1_only();
@@ -322,7 +479,7 @@ async fn stream_download(
     got
 }
 
-/// Streamed upload of STREAM_BYTES from a reused 1 MiB block; constant memory.
+/// Streamed chunked upload of STREAM_BYTES from a reused 1 MiB block; constant memory.
 /// The server echoes {"sha1","size"} which is verified. Returns bytes sent.
 async fn stream_upload(
     client: &reqwest::Client,
@@ -359,11 +516,15 @@ async fn stream_upload(
         Poll::Ready(Some(Ok::<Vec<u8>, std::io::Error>(chunk)))
     });
 
+    // No content-length header: hyper then frames this unknown-length body as
+    // Transfer-Encoding: chunked over h1, like navi and Python. Setting it made hyper
+    // emit a length-delimited body instead, so the h1 upload cell compared two wire
+    // formats and the origin got the cheaper read. (navi cannot opt out: its h1 writer
+    // always chunks a producer body and drops a caller-supplied content-length.)
     let url = format!("{}/upload", base);
     let resp = client
         .post(&url)
         .header("content-type", "application/octet-stream")
-        .header("content-length", total)
         .body(reqwest::Body::wrap_stream(body_stream))
         .send()
         .await
@@ -451,45 +612,13 @@ fn sse_data_len(frame: &[u8]) -> usize {
 
 // --- WebSocket workload ----------------------------------------------------
 
-/// A rustls certificate verifier that accepts any server certificate. This is
-/// intentionally insecure and used only to talk to the benchmark server's
-/// self-signed cert, mirroring reqwest's danger_accept_invalid_certs above.
-#[derive(Debug)]
-struct NoVerify(Arc<rustls::crypto::CryptoProvider>);
-
-impl rustls::client::danger::ServerCertVerifier for NoVerify {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
+/// TLS connector for the tungstenite WebSocket path: the same verifying rustls config
+/// as the reqwest client, minus ALPN (a WebSocket is a plain HTTP/1.1 upgrade). `None`
+/// means NAVI_CERT is unset, which lets tokio-tungstenite build its own default
+/// connector (built-in webpki roots, verification on); it never means "accept
+/// anything".
+fn ws_connector() -> Option<tokio_tungstenite::Connector> {
+    harness_tls_config(&[]).map(|c| tokio_tungstenite::Connector::Rustls(Arc::new(c)))
 }
 
 /// WebSocket text-echo round-trips over wss (an HTTP/1.1 upgrade; no version
@@ -508,21 +637,11 @@ async fn ws(
     // wss URL from the https base.
     let url = format!("{}/ws", base.replacen("https://", "wss://", 1));
 
-    // rustls config that trusts the self-signed server cert.
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .unwrap_or_else(|e| fail(e))
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
-        .with_no_client_auth();
-    let connector = tokio_tungstenite::Connector::Rustls(Arc::new(config));
-
     let (mut socket, _resp) = tokio_tungstenite::connect_async_tls_with_config(
         &url,
         None,
         false,
-        Some(connector),
+        ws_connector(),
     )
     .await
     .unwrap_or_else(|e| fail(e));
