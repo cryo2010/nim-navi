@@ -3,7 +3,7 @@
 ## request/stream/tunnel logic here is identical across the two backends; only the
 ## fd-readiness core -- `wake`, `step`, `reader`, `waitProgress`, and `openConn*` --
 ## genuinely differs (asyncdispatch's `addRead`/`sleepAsync` vs chronos's
-## `addReader2`/`one`), so each includer defines those ABOVE the include, along with
+## `addReader2`/`setTimer`), so each includer defines those ABOVE the include, along with
 ## its own `QuicConn` object type (aliased to the public `QuicConnAsync` /
 ## `QuicConnChronos`). This fragment refers to the connection only as `QuicConn` and
 ## calls `wake` / `waitProgress`, which resolve to the includer's definitions.
@@ -113,8 +113,8 @@ proc requestOnConn*(qc: QuicConn, verb, path: string,
 # Unlike requestOnConn (which awaits the whole buffered response), these let the
 # caller read a response incrementally: submit, await headers, then pull body
 # chunks. A parked pull waits on a per-stream `recvReady` future (`waitProgress`,
-# defined per backend) that the reader wakes each cycle, then re-checks the C-side
-# buffers (mirrors the h2 mux's recvReady).
+# defined per backend) that the reader completes on each cycle that moved bytes, then
+# re-checks the C-side buffers (mirrors the h2 mux's recvReady).
 
 proc submitStream*(qc: QuicConn, verb, path: string,
                    headers: seq[(string, string)], body: string,
@@ -185,6 +185,9 @@ proc readStreamBody*(qc: QuicConn, sid: int64): Future[string] {.async.} =
                               csize_t(buf.len), addr eof)
     if n < 0: raise newException(QuicSubmittedError, "navi HTTP/3 stream gone")
     if n > 0:
+      # read_body returned this stream's flow-control credit, so there are frames to
+      # put on the wire: let the next park poke the reader (chronos; see waitProgress).
+      qc.flushPending = true
       buf.setLen(int(n)); return buf
     if eof != 0: return ""
     await waitProgress(qc, sid)
@@ -234,9 +237,10 @@ const settingsWaitId = -1'i64
 
 proc awaitPeerSettings(qc: QuicConn) {.async.} =
   ## Park until the peer's SETTINGS frame has been received (RFC 9114 7.2.4). The
-  ## reader completes every parked progress future each cycle, so this re-checks the
-  ## C-side flag once per cycle, exactly like a parked header/body pull. Returns
-  ## early if the connection dies; the caller re-checks `alive`.
+  ## reader completes every parked progress future on each cycle that moved bytes, and
+  ## SETTINGS can only arrive on such a cycle, so this re-checks the C-side flag
+  ## exactly like a parked header/body pull. Returns early if the connection dies; the
+  ## caller re-checks `alive`.
   while qc.alive and navi_h3_peer_settings_seen(qc.c) == 0:
     await waitProgress(qc, settingsWaitId)
 
