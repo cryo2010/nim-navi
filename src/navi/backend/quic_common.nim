@@ -176,19 +176,30 @@ proc readStreamBody*(qc: QuicConn, sid: int64): Future[string] {.async.} =
   ## The next body chunk of `sid`, or "" at end of body. Parks until data lands.
   ## Like `awaitHeaders`, every failure here is post-submit, so it raises
   ## `QuicSubmittedError` (#378).
-  var buf = newString(64 * 1024)
+  ##
+  ## Reads into the connection's reusable scratch buffer and hands back a right-sized
+  ## copy. Allocating a fresh `newString(64 * 1024)` per call and only `setLen`ing it
+  ## down (setLen never shrinks the allocation) charged 64 KiB to every chunk, however
+  ## small -- and an SSE flood is thousands of tiny chunks a second. Sharing one
+  ## scratch across the connection's streams is safe on both backends: the read into
+  ## it and the copy out of it are one synchronous FFI call apart, with no await
+  ## between them.
+  const readCap = 64 * 1024
+  if qc.scratch.len < readCap: qc.scratch = newString(readCap)
   var eof: cint
   while true:
     if not qc.alive:
       raise newException(QuicSubmittedError, "navi HTTP/3 connection closed")
-    let n = navi_h3_read_body(qc.c, sid, cast[ptr char](addr buf[0]),
-                              csize_t(buf.len), addr eof)
+    let n = navi_h3_read_body(qc.c, sid, cast[ptr char](addr qc.scratch[0]),
+                              csize_t(readCap), addr eof)
     if n < 0: raise newException(QuicSubmittedError, "navi HTTP/3 stream gone")
     if n > 0:
       # read_body returned this stream's flow-control credit, so there are frames to
       # put on the wire: let the next park poke the reader (chronos; see waitProgress).
       qc.flushPending = true
-      buf.setLen(int(n)); return buf
+      var chunk = newString(int(n))
+      copyMem(addr chunk[0], addr qc.scratch[0], int(n))
+      return chunk
     if eof != 0: return ""
     await waitProgress(qc, sid)
 

@@ -44,6 +44,7 @@ type
     timerAt: Moment                   ## when `timer` fires
     flushPending: bool                ## a consumer queued frames (stream-window credit
                                       ## from a body read): the next park pokes the reader
+    scratch: string                   ## reusable body-read buffer (see quic_common)
     alive*: bool
     readerDone: Future[void]
   QuicConn = QuicConnChronos          ## the name the shared quic_common fragment uses

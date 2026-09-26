@@ -36,6 +36,7 @@ type
     flushPending: bool                ## set by the shared quic_common when a body read
                                       ## queued stream credit; only chronos acts on it
                                       ## (this backend must never poke -- see below)
+    scratch: string                   ## reusable body-read buffer (see quic_common)
     alive*: bool
     readerDone: Future[void]
   QuicConn = QuicConnAsync            ## the name the shared quic_common fragment uses
