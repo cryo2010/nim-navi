@@ -135,6 +135,20 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **An HTTP/3 connection now says goodbye: `close` sends a CONNECTION_CLOSE before
+  freeing the connection.** The h3 driver used to drop its UDP socket and free the
+  ngtcp2/nghttp3/OpenSSL state without telling the peer anything, so a server had no
+  way to learn the connection was over and held its per-connection state until its own
+  idle timer fired (~30 s for quic-go, which is what Caddy runs). Under connection
+  churn that pins thousands of dead connections server side -- the sync h3 stress cell
+  drove the Caddy front to 3.45 GB RSS against ~70 MB for the same load over the async
+  clients. Teardown now writes a CONNECTION_CLOSE (H3_NO_ERROR once the handshake has
+  completed, transport NO_ERROR before that) and sends that one datagram first, so the
+  peer releases its state immediately; the write is best effort, and a connection
+  already closing or draining is left alone. The client also advertises a 30 s
+  `max_idle_timeout` now, which bounds peer retention even when the close datagram
+  never arrives (a crash, a killed process, a lost packet); the existing 15 s
+  keep-alive PING sits comfortably below it, so a pooled idle connection is unaffected.
 - **The chronos client shuts a socket down before closing it, so the last write is
   delivered.** chronos's `closeWait` calls `closesocket` straight away, with no
   `shutdown` first; on Windows that could drop the bytes written just before the

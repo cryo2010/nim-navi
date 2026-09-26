@@ -995,6 +995,13 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
     params.initial_max_stream_data_bidi_local = 8 * 1024 * 1024;
     params.initial_max_stream_data_uni = 1024 * 1024;
     params.initial_max_data = 256 * 1024 * 1024;
+    // Advertise our own idle timeout. The effective timeout is the minimum of the two
+    // advertised values (RFC 9000 10.1), so this bounds how long a peer keeps state
+    // for a connection we walked away from without a CONNECTION_CLOSE (a crash, a
+    // lost close datagram, a killed process) instead of leaving that entirely to the
+    // server's policy. 30 s is comfortably above the 15 s keep-alive PING below, so a
+    // pooled-but-idle connection is kept alive by the PINGs and never trips this.
+    params.max_idle_timeout = 30 * NGTCP2_SECONDS;
 
     ngtcp2_cid dcid, scid;
     dcid.datalen = 16;
@@ -1030,7 +1037,36 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
   }
 }
 
-void navi_h3_close(H3Conn *c) { delete c; }
+// Close the connection and free everything it owns. Before freeing, tell the peer we
+// are gone: write a CONNECTION_CLOSE (H3_NO_ERROR once h3 is up, transport NO_ERROR
+// during the handshake) and send that one datagram. Without it the client just drops
+// the UDP socket, so the server has no way to learn the connection is dead and holds
+// its per-connection state until its own idle timer fires (~30 s in quic-go/Caddy).
+// Under connection churn that is thousands of resident dead connections and gigabytes
+// of server RSS. The frame is best-effort and non-blocking: a failed write only costs
+// the peer the timeout it would have taken anyway, so nothing here is fatal.
+void navi_h3_close(H3Conn *c) {
+  if (!c) return;
+  if (c->conn && c->fd >= 0 && !c->draining &&
+      !ngtcp2_conn_in_closing_period(c->conn) &&
+      !ngtcp2_conn_in_draining_period(c->conn)) {
+    std::array<std::uint8_t, 1500> buf{};
+    ngtcp2_ccerr ccerr;
+    ngtcp2_ccerr_default(&ccerr);     // transport NO_ERROR: valid at any stage
+    if (c->h3 && ngtcp2_conn_get_handshake_completed(c->conn))
+      // An application CONNECTION_CLOSE is only legal once the handshake is done;
+      // H3_NO_ERROR is the graceful HTTP/3 shutdown code (RFC 9114 8.1).
+      ngtcp2_ccerr_set_application_error(&ccerr, NGHTTP3_H3_NO_ERROR, nullptr, 0);
+    ngtcp2_pkt_info pi;
+    ngtcp2_ssize n = ngtcp2_conn_write_connection_close(
+        c->conn, &c->path, &pi, buf.data(), buf.size(), &ccerr, now_ns());
+    if (n > 0) {
+      ssize_t sent = send(c->fd, buf.data(), static_cast<std::size_t>(n), 0);
+      (void)sent;   // best-effort: the peer falls back to its idle timer
+    }
+  }
+  delete c;
+}
 
 // Sync convenience: create, drive the handshake to completion with a blocking
 // poll loop, and bind the h3 session. Returns nullptr on failure.
