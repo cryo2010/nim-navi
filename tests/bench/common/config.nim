@@ -1,7 +1,8 @@
 ## Shared, backend-agnostic config for the navi benchmark workloads. Mirror of
 ## tests/stress/common/config.nim (same NAVI_* dimensions and gap policy) with two
 ## bench-only knobs: `mode` (pooled vs a fresh connection per request) and
-## `warmupSeconds` (an unmeasured prelude before the timed window). Parses the env
+## `warmupSeconds` (an unmeasured prelude before the timed window), and one differing
+## default: `reqCompression` is none here (fairness; see the field). Parses the env
 ## into one `Config` for a single cell (one workload x one backend x one protocol).
 ## No navi import, so every backend and `nim js` peer (harness_js) can share the shape.
 
@@ -20,7 +21,11 @@ type
     mode*: string            ## pooled (reuse connections) | cold (fresh conn per request)
     clients*: int            ## concurrent navi client instances (NAVI_CLIENT_COUNT)
     concurrency*: int        ## in-flight requests per client (async fan-out width)
-    reqCompression*: string  ## none|gzip|deflate (request body; native only)
+    reqCompression*: string  ## none|gzip|deflate (request body; native only).
+                             ## Defaults to none for the cross-language tables: no
+                             ## reference client gzips its request body, so leaving
+                             ## it on made navi (and only navi) pay a deflate per
+                             ## POST/PUT. Set gzip/deflate to measure that path.
     respCompression*: string ## none|gzip|deflate|br|zstd (asked via x-want-encoding)
     reportSeconds*: int      ## per-report cadence
     streamBytes*: int        ## stream transfer size (bytes)
@@ -48,7 +53,7 @@ proc loadConfig*(backend: string): Config =
     mode: getEnv("NAVI_MODE", "pooled"),
     clients: max(1, getInt("NAVI_CLIENT_COUNT", 3)),
     concurrency: max(1, getInt("NAVI_CONCURRENCY", 8)),
-    reqCompression: getEnv("NAVI_REQ_COMPRESSION", "gzip"),
+    reqCompression: getEnv("NAVI_REQ_COMPRESSION", "none"),
     respCompression: getEnv("NAVI_RESP_COMPRESSION", "gzip"),
     reportSeconds: max(1, getInt("NAVI_REPORT_SECONDS", 60)),
     streamBytes: getInt("NAVI_STREAM_BYTES", 1073741824),

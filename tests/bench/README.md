@@ -37,6 +37,8 @@ verify a SHA-1 and fail hard on mismatch.
 | `NAVI_MODE` | `pooled` | `pooled` (reuse connections) \| `cold` (fresh connection per request) |
 | `NAVI_CLIENT_COUNT` | `3` | concurrent navi client instances per cell |
 | `NAVI_CONCURRENCY` | `8` | in-flight ops per client (fan-out width) |
+| `NAVI_REQ_COMPRESSION` | `none` | request body encoding: `none` \| `gzip` \| `deflate` (navi native only). Off by default: no reference client gzips its request body |
+| `NAVI_RESP_COMPRESSION` | `gzip` | response encoding navi asks for via `x-want-encoding`: `none` \| `gzip` \| `deflate` \| `br` \| `zstd`. The server gzips for every client (they all send `Accept-Encoding: gzip`), so this stays on |
 | `NAVI_STREAM_BYTES` | `1073741824` | bytes per streaming transfer (1 GiB; lower for a smoke) |
 | `NAVI_NETEM` | `0` | `1` adds a lossy-link regime (`tc netem`; needs `--cap-add=NET_ADMIN`, added automatically) |
 | `NAVI_NETEM_DELAY` / `NAVI_NETEM_LOSS` | `25ms` / `1.5%` | netem link parameters |
@@ -64,6 +66,10 @@ Two things keep the comparison apples-to-apples with the multi-core Go/Rust clie
 - **Hardware hash:** the streaming clients verify integrity with OpenSSL's SHA-1
   (SHA-NI), matching Go/Rust/Node. Nim's software `checksums/sha1` (~0.8 GB/s) would
   otherwise bottleneck navi's core and understate its download throughput.
+- **No navi-only request gzip:** `NAVI_REQ_COMPRESSION` defaults to `none`. It used to
+  default to `gzip`, which only navi's native clients honored, so navi alone paid a
+  `deflate` (and the server an `inflate`) per POST/PUT while Go/Rust/Node/Python/std
+  and navi/js sent the body plain. Set it explicitly to measure request compression.
 
 With both, navi's streaming throughput lands in the Go/Rust range; per single stream,
 navi's transport is already competitive (its per-transfer latency beats both).
