@@ -207,19 +207,31 @@ run_client() {
   fi
 }
 
+# cores_for <row label>: how many cores that client can actually use. navi's native
+# clients run NAVI_THREADS client threads in one process and Go/Rust use every core
+# inside one process, but the js, Python and std/httpclient clients are a single event
+# loop pinned to one core. Printed as a column so a 1-core row is never read as an
+# all-cores one (the REQ/S ranking alone would invite exactly that).
+cores_for() {
+  case "$1" in
+    nim/navi-js|js/node|python/httpx|nim/std-sync|nim/std-async) echo 1 ;;
+    *) echo "$threads" ;;
+  esac
+}
+
 print_table() {   # <cellfile> <workload> <proto>
   local cell="$1" wl="$2" pr="$3"
   [ -s "$cell" ] || { echo "  (no results)"; return; }
   echo ""
   echo "== bench: $wl | $pr | ${servers} servers =="
   local max; max="$(sort -t$'\t' -k5 -nr "$cell" | head -1 | cut -f5)"
-  printf "%-20s %11s %8s %11s %9s %9s %9s %9s %6s\n" \
-    CLIENT REQUESTS "TIME(s)" "REQ/S" p50ms p99ms p999ms "MB/s" REL
-  printf -- "--------------------------------------------------------------------------------------------------\n"
+  printf "%-20s %6s %11s %8s %11s %9s %9s %9s %9s %6s\n" \
+    CLIENT CORES REQUESTS "TIME(s)" "REQ/S" p50ms p99ms p999ms "MB/s" REL
+  printf -- "---------------------------------------------------------------------------------------------------------\n"
   sort -t$'\t' -k5 -nr "$cell" | while IFS=$'\t' read -r _ name req sec rps p50 p99 p999 mbps; do
     local rel; rel="$(awk -v r="$rps" -v m="$max" 'BEGIN{printf "%.0f", (m>0? r/m*100 : 0)}')"
-    printf "%-20s %11s %8s %11s %9s %9s %9s %9s %5s%%\n" \
-      "$name" "$req" "$sec" "$rps" "$p50" "$p99" "$p999" "$mbps" "$rel"
+    printf "%-20s %6s %11s %8s %11s %9s %9s %9s %9s %5s%%\n" \
+      "$name" "$(cores_for "$name")" "$req" "$sec" "$rps" "$p50" "$p99" "$p999" "$mbps" "$rel"
   done
 }
 
