@@ -12,6 +12,7 @@
 // modules only.
 'use strict';
 
+const fs = require('fs');
 const https = require('https');
 const http2 = require('http2');
 const zlib = require('zlib');
@@ -21,6 +22,19 @@ const { performance } = require('perf_hooks');
 function envStr(k, def) { const v = process.env[k]; return v ? v : def; }
 function envInt(k, def) { const v = process.env[k]; const n = v ? parseInt(v, 10) : NaN; return Number.isFinite(n) ? n : def; }
 function envFloat(k, def) { const v = process.env[k]; const n = v ? parseFloat(v) : NaN; return Number.isFinite(n) ? n : def; }
+
+// --- TLS trust (parity with navi, whose TlsConfig.verify defaults on) ---
+// Verify the origin's certificate on every connection: with verification off this
+// client would skip X.509 chain building and the hostname match, so its row would be
+// cheaper than navi's for free. NAVI_CERT is the harness's self-signed cert, which
+// doubles as the trust anchor (CA:TRUE); with none configured we fall back to the
+// platform trust store plus NODE_EXTRA_CA_CERTS, never to an unverified handshake.
+// Passing `ca` explicitly would shadow NODE_EXTRA_CA_CERTS, so it is only passed when
+// NAVI_CERT names a file. A handshake failure then surfaces as a FAIL, as it should.
+const tlsOpts = (() => {
+  const p = process.env.NAVI_CERT;
+  return p ? { ca: fs.readFileSync(p) } : {};
+})();
 
 function fail(verb, url, err) {
   process.stderr.write(`FAIL: ${verb} ${url} -> ${err && err.stack ? err.stack : err}\n`);
@@ -121,17 +135,18 @@ async function main() {
   }
 
   // --- h1 transport (https module, HTTP/1.1) ---
+  // The agent's TLS options win over a per-request object, so `ca` lives here only.
   const agent = new https.Agent({
     keepAlive: !cold,
     maxSockets: cold ? Infinity : 4096,
-    rejectUnauthorized: false,
+    ...tlsOpts,
   });
 
   // --- h2 transport (http2 module) ---
   // One ClientHttp2Session per base for pooled; per-request session for cold.
   const sessions = new Array(servers).fill(null);
   function connect(base) {
-    const s = http2.connect(base, { rejectUnauthorized: false });
+    const s = http2.connect(base, { ...tlsOpts });
     s.on('error', (e) => fail('h2-session', base, e));
     return s;
   }
@@ -150,7 +165,7 @@ async function main() {
         headers['content-type'] = 'text/plain';
         headers['content-length'] = bodyBuf.length;
       }
-      const req = https.request(base + '/echo', { method: verb, agent, headers, rejectUnauthorized: false }, (res) => {
+      const req = https.request(base + '/echo', { method: verb, agent, headers }, (res) => {
         gateH1(res);
         const chunks = [];
         res.on('data', (c) => chunks.push(c));
@@ -197,7 +212,7 @@ async function main() {
   function downH1(base) {
     return new Promise((resolve, reject) => {
       const url = `${base}/download?size=${streamBytes}`;
-      const req = https.request(url, { method: 'GET', agent, rejectUnauthorized: false }, (res) => {
+      const req = https.request(url, { method: 'GET', agent }, (res) => {
         gateH1(res);
         const h = crypto.createHash('sha1');
         let got = 0;
@@ -287,8 +302,15 @@ async function main() {
   function upH1(base) {
     const url = base + '/upload';
     return new Promise((resolve, reject) => {
-      const headers = { 'content-type': 'application/octet-stream', 'content-length': streamBytes };
-      const req = https.request(url, { method: 'POST', agent, headers, rejectUnauthorized: false }, (res) => {
+      // No content-length: send Transfer-Encoding: chunked, which is what navi, Rust
+      // and Python all send here. navi's h1 writer always chunks a producer body and
+      // drops a caller-supplied length (src/navi/proto/h1.nim), so a length-delimited
+      // body would have the origin do a cheaper read for this row only. Node adds the
+      // chunked framing itself for a POST with no length. (The h2 upload path below
+      // needs no equivalent: HTTP/2 frames DATA and has no chunked encoding, and it
+      // already sends no content-length.)
+      const headers = { 'content-type': 'application/octet-stream' };
+      const req = https.request(url, { method: 'POST', agent, headers }, (res) => {
         gateH1(res);
         collect(res).then((body) => { checkUpload(url, sentSha1, body); resolve(streamBytes); }, reject);
       });
@@ -360,7 +382,7 @@ async function main() {
   function sseH1(base) {
     const url = base + '/events';
     return new Promise((resolve, reject) => {
-      const req = https.request(url, { method: 'GET', agent, rejectUnauthorized: false }, (res) => {
+      const req = https.request(url, { method: 'GET', agent }, (res) => {
         gateH1(res);
         sseConsume(res, () => req.destroy()).then(resolve, reject);
       });

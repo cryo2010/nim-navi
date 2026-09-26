@@ -48,6 +48,14 @@ CLIENTS = env_int("NAVI_CLIENT_COUNT", 3)
 CONCURRENCY = env_int("NAVI_CONCURRENCY", 8)
 WORKLOAD = env_str("NAVI_WORKLOAD", "requests")
 STREAM_BYTES = env_int("NAVI_STREAM_BYTES", 1073741824)
+# The harness's self-signed cert, which doubles as the trust anchor (CA:TRUE). Passed
+# to every TLS dial so this client verifies the chain and the hostname exactly as navi
+# does (its TlsConfig.verify defaults on): with verification off this row would skip
+# that work and come out cheaper than navi's for free. Empty -> the platform trust
+# store (VERIFY below), never an unverified handshake; a handshake failure must reach
+# the FAIL paths rather than be swallowed.
+CERT = env_str("NAVI_CERT", "")
+VERIFY = CERT if CERT else True
 
 COLD = MODE == "cold"
 VERBS = ("GET", "POST", "PUT")
@@ -258,10 +266,11 @@ def pick_ws():
 
 
 async def ws_worker(client, i, measure_start, deadline):
-    # WebSocket is an HTTP/1.1 upgrade; no version gate. Self-signed TLS.
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    # WebSocket is an HTTP/1.1 upgrade; no version gate. The default context keeps
+    # check_hostname and CERT_REQUIRED on; cafile=None (no NAVI_CERT) loads the
+    # platform roots instead. The wss URI dials 127.0.0.1, which the cert's IP SAN
+    # covers, so hostname checking stays on rather than being disabled.
+    ctx = ssl.create_default_context(cafile=CERT or None)
     uri = pick_ws()
     try:
         async with websockets.connect(uri, ssl=ctx) as ws:
@@ -306,7 +315,7 @@ async def main():
     )
     async with httpx.AsyncClient(
         http2=(PROTO == "h2"),
-        verify=False,
+        verify=VERIFY,
         limits=limits,
     ) as client:
         start = time.perf_counter()
