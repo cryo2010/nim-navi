@@ -1,0 +1,43 @@
+# Docs-only PRs (**.md, .claude/**) are excluded from ci.yml, fuzz.yml and
+# badssl.yml via paths-ignore, but the "Main ruleset" still requires their
+# checks, so such PRs could never merge. This workflow runs on the inverse
+# filter and reports every required context as a trivial success, which is
+# GitHub's documented pattern for skipped-but-required checks.
+#
+# Job names here must match the required contexts exactly. When a PR touches
+# both docs and code, both workflows report the same context and GitHub keeps
+# the most recently completed run, so the real (slower) result wins.
+name: CI (docs-only skip)
+
+on:
+  pull_request:
+    paths:
+      - '**.md'
+      - '.claude/**'
+
+jobs:
+  skip:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        check:
+          - "tests (--mm:orc)"
+          - "tests (--mm:arc)"
+          - "compile entries (--mm:orc, -d:ssl)"
+          - "compile entries (--mm:arc, -d:ssl)"
+          - "compile navi/js (nim js)"
+          - "sanitizers (asan + ubsan)"
+          - "nghttpd interop (http/2)"
+          - "leak check (--mm:orc)"
+          - "leak check (--mm:arc)"
+          - "leak check (codec FFI, LeakSanitizer)"
+          - "valgrind leak check (TLS client, --mm:orc)"
+          - "valgrind leak check (TLS client, --mm:arc)"
+          - "fuzz frame"
+          - "fuzz hpack"
+          - "fuzz huffman"
+          - "fuzz h1"
+          - "badssl TLS conformance"
+    name: ${{ matrix.check }}
+    steps:
+      - run: echo "docs-only change, '${{ matrix.check }}' not required"
