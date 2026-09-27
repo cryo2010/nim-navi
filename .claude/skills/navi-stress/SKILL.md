@@ -58,9 +58,6 @@ Reference (don't re-derive): tasks + the `runStress` env passthrough live in `na
 the full knob table with defaults and the pass/fail banner semantics are in
 `tests/stress/README.md`.
 
-Important: You can separate the stress run by protocol, client or workload. A simple distribution
-is one agent per client or one agent per workload.
-
 **Echo the exact command before running it**, on its own line for observability, e.g.:
 
 ```
