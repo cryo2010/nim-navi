@@ -34,6 +34,17 @@ when defined(naviHttp3):
 
 template msOf(ms: int): untyped = ms.milliseconds
 
+proc awaitWithin[T](fut: Future[T], deadline: Future[void]): Future[bool] {.async.} =
+  ## Wait for `fut`, giving up once the long-lived `deadline` completes; true if `fut`
+  ## finished. Neither future is consumed, so ONE deadline can bound a whole series of
+  ## waits instead of a fresh timer per wait (`race` drops its callbacks from the loser,
+  ## so nothing accretes on the deadline either). `fut` is never cancelled -- a chronos
+  ## read cancelled mid-flight loses its buffered bytes. The caller keeps at most one
+  ## wait per deadline in flight (see the asyncdispatch twin, which needs that).
+  if fut.finished: return true
+  discard await race(fut, deadline)
+  return fut.finished
+
 proc guard[T](totalMs: int; fut: Future[T];
               cancel: CancelToken): Future[T] {.async.} =
   ## Bound the whole operation by `timeout` and `cancel`. On either, the in-flight

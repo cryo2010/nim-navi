@@ -34,6 +34,29 @@ when defined(naviHttp3):
 
 template msOf(ms: int): int = ms
 
+proc awaitWithin[T](fut: Future[T], deadline: Future[void]): Future[bool] =
+  ## Wait for `fut`, giving up once the long-lived `deadline` completes; true if `fut`
+  ## finished. Neither future is consumed, so ONE deadline can bound a whole series of
+  ## waits instead of a fresh timer per wait: `withTimeout` leaves its losing
+  ## `sleepAsync` in the dispatcher's timer heap for the full timeout, so per-wait
+  ## timers accrete under a flood.
+  ##
+  ## The caller must keep at most one wait per deadline in flight: asyncdispatch has no
+  ## removeCallback, so a won wait clears the deadline's callbacks wholesale, which
+  ## would drop a second waiter's too. A callback left behind on a timed-out `fut` is
+  ## harmless -- it finds the result already finished.
+  let res = newFuture[bool]("navi.awaitWithin")
+  if fut.finished or deadline.finished:
+    res.complete(fut.finished)
+    return res
+  proc settle() {.closure, gcsafe.} =
+    if not res.finished:
+      deadline.clearCallbacks()
+      res.complete(fut.finished)
+  fut.addCallback(settle)
+  deadline.addCallback(settle)
+  res
+
 proc guard[T](totalMs: int; fut: Future[T];
               cancel: CancelToken): Future[T] {.async.} =
   ## Bound the whole request (all attempts) by `timeout` and `cancel`. On expiry

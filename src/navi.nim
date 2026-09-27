@@ -23,6 +23,22 @@ from std/strutils import startsWith, find, splitLines, strip, cmpIgnoreCase,
 when defined(naviHttp3):
   import navi/core/altsvc
   import navi/backend/quic
+  from std/times import epochTime
+
+  type H3Cached = object
+    ## One pooled HTTP/3 connection, keyed by origin (see `NaviObj.h3conns`).
+    conn: QuicConn
+    lastUse: float          ## epochTime() when its last request finished
+
+  const h3MaxIdleSec = 20.0
+    ## Reuse a pooled h3 connection only if it went idle less than this long ago.
+    ## The sync backend runs no background pump, so an idle connection sends no
+    ## keep-alive PINGs and the peer silently reclaims it once its idle timer fires
+    ## (the client advertises 30 s, the effective timeout is the minimum of the two).
+    ## Reusing it past that point would submit a request onto a connection that is
+    ## already gone -- an indeterminate, non-replayable failure for a POST. Below the
+    ## threshold, re-open pre-emptively instead: a cold connect is provably
+    ## pre-submit, so every method stays safe.
 export sse.SseEvent, sse.defaultSseMinRetryMs
 
 claimEntry("navi")
@@ -65,6 +81,12 @@ type
     jar*: CookieJar
     when defined(naviHttp3):
       altSvc: AltSvcCache      ## per-origin h3 discovery cache (HTTP/3 builds)
+      h3conns: Table[string, H3Cached]
+        ## Live per-origin HTTP/3 connections, the QUIC twin of `pool`. Requests to
+        ## the same origin reuse one connection (new h3 stream each) instead of
+        ## paying a fresh QUIC handshake -- and, far worse, leaving the server a
+        ## dead connection to time out -- per request. Unsynchronised, like `pool`:
+        ## one sync client is used by one thread at a time.
   Navi* = ref NaviObj
 
 proc closeIdle(pool: Pool[PooledConn[Conn]]) =
@@ -75,6 +97,18 @@ proc closeIdle(pool: Pool[PooledConn[Conn]]) =
     try: pc.transport.close()
     except CatchableError: discard
 
+when defined(naviHttp3):
+  proc closeH3Conns(conns: var Table[string, H3Cached]) =
+    ## Close and forget every pooled h3 connection (each owns a UDP socket plus
+    ## ngtcp2/nghttp3/OpenSSL state, and its `close` sends the peer a
+    ## CONNECTION_CLOSE so the server drops its half immediately). Shared by
+    ## `close` and the destructor leak-guard; safe to call twice, and never raises
+    ## out of a destructor.
+    for e in conns.mvalues:
+      try: e.conn.close()
+      except CatchableError: discard
+    conns.clear()
+
 proc `=destroy`(o: var NaviObj) =
   ## Leak-guard: a client collected without an explicit `close` still gets its idle
   ## pooled connections closed here (each holds an ~85 KB OpenSSL context, so they
@@ -84,6 +118,7 @@ proc `=destroy`(o: var NaviObj) =
   ## already drained the pool. `close` remains the recommended shutdown. Declared
   ## before `newNavi` so it binds before NaviObj is first constructed.
   if o.pool != nil: closeIdle(o.pool)
+  when defined(naviHttp3): closeH3Conns(o.h3conns)
   # A custom `=destroy` suppresses the compiler's field destruction, so destroy the
   # managed fields explicitly or they leak. Keep in sync with NaviObj's fields.
   `=destroy`(o.config)
@@ -91,6 +126,7 @@ proc `=destroy`(o: var NaviObj) =
   `=destroy`(o.jar)
   when defined(naviHttp3):
     `=destroy`(o.altSvc)
+    `=destroy`(o.h3conns)
 
 proc initNaviConfig*(): NaviConfig =
   ## The only way to build a config: `NaviConfig` requires every field. Sets the
@@ -124,7 +160,9 @@ proc newNavi*(config = initNaviConfig()): Navi =
   result = Navi(config: cfg,
     pool: newPool[PooledConn[Conn]](cfg.idlePerHost, cfg.idleGlobal, cfg.idleTimeoutMs),
     jar: newCookieJar())
-  when defined(naviHttp3): result.altSvc = newAltSvcCache()
+  when defined(naviHttp3):
+    result.altSvc = newAltSvcCache()
+    result.h3conns = initTable[string, H3Cached]()
 
 proc extend*(client: Navi, config: NaviConfig): Navi =
   ## Derive a new client, layering `config` over this client's (middleware is
@@ -140,7 +178,9 @@ proc extend*(client: Navi, config: NaviConfig): Navi =
   result = Navi(config: merged,
     pool: newPool[PooledConn[Conn]](merged.idlePerHost, merged.idleGlobal, merged.idleTimeoutMs),
     jar: newCookieJar())
-  when defined(naviHttp3): result.altSvc = newAltSvcCache()
+  when defined(naviHttp3):
+    result.altSvc = newAltSvcCache()
+    result.h3conns = initTable[string, H3Cached]()
 
 proc close*(client: Navi) =
   ## Close all idle pooled connections, freeing their TLS contexts and cached
@@ -148,10 +188,33 @@ proc close*(client: Navi) =
   ## just opens fresh connections. Without it, pooled connections are reclaimed
   ## only at process exit (and their OpenSSL contexts leak until then).
   closeIdle(client.pool)
+  when defined(naviHttp3): closeH3Conns(client.h3conns)
   closeTlsStore(client.config.tls.sessionCache)
   closeTlsCtxStore(client.config.tls.contextStore)
 
 when defined(naviHttp3):
+  proc evictH3(client: Navi, origin: string, conn: QuicConn) =
+    ## Drop `conn` from the pool (if it is still the entry for `origin`) and close it,
+    ## which also sends the peer a CONNECTION_CLOSE so it releases its state at once.
+    client.h3conns.withValue(origin, e):
+      if e.conn == conn: client.h3conns.del(origin)
+    try: conn.close()
+    except CatchableError: discard
+
+  proc liveH3Conn(client: Navi, origin: string): QuicConn =
+    ## The pooled connection for `origin` when it is still usable, else nil (having
+    ## closed and dropped the unusable one). "Usable" is `alive` -- the handle is open
+    ## and the peer is not draining -- plus recently used: see `h3MaxIdleSec` for why
+    ## a long-idle connection is retired rather than probed.
+    client.h3conns.withValue(origin, e):
+      if e.conn.alive and epochTime() - e.lastUse < h3MaxIdleSec:
+        return e.conn
+      let dead = e.conn
+      client.h3conns.del(origin)
+      try: dead.close()
+      except CatchableError: discard
+    nil
+
   proc h3Transport(client: Navi, req: Request, ep: AltSvcEndpoint): Response =
     ## Send `req` (any verb with a buffered body) over HTTP/3 to a discovered
     ## endpoint and build a navi Response, so the caller's policy layer (cookies,
@@ -170,10 +233,6 @@ when defined(naviHttp3):
       let lk = k.toLowerAscii
       if not isForbiddenTrailer(lk):     # the shared h1/h2/h3 trailer filter (#296)
         fwdTrl.add((lk, v))
-    let conn = h3Open(ep.host, ep.port, sni = req.url.host,
-                      caFile = client.config.tls.caFile,
-                      verify = client.config.tls.wantsVerify,
-                      maxBody = uint64(max(0, client.config.maxResponseBytes)))
     # Bound the blocking drive loop with the client's own budget: attempt (the
     # per-attempt wall clock) when set, else read, else total. Without a cap the
     # sync h3 leg has NO timeout at all -- pump waits on the ngtcp2 timer/socket,
@@ -184,13 +243,49 @@ when defined(naviHttp3):
     let capMs = if client.config.attemptMs > 0: client.config.attemptMs
                 elif client.config.readMs > 0: client.config.readMs
                 else: client.config.totalMs
-    try:
-      let r = conn.request($req.verb, req.url.requestTarget, fwd, req.body,
-                           req.bodyStream, fwdTrl, deadlineMs = capMs)
-      result = initResponse(r.status, "", "HTTP/3", initHeaders(r.headers), r.body)
-      result.trailers = initHeaders(r.trailers)
-    finally:
-      conn.close()
+    let origin = originKey(req.url)
+    var retried = false
+    while true:
+      # Reuse this origin's pooled connection, or open (and pool) a fresh one. Opening
+      # raises `QuicError` before anything is submitted, so `transport` may fall back
+      # to h2/h1 for any method.
+      var reused = true
+      var conn = client.liveH3Conn(origin)
+      if conn == nil:
+        reused = false
+        conn = h3Open(ep.host, ep.port, sni = req.url.host,
+                      caFile = client.config.tls.caFile,
+                      verify = client.config.tls.wantsVerify,
+                      maxBody = uint64(max(0, client.config.maxResponseBytes)))
+        client.h3conns[origin] = H3Cached(conn: conn, lastUse: epochTime())
+      try:
+        let r = conn.request($req.verb, req.url.requestTarget, fwd, req.body,
+                             req.bodyStream, fwdTrl, deadlineMs = capMs)
+        client.h3conns.withValue(origin, e):
+          if e.conn == conn: e.lastUse = epochTime()
+        result = initResponse(r.status, "", "HTTP/3", initHeaders(r.headers), r.body)
+        result.trailers = initHeaders(r.trailers)
+        return
+      except QuicError as e:
+        # The connection state is unknown after any transport failure (a half-read
+        # stream, a peer that is still sending), so drop it rather than hand it to the
+        # next request. A pooled connection the peer had already reclaimed fails here
+        # exactly like a live one that broke, so retry once on a fresh connection when
+        # the request may be re-sent -- otherwise this pool would turn a recoverable
+        # stale-connection race into a hard failure (the same discipline the h1/h2
+        # pool applies to a stale keep-alive socket).
+        client.evictH3(origin, conn)
+        if reused and not retried and mayFallBackFromH3(req, e of QuicSubmittedError):
+          retried = true
+          continue
+        raise
+      except CatchableError:
+        # TimeoutError / ResponseTooLargeError / a body-length mismatch: the stream is
+        # gone but the peer may still be transmitting on it, so the connection is not
+        # safe to reuse either. No retry -- these are the caller's own limits, not a
+        # transport race.
+        client.evictH3(origin, conn)
+        raise
 
 proc transport(client: Navi, req: Request, sink: BodySink,
                asyncStream: BodyProducer = nil,

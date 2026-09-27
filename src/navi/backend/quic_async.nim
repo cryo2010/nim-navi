@@ -33,6 +33,10 @@ type
                                           ## woken each reader cycle so a parked
                                           ## headers/body pull re-checks the C buffers
     wakeup: Future[void]              ## the reader's current wait, wake() to poke it
+    flushPending: bool                ## set by the shared quic_common when a body read
+                                      ## queued stream credit; only chronos acts on it
+                                      ## (this backend must never poke -- see below)
+    scratch: string                   ## reusable body-read buffer (see quic_common)
     alive*: bool
     readerDone: Future[void]
   QuicConn = QuicConnAsync            ## the name the shared quic_common fragment uses
@@ -41,6 +45,7 @@ proc wake(qc: QuicConn) =
   ## Poke the reader so it sends a just-submitted request without waiting for its
   ## timer. A lost poke (reader momentarily not waiting) is bounded by the capped
   ## wait below.
+  qc.flushPending = false             # whatever was queued goes out on the next cycle
   if qc.wakeup != nil and not qc.wakeup.finished: qc.wakeup.complete()
 
 proc step(qc: QuicConn) {.async.} =
@@ -109,14 +114,19 @@ proc reader(qc: QuicConn) {.async.} =
   if not qc.readerDone.finished: qc.readerDone.complete()
 
 proc waitProgress(qc: QuicConn, sid: int64) {.async.} =
-  ## Park until the reader makes a cycle (headers/body may have advanced). Unlike
-  ## chronos, we must NOT poke the reader here: wake() completes the reader's wait
-  ## synchronously, so asyncdispatch runs the continuation without returning to
-  ## poll(). The per-cycle sleepAsync fallback timers then never fire (poll is
-  ## starved) and pile up unbounded -- a busy streaming read OOMs in seconds. The
-  ## reader is instead paced by real I/O: the fd-readable callback wakes it when
-  ## body data lands, and its own 100ms fallback bounds an idle wait. (chronos can
-  ## wake here because its `one()` cancels the loser timer; asyncdispatch cannot.)
+  ## Park until the reader makes a cycle (headers/body may have advanced). We must
+  ## NOT poke the reader here: wake() completes the reader's wait synchronously, so
+  ## asyncdispatch runs the continuation without returning to poll(). The per-cycle
+  ## sleepAsync fallback timers then never fire (poll is starved) and pile up
+  ## unbounded -- a busy streaming read OOMs in seconds. The reader is instead paced
+  ## by real I/O: the fd-readable callback wakes it when body data lands, and its own
+  ## 100ms fallback bounds an idle wait.
+  ##
+  ## chronos does not poke on every park either. It used to, on the theory that its
+  ## `one()` cancelled the loser timer -- it does not (`one`'s docstring: the other
+  ## futures WILL NOT be cancelled), so that backend spun the same self-sustaining
+  ## pump and floated its heap up over a soak. It now pokes only when a stream has
+  ## frames waiting, which is the pacing this comment describes.
   let f = newFuture[void]("navi.h3.recv")
   qc.recvReady[sid] = f
   defer: qc.recvReady.del(sid)    # runs on cancellation/exception too, not just success

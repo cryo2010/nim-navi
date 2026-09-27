@@ -22,6 +22,8 @@ type
     maxRetryMs: int
     sawEvent: bool        ## the current connection delivered at least one event
     idleTimeoutMs: int    ## bound on a single read / (re)open wait; 0 = unbounded
+    idleDeadline: Future[void]  ## the stream's ONE re-armed idle bound (see `awaitRead`)
+    lastByteAt: MonoTime  ## when the last chunk (any byte) landed; the bound slides off it
     handle: StreamResponse
     parser: SseParser
     started: bool
@@ -47,6 +49,7 @@ proc openConn(s: SseStream): Future[void] {.async.} =
     raise newException(IOError,
       "navi: SSE expected Content-Type text/event-stream, got '" & ct & "'")
   s.handle = handle
+  s.lastByteAt = getMonoTime()     # a fresh connection gets a full idle window
 
 proc sse*(client: Navi, target: string, verb = GET,
           headers = initHeaders(), body = "",
@@ -126,6 +129,28 @@ proc dropConn(s: SseStream) =
   else: s.retryMs = sseBackoff(s.retryMs, s.baseRetryMs, s.minRetryMs, s.maxRetryMs)
   s.sawEvent = false
 
+proc awaitRead(s: SseStream, readFut: Future[string]): Future[bool] {.async.} =
+  ## Park on `readFut` under the stream's sliding idle bound: true once the read
+  ## completes, false once `idleTimeoutMs` has gone by with no byte arriving at all.
+  ##
+  ## The bound is ONE re-armed sleep per stream that every parked read is raced against
+  ## (`awaitWithin`, per backend), not a `withTimeout` per read. Neither backend evicts
+  ## a `withTimeout`'s losing timer: asyncdispatch leaves the `sleepAsync` future in its
+  ## timer heap, and chronos's `clearTimer` only nils the callback while the entry stays
+  ## in `loop.timers` until its moment. Under a server that floods events -- where a
+  ## read parks constantly -- that was one live idleTimeoutMs-long (default 45 s) timer
+  ## per read: a sliding window of them that no collection can reclaim, since they are
+  ## reachable from the dispatcher.
+  while true:
+    let idleMs = int((getMonoTime() - s.lastByteAt).inMilliseconds)
+    if idleMs >= s.idleTimeoutMs: return false    # a whole window without a byte
+    if s.idleDeadline == nil or s.idleDeadline.finished:
+      s.idleDeadline = sleepAsync(msOf(s.idleTimeoutMs - idleMs))
+    if await awaitWithin(readFut, s.idleDeadline): return true
+    # The deadline elapsed, but it may have been armed before this read started (a
+    # window that began at an earlier chunk): re-arm for what is left and keep waiting
+    # on the same read. Only a full window with no byte at all returns false above.
+
 proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
   ## The next event, or none once the stream ends. Reconnects transparently on a
   ## drop when enabled, resending Last-Event-ID.
@@ -142,19 +167,24 @@ proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
       # stream parks in the read below long before 128 events and trips neither:
       #   1. On asyncdispatch the loop never re-enters `poll()`, starving its timers
       #      (e.g. a caller's reporter) and other tasks -- so yield cooperatively.
-      #   2. The per-read future/closure chain is cyclic, and asyncdispatch relies on
+      #   2. The per-read future/closure chain is cyclic, and both backends rely on
       #      ORC's cycle collector (whose trigger scales with the live heap) to
       #      reclaim it, so a flooded stream floats into the GiBs before auto-
       #      collection fires. Force a collection on a spaced cadence (~1M events):
       #      spacing is what makes it cheap -- a collect only frees futures that have
       #      already died, so a sparse one reclaims a whole batch and amortizes to
       #      well under 1% of runtime, where a frequent one frees little yet still
-      #      pays the O(heap) cost. chronos reclaims by refcount and needs neither.
+      #      pays the O(heap) cost. chronos reclaims the plain refcounted chain
+      #      eagerly, but a future abandoned mid-await and a Future/cancel-callback-env
+      #      pair are cyclic there too, so it gets the same valve (a flooded chronos
+      #      h3 SSE soak floated ~14 MiB per two minutes without it). The yield in 1.
+      #      is kept on both: chronos re-enters poll() on its own, and a yield it does
+      #      not need is only a queue hop.
       inc s.yieldCtr
       if s.yieldCtr >= 128:
         s.yieldCtr = 0
         await sleepAsync(msOf(0))
-        when not defined(useChronos) and not defined(js):
+        when not defined(js):
           inc s.collectCtr
           if s.collectCtr >= 8192:
             s.collectCtr = 0
@@ -179,20 +209,13 @@ proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
       # Bound the read so a wedged mux (a parked read that never returns or raises)
       # is caught here and driven back through reconnect+backoff, instead of hanging
       # forever. Any byte, incl. a keep-alive comment, completes readFut and resets
-      # the bound, so a live-but-quiet stream is untouched.
+      # the bound (`lastByteAt`), so a live-but-quiet stream is untouched.
       #
-      # Only arm the bound when the read did NOT complete synchronously. Under a server
-      # that floods events, readChunk resolves immediately every time; wrapping each such
-      # read in withTimeout would push a fresh idle-deadline timer onto asyncdispatch's
-      # global timer heap, and asyncdispatch's withTimeout does not evict the losing
-      # sleepAsync timer when the read wins -- it only clears its callback -- so one live
-      # idleTimeoutMs-long (default 45s) timer future accretes per read and the heap
-      # floods into the hundreds of MiB over a soak (GC_fullCollect cannot reclaim them:
-      # they are reachable through the dispatcher). A ready read needs no bound anyway, so
-      # skip the wrap; the bound still arms the moment a read actually parks. chronos
-      # evicts the timer on completion and is unaffected either way.
+      # A read that completed synchronously needs no bound at all -- under a server that
+      # floods events that is most of them -- and one that parks is bounded by the
+      # stream's single sliding deadline rather than a timer of its own (`awaitRead`).
       if s.idleTimeoutMs > 0 and not readFut.finished and
-         not await withTimeout(readFut, msOf(s.idleTimeoutMs)):
+         not await s.awaitRead(readFut):
         # Idle bound elapsed with the read still parked. Dispose the handle so its h2
         # stream is RST and its concurrency slot freed -- abandoning it with just
         # `s.handle = nil` left the sid in the mux's sinkStreams, the orphaned read
@@ -206,6 +229,7 @@ proc next*(s: SseStream): Future[Option[SseEvent]] {.async.} =
         if not s.reconnect: return none(SseEvent)
         continue
       chunk = await readFut
+      s.lastByteAt = getMonoTime()      # a byte landed: the idle window starts over
     except CatchableError:
       s.dropConn()
       if not s.reconnect: raise
