@@ -422,6 +422,97 @@ suite "websocket message assembly":
     let o = a.offer(Frame(fin: true, opcode: opText, payload: repeat("x", 100_000)))
     check o.ready and o.message.data.len == 100_000
 
+suite "websocket message copy path (#411)":
+  # `offer` takes the frame as a `sink` and moves the payload through the
+  # assembler into the delivered message, so a received message is no longer
+  # copied into `a.buf` and then out of it again. These pin the behaviour that
+  # the moves must not break: the delivered bytes are right, the message stays
+  # valid once later frames arrive, and the assembler starts each message clean.
+  test "a single-frame message should be delivered whole from a moved-from frame":
+    var a: WsAssembler
+    let payload = repeat("\xab", 64 * 1024)
+    var f = Frame(fin: true, opcode: opBinary, payload: payload)
+    let o = a.offer(move(f))                 # the caller hands the frame over
+    check o.ready
+    check o.message.kind == wmBinary
+    check o.message.data.len == payload.len
+    check o.message.data == payload
+
+  test "a delivered message should survive the messages that follow it":
+    # The assembler hands its buffer to the message; it must not keep an alias of
+    # it and overwrite the caller's message with the next one's bytes.
+    var a: WsAssembler
+    let first = a.offer(Frame(fin: true, opcode: opText, payload: "first"))
+    check first.ready and first.message.data == "first"
+    let second = a.offer(Frame(fin: true, opcode: opText, payload: "second"))
+    check second.ready and second.message.data == "second"
+    check first.message.data == "first"      # untouched by the second message
+
+  test "a fragmented message should assemble across frames and not leak into the next":
+    var a: WsAssembler
+    check not a.offer(Frame(fin: false, opcode: opText, payload: "aa")).ready
+    check not a.offer(Frame(fin: false, opcode: opContinuation, payload: "bb")).ready
+    let o = a.offer(Frame(fin: true, opcode: opContinuation, payload: "cc"))
+    check o.ready and o.message.data == "aabbcc"
+    check not a.offer(Frame(fin: false, opcode: opText, payload: "xx")).ready
+    let o2 = a.offer(Frame(fin: true, opcode: opContinuation, payload: "yy"))
+    check o2.ready and o2.message.data == "xxyy"   # not "aabbccxxyy"
+    check o.message.data == "aabbcc"
+
+  test "decoded frames fed through move() should assemble every message":
+    # The shape both backends use: one reused `Frame`, refilled by `next` and
+    # handed to `offer` with `move`. Covers a single-frame and a fragmented
+    # message arriving in one read.
+    var wire = encodeFrame(opText, "solo", masked = true)
+    wire.add encodeFrame(opBinary, "he", masked = true, fin = false)
+    wire.add encodeFrame(opContinuation, "llo", masked = true, fin = true)
+    var d: WsDecoder
+    d.feed(wire)
+    var a: WsAssembler
+    var f: Frame
+    var msgs: seq[string]
+    var kinds: seq[WsMessageKind]
+    while d.next(f):
+      let o = a.offer(move(f))
+      if o.ready:
+        msgs.add o.message.data
+        kinds.add o.message.kind
+    check msgs == @["solo", "hello"]
+    check kinds == @[wmText, wmBinary]
+    check d.buffered == 0
+
+  test "a close frame should echo its whole payload while the message keeps the reason":
+    # `offer` moves the payload into `replyPayload`, so the echo must still be the
+    # code plus reason while `message.data` is the reason alone.
+    var a: WsAssembler
+    var f = Frame(fin: true, opcode: opClose,
+                  payload: closePayload(closeNormal, "bye"))
+    let o = a.offer(move(f))
+    check o.reply == wrCloseEcho
+    check o.replyPayload == closePayload(closeNormal, "bye")
+    check o.ready
+    check o.message.closeCode == closeNormal
+    check o.message.data == "bye"
+
+  test "a ping should still be ponged with its payload after the move":
+    var a: WsAssembler
+    var f = Frame(fin: true, opcode: opPing, payload: "ping-me")
+    let o = a.offer(move(f))
+    check o.reply == wrPong
+    check o.replyPayload == "ping-me"
+    check not o.ready
+
+  test "maxMessageBytes and UTF-8 validation should survive the moved payload":
+    var a: WsAssembler
+    expect WsMessageTooLarge:
+      discard a.offer(Frame(fin: true, opcode: opText, payload: "toolong"),
+                      maxMessageBytes = 4)
+    expect ValueError:                       # a rejected message must not be kept
+      discard a.offer(Frame(fin: true, opcode: opText, payload: "\xff\xfe"))
+    let o = a.offer(Frame(fin: true, opcode: opText, payload: "caf\xc3\xa9"),
+                    maxMessageBytes = 8)
+    check o.ready and o.message.data == "caf\xc3\xa9"
+
 # End-to-end: navi's sync WebSocket client against the shared in-process servers
 # in support.nim (built from the same sans-io core; server frames unmasked).
 import navi
@@ -443,6 +534,46 @@ suite "websocket streaming":
     reader.each(chunk):
       chunks.add chunk
     check chunks == @["one", "-two", "-three"]  # one chunk per frame, not reassembled
+    ws.close()
+    joinThread(th)
+
+  test "stream() should hand the first frame over and keep reading (#411)":
+    # The reader buffers the opening frame; `readChunk` moves it out instead of
+    # returning a copy and pinning the original for the reader's lifetime. What
+    # is observable: the chunk is right, the stream continues past it, and the
+    # connection is still usable for the next message.
+    var th: Thread[WsSrv]
+    var port: int
+    startWsStreamEcho(th, port)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("fragment")                        # server replies with 3 fragments
+    let reader = ws.stream()
+    check reader.kind == wmText
+    check reader.readChunk() == "one"          # the buffered first frame
+    check reader.readChunk() == "-two"         # the reader is not stuck on it
+    check reader.readChunk() == "-three"
+    check reader.readChunk() == ""             # fin consumed
+    ws.send("after")                           # and the socket still works
+    let m = ws.receive()
+    check m.kind == wmText
+    check m.data == "after"
+    ws.close()
+    joinThread(th)
+
+  test "stream() should deliver a single-frame message from the buffered frame (#411)":
+    var th: Thread[WsSrv]
+    var port: int
+    startWsStreamEcho(th, port)
+
+    let api = newNavi()
+    let ws = api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    ws.send("solo")                            # echoed back as one frame
+    let reader = ws.stream()
+    check reader.kind == wmText
+    check reader.readChunk() == "solo"
+    check reader.readChunk() == ""             # the fin frame was the first one
     ws.close()
     joinThread(th)
 
@@ -1037,3 +1168,108 @@ suite "websocket handshake head cap (#406)":
       msg = e.msg
     check "maxHeaderListBytes" in msg
     joinThread(th)
+
+suite "websocket incremental UTF-8 validation, chunk splits (#414)":
+  # `scanUtf8` validates each chunk in place from an offset instead of joining the
+  # carried bytes onto a copy of it, so the split points are where it can go wrong:
+  # these check it against an independent whole-string reference at every offset.
+  proc refValidUtf8(s: string): bool =
+    ## Reference decoder (RFC 3629): decodes each code point by value and rejects
+    ## overlongs, surrogates and anything above U+10FFFF from the value itself.
+    var i = 0
+    while i < s.len:
+      let b = uint32(uint8(s[i]))
+      var need: int
+      var cp: uint32
+      if b < 0x80'u32: (need, cp) = (0, b)
+      elif b >= 0xC0'u32 and b < 0xE0'u32: (need, cp) = (1, b and 0x1F'u32)
+      elif b >= 0xE0'u32 and b < 0xF0'u32: (need, cp) = (2, b and 0x0F'u32)
+      elif b >= 0xF0'u32 and b < 0xF8'u32: (need, cp) = (3, b and 0x07'u32)
+      else: return false
+      if i + need >= s.len: return false
+      for k in 1 .. need:
+        let c = uint32(uint8(s[i + k]))
+        if (c and 0xC0'u32) != 0x80'u32: return false
+        cp = (cp shl 6) or (c and 0x3F'u32)
+      if cp > 0x10FFFF'u32: return false
+      if cp >= 0xD800'u32 and cp <= 0xDFFF'u32: return false
+      if (need == 1 and cp < 0x80'u32) or (need == 2 and cp < 0x800'u32) or
+         (need == 3 and cp < 0x10000'u32): return false          # overlong
+      i += need + 1
+    true
+
+  proc chunkedValid(parts: varargs[string]): bool =
+    ## Feed the parts through one scanner: valid only if no chunk was rejected and
+    ## the stream did not end part-way through a code point (RFC 6455 8.1).
+    var v: WsUtf8Scanner
+    for p in parts:
+      if not v.scanUtf8(p): return false
+    not v.midCodePoint
+
+  const samples = [
+    "ab\xc3\xa9cd",                                   # 2-byte (U+00E9)
+    "\xe2\x82\xac euro",                              # 3-byte (U+20AC)
+    "hi \xf0\x9f\x92\xa9!",                           # 4-byte (U+1F4A9)
+    "\xc2\x80\xdf\xbf\xe0\xa0\x80\xef\xbf\xbf" &
+      "\xf0\x90\x80\x80\xf4\x8f\xbf\xbf",             # the range edges, back to back
+    "\xed\x9f\xbf\xee\x80\x80",                       # U+D7FF / U+E000: around the surrogates
+  ]
+
+  test "a valid message should scan the same split across two chunks at every offset":
+    for s in samples:
+      check refValidUtf8(s)                          # the sample itself is well-formed
+      for i in 0 .. s.len:
+        check chunkedValid(s[0 ..< i], s[i .. ^1])
+
+  test "a valid message should scan the same split across three chunks at every offset":
+    for s in samples:
+      for i in 0 .. s.len:
+        for j in i .. s.len:
+          check chunkedValid(s[0 ..< i], s[i ..< j], s[j .. ^1])
+
+  test "an invalid message should be rejected at every split across two chunks":
+    const bad = [
+      "\xed\xa0\x80",             # U+D800: a surrogate
+      "\xed\xbf\xbf",             # U+DFFF: a surrogate
+      "\xc0\xaf",                 # overlong "/"
+      "\xe0\x80\xaf",             # overlong "/" again
+      "\xf0\x80\x80\xaf",         # and once more
+      "\xf4\x90\x80\x80",         # U+110000: past the last code point
+      "\xf5\x80\x80\x80",         # lead byte that can never start a sequence
+      "a\xe2\x28\xa1b",           # a continuation byte that is not one
+      "ok\xff!",                  # 0xFF is never valid UTF-8
+      "\x80\xbf",                 # bare continuation bytes
+    ]
+    for s in bad:
+      check not refValidUtf8(s)
+      for i in 0 .. s.len:
+        check not chunkedValid(s[0 ..< i], s[i .. ^1])
+        for j in i .. s.len:
+          check not chunkedValid(s[0 ..< i], s[i ..< j], s[j .. ^1])
+
+  test "a message ending part-way through a code point should be rejected":
+    for s in ["\xc3", "\xe2\x82", "\xf0\x9f\x92", "text \xf0"]:
+      check not chunkedValid(s)                      # incomplete as one chunk
+      for i in 0 .. s.len:                           # ... and however it is split
+        check not chunkedValid(s[0 ..< i], s[i .. ^1])
+
+  test "empty chunks should not disturb a carried code point":
+    var v: WsUtf8Scanner
+    check v.scanUtf8("\xf0")
+    check v.scanUtf8("")                             # nothing to complete it with
+    check v.midCodePoint
+    check v.scanUtf8("\x9f\x92")
+    check v.midCodePoint
+    check v.scanUtf8("\xa9 done")
+    check not v.midCodePoint
+
+  test "a chunk should still be validated in place after completing a carry":
+    # The bytes after the completed carry are scanned from an offset, so a fault
+    # there must still be caught (and a clean tail must still pass).
+    var ok: WsUtf8Scanner
+    check ok.scanUtf8("\xe2\x82")
+    check ok.scanUtf8("\xac plain ascii tail")
+    check not ok.midCodePoint
+    var bad: WsUtf8Scanner
+    check bad.scanUtf8("\xe2\x82")
+    check not bad.scanUtf8("\xac tail \xc3\x28")

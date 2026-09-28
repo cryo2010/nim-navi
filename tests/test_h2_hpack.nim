@@ -32,6 +32,32 @@ suite "hpack decode (RFC 7541 Appendix C.3, without Huffman)":
       (":method", "GET"), (":scheme", "http"), (":path", "/"),
       (":authority", "www.example.com"), ("cache-control", "no-cache")]
 
+suite "hpack literal strings":
+  test "a Huffman-coded literal round trips through encode and decode":
+    let enc = HpackEncoder()
+    var dec = initHpackDecoder()
+    # "www.example.com" is 12 bytes Huffman-coded against 15 raw, so the encoder
+    # emits it with the H bit set and the decoder takes the Huffman path.
+    let wire = enc.encode(@[("x-host", "www.example.com")])
+    check hex("f1e3c2e5f23a6ba0ab90f4ff") in wire
+    check dec.decode(wire) == @[("x-host", "www.example.com")]
+
+  test "raw, empty and binary literals survive a decode":
+    let enc = HpackEncoder()
+    var dec = initHpackDecoder()
+    # A single byte is never shorter Huffman-coded, so "x" stays a raw literal;
+    # the empty value exercises the zero-length string path.
+    let pairs = @[("x-a", "x"), ("x-empty", ""), ("x-bin", "\x00\x01\xfe\xff")]
+    check dec.decode(enc.encode(pairs)) == pairs
+
+  test "a Huffman-coded literal at the very end of a block decodes":
+    var dec = initHpackDecoder()
+    # Literal without indexing, new name (0x00), name "custom-key" and value
+    # "custom-value", both Huffman-coded, and nothing after them (RFC 7541 C.2.1).
+    let headers = dec.decode(hex("00") & hex("88") & hex("25a849e95ba97d7f") &
+                             hex("89") & hex("25a849e95bb8e8b4bf"))
+    check headers == @[("custom-key", "custom-value")]
+
 suite "hpack encode":
   test "the HPACK encoder should index an exact static-table entry":
     let enc = HpackEncoder()

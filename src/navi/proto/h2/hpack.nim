@@ -118,9 +118,18 @@ proc decodeString(data: string, i: var int): string =
   let length = decodeInteger(data, i, 7)
   if length < 0 or i + length > data.len:
     raise newException(ValueError, "hpack: truncated string")
-  let raw = data[i ..< i + length]
+  # Decode in place. Slicing the literal out first (`data[i ..< i + length]`) cost
+  # an allocation plus a byte-at-a-time loop per string -- Nim's string slice --
+  # before the value was even looked at, and a Huffman-coded one was then thrown
+  # away again (issue #413). A raw literal is copied once with setLen + copyMem,
+  # and a coded one is handed to the decoder as a view over the block.
+  if length > 0:
+    if huffman:
+      result = huffmanDecode(data.toOpenArray(i, i + length - 1))
+    else:
+      result.setLen(length)
+      copyMem(addr result[0], unsafeAddr data[i], length)
   i += length
-  if huffman: huffmanDecode(raw) else: raw
 
 # --- Dynamic table ---
 

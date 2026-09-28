@@ -21,11 +21,12 @@ type
     ## owned `seq[byte]` (the chunk crosses an `await`).
     ##
     ## Deliberately `seq[byte]`, unlike the native backends' `string` sink: the chunk
-    ## originates as a JS `Uint8Array` (marshaled byte-by-byte into Nim, so there is
-    ## no owned Nim buffer to move regardless of type), and `seq[byte]` is the
-    ## binary-clean representation here -- a Nim js `string` is a JS (UTF-16) string,
-    ## so routing bytes through it risks the same lossiness as the buffered `.text()`
-    ## path. Portable sinks targeting both js and native must handle both element types.
+    ## originates as a JS `Uint8Array` (bulk-copied into Nim, so there is no owned
+    ## Nim buffer to move regardless of type), and `seq[byte]` is the
+    ## binary-clean representation here -- the buffered `.text()` path goes through a
+    ## JS (UTF-16) string and a UTF-8 transcode, so routing bytes through it would
+    ## risk the same lossiness. Portable sinks targeting both js and native must
+    ## handle both element types.
 
   GatedBodySink* = proc(data: seq[byte]): Future[bool] {.closure.}
     ## A response sink for `request()` that can stop the download early. Like
@@ -51,6 +52,21 @@ proc jsText(res: JsObject): Future[cstring] {.importjs: "#.text()".}
 proc headerEntries(res: JsObject): JsObject {.importjs: "Array.from(#.headers.entries())".}
 proc setCookieList(res: JsObject): JsObject {.importjs: "(#.headers.getSetCookie?.() ?? [])".}
 proc jsLen(arr: JsObject): int {.importjs: "#.length".}
+proc u8ToBytes(arr: JsObject): seq[byte] {.importjs: "Array.prototype.slice.call(#)".}
+  ## Bulk-copy a JS `Uint8Array` into a Nim `seq[byte]` in ONE call, instead of a
+  ## jsffi property read plus a `.to(int)` conversion per byte (#412: a 50 MB body
+  ## cost 50 million of each, and blocked the event loop for the whole chunk).
+  ## Exact for arbitrary binary: nim's js backend represents `seq[byte]` as a plain
+  ## JS array of byte values, which is precisely what `Array.prototype.slice.call`
+  ## produces from a `Uint8Array` (element-wise, no numeric coercion, no arg-count
+  ## limit -- unlike `String.fromCharCode.apply`, which blows the stack on a big
+  ## chunk and would round-trip through a UTF-16 string anyway).
+
+proc bytesOfBody*(s: string): seq[byte] {.importjs: "Array.prototype.slice.call(#)".}
+  ## Bulk-copy a Nim js `string` to `seq[byte]` in one call: on the js backend both
+  ## are plain JS arrays of byte values, so this is a native array copy rather than
+  ## a per-char loop. For the buffered-body fallback that hands a `.text()` body to
+  ## a `seq[byte]` sink.
 proc bodyReader*(res: JsObject): JsObject {.importjs: "#.body.getReader()".}
 proc readChunk(reader: JsObject): Future[JsObject] {.importjs: "#.read()".}
 proc setTimeout(cb: proc (), ms: int) {.importjs: "setTimeout(#, #)".}
@@ -96,7 +112,8 @@ proc toResponse(res: JsObject, body: string): Response =
                readHeaders(res), body)
 
 proc drainToSink*(res: JsObject, sink: BodySink, cap: int) {.async.} =
-  ## Stream the response body to `sink`, copying each Uint8Array chunk to bytes.
+  ## Stream the response body to `sink`, copying each Uint8Array chunk to bytes
+  ## with a single bulk array copy (see `u8ToBytes`).
   ## `await`ing the sink paces reads from the stream (backpressure). When `cap` is
   ## set, the cumulative bytes read are capped (the browser already decoded the
   ## body, so this counts decoded bytes) and `ResponseTooLargeError` is raised.
@@ -105,10 +122,7 @@ proc drainToSink*(res: JsObject, sink: BodySink, cap: int) {.async.} =
   while true:
     let chunk = await readChunk(reader)
     if chunk["done"].to(bool): break
-    let arr = chunk["value"]
-    var bytes = newSeq[byte](jsLen(arr))
-    for i in 0 ..< bytes.len:
-      bytes[i] = byte(arr[i].to(int))
+    let bytes = u8ToBytes(chunk["value"])
     seen += bytes.len
     if cap > 0 and seen > cap:
       raise newException(ResponseTooLargeError,
@@ -139,10 +153,7 @@ proc readOne*(reader: JsObject): Future[seq[byte]] {.async.} =
     if chunk["done"].to(bool): return newSeq[byte](0)
     let arr = chunk["value"]
     if jsLen(arr) == 0: continue            # empty chunk mid-stream: read more
-    var bytes = newSeq[byte](jsLen(arr))
-    for i in 0 ..< bytes.len:
-      bytes[i] = byte(arr[i].to(int))
-    return bytes
+    return u8ToBytes(arr)
 
 proc fetchExchange*(req: Request, sink: BodySink, timeout = 0,
                     cancel: CancelToken = nil, cap = 0,

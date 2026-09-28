@@ -260,7 +260,10 @@ proc receive*(ws: WebSocket): Future[WsMessage] {.async.} =
       ws.dec.feed(chunk)
     var o: WsOutcome
     try:
-      o = ws.asmb.offer(f, ws.maxMessageBytes, rejectMasked = true)
+      # `move`: `offer` takes the frame as a sink and carries its payload into the
+      # delivered message, so the message is never copied on the way out (#411).
+      # `f` is refilled wholesale by the next `dec.next(f)`.
+      o = ws.asmb.offer(move(f), ws.maxMessageBytes, rejectMasked = true)
     except WsMessageTooLarge:
       await ws.failClose(closeMessageTooBig)   # tell the peer why (1009), then drop
       raise
@@ -385,11 +388,11 @@ proc closeFromPeer(ws: WebSocket, f: Frame, eof: bool): Future[uint16] {.async.}
 
 proc openStreamReader(ws: WebSocket): Future[WsReader] {.async.} =
   result = WsReader(ws: ws)
-  let (f, eof) = await ws.readDataFrame()
+  var (f, eof) = await ws.readDataFrame()
   case f.opcode
   of opText, opBinary:
     result.kind = if f.opcode == opText: wmText else: wmBinary
-    result.first = f.payload
+    result.first = move(f.payload)
     result.hasFirst = true
     result.done = f.fin
   of opClose:
@@ -428,7 +431,9 @@ proc readChunk*(r: WsReader): Future[string] {.async.} =
   if r.hasFirst:
     r.hasFirst = false
     await r.checkTextUtf8(r.first)
-    return r.first
+    # Hand the buffered frame over instead of copying it: the reader kept a live
+    # copy of the first frame for its whole lifetime otherwise (#411).
+    return move(r.first)
   if r.done: return ""
   var nxt: tuple[f: Frame, eof: bool]
   try:
@@ -436,12 +441,12 @@ proc readChunk*(r: WsReader): Future[string] {.async.} =
   except ValueError:         # a masked or otherwise malformed frame: failed with 1002
     r.protocolFailed()
     raise
-  let (f, eof) = nxt
+  var (f, eof) = move(nxt)
   case f.opcode
   of opContinuation:
     r.done = f.fin
     await r.checkTextUtf8(f.payload)
-    return f.payload
+    return move(f.payload)
   of opClose:                # a close interrupted the message: truncate and drop
     r.done = true
     try:

@@ -23,6 +23,14 @@ suite "huffman decode (RFC 7541 vectors)":
     check huffmanDecode(hex("d07abe941054d444a8200595040b8166e082a62d1bff")) ==
       "Mon, 21 Oct 2013 20:13:21 GMT"
 
+  test "decoding a slice of a larger buffer matches decoding those bytes alone":
+    # The HPACK decoder hands `huffmanDecode` a view into the header block rather
+    # than a substring sliced out of it, so a coded literal must decode the same
+    # with bytes on either side of it.
+    let coded = hex("f1e3c2e5f23a6ba0ab90f4ff")
+    let buf = "prefix" & coded & "suffix"
+    check huffmanDecode(buf.toOpenArray(6, 6 + coded.len - 1)) == "www.example.com"
+
 suite "huffman encode":
   test "the Huffman encoder should encode www.example.com (C.4.1)":
     check huffmanEncode("www.example.com") == hex("f1e3c2e5f23a6ba0ab90f4ff")

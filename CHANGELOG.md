@@ -84,6 +84,65 @@ onward (pre-1.0, minor versions may include breaking changes).
   `BodySink`), since the `Future` type differs per backend (#367).
 
 ### Changed
+- **`navi/js` marshals body and WebSocket bytes with bulk typed-array copies, and
+  its WebSocket queue is a deque.** Every byte of a streamed response body used to
+  cross the jsffi boundary through its own dynamic `JsObject` index plus a
+  `.to(int)` conversion, and a WebSocket payload through its own `Uint8Array` read
+  or write, so a 50 MB download ran 50 million property lookups and int conversions
+  and blocked the event loop for the whole of each chunk. Nim's js backend already
+  represents a `string` and a `seq[byte]` as a plain JS array of byte values, so
+  each conversion is now a single native array copy: `Array.prototype.slice.call`
+  from a `Uint8Array` (sink chunks, pull-stream chunks, WebSocket binary receive),
+  `new Uint8Array(s)` back out (WebSocket binary send), and one array copy for the
+  buffered-body fallback that hands a `.text()` body to a `seq[byte]` sink. It is
+  byte-exact for arbitrary binary (no UTF-16 round trip, no `fromCharCode.apply`
+  argument-count limit), and a new Node test asserts all 256 byte values survive a
+  1 MiB multi-chunk download and a 64 KiB WebSocket echo. `receive` also pops the
+  pending-message queue from the head in O(1) instead of `delete(0)`, which was
+  O(queue) per message and quadratic under a flooding peer (#412).
+- **The streaming WebSocket UTF-8 scanner validates each chunk in place.**
+  `scanUtf8` used to build `carry & chunk` and validate that copy, so every streamed
+  text frame was copied once more into a chunk-sized temporary just to prepend at
+  most three bytes carried over from the last frame. The carried bytes are now
+  completed from the head of the new chunk and checked on their own, the rest of the
+  chunk is validated in place from that offset (`isValidUtf8` takes an `openArray`),
+  and the carry lives in a fixed 4-byte array instead of a string. Scanning a chunk
+  now allocates nothing at all (it was two allocations plus a full copy per frame):
+  256-byte frames scan ~1.22x faster and 16 KiB frames ~1.02x, allocation-free in
+  both cases. Overlongs, surrogates, anything above U+10FFFF, a sequence split at any
+  byte boundary and a message that ends part-way through a code point are accepted
+  and rejected exactly as before (#414).
+- **A received WebSocket message is moved through the assembler instead of being
+  copied twice more.** `WsAssembler.offer` took its frame by value, copied the
+  payload into its reassembly buffer, and then copied that buffer again into the
+  delivered `WsMessage`, so every message cost three copies of its bytes (the
+  decoder's included) and briefly held three live copies: a 64 MiB binary message
+  moved 192 MiB. `offer` now takes the frame as a `sink` and moves the payload into
+  the buffer and the buffer into the message, so an unfragmented message reaches the
+  caller with only the decoder's copy and a fragmented one with one copy per
+  fragment. The streaming readers no longer pin their opening frame either:
+  `readChunk` moves the buffered first frame out rather than returning a copy and
+  keeping the original alive for the reader's lifetime (a 64 MiB first frame used to
+  stay resident until the reader was collected). Fragmentation, the control-frame
+  replies, `maxMessageBytes` and the UTF-8 validation are unchanged, and the close
+  echo still carries the whole payload while the message carries only the reason.
+  The one visible change for direct users of the sans-io core: `offer` consumes the
+  frame it is given, so its `payload` must not be read again afterwards (feed a
+  reused `Frame` refilled by `WsDecoder.next`, as the backends do) (#411).
+- **HTTP/2 appends header blocks straight from the frame decoder and decodes HPACK
+  literals in place.** A HEADERS payload used to be materialized into a `Frame`,
+  copied into a local fragment, sliced again to strip the padding and the 5-byte
+  priority block, and copied once more into the stream's header buffer -- four
+  copies of every header byte (a 100 KiB block moved ~400 KiB) before HPACK even
+  ran, with each literal string sliced out a fifth time inside the decoder. HEADERS,
+  CONTINUATION and PUSH_PROMISE now go through the same peek path DATA has used
+  since #400: padding and priority are skipped by offset arithmetic and the fragment
+  is appended to the header buffer with one setLen + copyMem, while `decodeString`
+  copies a raw literal once and hands a Huffman-coded one to the decoder as a view
+  over the block. Padding and priority validation, the 128 KiB header-block cap (now
+  checked before the fragment is copied, not after), CONTINUATION sequencing (RFC
+  9113 6.10) and every PROTOCOL_ERROR / FRAME_SIZE_ERROR / COMPRESSION_ERROR
+  condition are unchanged (#413).
 - **The SSE parser copies each line's value once and moves the event out on
   dispatch.** A line used to be materialized as a string slice, its value sliced out
   of that, and the leading space sliced off again before being appended to the data

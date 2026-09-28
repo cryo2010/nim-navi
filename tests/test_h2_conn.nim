@@ -389,6 +389,132 @@ suite "h2 frame padding":
     check c.connError.len > 0
     check firstFrameOfType(toSend, ftGoAway)
 
+proc goAwayCode(s: string): uint32 =
+  ## The error code carried by the first GOAWAY frame in `s`.
+  var d: FrameDecoder
+  d.feed(s)
+  var f: Frame
+  while d.next(f):
+    if f.typ == uint8(ftGoAway) and f.payload.len >= 8: return readU32(f.payload, 4)
+  high(uint32)                                 # no GOAWAY: never a real error code
+
+proc priorityBlock(): string =
+  ## The 5-octet priority block of a HEADERS frame (RFC 9113 6.2): a 31-bit stream
+  ## dependency (plus the exclusive bit) and a weight.
+  "\x80\x00\x00\x01" & "\x10"
+
+suite "h2 header block framing":
+  test "a HEADERS frame with a priority block decodes the header block after it":
+    let c = newServerConn()
+    let id = c.openStream()
+    let block0 = (HpackEncoder()).encode(@[(":status", "200"), ("x-k", "v")])
+    var server = encodeFrame(ftHeaders, flagPriority or flagEndHeaders, id,
+                             priorityBlock() & block0)
+    server.add encodeData(id, "body", endStream = true)
+    discard c.feed(server)
+    check c.connError.len == 0
+    check c.streamDone(id)
+    let resp = c.takeResponse(id)
+    check resp.status == 200
+    check resp.headers == @[("x-k", "v")]      # the priority block did not reach HPACK
+    check resp.body == "body"
+
+  test "a HEADERS frame that is both padded and prioritized strips both":
+    let c = newServerConn()
+    let id = c.openStream()
+    let block0 = (HpackEncoder()).encode(@[(":status", "200"), ("x-k", "v")])
+    let payload = char(6) & priorityBlock() & block0 & repeat('\0', 6)
+    var server = encodeFrame(ftHeaders, flagPadded or flagPriority or flagEndHeaders,
+                             id, payload)
+    server.add encodeData(id, "body", endStream = true)
+    discard c.feed(server)
+    check c.connError.len == 0
+    check c.streamDone(id)
+    let resp = c.takeResponse(id)
+    check resp.status == 200
+    check resp.headers == @[("x-k", "v")]
+    check resp.body == "body"
+
+  test "a header block split across CONTINUATION frames decodes as one block":
+    let c = newServerConn()
+    let id = c.openStream()
+    let long = repeat("v", 4000)
+    let block0 = (HpackEncoder()).encode(@[
+      (":status", "200"), ("x-long", long), ("x-b", "2")])
+    check block0.len > 60                      # the split points below must be interior
+    # Cut the block at two offsets that fall inside a literal, so the fragments are
+    # only valid once reassembled, and hand each frame to its own `feed` so the
+    # decoder buffer is compacted between them.
+    let a = 7
+    let b = block0.len - 9
+    var toSend = c.feed(encodeFrame(ftHeaders, flagPadded, id,
+      char(3) & block0[0 ..< a] & repeat('\0', 3)))   # padded, no END_HEADERS
+    toSend.add c.feed(encodeContinuation(id, block0[a ..< b], endHeaders = false))
+    toSend.add c.feed(encodeContinuation(id, block0[b ..< block0.len], endHeaders = true))
+    toSend.add c.feed(encodeData(id, "body", endStream = true))
+    check c.connError.len == 0
+    check c.streamDone(id)
+    let resp = c.takeResponse(id)
+    check resp.status == 200
+    check resp.headers == @[("x-long", long), ("x-b", "2")]
+    check resp.body == "body"
+
+  test "a padded HEADERS frame whose content is all padding contributes nothing":
+    let c = newServerConn()
+    let id = c.openStream()
+    let block0 = (HpackEncoder()).encode(@[(":status", "200"), ("x-k", "v")])
+    # Pad length 4 with exactly 4 bytes after the pad-length octet: a legal frame
+    # with a zero-length fragment. The block then arrives on the CONTINUATION.
+    var toSend = c.feed(encodeFrame(ftHeaders, flagPadded, id,
+                                    char(4) & repeat('\0', 4)))
+    toSend.add c.feed(encodeContinuation(id, block0, endHeaders = true))
+    toSend.add c.feed(encodeData(id, "body", endStream = true))
+    check c.connError.len == 0
+    check c.streamDone(id)
+    let resp = c.takeResponse(id)
+    check resp.status == 200
+    check resp.headers == @[("x-k", "v")]
+
+  test "HEADERS padding that exceeds the payload is a PROTOCOL_ERROR":
+    let c = newServerConn()
+    let id = c.openStream()
+    # Pad length 10, but only 5 bytes follow the pad-length byte.
+    let toSend = c.feed(encodeFrame(ftHeaders, flagPadded or flagEndHeaders, id,
+                                    char(10) & "short"))
+    check c.connError.len > 0
+    check firstFrameOfType(toSend, ftGoAway)
+    check goAwayCode(toSend) == errProtocolError
+
+  test "a padded HEADERS frame with no pad-length octet is a FRAME_SIZE_ERROR":
+    let c = newServerConn()
+    let id = c.openStream()
+    let toSend = c.feed(encodeFrame(ftHeaders, flagPadded or flagEndHeaders, id, ""))
+    check c.connError.len > 0
+    check goAwayCode(toSend) == errFrameSizeError
+
+  test "a HEADERS frame with a truncated priority block is a FRAME_SIZE_ERROR":
+    let c = newServerConn()
+    let id = c.openStream()
+    let toSend = c.feed(encodeFrame(ftHeaders, flagPriority or flagEndHeaders, id,
+                                    "\x00\x00\x00\x01"))   # 4 octets, 5 required
+    check c.connError.len > 0
+    check goAwayCode(toSend) == errFrameSizeError
+
+  test "a Huffman-coded response header round trips through the connection":
+    let c = newServerConn()
+    let id = c.openStream()
+    # The encoder Huffman-codes a literal when that is shorter on the wire, so this
+    # value reaches the decoder as a coded literal inside the header block.
+    let value = "https://cdn.example.com/a/very/compressible/path?q=aaaaaaaa"
+    let block0 = (HpackEncoder()).encode(@[(":status", "200"), ("location", value)])
+    check block0.len < (":status200location" & value).len   # it really was coded
+    var server = encodeFrame(ftHeaders, flagEndHeaders, id, block0)
+    server.add encodeData(id, "body", endStream = true)
+    discard c.feed(server)
+    check c.streamDone(id)
+    let resp = c.takeResponse(id)
+    check resp.headers == @[("location", value)]
+
 proc hasConnWindowUpdate(s: string): bool =
   ## True if `s` contains a connection-level (stream 0) WINDOW_UPDATE.
   var d: FrameDecoder

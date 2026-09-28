@@ -354,10 +354,12 @@ type
     ## Raised by `offer` when a reassembled message would exceed the caller's
     ## `maxMessageBytes`. The caller should close with `closeMessageTooBig` (1009).
 
-proc isValidUtf8(s: string): bool =
+proc isValidUtf8(s: openArray[char]): bool =
   ## Strict UTF-8 well-formedness (RFC 3629): rejects overlong encodings, surrogate
   ## code points (U+D800..U+DFFF), values above U+10FFFF, and bad continuation bytes.
   ## Used to fail a text message or close reason that is not valid UTF-8 (RFC 6455 8.1).
+  ## Takes an `openArray` so the streaming scanner can validate a slice of a chunk
+  ## in place, without copying it to join the bytes carried over from the last one.
   var i = 0
   while i < s.len:
     let b = uint8(s[i])
@@ -425,12 +427,19 @@ proc parseClose*(f: Frame): tuple[code: uint16, reason: string] =
   if not isValidUtf8(result.reason):     # RFC 6455 8.1: the close reason must be valid UTF-8
     raise newException(ValueError, "navi: invalid UTF-8 in a WebSocket close reason")
 
-proc offer*(a: var WsAssembler, f: Frame, maxMessageBytes = 0,
+proc offer*(a: var WsAssembler, f: sink Frame, maxMessageBytes = 0,
             rejectMasked = false): WsOutcome =
   ## Feed one decoded frame. Handles fragmentation (text/binary + continuation)
   ## and the control frames: a ping asks for a pong, a close both yields a
   ## `wmClose` message and asks for a close echo. No I/O -- the caller sends any
   ## `reply` and surfaces `message` when `ready`.
+  ##
+  ## `f` is a `sink`: the frame's payload is *moved* through the assembler rather
+  ## than copied, so the buffer the decoder allocated becomes the reassembly buffer
+  ## and then the delivered `WsMessage.data` (an unfragmented message reaches the
+  ## caller with no copy at all, #411). The caller must not read `f.payload` again
+  ## afterwards -- pass `move(f)` from a reused frame variable, as the backends do,
+  ## and let the next `WsDecoder.next` refill it.
   ##
   ## `maxMessageBytes` (0 = unlimited) bounds a *reassembled* message across its
   ## fragments: the per-frame length cap does not, so without it a peer can grow the
@@ -447,28 +456,28 @@ proc offer*(a: var WsAssembler, f: Frame, maxMessageBytes = 0,
     if a.kind == wmText and not isValidUtf8(a.buf):
       raise newException(ValueError, "navi: invalid UTF-8 in a WebSocket text message")
     result.ready = true
-    result.message = WsMessage(kind: a.kind, data: a.buf)
+    result.message = WsMessage(kind: a.kind, data: move(a.buf))  # hand the buffer over
   if rejectMasked and f.masked:     # RFC 6455 5.1: a server->client frame must not be masked
     raise newException(ValueError, "navi: masked WebSocket frame received from server")
   case f.opcode
   of opPing:
     result.reply = wrPong
-    result.replyPayload = f.payload
+    result.replyPayload = move(f.payload)
   of opPong:
     discard
   of opClose:
-    let (code, reason) = parseClose(f)   # 1-byte body, bad code, bad UTF-8: ValueError
+    var (code, reason) = parseClose(f)   # 1-byte body, bad code, bad UTF-8: ValueError
     result.reply = wrCloseEcho
-    result.replyPayload = f.payload
+    result.replyPayload = move(f.payload)   # echoed verbatim; the frame is ours now
     result.ready = true
-    result.message = WsMessage(kind: wmClose, closeCode: code, data: reason)
+    result.message = WsMessage(kind: wmClose, closeCode: code, data: move(reason))
   of opText, opBinary:
     if a.fragmented:                # RFC 6455 5.4: a new data frame mid-fragmentation
       raise newException(ValueError, "navi: new WebSocket data frame during a fragmented message")
     a.buf.setLen(0)                 # a new message starts; the prior one's bytes must not
     guardSize(f.payload.len)        # count against maxMessageBytes here
     a.kind = if f.opcode == opText: wmText else: wmBinary
-    a.buf = f.payload
+    a.buf = move(f.payload)
     if f.fin:
       finishMessage()
     else:
@@ -575,11 +584,16 @@ type
     ## 8.1), for a streaming reader that never holds the whole message. A code
     ## point split across two frames is carried here (at most 3 bytes) and checked
     ## once the rest lands; `midCodePoint` must be false when the message ends.
-    carry: string
+    ##
+    ## The carry is a fixed array rather than a string so that scanning a chunk
+    ## allocates nothing at all (the fourth byte is room for the one that completes
+    ## a 4-byte sequence).
+    carry: array[4, char]
+    carryLen: int
 
 proc midCodePoint*(v: WsUtf8Scanner): bool =
   ## True while the bytes seen so far end part-way through a code point.
-  v.carry.len > 0
+  v.carryLen > 0
 
 proc utf8SeqLen(b: uint8): int =
   ## How many bytes the code point started by lead byte `b` occupies. A byte that
@@ -595,14 +609,35 @@ proc scanUtf8*(v: var WsUtf8Scanner, chunk: string): bool =
   ## Validate `chunk` as the continuation of a UTF-8 byte stream, holding back a
   ## trailing code point whose bytes have not all arrived. False once the stream is
   ## malformed (the caller must then fail the connection).
-  var s = v.carry & chunk
-  v.carry = ""
+  ##
+  ## The chunk is never copied: the carried bytes (at most three) are completed from
+  ## the chunk's first bytes and validated on their own, and the rest of the chunk is
+  ## validated in place from that offset.
+  var start = 0
+  if v.carryLen > 0:
+    # Complete the carried sequence from the head of the chunk. `carry` always holds
+    # the start of a 2-, 3- or 4-byte sequence (utf8SeqLen reports 1 for a byte that
+    # cannot lead, and such a byte is never carried), so `want` is 2..4.
+    let want = utf8SeqLen(uint8(v.carry[0]))
+    let take = min(want - v.carryLen, chunk.len)
+    for i in 0 ..< take:
+      v.carry[v.carryLen] = chunk[i]
+      inc v.carryLen
+    start = take
+    if v.carryLen < want:
+      return true                        # still short: the whole chunk was carried
+    if not isValidUtf8(v.carry.toOpenArray(0, want - 1)): return false
+    v.carryLen = 0
   # Find the last sequence's lead byte by walking back over at most three
-  # continuation bytes (10xxxxxx), and hold that sequence if it is still short.
-  var j = s.len
-  while j > 0 and s.len - j < 3 and (uint8(s[j - 1]) and 0xC0'u8) == 0x80'u8:
+  # continuation bytes (10xxxxxx), and hold that sequence if it is still short. The
+  # bytes before `start` completed a code point, so the walk never reaches them.
+  var j = chunk.len
+  while j > start and chunk.len - j < 3 and (uint8(chunk[j - 1]) and 0xC0'u8) == 0x80'u8:
     dec j
-  if j > 0 and utf8SeqLen(uint8(s[j - 1])) > s.len - (j - 1):
-    v.carry = s[j - 1 .. ^1]
-    s.setLen(j - 1)
-  isValidUtf8(s)
+  var stop = chunk.len                   # exclusive end of the part validated now
+  if j > start and utf8SeqLen(uint8(chunk[j - 1])) > chunk.len - (j - 1):
+    stop = j - 1
+    v.carryLen = chunk.len - stop        # at most three bytes: a 4-byte tail is whole
+    for i in 0 ..< v.carryLen: v.carry[i] = chunk[stop + i]
+  if stop <= start: return true
+  isValidUtf8(chunk.toOpenArray(start, stop - 1))

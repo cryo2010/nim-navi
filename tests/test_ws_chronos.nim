@@ -78,6 +78,40 @@ suite "chronos websocket client end to end":
     joinThread(th)
     check outcome == "timeout"
 
+  test "stream() should hand the first frame over and keep reading (#411)":
+    # `readChunk` moves the buffered opening frame out instead of returning a copy
+    # and pinning the original for the reader's lifetime: the chunk is right, the
+    # stream continues past it, and the socket still carries the next message.
+    var th: Thread[WsSrv]
+    var port: int
+    startWsStreamEcho(th, port)
+
+    proc run(): Future[tuple[chunks: seq[string], echoed: string,
+                             solo: seq[string]]] {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("fragment")                  # server replies with 3 fragments
+      let reader = await ws.stream()
+      doAssert reader.kind == wmText
+      var got: seq[string]
+      for _ in 0 .. 3: got.add(await reader.readChunk())
+      await ws.send("after")                     # the socket still works after it
+      let echoed = (await ws.receive()).data
+      await ws.send("solo")                      # echoed back as a single frame
+      let one = await ws.stream()
+      doAssert one.kind == wmText
+      var soloChunks: seq[string]
+      soloChunks.add(await one.readChunk())
+      soloChunks.add(await one.readChunk())
+      await ws.close()
+      return (got, echoed, soloChunks)
+
+    let (chunks, echoed, solo) = waitFor run()
+    joinThread(th)
+    check chunks == @["one", "-two", "-three", ""]
+    check echoed == "after"
+    check solo == @["solo", ""]
+
   test "stream()/stream(writer) should read and write a message as fragments":
     var th: Thread[WsSrv]
     var port: int
