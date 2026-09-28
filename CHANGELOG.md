@@ -84,6 +84,14 @@ onward (pre-1.0, minor versions may include breaking changes).
   `BodySink`), since the `Future` type differs per backend (#367).
 
 ### Changed
+- **The WebSocket frame decoder advances a read cursor instead of front-deleting
+  per frame.** `WsDecoder.next` deleted the consumed prefix after every frame, so a
+  burst of small messages arriving in one read shifted the whole remainder down once
+  per frame (O(N x buffered)); it now advances a cursor and `feed` compacts the
+  consumed prefix in place, amortized, the way the h1 parser and the h2 frame decoder
+  do. Decoding 1000 40-byte frames out of one 42 KB read goes from ~14.7 ms to
+  ~17 us. Framing, fragmentation, control frames and the length caps are unchanged
+  (#409).
 - **HTTP/2 downloads decode DATA straight into the response body.** The frame
   decoder gained a peek/consume API, so a DATA payload is copied once from the
   decode buffer into the stream body instead of being sliced out into a `Frame`
