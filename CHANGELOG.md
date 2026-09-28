@@ -135,6 +135,15 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **A decoded body is no longer cut short when the codec's output fills the 16 KiB
+  decode scratch exactly.** The inflate loop stopped as soon as zlib had consumed
+  every input byte, even when the scratch came back completely full; zlib pulls input
+  into its own bit buffer, so that happens with a match still half written, and the
+  pending bytes (plus the `Z_STREAM_END` behind them) were dropped. A headerless
+  `deflate` body a few dozen bytes past a scratch boundary decoded to exactly 16384
+  bytes and was then reported as truncated by the buffered path and delivered short by
+  the streamed one. Both loops now drain the codec while it keeps filling the buffer,
+  and the zstd loop does the same for a frame it has only partly flushed (#405).
 - **An HTTP/3 connection now says goodbye: `close` sends a CONNECTION_CLOSE before
   freeing the connection.** The h3 driver used to drop its UDP socket and free the
   ngtcp2/nghttp3/OpenSSL state without telling the peer anything, so a server had no

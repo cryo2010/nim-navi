@@ -38,6 +38,9 @@ const
   zNoFlush = cint(0)
   zOk = cint(0)
   zStreamEnd = cint(1)
+  # Non-fatal: inflate could make no progress at all. Returned when a drain call
+  # (see updateZlib) finds the codec holding neither pending output nor input.
+  zBufError = cint(-5)
   # windowBits: +32 auto-detects a gzip or zlib header; -15 is raw deflate.
   wbAuto = cint(15 + 32)
   wbRaw = cint(-15)
@@ -271,6 +274,10 @@ proc updateZlib(d: StreamDecoder, input: openArray[byte], capRemaining: int): st
     d.zs.nextOut = cast[ptr uint8](addr d.scratch[0])
     d.zs.availOut = cuint(d.scratch.len)
     let ret = inflate(addr d.zs, zNoFlush)
+    if ret == zBufError and d.zs.availIn == 0:
+      # The drain call below found nothing left to flush: zlib's "no progress
+      # possible", which is not an error, just the end of what this chunk yields.
+      break
     if ret != zOk and ret != zStreamEnd:
       if d.allowRawRetry and isFirst and not d.triedRaw and result.len == 0:
         # A raw (headerless) deflate body fails under the header-detecting decoder.
@@ -297,7 +304,17 @@ proc updateZlib(d: StreamDecoder, input: openArray[byte], capRemaining: int): st
         d.state = dsAtBoundary                 # ended exactly at a member boundary
         break
       continue
-    if d.zs.availIn == 0: break                # mid-member: more input expected (state stays dsMidMember)
+    if d.zs.availIn == 0 and d.zs.availOut != 0:
+      # Input drained AND the codec had room left over, so it is holding nothing
+      # back: more input is expected (the state stays dsMidMember). A call that
+      # filled the scratch exactly proves nothing -- zlib pulls input into its bit
+      # buffer, so availIn can hit 0 with a match still half written -- and zlib's
+      # contract is to keep calling inflate while avail_out comes back 0. Stopping
+      # there dropped the tail of a body (and with it Z_STREAM_END), reporting a
+      # valid body as truncated (#405). Looping cannot spin: an iteration that
+      # produces less than a full scratch leaves availOut != 0 and breaks here, and
+      # one that produces nothing at all returns zBufError above.
+      break
 
 proc updateBrotli(d: StreamDecoder, input: openArray[byte], capRemaining: int): string =
   var availIn = csize_t(input.len)
@@ -315,11 +332,17 @@ proc updateBrotli(d: StreamDecoder, input: openArray[byte], capRemaining: int): 
 
 proc updateZstd(d: StreamDecoder, input: openArray[byte], capRemaining: int): string =
   var inb: ZstdBuffer
+  var pendingFlush = false   ## the last call filled the scratch exactly, so libzstd
+                             ## may still be holding decoded bytes of that frame
   if input.len != 0:
     inb = ZstdBuffer(buf: cast[typeof(ZstdBuffer().buf)](unsafeAddr input[0]),
                      size: csize_t(input.len), pos: 0)
   decodeLoop(d, input, capRemaining):
-    if inb.pos >= inb.size: break              # input drained (the last step set the state)
+    # Input drained, and the previous call had output room to spare, so libzstd has
+    # flushed everything it decoded (the last step set the state). A call that filled
+    # the scratch exactly may still be holding part of a frame, so drain it first
+    # rather than dropping those bytes and calling the body truncated (#405).
+    if inb.pos >= inb.size and not pendingFlush: break
     d.state = dsMidMember                      # inside a frame until this step completes it
     let wasAt = inb.pos                        # to prove the call made progress
     var outb = ZstdBuffer(buf: cast[typeof(ZstdBuffer().buf)](addr d.scratch[0]),
@@ -328,6 +351,9 @@ proc updateZstd(d: StreamDecoder, input: openArray[byte], capRemaining: int): st
     if zstdIsError(r) != 0:
       raise newException(ValueError, "navi: malformed zstd body")
     emitScratch(d, result, int(outb.pos), capRemaining)
+    # Only a call that returned with output room left proves the flush is done; r == 0
+    # is a fully flushed frame, so it never leaves anything pending.
+    pendingFlush = r != 0 and int(outb.pos) == d.scratch.len
     if r == 0:
       # A zstd body may be several concatenated frames (RFC 8878 4), exactly like a
       # multi-member gzip body. A completed frame is a clean boundary, not the end of
