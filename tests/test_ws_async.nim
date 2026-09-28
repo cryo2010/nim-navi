@@ -56,6 +56,39 @@ suite "async websocket client end to end":
     waitFor run2()
     joinThread(th)
 
+  test "stream() should hand the first frame over and keep reading (#411)":
+    # `readChunk` moves the buffered opening frame out instead of returning a copy
+    # and pinning the original for the reader's lifetime: the chunk is right, the
+    # stream continues past it, and the socket still carries the next message.
+    var th: Thread[WsSrv]
+    var port: int
+    startWsStreamEcho(th, port)
+
+    proc runFirst() {.async.} =
+      let api = newNavi()
+      let ws = await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      await ws.send("fragment")                  # server replies with 3 fragments
+      let reader = await ws.stream()
+      check reader.kind == wmText
+      check (await reader.readChunk()) == "one"  # the buffered first frame
+      check (await reader.readChunk()) == "-two" # the reader is not stuck on it
+      check (await reader.readChunk()) == "-three"
+      check (await reader.readChunk()) == ""     # fin consumed
+      await ws.send("after")                     # and the socket still works
+      let m = await ws.receive()
+      check m.kind == wmText
+      check m.data == "after"
+
+      await ws.send("solo")                      # echoed back as a single frame
+      let solo = await ws.stream()
+      check solo.kind == wmText
+      check (await solo.readChunk()) == "solo"
+      check (await solo.readChunk()) == ""
+      await ws.close()
+
+    waitFor runFirst()
+    joinThread(th)
+
   test "stream()/stream(writer) should read and write a message as fragments":
     var th: Thread[WsSrv]
     var port: int

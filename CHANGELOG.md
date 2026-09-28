@@ -84,6 +84,23 @@ onward (pre-1.0, minor versions may include breaking changes).
   `BodySink`), since the `Future` type differs per backend (#367).
 
 ### Changed
+- **A received WebSocket message is moved through the assembler instead of being
+  copied twice more.** `WsAssembler.offer` took its frame by value, copied the
+  payload into its reassembly buffer, and then copied that buffer again into the
+  delivered `WsMessage`, so every message cost three copies of its bytes (the
+  decoder's included) and briefly held three live copies: a 64 MiB binary message
+  moved 192 MiB. `offer` now takes the frame as a `sink` and moves the payload into
+  the buffer and the buffer into the message, so an unfragmented message reaches the
+  caller with only the decoder's copy and a fragmented one with one copy per
+  fragment. The streaming readers no longer pin their opening frame either:
+  `readChunk` moves the buffered first frame out rather than returning a copy and
+  keeping the original alive for the reader's lifetime (a 64 MiB first frame used to
+  stay resident until the reader was collected). Fragmentation, the control-frame
+  replies, `maxMessageBytes` and the UTF-8 validation are unchanged, and the close
+  echo still carries the whole payload while the message carries only the reason.
+  The one visible change for direct users of the sans-io core: `offer` consumes the
+  frame it is given, so its `payload` must not be read again afterwards (feed a
+  reused `Frame` refilled by `WsDecoder.next`, as the backends do) (#411).
 - **HTTP/2 appends header blocks straight from the frame decoder and decodes HPACK
   literals in place.** A HEADERS payload used to be materialized into a `Frame`,
   copied into a local fragment, sliced again to strip the padding and the 5-byte

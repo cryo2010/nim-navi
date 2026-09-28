@@ -425,12 +425,19 @@ proc parseClose*(f: Frame): tuple[code: uint16, reason: string] =
   if not isValidUtf8(result.reason):     # RFC 6455 8.1: the close reason must be valid UTF-8
     raise newException(ValueError, "navi: invalid UTF-8 in a WebSocket close reason")
 
-proc offer*(a: var WsAssembler, f: Frame, maxMessageBytes = 0,
+proc offer*(a: var WsAssembler, f: sink Frame, maxMessageBytes = 0,
             rejectMasked = false): WsOutcome =
   ## Feed one decoded frame. Handles fragmentation (text/binary + continuation)
   ## and the control frames: a ping asks for a pong, a close both yields a
   ## `wmClose` message and asks for a close echo. No I/O -- the caller sends any
   ## `reply` and surfaces `message` when `ready`.
+  ##
+  ## `f` is a `sink`: the frame's payload is *moved* through the assembler rather
+  ## than copied, so the buffer the decoder allocated becomes the reassembly buffer
+  ## and then the delivered `WsMessage.data` (an unfragmented message reaches the
+  ## caller with no copy at all, #411). The caller must not read `f.payload` again
+  ## afterwards -- pass `move(f)` from a reused frame variable, as the backends do,
+  ## and let the next `WsDecoder.next` refill it.
   ##
   ## `maxMessageBytes` (0 = unlimited) bounds a *reassembled* message across its
   ## fragments: the per-frame length cap does not, so without it a peer can grow the
@@ -447,28 +454,28 @@ proc offer*(a: var WsAssembler, f: Frame, maxMessageBytes = 0,
     if a.kind == wmText and not isValidUtf8(a.buf):
       raise newException(ValueError, "navi: invalid UTF-8 in a WebSocket text message")
     result.ready = true
-    result.message = WsMessage(kind: a.kind, data: a.buf)
+    result.message = WsMessage(kind: a.kind, data: move(a.buf))  # hand the buffer over
   if rejectMasked and f.masked:     # RFC 6455 5.1: a server->client frame must not be masked
     raise newException(ValueError, "navi: masked WebSocket frame received from server")
   case f.opcode
   of opPing:
     result.reply = wrPong
-    result.replyPayload = f.payload
+    result.replyPayload = move(f.payload)
   of opPong:
     discard
   of opClose:
-    let (code, reason) = parseClose(f)   # 1-byte body, bad code, bad UTF-8: ValueError
+    var (code, reason) = parseClose(f)   # 1-byte body, bad code, bad UTF-8: ValueError
     result.reply = wrCloseEcho
-    result.replyPayload = f.payload
+    result.replyPayload = move(f.payload)   # echoed verbatim; the frame is ours now
     result.ready = true
-    result.message = WsMessage(kind: wmClose, closeCode: code, data: reason)
+    result.message = WsMessage(kind: wmClose, closeCode: code, data: move(reason))
   of opText, opBinary:
     if a.fragmented:                # RFC 6455 5.4: a new data frame mid-fragmentation
       raise newException(ValueError, "navi: new WebSocket data frame during a fragmented message")
     a.buf.setLen(0)                 # a new message starts; the prior one's bytes must not
     guardSize(f.payload.len)        # count against maxMessageBytes here
     a.kind = if f.opcode == opText: wmText else: wmBinary
-    a.buf = f.payload
+    a.buf = move(f.payload)
     if f.fin:
       finishMessage()
     else:
