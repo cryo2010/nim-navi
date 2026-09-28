@@ -10,6 +10,9 @@
 ##   3. buffered fallback: `bytesOfBody` converts a Nim js string holding all 256
 ##      byte values to seq[byte] exactly (the gate-miss sink path).
 ##   4. empty body: a zero-length chunk conversion yields an empty seq, not junk.
+##   5. upload: a request body of every byte value, and a gzip blob, reach the
+##      server byte-exact (#417 -- a `cstring` body was UTF-8 transcoded, so every
+##      byte >= 0x80 outside a valid sequence went out as U+FFFD and the body grew).
 
 import navi/js
 import navi/backend/js as jsbackend
@@ -81,11 +84,78 @@ proc emptyBody(): Future[void] {.async.} =
   doAssert total == 0, "empty body delivered " & $total & " bytes"
   echo "OK: empty body delivers no bytes (", calls, " sink call(s))"
 
+proc hexOf(s: string): string =
+  ## Lowercase hex of every byte in `s`, to compare against what the server saw.
+  const digits = "0123456789abcdef"
+  result = newString(s.len * 2)
+  for i in 0 ..< s.len:
+    let b = int(uint8(s[i]))
+    result[i * 2] = digits[b shr 4]
+    result[i * 2 + 1] = digits[b and 0x0f]
+
+proc download(path: string): Future[string] {.async.} =
+  ## Fetch `path` over the (byte-exact) streaming sink, as a byte string.
+  let api = newNavi()
+  var got: seq[byte] = @[]
+  let sink = proc(data: seq[byte]): Future[bool] {.async.} =
+    got.add data
+    return true
+  let res = await api.get(base & path, sink = sink)
+  doAssert res.status == 200, path & ": status " & $res.status
+  var bytes = newString(got.len)
+  for i in 0 ..< got.len: bytes[i] = char(got[i])
+  return bytes
+
+proc uploadExact(payload, what: string): Future[void] {.async.} =
+  ## POST `payload` and assert the server received exactly those bytes.
+  let api = newNavi()
+  let res = await api.post(base & "/echo", body = payload)
+  doAssert res.status == 200, what & ": status " & $res.status
+  let gotLen = res.headers.get("x-body-len")
+  doAssert gotLen == $payload.len,
+    what & ": server received " & gotLen & " bytes, sent " & $payload.len
+  let gotHex = res.headers.get("x-body-hex")
+  let wantHex = hexOf(payload)
+  if gotHex != wantHex:
+    var at = 0
+    while at < gotHex.len and at < wantHex.len and gotHex[at] == wantHex[at]: inc at
+    doAssert false, what & ": bytes differ at byte " & $(at div 2) &
+      ": got " & gotHex[at div 2 * 2 .. min(gotHex.high, at div 2 * 2 + 1)] &
+      ", want " & wantHex[at div 2 * 2 .. min(wantHex.high, at div 2 * 2 + 1)]
+  echo "OK: upload byte-exact, ", what, ", ", payload.len, " bytes"
+
+proc uploadAllByteValues(): Future[void] {.async.} =
+  await uploadExact(allBytes(), "all 256 byte values")
+
+proc uploadGzipBody(): Future[void] {.async.} =
+  let gz = await download("/gzip")
+  doAssert gz.len > 0, "gzip blob download was empty"
+  doAssert gz[0] == '\x1F' and gz[1] == '\x8B', "downloaded blob is not gzip"
+  await uploadExact(gz, "gzip blob")
+
+proc uploadUtf8Body(): Future[void] {.async.} =
+  ## A valid UTF-8 body must still go out unchanged (no double encoding).
+  await uploadExact("h\xC3\xA9llo \xE4\xB8\x96\xE7\x95\x8C", "valid UTF-8 text")
+
+proc uploadNoImplicitContentType(): Future[void] {.async.} =
+  ## A raw string body carries no Content-Type, and fetch must not add its
+  ## text/plain default for a byte body (the native clients send none either).
+  let api = newNavi()
+  let res = await api.post(base & "/echo", body = "plain")
+  doAssert res.status == 200, "status " & $res.status
+  let ct = res.headers.get("x-req-ctype")
+  doAssert ct == "", "raw body sent an implicit Content-Type: " & ct
+  echo "OK: raw string body sends no implicit Content-Type"
+
 proc main() {.async.} =
   bufferedFallbackConversion()
   await sinkRoundTrip()
   await pullRoundTrip()
   await emptyBody()
+  await uploadAllByteValues()
+  await uploadGzipBody()
+  await uploadUtf8Body()
+  await uploadNoImplicitContentType()
   echo "ALL OK: navi/js binary body round trip"
 
 discard main()

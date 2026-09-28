@@ -216,6 +216,22 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **`navi/js` request bodies now go on the wire as the Nim string's bytes, like every
+  native backend.** `buildInit` handed the body to `fetch` as a `cstring`, and on the
+  js backend that conversion decodes the string's bytes as UTF-8 into a JS (UTF-16)
+  string, which `fetch` then re-encodes as UTF-8. The round trip is only the identity
+  for a body that is already valid UTF-8: any other byte >= 0x80 was replaced with
+  U+FFFD (`EF BF BD`), so binary uploads (gzip, images, `application/octet-stream`)
+  arrived corrupted and longer than they were sent (a 256-byte body of every byte
+  value arrived as 384 bytes, first mismatch at byte 128), and a latin1 text body was
+  silently transcoded while its `Content-Type` charset still claimed the original
+  encoding. The body is now passed as a `Uint8Array` of those bytes, so `fetch`
+  transmits them verbatim. One knock-on: `fetch` no longer adds its default
+  `Content-Type: text/plain;charset=UTF-8` to a raw string body that carries no
+  Content-Type, which matches the native clients (a body whose type is implied, such
+  as JSON or a form, still sets its own header). The streamed download side has been
+  byte-exact since #412; this was the last lossy byte path in `navi/js`. Covered end
+  to end under Node by `tests/interop/js_bytes.sh` (#417).
 - **The sync WebSocket-over-h2 tunnel no longer buffers a peer flood without bound
   (#407).** Its Extended CONNECT stream now opens in sink mode and `receive` acks the
   bytes the application consumed, matching the async tunnel: while a large `send` waits
