@@ -84,6 +84,18 @@ onward (pre-1.0, minor versions may include breaking changes).
   `BodySink`), since the `Future` type differs per backend (#367).
 
 ### Changed
+- **The streaming WebSocket UTF-8 scanner validates each chunk in place.**
+  `scanUtf8` used to build `carry & chunk` and validate that copy, so every streamed
+  text frame was copied once more into a chunk-sized temporary just to prepend at
+  most three bytes carried over from the last frame. The carried bytes are now
+  completed from the head of the new chunk and checked on their own, the rest of the
+  chunk is validated in place from that offset (`isValidUtf8` takes an `openArray`),
+  and the carry lives in a fixed 4-byte array instead of a string. Scanning a chunk
+  now allocates nothing at all (it was two allocations plus a full copy per frame):
+  256-byte frames scan ~1.22x faster and 16 KiB frames ~1.02x, allocation-free in
+  both cases. Overlongs, surrogates, anything above U+10FFFF, a sequence split at any
+  byte boundary and a message that ends part-way through a code point are accepted
+  and rejected exactly as before (#414).
 - **A received WebSocket message is moved through the assembler instead of being
   copied twice more.** `WsAssembler.offer` took its frame by value, copied the
   payload into its reassembly buffer, and then copied that buffer again into the

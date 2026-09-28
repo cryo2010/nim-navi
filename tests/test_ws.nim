@@ -1168,3 +1168,108 @@ suite "websocket handshake head cap (#406)":
       msg = e.msg
     check "maxHeaderListBytes" in msg
     joinThread(th)
+
+suite "websocket incremental UTF-8 validation, chunk splits (#414)":
+  # `scanUtf8` validates each chunk in place from an offset instead of joining the
+  # carried bytes onto a copy of it, so the split points are where it can go wrong:
+  # these check it against an independent whole-string reference at every offset.
+  proc refValidUtf8(s: string): bool =
+    ## Reference decoder (RFC 3629): decodes each code point by value and rejects
+    ## overlongs, surrogates and anything above U+10FFFF from the value itself.
+    var i = 0
+    while i < s.len:
+      let b = uint32(uint8(s[i]))
+      var need: int
+      var cp: uint32
+      if b < 0x80'u32: (need, cp) = (0, b)
+      elif b >= 0xC0'u32 and b < 0xE0'u32: (need, cp) = (1, b and 0x1F'u32)
+      elif b >= 0xE0'u32 and b < 0xF0'u32: (need, cp) = (2, b and 0x0F'u32)
+      elif b >= 0xF0'u32 and b < 0xF8'u32: (need, cp) = (3, b and 0x07'u32)
+      else: return false
+      if i + need >= s.len: return false
+      for k in 1 .. need:
+        let c = uint32(uint8(s[i + k]))
+        if (c and 0xC0'u32) != 0x80'u32: return false
+        cp = (cp shl 6) or (c and 0x3F'u32)
+      if cp > 0x10FFFF'u32: return false
+      if cp >= 0xD800'u32 and cp <= 0xDFFF'u32: return false
+      if (need == 1 and cp < 0x80'u32) or (need == 2 and cp < 0x800'u32) or
+         (need == 3 and cp < 0x10000'u32): return false          # overlong
+      i += need + 1
+    true
+
+  proc chunkedValid(parts: varargs[string]): bool =
+    ## Feed the parts through one scanner: valid only if no chunk was rejected and
+    ## the stream did not end part-way through a code point (RFC 6455 8.1).
+    var v: WsUtf8Scanner
+    for p in parts:
+      if not v.scanUtf8(p): return false
+    not v.midCodePoint
+
+  const samples = [
+    "ab\xc3\xa9cd",                                   # 2-byte (U+00E9)
+    "\xe2\x82\xac euro",                              # 3-byte (U+20AC)
+    "hi \xf0\x9f\x92\xa9!",                           # 4-byte (U+1F4A9)
+    "\xc2\x80\xdf\xbf\xe0\xa0\x80\xef\xbf\xbf" &
+      "\xf0\x90\x80\x80\xf4\x8f\xbf\xbf",             # the range edges, back to back
+    "\xed\x9f\xbf\xee\x80\x80",                       # U+D7FF / U+E000: around the surrogates
+  ]
+
+  test "a valid message should scan the same split across two chunks at every offset":
+    for s in samples:
+      check refValidUtf8(s)                          # the sample itself is well-formed
+      for i in 0 .. s.len:
+        check chunkedValid(s[0 ..< i], s[i .. ^1])
+
+  test "a valid message should scan the same split across three chunks at every offset":
+    for s in samples:
+      for i in 0 .. s.len:
+        for j in i .. s.len:
+          check chunkedValid(s[0 ..< i], s[i ..< j], s[j .. ^1])
+
+  test "an invalid message should be rejected at every split across two chunks":
+    const bad = [
+      "\xed\xa0\x80",             # U+D800: a surrogate
+      "\xed\xbf\xbf",             # U+DFFF: a surrogate
+      "\xc0\xaf",                 # overlong "/"
+      "\xe0\x80\xaf",             # overlong "/" again
+      "\xf0\x80\x80\xaf",         # and once more
+      "\xf4\x90\x80\x80",         # U+110000: past the last code point
+      "\xf5\x80\x80\x80",         # lead byte that can never start a sequence
+      "a\xe2\x28\xa1b",           # a continuation byte that is not one
+      "ok\xff!",                  # 0xFF is never valid UTF-8
+      "\x80\xbf",                 # bare continuation bytes
+    ]
+    for s in bad:
+      check not refValidUtf8(s)
+      for i in 0 .. s.len:
+        check not chunkedValid(s[0 ..< i], s[i .. ^1])
+        for j in i .. s.len:
+          check not chunkedValid(s[0 ..< i], s[i ..< j], s[j .. ^1])
+
+  test "a message ending part-way through a code point should be rejected":
+    for s in ["\xc3", "\xe2\x82", "\xf0\x9f\x92", "text \xf0"]:
+      check not chunkedValid(s)                      # incomplete as one chunk
+      for i in 0 .. s.len:                           # ... and however it is split
+        check not chunkedValid(s[0 ..< i], s[i .. ^1])
+
+  test "empty chunks should not disturb a carried code point":
+    var v: WsUtf8Scanner
+    check v.scanUtf8("\xf0")
+    check v.scanUtf8("")                             # nothing to complete it with
+    check v.midCodePoint
+    check v.scanUtf8("\x9f\x92")
+    check v.midCodePoint
+    check v.scanUtf8("\xa9 done")
+    check not v.midCodePoint
+
+  test "a chunk should still be validated in place after completing a carry":
+    # The bytes after the completed carry are scanned from an offset, so a fault
+    # there must still be caught (and a clean tail must still pass).
+    var ok: WsUtf8Scanner
+    check ok.scanUtf8("\xe2\x82")
+    check ok.scanUtf8("\xac plain ascii tail")
+    check not ok.midCodePoint
+    var bad: WsUtf8Scanner
+    check bad.scanUtf8("\xe2\x82")
+    check not bad.scanUtf8("\xac tail \xc3\x28")
