@@ -94,13 +94,17 @@ proc doWebsocketH1(client: Navi, u: Url, headers: Headers,
   # uses try/except rather than defer).
   try:
     await conn.sendAll(upgradeRequest(u, key, headers))
+    # Same bounded, resumable head read as the sync handshake: see `scanHeadEnd` (#406).
     var buf = ""
-    while "\r\n\r\n" notin buf:
+    var scanned = 0
+    var headEnd = scanHeadEnd(buf, scanned)
+    while headEnd < 0:
       let chunk = await conn.recvSome()
       if chunk.len == 0:
         raise newException(IOError, "navi: websocket handshake closed by peer")
       buf.add chunk
-    let headEnd = buf.find("\r\n\r\n") + 4
+      headEnd = scanHeadEnd(buf, scanned)
+    headEnd += 4
     if not validate101(buf[0 ..< headEnd], key):
       raise newException(IOError, "navi: websocket upgrade rejected: " &
         buf[0 ..< headEnd].splitLines[0])

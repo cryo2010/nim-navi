@@ -1018,3 +1018,22 @@ suite "websocket frame validation (RFC 6455)":
     expect ValueError:
       discard a.offer(Frame(fin: true, opcode: opClose,
                             payload: closePayload(closeNormal, "\xff")))
+
+suite "websocket handshake head cap (#406)":
+  test "an endless non-CRLF 101 head should raise HeaderTooLargeError, not grow forever":
+    # The handshake reader used to accumulate the 101 response until it saw a blank
+    # line, with no bound and a whole-buffer rescan per read. An origin that answers
+    # "HTTP/1.1 101 ...\r\nX: " and then streams non-CRLF bytes forever would grow
+    # that buffer until the process died; maxResponseBytes caps only body bytes.
+    var th: Thread[WsSrv]
+    var port: int
+    startWsHeaderFlood(th, port)
+
+    let api = newNavi()
+    var msg = ""
+    try:
+      discard api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    except HeaderTooLargeError as e:
+      msg = e.msg
+    check "maxHeaderListBytes" in msg
+    joinThread(th)

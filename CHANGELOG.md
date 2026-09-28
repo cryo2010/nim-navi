@@ -157,6 +157,16 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **HTTP/1 header, chunk-size and WebSocket-handshake lines are now capped at
+  `maxHeaderListBytes` (128 KiB) and scanned incrementally.** A peer that opened a
+  status line, header field, chunk-size or trailer line and then streamed non-CRLF
+  bytes forever grew the parse buffer without bound (`maxResponseBytes` caps only
+  body bytes), and every 64 KiB read re-scanned the whole unterminated line, so CPU
+  was quadratic in header size; the sync and async WebSocket `101` readers had the
+  same unbounded accumulation. Both now stop at the shared cap h2 already applied to
+  a CONTINUATION flood and raise the new `HeaderTooLargeError`, and the CRLF search
+  resumes from the previously scanned offset instead of restarting at the read
+  cursor. (#406)
 - **A multiplexed HTTP/2 read no longer sizes every stream's body to the whole
   decoder buffer.** `handleData` sized each stream's per-batch body to
   `frames.remaining`, everything still buffered for the connection including other

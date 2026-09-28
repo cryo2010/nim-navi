@@ -5,6 +5,18 @@
 
 import std/strutils
 
+const maxHeaderListBytes* = 128 * 1024
+  ## Cap on one message's accumulated header section, shared by every protocol so
+  ## a peer cannot grow navi's parse buffers without bound.
+  ##
+  ## h2 applies it to a stream's accumulated (compressed) header block, bounding a
+  ## CONTINUATION flood (CVE-2024-27316 and related). h1 applies it to the bytes of
+  ## the status line plus header fields it has accumulated without seeing the
+  ## terminating blank line, and to a single chunk-size or trailer line, bounding a
+  ## peer that never sends CRLF; the WebSocket handshake readers apply it to the 101
+  ## response head. Generous for real headers: what exceeds it is a flood, not a
+  ## message, and is rejected (h2 RSTs the stream, h1 raises `HeaderTooLargeError`).
+
 type
   Headers* = object
     fields: seq[(string, string)]

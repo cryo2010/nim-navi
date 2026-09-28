@@ -172,6 +172,16 @@ type
                             ## consumed prefix periodically (see `compact`), like h2's
                             ## FrameDecoder, avoiding the O(lines x bodyBytes) memmove
                             ## a front `delete` per consumed span costs.
+    scanned: int            ## how far into `buf` `takeLine` has already looked for a
+                            ## CRLF. A line that arrives over many reads is scanned
+                            ## once end to end instead of re-scanned from `pos` per
+                            ## feed, which is what made a long header quadratic (#406).
+                            ## Kept in the same coordinates as `pos`, so `compact`
+                            ## shifts it too.
+    lineBytes: int          ## bytes of the current line-oriented section already
+                            ## consumed (status line + header fields, one chunk-size
+                            ## line, or the trailer section). Bounded by
+                            ## `maxHeaderListBytes`; reset when the section ends.
     bodyMode: H1BodyMode
     remaining: int          ## bytes left in current length-delimited span
     status: int
@@ -265,14 +275,55 @@ proc markBodySkipped*(p: var H1Parser) =
   ## connection as the missing body, so the connection is retired instead of pooled.
   p.bodySkipped = true
 
+proc lineSectionCap(p: H1Parser, extra: int) =
+  ## Bound the line-oriented section being accumulated (status line + header fields,
+  ## a chunk-size line, or the trailer section). Without it a peer that opens a line
+  ## and then streams bytes forever without a CRLF grows `buf` until the process runs
+  ## out of memory: `maxResponseBytes` caps only body bytes (#406).
+  if p.lineBytes + extra > maxHeaderListBytes:
+    raise newException(HeaderTooLargeError,
+      "navi: h1 header section exceeds maxHeaderListBytes (" &
+      $maxHeaderListBytes & " bytes)")
+
 proc takeLine(p: var H1Parser, line: var string): bool =
   ## Pop one CRLF-terminated line from the buffer, if a full line is present.
-  ## Scans from the read cursor; consuming only advances `pos` (no memmove).
-  let idx = p.buf.find("\r\n", start = p.pos)
-  if idx < 0: return false
+  ## Consuming only advances `pos` (no memmove).
+  ##
+  ## The CRLF search resumes from `scanned` rather than restarting at `pos`, so a line
+  ## delivered over many reads costs one pass in total instead of one pass per read.
+  ## It backs up a single byte (`scanned - 1`) because the terminator may straddle a
+  ## feed boundary, with the "\r" the last byte of one read and the "\n" the first of
+  ## the next; `pos` is the floor, since bytes before it are already consumed.
+  let start = max(p.pos, p.scanned - 1)
+  let idx = p.buf.find("\r\n", start = start)
+  if idx < 0:
+    p.scanned = p.buf.len            # everything present has now been looked at
+    p.lineSectionCap(p.buf.len - p.pos)
+    return false
   line = p.buf[p.pos ..< idx]
   p.pos = idx + 2
+  p.scanned = p.pos                  # nothing past the consumed line is scanned yet
+  p.lineSectionCap(line.len + 2)     # also catches one huge line inside a single feed
+  p.lineBytes += line.len + 2
   true
+
+proc scanHeadEnd*(buf: string, scanned: var int): int =
+  ## Index of the blank line (CRLFCRLF) that ends an HTTP/1 head in `buf`, or -1 while
+  ## the head is still incomplete. `scanned` carries the search position across calls:
+  ## seed it with 0 and pass the same variable back, so a head arriving over many reads
+  ## is scanned once rather than re-scanned whole per read. The resume point backs up
+  ## three bytes, the most of the four-byte terminator that a previous read can hold.
+  ##
+  ## Raises `HeaderTooLargeError` once an unterminated head passes `maxHeaderListBytes`.
+  ## Shared by the sync and async WebSocket handshake readers, which read the `101`
+  ## response head by hand rather than through `H1Parser` (#406).
+  let start = max(0, scanned - 3)
+  result = buf.find("\r\n\r\n", start = start)
+  scanned = buf.len
+  if result < 0 and buf.len > maxHeaderListBytes:
+    raise newException(HeaderTooLargeError,
+      "navi: h1 head exceeds maxHeaderListBytes (" & $maxHeaderListBytes &
+      " bytes) with no terminating blank line")
 
 proc parseStatusLine(p: var H1Parser, line: string) =
   # e.g. "HTTP/1.1 200 OK"
@@ -290,6 +341,7 @@ proc parseStatusLine(p: var H1Parser, line: string) =
   p.state = stHeaders
 
 proc finishHeaders(p: var H1Parser) =
+  p.lineBytes = 0          # the header section ended; an interim restarts the count
   if p.status in 100 .. 199:
     # Interim response (100 Continue, 103 Early Hints, ...): it has no body, and
     # its status/headers are not the final response (RFC 9110 15.2). Drop them and
@@ -403,6 +455,8 @@ proc step(p: var H1Parser): bool =
     const maxChunkSize = 1'i64 shl 40
     if p.remaining < 0 or p.remaining.int64 > maxChunkSize:
       raise newException(ValueError, "h1: invalid chunk size")
+    p.lineBytes = 0   # each chunk-size line is capped on its own, and the trailer
+                      # section that a zero-size chunk opens starts a fresh count
     p.state = if p.remaining == 0: stTrailers else: stChunkData
     true
   of stChunkData:
@@ -474,6 +528,9 @@ proc compact(p: var H1Parser) =
     p.buf.setLen(keep)
   else:
     return                               # leave the prefix; the cursor skips it
+  # `scanned` indexes the same buffer, so it shifts with it. It can sit behind `pos`
+  # (body consumption advances `pos` without scanning), hence the clamp at 0.
+  p.scanned = max(0, p.scanned - p.pos)
   p.pos = 0
 
 proc feed*(p: var H1Parser, data: openArray[char]) =

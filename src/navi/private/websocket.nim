@@ -185,13 +185,21 @@ proc websocketH1(client: Navi, u: Url, headers: Headers,
       except CatchableError: discard
   let key = genKey()
   conn.sendAll(upgradeRequest(u, key, headers))
+  # Read the 101 head through the shared `scanHeadEnd`: it resumes the blank-line
+  # search where the last read stopped (a `notin` per read re-scanned the whole
+  # buffer, quadratic in head size) and caps an unterminated head at
+  # maxHeaderListBytes, so an origin that answers with endless non-CRLF bytes raises
+  # instead of growing this buffer until the process dies (#406).
   var buf = ""
-  while "\r\n\r\n" notin buf:
+  var scanned = 0
+  var headEnd = scanHeadEnd(buf, scanned)
+  while headEnd < 0:
     let chunk = conn.recvSome()
     if chunk.len == 0:
       raise newException(IOError, "navi: websocket handshake closed by peer")
     buf.add chunk
-  let headEnd = buf.find("\r\n\r\n") + 4
+    headEnd = scanHeadEnd(buf, scanned)
+  headEnd += 4
   if not validate101(buf[0 ..< headEnd], key):
     raise newException(IOError, "navi: websocket upgrade rejected: " &
       buf[0 ..< headEnd].splitLines[0])

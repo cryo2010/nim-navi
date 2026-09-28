@@ -16,6 +16,7 @@
 
 import std/[strutils, tables]
 import ./frame, ./hpack
+from ../../core/headers import maxHeaderListBytes   # the cross-protocol header cap
 
 type
   H2Response* = object
@@ -83,11 +84,6 @@ type
 
 const
   defaultWindow = 65535          ## HTTP/2 default flow-control window (RFC 9113)
-  maxHeaderListBytes = 128 * 1024
-    ## Cap on a single response's accumulated (compressed) header block. Bounds
-    ## memory against a CONTINUATION flood -- a peer sending endless CONTINUATION
-    ## frames without END_HEADERS (CVE-2024-27316 and related). Generous for real
-    ## headers; a stream that exceeds it is RST'd.
   recvWindowSize = 8 * 1024 * 1024
     ## Per-stream receive window we advertise (SETTINGS_INITIAL_WINDOW_SIZE), so a
     ## single download is not throttled to the 64 KiB default per round trip.
