@@ -135,6 +135,17 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **A multiplexed HTTP/2 read no longer sizes every stream's body to the whole
+  decoder buffer.** `handleData` sized each stream's per-batch body to
+  `frames.remaining`, everything still buffered for the connection including other
+  streams' frames, so on a mux every stream that got any DATA in a read allocated a
+  read-sized string that then travelled through `takeBody` into the sink queue: one
+  64 KiB read carrying a ~100-byte frame for each of 200 SSE subscriptions produced
+  ~12.8 MB of live capacity for 20 KB of body, bounded in bytes by the connection
+  window but not in capacity. The hint is now the run of contiguous DATA frames for
+  that stream at the head of the buffer, so a stream is sized for what it actually
+  receives; a single-stream download is still one run, keeping the #401 fast path
+  (one sizing per read, no regrowth). (#408)
 - **A decoded body is no longer cut short when the codec's output fills the 16 KiB
   decode scratch exactly.** The inflate loop stopped as soon as zlib had consumed
   every input byte, even when the scratch came back completely full; zlib pulls input

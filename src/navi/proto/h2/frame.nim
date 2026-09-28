@@ -118,8 +118,30 @@ proc frameSizeError*(d: FrameDecoder): bool = d.frameSizeError
   ## A peer frame declared a length over `defaultMaxFrameSize` (FRAME_SIZE_ERROR).
 
 proc remaining*(d: FrameDecoder): int = d.buf.len - d.pos
-  ## Bytes buffered but not yet consumed, including any peeked frame. A capacity
-  ## hint for a destination the buffered frames are about to be copied into.
+  ## Bytes buffered but not yet consumed, including any peeked frame.
+
+proc dataRunLen*(d: FrameDecoder, streamId: uint32): int =
+  ## Total payload bytes of the run of complete DATA frames for `streamId` that
+  ## begins at the current read offset, stopping at the first buffered frame of
+  ## another type, for another stream, or only partially read. Always counts the
+  ## frame `peek` just reported, so it is never smaller than that frame.
+  ##
+  ## This is the capacity hint for the body those frames are about to be appended
+  ## to. Sizing to `remaining` instead would hand every stream in a multiplexed
+  ## read the whole buffer, so one 64 KiB read carrying a small frame for each of
+  ## 200 streams allocated 200 x 64 KiB of live body capacity (issue #408). The
+  ## run keeps the single-stream download fast path of issue #400: a read of
+  ## back-to-back DATA for one stream is one run, so the body is still sized once
+  ## for the whole read and never regrows.
+  var p = d.pos
+  while p + 9 <= d.buf.len:
+    let length = readU24(d.buf, p)
+    if length > defaultMaxFrameSize: break     # `peek` would reject it anyway
+    if p + 9 + length > d.buf.len: break       # partial frame: the rest is not here yet
+    if uint8(d.buf[p + 3]) != uint8(ftData): break
+    if (readU32(d.buf, p + 5) and 0x7fffffff'u32) != streamId: break
+    result += length
+    p += 9 + length
 
 proc peek*(d: var FrameDecoder, h: var FrameHeader): bool =
   ## Report the next complete frame's header, if one is fully buffered, WITHOUT

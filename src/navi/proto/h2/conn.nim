@@ -541,9 +541,15 @@ proc handleData(c: H2Conn, h: FrameHeader, outbuf: var string) =
         contentLen = h.length - 1 - padLen
       if contentLen > 0 and s.resp.body.len == 0:
         # `takeBody` drains the body once per feed batch, so it restarts empty with
-        # every batch and would regrow frame by frame. Size it once for what is
-        # still buffered (or for this frame, whichever is larger).
-        s.resp.body = newStringOfCap(max(contentLen, c.frames.remaining))
+        # every batch and would regrow frame by frame. Size it once for the run of
+        # DATA frames THIS stream is about to receive, not for everything still
+        # buffered: on a multiplexed connection the rest of the read belongs to
+        # other streams, and sizing each one to the whole read gave every stream
+        # with any DATA in the batch a read-sized body, so a 64 KiB read carrying
+        # one small frame for each of 200 sink streams allocated ~200 x 64 KiB of
+        # live capacity queued in the sink (issue #408). A single-stream download
+        # is still one run, so it is sized once for the whole read (issue #400).
+        s.resp.body = newStringOfCap(c.frames.dataRunLen(h.streamId))
       c.frames.appendPayload(s.resp.body, contentOff, contentLen)
       s.bodyTotal += contentLen
       if c.maxBodyBytes > 0 and s.bodyTotal > c.maxBodyBytes:  # over the size cap: RST
