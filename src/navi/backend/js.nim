@@ -52,6 +52,13 @@ proc jsText(res: JsObject): Future[cstring] {.importjs: "#.text()".}
 proc headerEntries(res: JsObject): JsObject {.importjs: "Array.from(#.headers.entries())".}
 proc setCookieList(res: JsObject): JsObject {.importjs: "(#.headers.getSetCookie?.() ?? [])".}
 proc jsLen(arr: JsObject): int {.importjs: "#.length".}
+proc bodyToU8(s: string): JsObject {.importjs: "new Uint8Array(#)".}
+  ## A `Uint8Array` of a Nim js `string`'s bytes, byte-exact, in one copy. A Nim js
+  ## `string` is a plain JS array of byte values, so `new Uint8Array` on it already
+  ## IS its bytes. Request bodies go to `fetch` this way rather than as a `cstring`:
+  ## the `cstring` conversion decodes the bytes as UTF-8 into a JS (UTF-16) string
+  ## and `fetch` re-encodes them, which is only the identity for a body that is
+  ## already valid UTF-8 -- any other byte >= 0x80 went on the wire as U+FFFD (#417).
 proc u8ToBytes(arr: JsObject): seq[byte] {.importjs: "Array.prototype.slice.call(#)".}
   ## Bulk-copy a JS `Uint8Array` into a Nim `seq[byte]` in ONE call, instead of a
   ## jsffi property read plus a `.to(int)` conversion per byte (#412: a 50 MB body
@@ -84,7 +91,7 @@ proc buildInit(req: Request, signal: JsObject, hasSignal: bool): JsObject =
     append(h, cstring(name), cstring(value))
   result["headers"] = h
   if req.body.len > 0:
-    result["body"] = cstring(req.body)
+    result["body"] = bodyToU8(req.body)   # raw bytes, not a transcoded cstring
   result["redirect"] = cstring("follow")      # the browser follows redirects
   result["credentials"] = cstring("include")  # and owns the cookie jar
   if hasSignal:
