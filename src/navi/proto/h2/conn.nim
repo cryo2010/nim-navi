@@ -911,6 +911,16 @@ proc setSinkMode*(c: H2Conn, streamId: uint32) =
   let s = c.streams.getOrDefault(streamId)
   if s != nil: s.sinkMode = true
 
+proc openTunnelStream*(c: H2Conn): uint32 =
+  ## Open a stream for an Extended CONNECT tunnel (RFC 8441): `openStream` with the
+  ## receive window gated (sink mode) from the start, so the tunnel's inbound bytes
+  ## are bounded by the advertised window until the application consumes and acks
+  ## them. A tunnel reader can be blocked for a long time (a large send waiting on
+  ## the peer's WINDOW_UPDATE), and an eagerly replenished window buffers the peer's
+  ## flood without bound there (#407).
+  result = c.openStream()
+  c.setSinkMode(result)
+
 proc ackRecv*(c: H2Conn, streamId: uint32, n: int): string =
   ## Acknowledge that the sink consumed `n` received body bytes, replenishing the
   ## STREAM receive window (batched, like the eager path). For a sinkMode stream

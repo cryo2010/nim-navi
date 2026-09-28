@@ -20,7 +20,9 @@ type
     sock: Conn
     h2: H2Conn
     sid: uint32
-    inbuf: string   ## inbound tunnel bytes read ahead of a `recv` (e.g. during a send)
+    inbuf: string   ## inbound tunnel bytes read ahead of a `recv` (e.g. during a send);
+                    ## bounded by the stream receive window, which `h2Recv` acks only
+                    ## as the application consumes (the stream is in sink mode)
     eof: bool       ## the peer half-closed the tunnel (its stream ended or was reset)
   WsTransport = object
     ## The duplex byte channel under a sync WebSocket: an h1 Upgrade connection, an
@@ -73,11 +75,21 @@ proc h2Send(w: WsH2, data: string) =
 
 proc h2Recv(w: WsH2): string =
   ## The next inbound tunnel chunk, or "" once the peer half-closes with nothing
-  ## buffered (the transport-EOF signal the frame reader expects).
+  ## buffered (the transport-EOF signal the frame reader expects). The tunnel stream
+  ## is in sink mode, so its receive window is held until the bytes leave `inbuf`
+  ## here: acking on consumption is what paces the peer (#407).
   while w.inbuf.len == 0 and not w.eof:
     w.pumpH2()
+  let consumed = w.inbuf.len
   result = move(w.inbuf)
   w.inbuf = ""
+  if consumed > 0 and not w.eof:
+    let upd = w.h2.ackRecv(w.sid, consumed)   # batched: a WINDOW_UPDATE now and then
+    if upd.len > 0:
+      # The bytes are already out of the buffer, so a failed write must not lose
+      # them: note the dead transport instead and let the next recv report EOF.
+      try: w.sock.sendAll(upd)
+      except CatchableError: w.eof = true
 
 proc h2DataWaiting(w: WsH2, ms: int): bool =
   ## Whether a `recv` would return promptly: buffered bytes, a known EOF, or the
@@ -252,7 +264,11 @@ proc websocketH2(client: Navi, u: Url, headers: Headers,
   # the h1-only handshake fields and the hop-by-hop ones, and adds
   # sec-websocket-version. h2ConnectHeaderList then applies the h2 rules.
   let extra = initHeaders(wsExtraFields(headers))
-  let sid = h2.openStream()
+  # openTunnelStream gates the receive window (sink mode): without it `feed`
+  # replenishes per DATA frame, so a peer flooding the tunnel while a send is blocked
+  # on the send window grows `inbuf` without bound (#407). h2Recv acks what the
+  # application consumes, which is what paces the peer.
+  let sid = h2.openTunnelStream()
   conn.sendAll(h2.encodeRequestHead(sid, h2ConnectHeaderList(u, "websocket", extra)))
   while not h2.headersReady(sid):        # await the CONNECT response headers
     let chunk = conn.recvSome()

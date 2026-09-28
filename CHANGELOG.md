@@ -157,6 +157,11 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **The sync WebSocket-over-h2 tunnel no longer buffers a peer flood without bound
+  (#407).** Its Extended CONNECT stream now opens in sink mode and `receive` acks the
+  bytes the application consumed, matching the async tunnel: while a large `send` waits
+  for the peer's WINDOW_UPDATE, inbound DATA is bounded by the advertised receive
+  window instead of being replenished eagerly frame by frame.
 - **HTTP/1 header, chunk-size and WebSocket-handshake lines are now capped at
   `maxHeaderListBytes` (128 KiB) and scanned incrementally.** A peer that opened a
   status line, header field, chunk-size or trailer line and then streamed non-CRLF
