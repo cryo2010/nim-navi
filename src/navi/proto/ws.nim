@@ -72,6 +72,13 @@ type
 
   WsDecoder* = object
     buf: string
+    pos: int           ## read cursor into `buf`: bytes consumed by `next` but not
+                       ## yet dropped. Popping a frame only advances the cursor, and
+                       ## `feed` reclaims the consumed prefix (see `compact`), the
+                       ## same shape h1's parser and the h2 frame decoder use.
+                       ## Front-deleting per frame memmoved the whole remainder once
+                       ## per frame, so decoding N small frames out of one read cost
+                       ## O(N x buffered) instead of O(buffered) (#409).
 
 const
   wsGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"  ## RFC 6455 handshake magic
@@ -200,26 +207,64 @@ proc encodeFrame*(opcode: Opcode, payload: string, masked = true,
   else:
     result.add payload
 
+const wsCompactMin = 8 * 1024
+  ## Smallest consumed prefix worth shifting the retained bytes for (see `compact`).
+
+proc compact(d: var WsDecoder) =
+  ## Reclaim the consumed prefix of the frame buffer. A read whose frames are all
+  ## decoded leaves nothing retained, which costs a `setLen(0)` and keeps the
+  ## capacity for the next read. Otherwise the retained tail moves down IN PLACE,
+  ## and only once the prefix is both worth reclaiming and at least as large as
+  ## what the move copies, so shifting stays amortized O(1) per byte rather than
+  ## re-copying a large remainder on every feed to drop a few consumed bytes.
+  if d.pos == 0: return
+  if d.pos >= d.buf.len:
+    d.buf.setLen(0)
+  elif d.pos >= wsCompactMin and d.pos >= d.buf.len - d.pos:
+    let keep = d.buf.len - d.pos
+    when defined(js):                     # no moveMem (and no pointers) on js
+      for i in 0 ..< keep: d.buf[i] = d.buf[d.pos + i]
+    else:
+      moveMem(addr d.buf[0], addr d.buf[d.pos], keep)
+    d.buf.setLen(keep)
+  else:
+    return                                # leave the prefix; the cursor skips it
+  d.pos = 0
+
 proc feed*(d: var WsDecoder, data: string) =
+  ## Supply received bytes, first dropping whatever `next` has already consumed.
+  d.compact()
   d.buf.add data
+
+proc buffered*(d: WsDecoder): int = d.buf.len - d.pos
+  ## Bytes received but not yet consumed by `next`: a partial frame, plus any
+  ## whole frames still waiting to be popped.
+
+proc bufferLen*(d: WsDecoder): int = d.buf.len
+  ## The retained buffer, consumed prefix included. Diagnostic: it lets a test
+  ## assert the buffer stays bounded across feed/consume cycles instead of growing
+  ## with the number of frames decoded.
 
 proc next*(d: var WsDecoder, f: var Frame): bool =
   ## Pop one complete frame from the buffer, unmasking if needed. Returns false
-  ## when more bytes are required.
-  if d.buf.len < 2: return false
-  let b0 = ord(d.buf[0])
-  let b1 = ord(d.buf[1])
+  ## when more bytes are required. Consuming a frame only advances the read
+  ## cursor; those bytes are reclaimed by the next `feed`.
+  let base = d.pos
+  let avail = d.buf.len - base
+  if avail < 2: return false
+  let b0 = ord(d.buf[base])
+  let b1 = ord(d.buf[base + 1])
   if (b0 and 0x70) != 0:        # RFC 6455 5.2: RSV1/2/3 must be 0 (no extension negotiated)
     raise newException(ValueError, "navi: WebSocket reserved bit (RSV) set")
   let masked = (b1 and 0x80) != 0
   var length = b1 and 0x7F
-  var pos = 2
+  var pos = base + 2
   if length == 126:
-    if d.buf.len < 4: return false
-    length = (ord(d.buf[2]) shl 8) or ord(d.buf[3])
-    pos = 4
+    if avail < 4: return false
+    length = (ord(d.buf[base + 2]) shl 8) or ord(d.buf[base + 3])
+    pos = base + 4
   elif length == 127:
-    if d.buf.len < 10: return false
+    if avail < 10: return false
     # Accumulate the 64-bit length into an explicit uint64 and cap it before
     # narrowing. `int` is only 32 bits on some targets (32-bit natives, and the
     # js backend), where shifting the eight bytes into an `int` silently drops
@@ -227,11 +272,11 @@ proc next*(d: var WsDecoder, f: var Frame): bool =
     # under-declare a frame. uint64 also keeps a high-bit-set length (RFC 6455
     # 5.2 forbids it) from turning into a negative `int`.
     var len64 = 0'u64
-    for i in 2 ..< 10: len64 = (len64 shl 8) or uint64(ord(d.buf[i]))
+    for i in base + 2 ..< base + 10: len64 = (len64 shl 8) or uint64(ord(d.buf[i]))
     if len64 > uint64(maxFramePayload):
       raise newException(ValueError, frameLenError)
     length = int(len64)
-    pos = 10
+    pos = base + 10
   # An oversized length must fail the connection, not reach `newString(length)`
   # (a RangeDefect / huge allocation).
   if length < 0 or length > maxFramePayload:
@@ -261,6 +306,9 @@ proc next*(d: var WsDecoder, f: var Frame): bool =
       raise newException(ValueError, "navi: WebSocket control frame over 125 bytes")
     if not f.fin:
       raise newException(ValueError, "navi: fragmented WebSocket control frame")
+  # Take the payload straight out of the buffer: `newString` + unmask, or
+  # `newString` + copyMem. A `d.buf[pos ..< pos + length]` slice would add a
+  # second allocation and a per-byte loop (Nim's string slice; see #400).
   f.payload = newString(length)
   if masked:
     applyMask(f.payload, 0, d.buf, pos, length, key)
@@ -269,7 +317,7 @@ proc next*(d: var WsDecoder, f: var Frame): bool =
       for i in 0 ..< length: f.payload[i] = d.buf[pos + i]
     else:
       copyMem(addr f.payload[0], unsafeAddr d.buf[pos], length)
-  d.buf.delete(0 ..< pos + length)
+  d.pos = pos + length
   true
 
 proc closePayload*(code: uint16, reason = ""): string =

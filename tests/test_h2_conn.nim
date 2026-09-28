@@ -1274,3 +1274,90 @@ suite "h2 DATA decoded straight off the frame buffer (#400)":
     srv.add encodePing("01234567")
     discard c.feed(srv)                     # must terminate
     check c.connError.len > 0
+
+suite "h2 DATA body capacity is per stream, not per read (#408)":
+  # A body is sized once per feed batch. The hint must cover what THIS stream is
+  # about to receive, not everything still buffered for the whole connection:
+  # sizing to the buffer gave every stream in a multiplexed read a read-sized
+  # string, which `takeBody` then handed to the sink to hold.
+  proc sinkStreams(c: H2Conn, n: int): seq[uint32] =
+    for _ in 0 ..< n:
+      let sid = c.openStream()
+      discard c.encodeRequest(sid, @[(":method", "GET"), (":scheme", "https"),
+                                     (":path", "/"), (":authority", "x")], "")
+      c.setSinkMode(sid)
+      discard c.feed(headForStream(sid))
+      result.add sid
+
+  test "one read of small DATA for 50 streams should not size 50 bodies to the read":
+    # 50 SSE-shaped subscriptions on one mux, each getting a ~100-byte frame in the
+    # same transport read. Before the fix every body was newStringOfCap(remaining),
+    # so the live capacity was ~50x the bytes delivered.
+    const streams = 50
+    const chunk = 100
+    let c = newServerConn()
+    let ids = c.sinkStreams(streams)
+    var wire = ""
+    for sid in ids: wire.add encodeData(sid, repeat('x', chunk), endStream = false)
+    discard c.feed(wire)
+    var delivered = 0
+    var capacity = 0
+    for sid in ids:
+      let got = c.takeBody(sid)
+      check got == repeat('x', chunk)       # still byte-exact
+      delivered += got.len
+      capacity += got.capacity
+      discard c.ackRecv(sid, got.len)
+    check c.connError.len == 0
+    check delivered == streams * chunk
+    check capacity <= delivered * 2         # was ~ streams * wire.len
+
+  test "interleaved DATA for two streams should stay bounded and byte-exact":
+    let c = newServerConn()
+    let ids = c.sinkStreams(2)
+    var wire = ""
+    for i in 0 ..< 20:
+      for sid in ids: wire.add encodeData(sid, repeat(char(ord('a') + i), 200),
+                                          endStream = false)
+    discard c.feed(wire)
+    var want = ""
+    for i in 0 ..< 20: want.add repeat(char(ord('a') + i), 200)
+    for sid in ids:
+      let got = c.takeBody(sid)
+      check got == want
+      check got.capacity <= got.len * 2     # amortized growth, not the whole read
+      discard c.ackRecv(sid, got.len)
+    check c.connError.len == 0
+
+  test "a single-stream read of back-to-back DATA should still be sized once (#400)":
+    # The #400 fast path: contiguous DATA for one stream is one run, so the body is
+    # allocated once for the whole read and never regrows.
+    const frames = 3
+    const frameLen = 16384
+    let c = newServerConn()
+    let sid = c.sinkStreams(1)[0]
+    var wire = ""
+    for i in 0 ..< frames: wire.add encodeData(sid, repeat('z', frameLen),
+                                               endStream = false)
+    discard c.feed(wire)
+    let got = c.takeBody(sid)
+    check got.len == frames * frameLen
+    check got.capacity == got.len           # exactly the run: no regrowth, no slack
+    check c.connError.len == 0
+
+  test "the run hint should stop at another stream's frames, not at the read end":
+    # One 64 KiB-ish read: a run for stream A, then a small frame for stream B.
+    # B must be sized for its own 10 bytes, not for what A left in the buffer.
+    let c = newServerConn()
+    let ids = c.sinkStreams(2)
+    var wire = encodeData(ids[1], "0123456789", endStream = false)
+    wire.add encodeData(ids[0], repeat('a', 16384), endStream = false)
+    wire.add encodeData(ids[0], repeat('a', 16384), endStream = false)
+    discard c.feed(wire)
+    let b = c.takeBody(ids[1])
+    check b == "0123456789"
+    check b.capacity <= 64                  # not the 32 KiB of stream A behind it
+    let a = c.takeBody(ids[0])
+    check a.len == 2 * 16384
+    check a.capacity == a.len
+    check c.connError.len == 0

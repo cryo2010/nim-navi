@@ -84,6 +84,28 @@ onward (pre-1.0, minor versions may include breaking changes).
   `BodySink`), since the `Future` type differs per backend (#367).
 
 ### Changed
+- **The SSE parser copies each line's value once and moves the event out on
+  dispatch.** A line used to be materialized as a string slice, its value sliced out
+  of that, and the leading space sliced off again before being appended to the data
+  buffer, which `dispatch` then copied into the event: about five copies of every
+  payload byte, each one an allocation plus a byte-at-a-time loop. The colon and the
+  optional single leading space are now located in the parse buffer and the value is
+  copied straight into its field (setLen + copyMem, the shape #400 gave h2), the
+  field name is compared in place, `retry:` is accumulated in place with the same
+  range check, and the event's buffers are moved rather than copied on dispatch. A
+  16 MiB event (the `maxSseEventBytes` ceiling) no longer costs ~80 MB of byte-loop
+  copying before delivery: a one-core parse of that event goes from ~41 MB/s to
+  ~665 MB/s, and a 100k-small-event stream from ~16 MB/s to ~119 MB/s. Line endings
+  (LF, CR, CRLF, and a CRLF split across feeds), the BOM strip, the `data:` join,
+  the id-at-dispatch promotion and every size cap are unchanged (#410).
+- **The WebSocket frame decoder advances a read cursor instead of front-deleting
+  per frame.** `WsDecoder.next` deleted the consumed prefix after every frame, so a
+  burst of small messages arriving in one read shifted the whole remainder down once
+  per frame (O(N x buffered)); it now advances a cursor and `feed` compacts the
+  consumed prefix in place, amortized, the way the h1 parser and the h2 frame decoder
+  do. Decoding 1000 40-byte frames out of one 42 KB read goes from ~14.7 ms to
+  ~17 us. Framing, fragmentation, control frames and the length caps are unchanged
+  (#409).
 - **HTTP/2 downloads decode DATA straight into the response body.** The frame
   decoder gained a peek/consume API, so a DATA payload is copied once from the
   decode buffer into the stream body instead of being sliced out into a `Frame`
@@ -135,6 +157,41 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **The sync WebSocket-over-h2 tunnel no longer buffers a peer flood without bound
+  (#407).** Its Extended CONNECT stream now opens in sink mode and `receive` acks the
+  bytes the application consumed, matching the async tunnel: while a large `send` waits
+  for the peer's WINDOW_UPDATE, inbound DATA is bounded by the advertised receive
+  window instead of being replenished eagerly frame by frame.
+- **HTTP/1 header, chunk-size and WebSocket-handshake lines are now capped at
+  `maxHeaderListBytes` (128 KiB) and scanned incrementally.** A peer that opened a
+  status line, header field, chunk-size or trailer line and then streamed non-CRLF
+  bytes forever grew the parse buffer without bound (`maxResponseBytes` caps only
+  body bytes), and every 64 KiB read re-scanned the whole unterminated line, so CPU
+  was quadratic in header size; the sync and async WebSocket `101` readers had the
+  same unbounded accumulation. Both now stop at the shared cap h2 already applied to
+  a CONTINUATION flood and raise the new `HeaderTooLargeError`, and the CRLF search
+  resumes from the previously scanned offset instead of restarting at the read
+  cursor. (#406)
+- **A multiplexed HTTP/2 read no longer sizes every stream's body to the whole
+  decoder buffer.** `handleData` sized each stream's per-batch body to
+  `frames.remaining`, everything still buffered for the connection including other
+  streams' frames, so on a mux every stream that got any DATA in a read allocated a
+  read-sized string that then travelled through `takeBody` into the sink queue: one
+  64 KiB read carrying a ~100-byte frame for each of 200 SSE subscriptions produced
+  ~12.8 MB of live capacity for 20 KB of body, bounded in bytes by the connection
+  window but not in capacity. The hint is now the run of contiguous DATA frames for
+  that stream at the head of the buffer, so a stream is sized for what it actually
+  receives; a single-stream download is still one run, keeping the #401 fast path
+  (one sizing per read, no regrowth). (#408)
+- **A decoded body is no longer cut short when the codec's output fills the 16 KiB
+  decode scratch exactly.** The inflate loop stopped as soon as zlib had consumed
+  every input byte, even when the scratch came back completely full; zlib pulls input
+  into its own bit buffer, so that happens with a match still half written, and the
+  pending bytes (plus the `Z_STREAM_END` behind them) were dropped. A headerless
+  `deflate` body a few dozen bytes past a scratch boundary decoded to exactly 16384
+  bytes and was then reported as truncated by the buffered path and delivered short by
+  the streamed one. Both loops now drain the codec while it keeps filling the buffer,
+  and the zstd loop does the same for a frame it has only partly flushed (#405).
 - **An HTTP/3 connection now says goodbye: `close` sends a CONNECTION_CLOSE before
   freeing the connection.** The h3 driver used to drop its UDP socket and free the
   ngtcp2/nghttp3/OpenSSL state without telling the peer anything, so a server had no

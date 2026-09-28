@@ -7,6 +7,7 @@
 
 import std/[net, strutils, os]
 import navi/proto/ws   # sans-io WS core (handshake + frame codec)
+import navi/core/headers   # maxHeaderListBytes: the head cap the flood server passes
 
 # --- WebSocket test servers (shared by test_ws / test_ws_async / test_ws_chronos) --
 # One in-process server per behavior, built from navi's sans-io WS core (server
@@ -277,6 +278,26 @@ proc serveWsCodelessClose(ctx: WsSrv) {.thread.} =
         except CatchableError: discard                     # timeout: treat as no echo
         if ctx.echoBody != nil: ctx.echoBody[] = echoed
 
+proc serveWsHeaderFlood(ctx: WsSrv) {.thread.} =
+  ## Read the upgrade request, then answer with a 101 status line and a header field
+  ## that never ends: an endless run of non-CRLF bytes, no terminating blank line. A
+  ## client that accumulates the head unbounded grows its buffer until the process
+  ## dies (#406); navi must raise HeaderTooLargeError and drop the connection.
+  ##
+  ## Sent with `flags = {}`: std/net's default SafeDisconn swallows the peer reset
+  ## without advancing the write offset, so the loop would spin once the client has
+  ## gone (see tests/test_sse_cap.nim). The send count is bounded too, so the thread
+  ## always returns for joinThread.
+  wsAcceptOne(ctx, server, c):
+    if wsReadHead(c).len > 0:
+      try:
+        const blob = 16 * 1024
+        c.send("HTTP/1.1 101 Switching Protocols\r\nX: ", flags = {})
+        let junk = repeat('x', blob)
+        for _ in 0 ..< maxHeaderListBytes div blob + 16:
+          c.send(junk, flags = {})
+      except CatchableError: discard          # the client tore us down: expected
+
 proc startWs(th: var Thread[WsSrv], run: proc(ctx: WsSrv) {.thread.}, port: var int) =
   ## Launch a WS server on an ephemeral port, write it to `port` (a mutable `var`),
   ## and block until it is listening.
@@ -289,6 +310,7 @@ proc startWsSilent*(th: var Thread[WsSrv], port: var int) = startWs(th, serveWsS
 proc startWsStall*(th: var Thread[WsSrv], port: var int) = startWs(th, serveWsStall, port)
 proc startWsPingCounter*(th: var Thread[WsSrv], port: var int) = startWs(th, serveWsPingCounter, port)
 proc startWsStreamEcho*(th: var Thread[WsSrv], port: var int) = startWs(th, serveWsStreamEcho, port)
+proc startWsHeaderFlood*(th: var Thread[WsSrv], port: var int) = startWs(th, serveWsHeaderFlood, port)
 
 proc startWsCodelessClose*(th: var Thread[WsSrv], port: var int, echoBody: var string) =
   ## The codeless-close server, plus the string it records the client's close echo

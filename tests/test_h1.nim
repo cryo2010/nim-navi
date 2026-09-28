@@ -445,6 +445,127 @@ suite "h1 parse":
     p.markBodySkipped()
     check not p.keepAliveAfter()         # ...but not with a body still owed
 
+suite "h1 header-size cap and incremental line scan (#406)":
+  # The parser used to put no bound on the line it was accumulating and to rescan
+  # from the read cursor on every feed, so a peer that opened a header and then
+  # streamed non-CRLF bytes forever grew `buf` without limit at quadratic CPU cost.
+
+  const blob = 8 * 1024
+  let floods = maxHeaderListBytes div blob + 2   # enough feeds to pass the cap
+
+  test "an unterminated header line past the cap should raise HeaderTooLargeError":
+    var p = initH1Parser()
+    p.feed("HTTP/1.1 200 OK\r\nX: ")            # a field that never ends
+    var msg = ""
+    try:
+      for _ in 0 ..< floods: p.feed(repeat('x', blob))
+    except HeaderTooLargeError as e: msg = e.msg
+    check "maxHeaderListBytes" in msg
+    check not p.finished
+
+  test "an unterminated status line past the cap should raise HeaderTooLargeError":
+    var p = initH1Parser()
+    expect HeaderTooLargeError:
+      for _ in 0 ..< floods: p.feed(repeat('H', blob))
+
+  test "an unterminated chunk-size line past the cap should raise HeaderTooLargeError":
+    var p = initH1Parser()
+    p.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+    check p.headersReady                        # the head is in; the chunk size is not
+    var msg = ""
+    try:
+      for _ in 0 ..< floods: p.feed(repeat('0', blob))
+    except HeaderTooLargeError as e: msg = e.msg
+    check "maxHeaderListBytes" in msg
+    check not p.finished                        # so the connection is never pooled
+    check not p.keepAliveAfter()
+
+  test "an unterminated trailer line past the cap should raise HeaderTooLargeError":
+    var p = initH1Parser()
+    p.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\nT: ")
+    expect HeaderTooLargeError:
+      for _ in 0 ..< floods: p.feed(repeat('t', blob))
+
+  test "a header section exactly at the cap should still parse":
+    const status = "HTTP/1.1 200 OK\r\n"
+    const clen = "Content-Length: 2\r\n"
+    # status line + Content-Length + the long field + the terminating blank line,
+    # summing to exactly maxHeaderListBytes: the cap rejects only what passes it.
+    let padLen = maxHeaderListBytes - status.len - clen.len - "X: \r\n".len - 2
+    let head = status & clen & "X: " & repeat('x', padLen) & "\r\n\r\n"
+    check head.len == maxHeaderListBytes
+    var p = initH1Parser()
+    p.feed(head & "hi")
+    check p.finished
+    let r = p.toResponse()
+    check r.status == 200
+    check r.body == "hi"
+    check r.headers.get("x").len == padLen
+
+    var over = initH1Parser()                   # one byte more is a flood
+    expect HeaderTooLargeError:
+      over.feed(status & clen & "X: " & repeat('x', padLen + 1) & "\r\n\r\n")
+
+  test "a head split across one-byte feeds should still parse":
+    # The scan cursor resumes from the previous offset, so every CRLF here straddles
+    # a feed boundary ("\r" ends one feed, "\n" starts the next). Backing the resume
+    # point up by one byte is what keeps that terminator visible.
+    let wire = "HTTP/1.1 200 OK\r\nX-Long: " & repeat('v', 5000) &
+               "\r\nContent-Length: 5\r\n\r\nhello"
+    var p = initH1Parser()
+    for ch in wire: p.feed([ch])
+    check p.finished
+    let r = p.toResponse()
+    check r.headers.get("x-long").len == 5000
+    check r.body == "hello"
+
+  test "a chunked response fed one byte at a time should still parse":
+    # Exercises the cursor across every line-oriented state and the body states that
+    # move `pos` past it, plus the buffer compaction that shifts both.
+    let wire = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" &
+               "5\r\nhello\r\n6\r\n world\r\n0\r\nX-T: 1\r\n\r\n"
+    var p = initH1Parser()
+    for ch in wire: p.feed([ch])
+    check p.finished
+    check p.toResponse().body == "hello world"
+    check p.trailers.get("x-t") == "1"
+
+  test "many small header lines should not add up past the cap":
+    # Each line is terminated, so the per-line check never fires; the section total
+    # is what bounds a peer that dribbles endless tiny fields.
+    var p = initH1Parser()
+    p.feed("HTTP/1.1 200 OK\r\n")
+    expect HeaderTooLargeError:
+      for _ in 0 ..< maxHeaderListBytes: p.feed("X: y\r\n")
+
+suite "h1 head scan (#406)":
+  # The shared helper the WebSocket handshake readers use in place of a
+  # `while "\r\n\r\n" notin buf` loop.
+
+  test "scanHeadEnd should find a terminator that straddles read boundaries":
+    let head = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\nFRAMES"
+    var buf = ""
+    var scanned = 0
+    var idx = -1
+    for ch in head:                    # one byte per "read": every resume is a straddle
+      buf.add ch
+      idx = scanHeadEnd(buf, scanned)
+      if idx >= 0: break
+    check idx == head.find("\r\n\r\n")
+    check buf.len == idx + 4           # stopped on the blank line, no byte over-read
+
+  test "scanHeadEnd should cap an endless head with no blank line":
+    var buf = ""
+    var scanned = 0
+    var msg = ""
+    try:
+      while true:
+        buf.add repeat('x', 8192)
+        discard scanHeadEnd(buf, scanned)
+    except HeaderTooLargeError as e: msg = e.msg
+    check "maxHeaderListBytes" in msg
+    check buf.len <= maxHeaderListBytes + 8192   # it stopped, it did not grow on
+
 suite "url port parsing":
   test "an explicit port and the scheme defaults parse":
     check parseUrl("http://h:8080/").port == 8080

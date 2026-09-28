@@ -7,6 +7,7 @@ import navi/asyncdispatch
 import navi/proto/ws        # WebSocket message types (wmText, closeNormal, ...)
 import navi/core/response   # navi's TimeoutError (qualified; std/net has one too)
 import ./support_ws         # shared WebSocket test servers (WsSrv / startWs*)
+from std/strutils import contains   # substring test for the head-cap error message
 
 suite "async websocket client end to end":
   test "the WebSocket client should handshake, echo text and binary, reassemble fragments, and close":
@@ -521,3 +522,23 @@ suite "WebSocket transport selection (asyncdispatch)":
       check raised
       await api.close()
     waitFor run()
+
+suite "websocket handshake head cap (asyncdispatch, #406)":
+  test "an endless non-CRLF 101 head should raise HeaderTooLargeError, not grow forever":
+    # Same bound as the sync reader (tests/test_ws.nim): both go through the shared
+    # `scanHeadEnd`, so they cap at maxHeaderListBytes and raise the same error.
+    var th: Thread[WsSrv]
+    var port: int
+    startWsHeaderFlood(th, port)
+
+    proc run() {.async.} =
+      let api = newNavi()
+      var msg = ""
+      try:
+        discard await api.websocket("ws://127.0.0.1:" & $port & "/chat")
+      except HeaderTooLargeError as e:
+        msg = e.msg
+      check "maxHeaderListBytes" in msg
+
+    waitFor run()
+    joinThread(th)

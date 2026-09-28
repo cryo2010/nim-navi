@@ -14,7 +14,7 @@
 ## `reset` clears the per-connection parse state but keeps that id and the retry,
 ## for use across a reconnect.
 
-import std/[deques, strutils, options]
+import std/[deques, strutils, options]   # strutils for `delete(string, HSlice)`
 
 const maxSseEventBytes* = 16 * 1024 * 1024
   ## A single event's accumulated data (or one unterminated line) may not exceed
@@ -50,6 +50,32 @@ proc initSseParser*(lastEventId = ""): SseParser =
   ## caller-supplied Last-Event-ID).
   SseParser(retry: -1, atStart: true, idBuf: lastEventId, lastId: lastEventId)
 
+proc addRange(dst: var string, src: string, first, n: int) {.inline.} =
+  ## Append `src[first ..< first + n]` to `dst` without materializing the slice as
+  ## its own string first. A Nim string slice is an allocation plus a byte-at-a-time
+  ## loop, and every byte of an SSE stream passes through here, so the temporary is
+  ## pure overhead (the same shape as the h1 parser's `addRange`).
+  if n <= 0: return
+  let start = dst.len
+  dst.setLen(start + n)
+  when defined(js):                           # no copyMem (and no pointers) on js
+    for i in 0 ..< n: dst[start + i] = src[first + i]
+  else:
+    copyMem(addr dst[start], unsafeAddr src[first], n)
+
+proc setRange(dst: var string, src: string, first, n: int) {.inline.} =
+  ## `dst = src[first ..< first + n]`, keeping `dst`'s capacity.
+  dst.setLen(0)
+  dst.addRange(src, first, n)
+
+proc fieldIs(buf: string, first, last: int, name: string): bool {.inline.} =
+  ## Whether `buf[first ..< last]` is exactly `name`, compared in place so a field
+  ## name is never copied out of the parse buffer just to be matched.
+  if last - first != name.len: return false
+  for i in 0 ..< name.len:
+    if buf[first + i] != name[i]: return false
+  true
+
 proc dispatch(p: var SseParser) =
   ## End of an event (a blank line). Fire it only if it accumulated data; either
   ## way reset the per-event buffers. The last-id buffer persists across events.
@@ -59,45 +85,62 @@ proc dispatch(p: var SseParser) =
   ## checkpoint without sending a payload), while an event still being received when
   ## the connection drops never reaches here and so cannot advance it -- which is
   ## what keeps a reconnect from skipping the events it never saw.
+  ##
+  ## The per-event buffers are moved into the event, not copied: an event at the
+  ## 16 MiB cap would otherwise be copied once more on its way out.
   p.lastId = p.idBuf
   if not p.hasData:
     p.evType.setLen(0)
     return
-  p.ready.addLast SseEvent(
-    event: (if p.evType.len == 0: "message" else: p.evType),
-    data: p.data, id: p.lastId, retry: p.retry)
+  var ev = SseEvent(id: p.lastId, retry: p.retry)
+  ev.event = if p.evType.len == 0: "message" else: move(p.evType)
+  ev.data = move(p.data)
+  p.ready.addLast(move(ev))
   p.evType.setLen(0)
-  p.data.setLen(0)                            # reuse the buffer's capacity next event
+  p.data.setLen(0)
   p.hasData = false
   p.dataBytes = 0
 
-proc processLine(p: var SseParser, line: string) =
-  if line.len == 0:
+proc processLine(p: var SseParser, first, last: int) =
+  ## Handle the line `p.buf[first ..< last]` (terminator excluded). The line is
+  ## addressed in place: the colon and the optional single leading space are located
+  ## in the buffer, the field name is matched without being copied, and only the
+  ## value is copied, once, straight into the field it belongs to.
+  if last <= first:
     p.dispatch()
     return
-  if line[0] == ':': return                 # comment line: ignored (keep-alive)
-  let c = line.find(':')
-  let field = if c < 0: line else: line[0 ..< c]
-  var val = if c < 0: "" else: line[c + 1 .. ^1]
-  if val.len > 0 and val[0] == ' ': val = val[1 .. ^1]   # strip one leading space
-  case field
-  of "event": p.evType = val
-  of "data":
+  if p.buf[first] == ':': return             # comment line: ignored (keep-alive)
+  var c = first
+  while c < last and p.buf[c] != ':': inc c  # only the first colon splits
+  var vs = if c < last: c + 1 else: last     # no colon: the whole line is the field
+  if vs < last and p.buf[vs] == ' ': inc vs  # strip one leading space
+  let n = last - vs
+  if p.buf.fieldIs(first, c, "data"):
     if p.hasData: p.data.add '\n'            # separator between successive data lines
-    p.data.add val
+    p.data.addRange(p.buf, vs, n)
     p.hasData = true
-    p.dataBytes += val.len + 1               # +1 for the "\n" join separator
+    p.dataBytes += n + 1                     # +1 for the "\n" join separator
     if p.dataBytes > maxSseEventBytes:
       raise newException(ValueError,
         "navi: SSE event exceeds the " & $maxSseEventBytes & "-byte limit")
-  of "id":
-    if '\0' notin val: p.idBuf = val         # an id containing NUL is ignored
-  of "retry":
+  elif p.buf.fieldIs(first, c, "event"):
+    p.evType.setRange(p.buf, vs, n)
+  elif p.buf.fieldIs(first, c, "id"):
+    for i in vs ..< last:
+      if p.buf[i] == '\0': return            # an id containing NUL is ignored
+    p.idBuf.setRange(p.buf, vs, n)
+  elif p.buf.fieldIs(first, c, "retry"):
     # All-digit but possibly out of int range; ignore an unparseable value rather
-    # than crash the stream.
-    if val.len > 0 and val.allCharsInSet({'0' .. '9'}):
-      try: p.retry = parseInt(val)
-      except ValueError: discard
+    # than crash the stream. Accumulated in place, with the range check `parseInt`
+    # would make, so a handful of digits costs no slice.
+    if n <= 0: return
+    var v = 0
+    for i in vs ..< last:
+      let d = ord(p.buf[i]) - ord('0')
+      if d < 0 or d > 9: return              # not all digits: ignored
+      if v > (int.high - d) div 10: return   # out of int range: ignored
+      v = v * 10 + d
+    p.retry = v
   else: discard                              # unknown field: ignored
 
 proc feed*(p: var SseParser, text: string) =
@@ -111,18 +154,18 @@ proc feed*(p: var SseParser, text: string) =
     # a 1-2 byte prefix can't complete a line.
     if p.buf.len < 3: return
     if p.buf[0] == '\xEF' and p.buf[1] == '\xBB' and p.buf[2] == '\xBF':
-      p.buf = p.buf[3 .. ^1]                  # strip a single leading UTF-8 BOM
+      p.buf.delete(0 ..< 3)                   # strip a single leading UTF-8 BOM
     p.atStart = false
   var i = p.scanned                           # resume; earlier bytes had no terminator
   var lineStart = 0
   while i < p.buf.len:
     case p.buf[i]
     of '\n':
-      p.processLine(p.buf[lineStart ..< i])
+      p.processLine(lineStart, i)
       inc i; lineStart = i
     of '\r':
       if i == p.buf.len - 1: break            # maybe a \r\n split across feeds: wait
-      p.processLine(p.buf[lineStart ..< i])
+      p.processLine(lineStart, i)
       if p.buf[i + 1] == '\n': inc i          # consume the \n of a \r\n terminator
       inc i; lineStart = i
     else: inc i

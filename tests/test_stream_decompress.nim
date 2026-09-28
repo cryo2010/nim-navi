@@ -2,9 +2,9 @@
 ## boundaries (deterministic), and the end-to-end `stream` path decoding a body.
 
 import unittest
-import std/net
+import std/[net, strutils, dynlib]
 import navi
-import navi/core/decompress
+import navi/core/[decompress, headers, request, response]
 import ./support
 
 proc feedSliced(encoding, compressed: string, sliceLen: int): string =
@@ -238,3 +238,188 @@ suite "the buffered path runs on the streaming decoder":
       discard newNavi(cfg).get("http://127.0.0.1:9240/")
     joinThread(th)
 
+
+# --- test-only compressors -------------------------------------------------
+# navi only decodes, so the boundary fixtures below have to be produced here:
+# zlib's deflate (gzip-wrapped, zlib-wrapped and raw) and libzstd's one-shot
+# compressor, bound the way decompress.nim binds the matching decoders. libz
+# loads by name everywhere; libzstd needs the same Homebrew fallback the
+# library's own loader uses, since macOS does not search those dirs.
+when defined(windows):
+  const zlibDll = "zlib1.dll"
+  const zstdDll = "libzstd.dll"
+elif defined(macosx):
+  const zlibDll = "libz.1.dylib"
+  const zstdDll = "libzstd.1.dylib"
+else:
+  const zlibDll = "libz.so.1"
+  const zstdDll = "libzstd.so.1"
+
+type ZStream {.pure.} = object
+  nextIn: ptr uint8
+  availIn: cuint
+  totalIn: culong
+  nextOut: ptr uint8
+  availOut: cuint
+  totalOut: culong
+  msg: cstring
+  state: pointer
+  zalloc: pointer
+  zfree: pointer
+  opaque: pointer
+  dataType: cint
+  adler: culong
+  reserved: culong
+
+proc deflateInit2(strm: ptr ZStream, level, meth, windowBits, memLevel,
+                  strategy: cint, version: cstring, streamSize: cint): cint
+  {.cdecl, dynlib: zlibDll, importc: "deflateInit2_".}
+proc deflate(strm: ptr ZStream, flush: cint): cint {.cdecl, dynlib: zlibDll, importc.}
+proc deflateEnd(strm: ptr ZStream): cint {.cdecl, dynlib: zlibDll, importc.}
+
+type
+  ZstdBoundFn = proc(n: csize_t): csize_t {.cdecl, gcsafe, raises: [].}
+  ZstdCompressFn = proc(dst: pointer, dstCap: csize_t, src: pointer,
+                        srcSize: csize_t, level: cint): csize_t
+    {.cdecl, gcsafe, raises: [].}
+
+var zstdBound: ZstdBoundFn
+var zstdComp: ZstdCompressFn
+
+proc loadZstdEncoder() =
+  if zstdComp != nil: return
+  var lib = loadLib(zstdDll)
+  when defined(macosx):
+    if lib == nil: lib = loadLib("/opt/homebrew/lib/" & zstdDll)
+    if lib == nil: lib = loadLib("/usr/local/lib/" & zstdDll)
+  when defined(windows):
+    if lib == nil: lib = loadLib("zstd.dll")
+  doAssert lib != nil, "cannot load " & zstdDll
+  zstdBound = cast[ZstdBoundFn](lib.symAddr("ZSTD_compressBound"))
+  zstdComp = cast[ZstdCompressFn](lib.symAddr("ZSTD_compress"))
+  doAssert zstdBound != nil and zstdComp != nil, zstdDll & " lacks ZSTD_compress"
+
+proc zdeflate(src, wrapper: string, level = 6): string =
+  ## Compress `src` with zlib: "gzip", "zlib" (what `deflate` officially means) or
+  ## "raw" (headerless deflate, which some servers send as `deflate` anyway).
+  let wb =
+    case wrapper
+    of "gzip": cint(15 + 16)
+    of "raw": cint(-15)
+    else: cint(15)
+  var strm = ZStream()
+  doAssert deflateInit2(addr strm, cint(level), 8, wb, 8, 0, "1",
+                        cint(sizeof(ZStream))) == 0
+  defer: discard deflateEnd(addr strm)
+  if src.len > 0:
+    strm.nextIn = cast[ptr uint8](unsafeAddr src[0])
+    strm.availIn = cuint(src.len)
+  var chunk = newString(65536)
+  while true:
+    strm.nextOut = cast[ptr uint8](addr chunk[0])
+    strm.availOut = cuint(chunk.len)
+    let ret = deflate(addr strm, cint(4))            # Z_FINISH
+    let produced = chunk.len - int(strm.availOut)
+    if produced > 0: result.add chunk[0 ..< produced]
+    if ret == 1: break                               # Z_STREAM_END
+    doAssert ret == 0, "deflate failed"
+
+proc zstdify(src: string, level = 3): string =
+  loadZstdEncoder()
+  let bound = int(zstdBound(csize_t(src.len)))
+  result = newString(bound)
+  let n = zstdComp(addr result[0], csize_t(bound),
+                   (if src.len > 0: unsafeAddr src[0] else: nil),
+                   csize_t(src.len), cint(level))
+  result.setLen(int(n))
+
+suite "output that fills the decode scratch buffer exactly (#405)":
+  # Each decode iteration hands the codec a 16 KiB scratch buffer. zlib pulls input
+  # into its internal bit buffer, so a call can come back having consumed every
+  # input byte with the scratch completely full and a match still half written;
+  # libzstd can likewise fill the buffer with part of a frame left to flush. Both
+  # loops used to stop on "no input left" alone, dropping those pending bytes and
+  # with them Z_STREAM_END: the buffered path then reported a valid body as
+  # truncated, and the streamed path delivered it short.
+  const scratch = 16384              # decodeScratchSize in decompress.nim
+
+  proc boundarySizes(): seq[int] =
+    ## Decoded lengths that land on, or just past, a scratch boundary. The pending
+    ## tail is at most one deflate match, so the lengths that trip it sit within a
+    ## few hundred bytes of the boundary; which ones exactly depends on the zlib
+    ## build, so sweep the window instead of pinning one magic length.
+    for extra in 0 .. 300:
+      result.add scratch + extra
+      result.add 2 * scratch + extra
+
+  proc fixtures(plain: string): seq[(string, string, string)] =
+    ## (label, content-encoding, compressed body) for every encoding navi decodes
+    ## with a scratch loop. A run of one byte is what makes zlib emit long matches,
+    ## the shape that leaves output pending when the scratch fills.
+    @[("gzip", "gzip", zdeflate(plain, "gzip")),
+      ("deflate/zlib", "deflate", zdeflate(plain, "zlib")),
+      ("deflate/raw", "deflate", zdeflate(plain, "raw")),
+      ("zstd", "zstd", zstdify(plain))]
+
+  test "the buffered path should decode such a body whole, not call it truncated":
+    var failures: seq[string]
+    for n in boundarySizes():
+      let plain = repeat('x', n)
+      for (label, encoding, body) in fixtures(plain):
+        var resp = initResponse(200, "", "HTTP/1.1",
+                                initHeaders({"content-encoding": encoding}), body)
+        try:
+          decodeBody(resp, NaviConfigBase(decompress: true))
+          if resp.body != plain:
+            failures.add label & " n=" & $n & ": got " & $resp.body.len & " bytes"
+        except CatchableError as e:
+          failures.add label & " n=" & $n & ": " & e.msg
+    if failures.len > 0:
+      checkpoint "first failures: " & failures[0 .. min(4, failures.high)].join("; ")
+    check failures.len == 0
+
+  test "the streaming path should emit every byte and end at a clean boundary":
+    var failures: seq[string]
+    for n in boundarySizes():
+      let plain = repeat('x', n)
+      for (label, encoding, body) in fixtures(plain):
+        for sliceLen in [body.len, 1024]:        # whole body, then split across reads
+          var cd = initCappedDecoder(decompress = true, cap = 0)
+          var got = ""
+          var i = 0
+          try:
+            while i < body.len:
+              let take = min(sliceLen, body.len - i)
+              got.add cd.feed(body[i ..< i + take], encoding)
+              i += take
+          except CatchableError as e:
+            failures.add label & " n=" & $n & " slice=" & $sliceLen & ": " & e.msg
+            continue
+          if got != plain:
+            failures.add label & " n=" & $n & " slice=" & $sliceLen &
+              ": got " & $got.len & " bytes"
+          elif not cd.streamComplete():
+            failures.add label & " n=" & $n & " slice=" & $sliceLen & ": incomplete"
+    if failures.len > 0:
+      checkpoint "first failures: " & failures[0 .. min(4, failures.high)].join("; ")
+    check failures.len == 0
+
+  test "an end-to-end streamed response should deliver the whole decoded body":
+    # The same shape over a real socket: a headerless `deflate` body whose decode
+    # fills the scratch exactly and leaves zlib holding the tail. This used to stop
+    # at 16384 bytes and fail the read with "compressed response body truncated".
+    const port = 9241
+    let plain = repeat('x', scratch + 67)
+    let body = zdeflate(plain, "raw")
+    let payload = "HTTP/1.1 200 OK\r\nContent-Encoding: deflate\r\n" &
+                  "Content-Length: " & $body.len & "\r\nConnection: close\r\n\r\n" & body
+    var th: Thread[ServerCtx]
+    startRaw(th, port, payload)
+
+    let api = newNavi()
+    var collected = ""
+    let res = api.stream.get("http://127.0.0.1:" & $port & "/")
+    check res.status == 200
+    res.each(chunk): collected.add chunk
+    check collected == plain
+    joinThread(th)

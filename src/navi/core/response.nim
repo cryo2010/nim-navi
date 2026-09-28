@@ -50,6 +50,14 @@ type
   ResponseTooLargeError* = object of CatchableError
     ## Raised when a response body exceeds the configured `maxResponseBytes`.
 
+  HeaderTooLargeError* = object of CatchableError
+    ## Raised when a peer's header section exceeds `maxHeaderListBytes` (the shared
+    ## 128 KiB cap in `navi/core/headers`) before it is terminated: an HTTP/1 status
+    ## line, header field, chunk-size or trailer line that never arrives with its
+    ## CRLF, or a WebSocket `101` head with no terminating blank line. `maxResponseBytes`
+    ## bounds only the body, so without this cap such a peer would grow the parse
+    ## buffer until the process ran out of memory.
+
   UnprocessedError* = object of CatchableError
     ## Raised when the peer signalled (HTTP/2 REFUSED_STREAM or a GOAWAY above the
     ## stream id) that the request was not processed. Safe to retry regardless of

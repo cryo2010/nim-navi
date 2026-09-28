@@ -185,6 +185,83 @@ suite "sse parser":
     p.feed("data: after\n\n")
     check p.drain()[0].id == "7"      # id persisted across the reconnect
 
+  test "mixed CR / LF / CRLF endings and leading spaces parse in place (#410)":
+    # The line's value is located in the parse buffer and copied once, so the
+    # terminator handling and the single-leading-space rule are pinned together:
+    # no space, one (the delimiter, stripped), two (one kept), an empty value, and
+    # a line with no colon at all.
+    var p = initSseParser()
+    p.feed("data:none\r" &            # bare CR terminator, no space after the colon
+           "data: one\n" &            # LF, one space: that is the delimiter
+           "data:  two\r\n" &         # CRLF, two spaces: only the first is stripped
+           "data:\n" &                # a colon and nothing else: empty value
+           "data\r\n" &               # no colon at all: empty value
+           "\r\n")                    # blank line dispatches
+    let ev = p.drain()
+    check ev.len == 1
+    check ev[0].event == "message"
+    check ev[0].data == "none\none\n two\n\n"
+
+  test "a multi-megabyte event round-trips byte-identically (#410)":
+    # 4 MiB of data lines, whole and then fed in 64 KiB chunks so the buffer
+    # compaction between feeds is exercised on the same payload.
+    const lineLen = 4096
+    const lines = 1024                              # 4 MiB of payload
+    var expected = newStringOfCap(lines * (lineLen + 1))
+    var wire = newStringOfCap(lines * (lineLen + 8))
+    for i in 0 ..< lines:
+      let v = repeat(chr(ord('a') + (i mod 26)), lineLen)
+      if i > 0: expected.add '\n'
+      expected.add v
+      wire.add "data: "
+      wire.add v
+      wire.add '\n'
+    wire.add '\n'
+
+    var whole = initSseParser()
+    whole.feed(wire)
+    let one = whole.drain()
+    check one.len == 1
+    check one[0].data.len == expected.len
+    check one[0].data == expected
+
+    var chunked = initSseParser()
+    var off = 0
+    while off < wire.len:
+      let n = min(65536, wire.len - off)
+      chunked.feed(wire[off ..< off + n])
+      off += n
+    let two = chunked.drain()
+    check two.len == 1
+    check two[0].data == expected
+
+  test "moving the event fields out on dispatch leaks nothing into the next (#410)":
+    # The per-event buffers are moved into the event, so the reset that follows has
+    # to leave the parser exactly as a fresh event expects: default type, empty
+    # data, and the persistent id still standing.
+    var p = initSseParser()
+    p.feed("event: a\nid: 1\ndata: first\n\n")
+    p.feed("data: second\n\n")          # no event, no id: default type, id persists
+    p.feed("event: b\nid: 2\ndata: third\n\n")
+    p.feed("id: 3\n\n")                 # id-only checkpoint: dispatches nothing
+    p.feed("data: fourth\n\n")
+    let ev = p.drain()
+    check ev.len == 4
+    check (ev[0].event, ev[0].data, ev[0].id) == ("a", "first", "1")
+    check (ev[1].event, ev[1].data, ev[1].id) == ("message", "second", "1")
+    check (ev[2].event, ev[2].data, ev[2].id) == ("b", "third", "2")
+    check (ev[3].event, ev[3].data, ev[3].id) == ("message", "fourth", "3")
+    check p.lastEventId() == "3"
+
+  test "a retry value that is not all digits is ignored (#410)":
+    var p = initSseParser()
+    p.feed("retry: 12x\ndata: x\n\n")
+    check p.retryMs() == -1
+    p.feed("retry:\ndata: y\n\n")        # empty value
+    check p.retryMs() == -1
+    p.feed("retry: 250\ndata: z\n\n")
+    check p.retryMs() == 250
+
 suite "sse parser DoS hardening":
   test "an out-of-range retry value is ignored, not a crash":
     var p = initSseParser()

@@ -16,6 +16,7 @@
 
 import std/[strutils, tables]
 import ./frame, ./hpack
+from ../../core/headers import maxHeaderListBytes   # the cross-protocol header cap
 
 type
   H2Response* = object
@@ -83,11 +84,6 @@ type
 
 const
   defaultWindow = 65535          ## HTTP/2 default flow-control window (RFC 9113)
-  maxHeaderListBytes = 128 * 1024
-    ## Cap on a single response's accumulated (compressed) header block. Bounds
-    ## memory against a CONTINUATION flood -- a peer sending endless CONTINUATION
-    ## frames without END_HEADERS (CVE-2024-27316 and related). Generous for real
-    ## headers; a stream that exceeds it is RST'd.
   recvWindowSize = 8 * 1024 * 1024
     ## Per-stream receive window we advertise (SETTINGS_INITIAL_WINDOW_SIZE), so a
     ## single download is not throttled to the 64 KiB default per round trip.
@@ -541,9 +537,15 @@ proc handleData(c: H2Conn, h: FrameHeader, outbuf: var string) =
         contentLen = h.length - 1 - padLen
       if contentLen > 0 and s.resp.body.len == 0:
         # `takeBody` drains the body once per feed batch, so it restarts empty with
-        # every batch and would regrow frame by frame. Size it once for what is
-        # still buffered (or for this frame, whichever is larger).
-        s.resp.body = newStringOfCap(max(contentLen, c.frames.remaining))
+        # every batch and would regrow frame by frame. Size it once for the run of
+        # DATA frames THIS stream is about to receive, not for everything still
+        # buffered: on a multiplexed connection the rest of the read belongs to
+        # other streams, and sizing each one to the whole read gave every stream
+        # with any DATA in the batch a read-sized body, so a 64 KiB read carrying
+        # one small frame for each of 200 sink streams allocated ~200 x 64 KiB of
+        # live capacity queued in the sink (issue #408). A single-stream download
+        # is still one run, so it is sized once for the whole read (issue #400).
+        s.resp.body = newStringOfCap(c.frames.dataRunLen(h.streamId))
       c.frames.appendPayload(s.resp.body, contentOff, contentLen)
       s.bodyTotal += contentLen
       if c.maxBodyBytes > 0 and s.bodyTotal > c.maxBodyBytes:  # over the size cap: RST
@@ -908,6 +910,16 @@ proc setSinkMode*(c: H2Conn, streamId: uint32) =
   ## Use for a streaming download that must apply backpressure to the peer.
   let s = c.streams.getOrDefault(streamId)
   if s != nil: s.sinkMode = true
+
+proc openTunnelStream*(c: H2Conn): uint32 =
+  ## Open a stream for an Extended CONNECT tunnel (RFC 8441): `openStream` with the
+  ## receive window gated (sink mode) from the start, so the tunnel's inbound bytes
+  ## are bounded by the advertised window until the application consumes and acks
+  ## them. A tunnel reader can be blocked for a long time (a large send waiting on
+  ## the peer's WINDOW_UPDATE), and an eagerly replenished window buffers the peer's
+  ## flood without bound there (#407).
+  result = c.openStream()
+  c.setSinkMode(result)
 
 proc ackRecv*(c: H2Conn, streamId: uint32, n: int): string =
   ## Acknowledge that the sink consumed `n` received body bytes, replenishing the

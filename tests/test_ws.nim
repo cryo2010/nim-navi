@@ -249,6 +249,85 @@ suite "websocket frame codec":
     check d.next(f) and f.opcode == opPing
     check d.next(f) and f.opcode == opText and f.payload == "hi"
 
+  test "the frame codec should decode 1000 small frames from one feed, in order (#409)":
+    # One 64 KiB-ish transport read carrying a burst of tiny messages. The decoder
+    # used to front-delete the buffer per frame, memmoving the whole remainder
+    # 1000 times (O(N x buffered)); with a read cursor this is one pass.
+    var wire = ""
+    for i in 0 ..< 1000:
+      wire.add encodeFrame(opText, "msg-" & $i & repeat(".", 30), masked = (i mod 2 == 0))
+    var d: WsDecoder
+    d.feed(wire)
+    var f: Frame
+    for i in 0 ..< 1000:
+      check d.next(f)
+      check f.opcode == opText
+      check f.payload == "msg-" & $i & repeat(".", 30)
+    check not d.next(f)
+    check d.buffered == 0
+
+  test "the frame codec should decode a frame split at every byte boundary (#409)":
+    # A two-frame wire cut at each possible split point: the cursor must hold a
+    # partial header, a partial mask key and a partial payload across feeds, and
+    # compaction on the second feed must not lose the retained prefix.
+    let wire = encodeFrame(opText, "hello", masked = true,
+                           maskKey = hexToBytes("37fa213d")) &
+               encodeFrame(opBinary, "world!", masked = false)
+    for cut in 0 .. wire.len:
+      var d: WsDecoder
+      var f: Frame
+      d.feed(wire[0 ..< cut])
+      var got: seq[(Opcode, string)] = @[]
+      while d.next(f): got.add (f.opcode, f.payload)
+      d.feed(wire[cut .. ^1])
+      while d.next(f): got.add (f.opcode, f.payload)
+      check got == @[(opText, "hello"), (opBinary, "world!")]
+      check d.buffered == 0
+
+  test "the frame codec should keep control frames interleaved with continuations (#409)":
+    # Fragmented message with a ping and a pong spliced between the fragments, all
+    # in one feed: the cursor must not reorder, drop or merge anything.
+    var wire = encodeFrame(opText, "he", masked = true, fin = false)
+    wire.add encodeFrame(opPing, "p", masked = true)
+    wire.add encodeFrame(opContinuation, "ll", masked = true, fin = false)
+    wire.add encodeFrame(opPong, "q", masked = true)
+    wire.add encodeFrame(opContinuation, "o", masked = true, fin = true)
+    var d: WsDecoder
+    d.feed(wire)
+    var f: Frame
+    var a: WsAssembler
+    var replies: seq[WsReply] = @[]
+    var message = ""
+    var seen: seq[Opcode] = @[]
+    while d.next(f):
+      seen.add f.opcode
+      let o = a.offer(f)
+      if o.reply != wrNone: replies.add o.reply
+      if o.ready: message = o.message.data
+    check seen == @[opText, opPing, opContinuation, opPong, opContinuation]
+    check message == "hello"
+    check replies == @[wrPong]
+    check d.buffered == 0
+
+  test "the frame codec should compact its buffer across feed/consume cycles (#409)":
+    # Feed a burst, drain it, repeat: the retained buffer must stay bounded by the
+    # burst rather than growing with the number of frames ever decoded. It also
+    # covers the partial-frame case, where a tail is carried into the next feed.
+    # 512 x ~46 bytes is over the 8 KiB compaction floor, so the in-place move
+    # branch runs and not just the "fully consumed, setLen(0)" one.
+    let frame = encodeFrame(opText, repeat("x", 40), masked = true)
+    var burst = ""
+    for _ in 0 ..< 512: burst.add frame
+    var d: WsDecoder
+    var f: Frame
+    for round in 0 ..< 100:
+      d.feed(burst[0 ..< burst.len - 3])      # last frame straddles the feed
+      while d.next(f): check f.payload == repeat("x", 40)
+      d.feed(burst[burst.len - 3 .. ^1])
+      while d.next(f): check f.payload == repeat("x", 40)
+      check d.buffered == 0
+      check d.bufferLen <= 2 * burst.len      # no unbounded growth
+
   test "the frame codec should reject a reserved opcode (RFC 6455 5.2)":
     var d: WsDecoder
     d.feed("\x83\x00")            # FIN + opcode 0x3 (reserved), unmasked, len 0
@@ -939,3 +1018,22 @@ suite "websocket frame validation (RFC 6455)":
     expect ValueError:
       discard a.offer(Frame(fin: true, opcode: opClose,
                             payload: closePayload(closeNormal, "\xff")))
+
+suite "websocket handshake head cap (#406)":
+  test "an endless non-CRLF 101 head should raise HeaderTooLargeError, not grow forever":
+    # The handshake reader used to accumulate the 101 response until it saw a blank
+    # line, with no bound and a whole-buffer rescan per read. An origin that answers
+    # "HTTP/1.1 101 ...\r\nX: " and then streams non-CRLF bytes forever would grow
+    # that buffer until the process died; maxResponseBytes caps only body bytes.
+    var th: Thread[WsSrv]
+    var port: int
+    startWsHeaderFlood(th, port)
+
+    let api = newNavi()
+    var msg = ""
+    try:
+      discard api.websocket("ws://127.0.0.1:" & $port & "/chat")
+    except HeaderTooLargeError as e:
+      msg = e.msg
+    check "maxHeaderListBytes" in msg
+    joinThread(th)

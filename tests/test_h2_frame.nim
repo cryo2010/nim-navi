@@ -248,6 +248,39 @@ suite "h2 frame peek/consume (the zero-copy DATA path)":
     d.consume()
     check d.remaining == 9 + 2
 
+  test "dataRunLen should measure only this stream's contiguous DATA (#408)":
+    var buf = encodeData(1'u32, "aaaa", endStream = false)    # run for stream 1
+    buf.add encodeData(1'u32, "bbbbbb", endStream = false)
+    buf.add encodeData(3'u32, "cc", endStream = false)        # another stream: stop
+    buf.add encodeData(1'u32, "dddddddd", endStream = false)  # past the break
+    var d: FrameDecoder
+    d.feed(buf)
+    var h: FrameHeader
+    check d.peek(h)
+    check d.dataRunLen(1'u32) == 10        # 4 + 6, not the 20 bytes buffered
+    d.consume(); check d.peek(h)
+    check d.dataRunLen(1'u32) == 6         # the rest of the run
+    d.consume(); check d.peek(h)
+    check d.dataRunLen(3'u32) == 2         # stream 3's own frame only
+    d.consume(); check d.peek(h)
+    check d.dataRunLen(1'u32) == 8
+
+  test "dataRunLen should stop at a non-DATA frame and at a partial one":
+    var buf = encodeData(1'u32, "aaaa", endStream = false)
+    buf.add encodeFrame(ftPing, 0, 0, "01234567")
+    buf.add encodeData(1'u32, "zzzz", endStream = false)
+    var d: FrameDecoder
+    d.feed(buf)
+    var h: FrameHeader
+    check d.peek(h)
+    check d.dataRunLen(1'u32) == 4         # the PING ends the run
+    var e: FrameDecoder
+    let whole = encodeData(1'u32, "aaaa", endStream = false) &
+                encodeData(1'u32, "bbbb", endStream = false)
+    e.feed(whole[0 ..< whole.len - 1])     # the second frame is one byte short
+    check e.peek(h)
+    check e.dataRunLen(1'u32) == 4         # a partial frame is not counted
+
   test "peek should flag a frame larger than the max frame size":
     var wire = encodeFrame(ftData, 0, 1'u32, "")
     wire[0] = char(0)                  # length = 16385, one over the max

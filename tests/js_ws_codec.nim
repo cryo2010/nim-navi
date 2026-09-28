@@ -52,6 +52,43 @@ block:
   d.feed(wire[wire.len - 2 .. ^1])
   doAssert d.next(f) and f.payload == "hello"
 
+# A burst of small frames out of one feed, then a split feed: the read cursor and
+# `feed`'s compaction (#409) have their own scalar path on js (no moveMem), so the
+# order, the mask handling and the retained-buffer bound get checked here too.
+block:
+  var wire = ""
+  for i in 0 ..< 500:
+    wire.add encodeFrame(opText, "m" & $i & repeat(".", 30), masked = (i mod 2 == 0))
+  var d: WsDecoder
+  var f: Frame
+  # Hold back the last three bytes so a partial frame is carried across the feed
+  # and the in-place compaction branch (prefix over 8 KiB) runs.
+  d.feed(wire[0 ..< wire.len - 3])
+  var got = 0
+  while d.next(f):
+    doAssert f.payload == "m" & $got & repeat(".", 30), "frame " & $got & " out of order"
+    inc got
+  doAssert got == 499, "499 whole frames should decode, got " & $got
+  d.feed(wire[wire.len - 3 .. ^1])
+  doAssert d.next(f) and f.payload == "m499" & repeat(".", 30)
+  doAssert not d.next(f)
+  doAssert d.buffered == 0
+  doAssert d.bufferLen <= 2 * wire.len, "the buffer should be compacted, not grown"
+
+# Every split point of a small two-frame wire still decodes both frames.
+block:
+  let wire = encodeFrame(opText, "hello", masked = true) &
+             encodeFrame(opBinary, "world!", masked = false)
+  for cut in 0 .. wire.len:
+    var d: WsDecoder
+    var f: Frame
+    var got: seq[string] = @[]
+    d.feed(wire[0 ..< cut])
+    while d.next(f): got.add f.payload
+    d.feed(wire[cut .. ^1])
+    while d.next(f): got.add f.payload
+    doAssert got == @["hello", "world!"], "split at " & $cut & " decoded " & $got
+
 proc decodeError(wire: string): string =
   var d: WsDecoder
   var f: Frame
