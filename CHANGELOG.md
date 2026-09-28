@@ -84,6 +84,20 @@ onward (pre-1.0, minor versions may include breaking changes).
   `BodySink`), since the `Future` type differs per backend (#367).
 
 ### Changed
+- **HTTP/2 appends header blocks straight from the frame decoder and decodes HPACK
+  literals in place.** A HEADERS payload used to be materialized into a `Frame`,
+  copied into a local fragment, sliced again to strip the padding and the 5-byte
+  priority block, and copied once more into the stream's header buffer -- four
+  copies of every header byte (a 100 KiB block moved ~400 KiB) before HPACK even
+  ran, with each literal string sliced out a fifth time inside the decoder. HEADERS,
+  CONTINUATION and PUSH_PROMISE now go through the same peek path DATA has used
+  since #400: padding and priority are skipped by offset arithmetic and the fragment
+  is appended to the header buffer with one setLen + copyMem, while `decodeString`
+  copies a raw literal once and hands a Huffman-coded one to the decoder as a view
+  over the block. Padding and priority validation, the 128 KiB header-block cap (now
+  checked before the fragment is copied, not after), CONTINUATION sequencing (RFC
+  9113 6.10) and every PROTOCOL_ERROR / FRAME_SIZE_ERROR / COMPRESSION_ERROR
+  condition are unchanged (#413).
 - **The SSE parser copies each line's value once and moves the event out on
   dispatch.** A line used to be materialized as a string slice, its value sliced out
   of that, and the leading space sliced off again before being appended to the data

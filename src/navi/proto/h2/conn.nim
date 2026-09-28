@@ -413,19 +413,24 @@ proc connFail(c: H2Conn, code: uint32, reason: string, outbuf: var string) =
     c.fatal = reason
     outbuf.add encodeGoAway(0, code)
 
-proc unpad(c: H2Conn, f: Frame, frag: var string, outbuf: var string): bool =
-  ## Strip DATA/HEADERS padding (RFC 9113 6.1/6.2): the first payload byte is the
-  ## pad length, and that many trailing bytes are the padding. Sets `frag` to the
-  ## content in between. A pad length that meets or exceeds the payload is a
-  ## PROTOCOL_ERROR (GOAWAY sent, returns false).
-  if f.payload.len < 1:                        # too short to hold the pad-length octet:
+proc stripPadding(c: H2Conn, off: var int, n: var int, outbuf: var string): bool =
+  ## Narrow `off`/`n` -- a range inside the peeked frame's payload, which is still
+  ## sitting in the decoder buffer -- past the padding of a padded DATA/HEADERS
+  ## frame (RFC 9113 6.1/6.2): the first payload byte is the pad length and that
+  ## many trailing bytes are the padding. Pure offset arithmetic, so the content is
+  ## never sliced out of the buffer; the caller appends it straight from the
+  ## decoder. A frame too short to hold the pad-length octet is a FRAME_SIZE_ERROR,
+  ## and a pad length that meets or exceeds the payload a PROTOCOL_ERROR (GOAWAY
+  ## sent, returns false).
+  if n < 1:                                    # too short to hold the pad-length octet:
     c.connFail(errFrameSizeError, "padded frame with no pad length", outbuf)  # RFC 9113 4.2
     return false
-  let padLen = int(uint8(f.payload[0]))
-  if padLen > f.payload.len - 1:
+  let padLen = int(c.frames.payloadByte(off))
+  if padLen > n - 1:
     c.connFail(errProtocolError, "padding exceeds frame payload", outbuf)
     return false
-  frag = f.payload[1 ..< f.payload.len - padLen]
+  off += 1
+  n -= 1 + padLen
   true
 
 proc handleSettings(c: H2Conn, f: Frame, outbuf: var string) =
@@ -522,19 +527,10 @@ proc handleData(c: H2Conn, h: FrameHeader, outbuf: var string) =
       # Locate the content inside the payload (RFC 9113 6.1: a padded frame leads
       # with the pad-length octet and trails that many bytes), then copy it out of
       # the decoder buffer into the body in one pass -- no slice, no temporary.
-      # The validation matches `unpad`, which still serves the HEADERS path.
       var contentOff = 0
       var contentLen = h.length
-      if (h.flags and flagPadded) != 0:
-        if h.length < 1:                       # too short to hold the pad-length octet:
-          c.connFail(errFrameSizeError, "padded frame with no pad length", outbuf)  # RFC 9113 4.2
-          return
-        let padLen = int(c.frames.payloadByte(0))
-        if padLen > h.length - 1:
-          c.connFail(errProtocolError, "padding exceeds frame payload", outbuf)
-          return
-        contentOff = 1
-        contentLen = h.length - 1 - padLen
+      if (h.flags and flagPadded) != 0 and
+         not c.stripPadding(contentOff, contentLen, outbuf): return
       if contentLen > 0 and s.resp.body.len == 0:
         # `takeBody` drains the body once per feed batch, so it restarts empty with
         # every batch and would regrow frame by frame. Size it once for the run of
@@ -617,58 +613,68 @@ proc handleWindowUpdate(c: H2Conn, f: Frame, outbuf: var string) =
         s.sendWindow += inc
         c.flushSend(f.streamId, s, outbuf)
 
-proc handleHeadersOrContinuation(c: H2Conn, f: Frame, outbuf: var string) =
+proc handleHeadersOrContinuation(c: H2Conn, h: FrameHeader, outbuf: var string) =
   ## RFC 9113 6.2/6.10: assemble a (possibly multi-frame) header block on a stream.
   ## Strips HEADERS padding/priority, buffers the fragment across CONTINUATION, and
   ## on END_HEADERS decodes it -- delivering to the stream, or (for a reset/unknown
   ## stream) decode-then-discard to keep the shared HPACK table in sync. The 6.10
   ## open/close gate and the CONTINUATION-flood size cap run here too.
-  if f.streamId == 0:                          # RFC 9113 6.2/6.10: never on stream 0
+  ##
+  ## Takes the peeked frame HEADER, not a `Frame`: the fragment is still in the
+  ## decoder buffer, padding and the priority block are skipped by offset
+  ## arithmetic, and what is left is appended to the header buffer with a single
+  ## copy -- instead of materializing the payload, copying it, slicing the padding
+  ## and priority off it, and appending that (issue #413). The caller (`feed`)
+  ## consumes the frame afterwards, including on every early return here.
+  if h.streamId == 0:                          # RFC 9113 6.2/6.10: never on stream 0
     c.connFail(errProtocolError, "HEADERS/CONTINUATION on stream 0", outbuf); return
-  let s = c.streams.getOrDefault(f.streamId)
+  let s = c.streams.getOrDefault(h.streamId)
   # A HEADERS opening a server-initiated (even) or never-allocated (idle, at/above
   # nextId) stream is illegal for a client (RFC 9113 5.1.1); a late frame on an
   # already-completed odd stream below nextId (s == nil) stays tolerated. The 6.10
   # gate already rejects a stray CONTINUATION, so this guards HEADERS only.
-  if f.typ == uint8(ftHeaders) and s == nil and
-     (f.streamId mod 2 == 0'u32 or f.streamId >= c.nextId):
+  if h.typ == uint8(ftHeaders) and s == nil and
+     (h.streamId mod 2 == 0'u32 or h.streamId >= c.nextId):
     c.connFail(errProtocolError, "HEADERS on an idle or server-initiated stream", outbuf)
     return
   # Open (or close) the header block per END_HEADERS, so the 6.10 gate above knows
   # whether a CONTINUATION must follow -- tracked even for an unknown stream.
-  c.contHeaderStream = if (f.flags and flagEndHeaders) != 0: 0'u32 else: f.streamId
-  var frag = f.payload
-  if f.typ == uint8(ftHeaders):
+  c.contHeaderStream = if (h.flags and flagEndHeaders) != 0: 0'u32 else: h.streamId
+  var fragOff = 0
+  var fragLen = h.length
+  if h.typ == uint8(ftHeaders):
     # Only HEADERS carries padding / priority; a CONTINUATION is a raw
-    # fragment. Strip the pad byte + trailing padding, then the 5-byte
-    # priority block (stream dependency + weight), so what is left is the
+    # fragment. Skip past the pad byte + trailing padding, then the 5-byte
+    # priority block (stream dependency + weight), so the range left is the
     # header block fragment HPACK expects. Done for every stream (including a
     # reset/unknown one) so the fragment fed to HPACK is correct.
-    if (f.flags and flagPadded) != 0 and not c.unpad(f, frag, outbuf): return
-    if (f.flags and flagPriority) != 0:
-      if frag.len < 5:                       # missing the 5-byte priority block:
+    if (h.flags and flagPadded) != 0 and
+       not c.stripPadding(fragOff, fragLen, outbuf): return
+    if (h.flags and flagPriority) != 0:
+      if fragLen < 5:                        # missing the 5-byte priority block:
         c.connFail(errFrameSizeError, "HEADERS priority block truncated", outbuf)  # RFC 9113 4.2
         return
-      frag = frag[5 ..< frag.len]
+      fragOff += 5
+      fragLen -= 5
   if s != nil and not s.reset:
-    s.hdrBuf.add frag
-    if s.hdrBuf.len > maxHeaderListBytes:       # CONTINUATION flood (CVE-2024-27316):
+    if s.hdrBuf.len + fragLen > maxHeaderListBytes:  # CONTINUATION flood (CVE-2024-27316):
       # fail the whole connection, not just the stream. An undecoded header block
       # can't be skipped without desyncing the connection-wide HPACK table, and a
       # stream RST would leave the 6.10 gate armed -- so GOAWAY, as Go/nghttp2 do.
+      # Checked before the append, so the flooding fragment is never even copied.
       c.connFail(errEnhanceYourCalm, "header block exceeds the size cap", outbuf)
       return
-    else:
-      if f.typ == uint8(ftHeaders):
-        s.hdrEndStream = (f.flags and flagEndStream) != 0
-      if (f.flags and flagEndHeaders) != 0:
-        # Any HPACK decoding failure (truncated block, integer overflow, a
-        # table-size update over the advertised max, or a header list past
-        # SETTINGS_MAX_HEADER_LIST_SIZE) is a connection-level COMPRESSION_ERROR.
-        try: c.applyHeaders(s, f.streamId, outbuf)
-        except ValueError as e:
-          c.connFail(errCompressionError, e.msg, outbuf)
-          return
+    c.frames.appendPayload(s.hdrBuf, fragOff, fragLen)
+    if h.typ == uint8(ftHeaders):
+      s.hdrEndStream = (h.flags and flagEndStream) != 0
+    if (h.flags and flagEndHeaders) != 0:
+      # Any HPACK decoding failure (truncated block, integer overflow, a
+      # table-size update over the advertised max, or a header list past
+      # SETTINGS_MAX_HEADER_LIST_SIZE) is a connection-level COMPRESSION_ERROR.
+      try: c.applyHeaders(s, h.streamId, outbuf)
+      except ValueError as e:
+        c.connFail(errCompressionError, e.msg, outbuf)
+        return
   else:
     # Reset or already-deleted (cancelled / never-opened) stream. HPACK is
     # stateful: EVERY header block on the connection must still be decoded to
@@ -677,11 +683,11 @@ proc handleHeadersOrContinuation(c: H2Conn, f: Frame, outbuf: var string) =
     # misattributed headers, or a spurious COMPRESSION_ERROR. So decode the
     # block and discard the result; only delivery is skipped. Buffer across
     # CONTINUATION frames the same way, decoding on END_HEADERS.
-    c.discardHdr.add frag
-    if c.discardHdr.len > maxHeaderListBytes:    # CONTINUATION flood: GOAWAY, as above
+    if c.discardHdr.len + fragLen > maxHeaderListBytes:  # CONTINUATION flood: GOAWAY, as above
       c.connFail(errEnhanceYourCalm, "header block exceeds the size cap", outbuf)
       return
-    if (f.flags and flagEndHeaders) != 0:
+    c.frames.appendPayload(c.discardHdr, fragOff, fragLen)
+    if (h.flags and flagEndHeaders) != 0:
       try: discard c.dec.decode(c.discardHdr)
       except ValueError as e:
         c.connFail(errCompressionError, e.msg, outbuf)
@@ -760,8 +766,10 @@ proc admit(c: H2Conn, typ: uint8, streamId: uint32, outbuf: var string): bool =
   true
 
 proc handle(c: H2Conn, f: Frame, outbuf: var string) =
-  ## Dispatch a decoded frame. DATA never arrives here: `feed` routes it to the
-  ## zero-copy `handleData` off the decoder buffer instead.
+  ## Dispatch a decoded frame. The frames whose payload is bulk data -- DATA and
+  ## the header-block carriers (HEADERS, CONTINUATION, PUSH_PROMISE) -- never
+  ## arrive here: `feed` routes them to handlers that read the payload straight
+  ## out of the decoder buffer instead.
   if not c.admit(f.typ, f.streamId, outbuf): return
   case f.typ
   of uint8(ftSettings):
@@ -770,17 +778,13 @@ proc handle(c: H2Conn, f: Frame, outbuf: var string) =
     c.handlePing(f, outbuf)
   of uint8(ftGoAway):
     c.handleGoAway(f, outbuf)
-  of uint8(ftHeaders), uint8(ftContinuation):
-    c.handleHeadersOrContinuation(f, outbuf)
   of uint8(ftRstStream):
     c.handleRstStream(f, outbuf)
   of uint8(ftWindowUpdate):
     c.handleWindowUpdate(f, outbuf)
-  of uint8(ftPushPromise):
-    # We advertised SETTINGS_ENABLE_PUSH=0, so a PUSH_PROMISE is a PROTOCOL_ERROR.
-    c.connFail(errProtocolError, "unexpected PUSH_PROMISE (push disabled)", outbuf)
   else:
-    discard # PRIORITY, DATA (handled in `feed`), unknown types: ignore
+    discard # PRIORITY, the frames `feed` handles off the decoder buffer, and
+            # unknown types: ignore
 
 proc feed*(c: H2Conn, data: string): string =
   ## Consume received bytes; return control bytes (ACKs, window updates) to send.
@@ -788,13 +792,28 @@ proc feed*(c: H2Conn, data: string): string =
   var h: FrameHeader
   var f: Frame
   while c.frames.peek(h):
-    if h.typ == uint8(ftData):
+    case h.typ
+    of uint8(ftData):
       # The download hot path: hand the DATA handler the header and let it copy
       # the payload out of the decoder buffer into the response body directly
       # (issue #400). A frame the gates reject is still consumed, exactly as
       # `next` would have, so the loop always makes progress.
       if c.admit(h.typ, h.streamId, result):
         c.handleData(h, result)
+      c.frames.consume()
+    of uint8(ftHeaders), uint8(ftContinuation):
+      # Same for a header block: the fragment is appended to the stream's header
+      # buffer straight from the decoder, padding and priority skipped by offset
+      # (issue #413).
+      if c.admit(h.typ, h.streamId, result):
+        c.handleHeadersOrContinuation(h, result)
+      c.frames.consume()
+    of uint8(ftPushPromise):
+      # We advertised SETTINGS_ENABLE_PUSH=0, so a PUSH_PROMISE is a PROTOCOL_ERROR.
+      # Handled off the header too: the promised header block is never read, so
+      # there is no reason to materialize the payload before tearing down.
+      if c.admit(h.typ, h.streamId, result):
+        c.connFail(errProtocolError, "unexpected PUSH_PROMISE (push disabled)", result)
       c.frames.consume()
     else:
       discard c.frames.next(f)      # peek proved a complete frame is buffered

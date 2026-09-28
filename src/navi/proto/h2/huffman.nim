@@ -99,7 +99,11 @@ const decodeTable = buildDecodeTable()
   ## reference-counted, so many threads can each decode against it concurrently
   ## (safe under any memory manager, incl. non-atomic orc).
 
-proc huffmanDecode*(data: string): string {.gcsafe.} =
+proc huffmanDecode*(data: openArray[char]): string {.gcsafe.} =
+  ## Takes an `openArray` so a caller can decode a literal straight out of the
+  ## header block it arrived in, without slicing a string out of it first
+  ## (issue #413); a `string` argument still converts implicitly.
+  result = newStringOfCap(data.len * 8 div 5 + 1)   # ~5 bits per symbol on average
   var idx = 0                # current node; 0 is the root
   var padBits = 0            # bits walked since the last completed symbol
   var padAllOnes = true      # were all of them 1 (the EOS code is all 1s)?
