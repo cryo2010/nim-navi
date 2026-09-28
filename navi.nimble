@@ -260,6 +260,12 @@ task jsSink, "navi/js response-sink runtime test (Node)":
   # the void form, the delivery rule, and throw-on-non-2xx never calling the sink.
   exec "bash tests/interop/js_sink.sh"
 
+task jsBytes, "navi/js binary body round-trip test (Node)":
+  # Streams a 1 MiB multi-chunk body of every byte value through the js sink and
+  # the pull stream handle and asserts byte-exactness, guarding the bulk
+  # Uint8Array <-> Nim conversions (#412) that `nim check` cannot validate.
+  exec "bash tests/interop/js_bytes.sh"
+
 task jsWsCodec, "navi/proto/ws frame codec under Node (js is the 32-bit `int` target)":
   # proto/ws is not used by navi/js at runtime, but the sans-io codec must keep
   # building for js -- and js is navi's only target where `int` is 32 bits, so the

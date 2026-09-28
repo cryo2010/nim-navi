@@ -158,6 +158,13 @@ jobs:
       - name: navi/js SSE reconnect delay runtime test
         run: bash tests/interop/js_sse_retry.sh
 
+      # Binary body round trip under Node: a 1 MiB multi-chunk body of every byte
+      # value must survive the bulk Uint8Array <-> Nim conversions (#412). A
+      # conversion that mangles bytes > 127 still compiles and still passes
+      # `nim check`, so it can only be caught by running it.
+      - name: navi/js binary body round-trip test
+        run: bash tests/interop/js_bytes.sh
+
   sanitize:
     runs-on: ubuntu-latest
     name: sanitizers (asan + ubsan)

@@ -9,7 +9,7 @@
 when not defined(js):
   {.error: "navi/backend/jsws is JavaScript-only; compile with `nim js` via `import navi/js`.".}
 
-import std/[asyncjs, jsffi]
+import std/[asyncjs, deques, jsffi]
 
 type
   WsMessageKind* = enum wmText, wmBinary, wmClose
@@ -22,7 +22,10 @@ type
 
   WebSocket* = ref object
     raw: JsObject
-    queue: seq[WsMessage]           ## messages received before a `receive` awaited them
+    queue: Deque[WsMessage]         ## messages received before a `receive` awaited them;
+                                    ## a deque so `receive` pops the head in O(1) -- a
+                                    ## `seq` + `delete(0)` was O(queue) per message and
+                                    ## quadratic under a flood (#412)
     resolve: proc(m: WsMessage)     ## resolver of a pending `receive`, or nil
     open: bool
     maxMessageBytes: int            ## cap on a received message; 0 = unlimited
@@ -62,29 +65,23 @@ proc jsClose(s: JsObject, code: int, reason: cstring) {.importjs: "#.close(#, #)
 proc jsReadyState(s: JsObject): int {.importjs: "#.readyState".}
 
 # --- event-payload helpers ---
-# Binary crosses the JS boundary as raw bytes (a Uint8Array indexed with ord()),
-# not via cstring, because a Nim js string <-> JS string conversion transcodes
-# UTF-8/UTF-16 and mangles bytes > 127.
+# Binary crosses the JS boundary as raw bytes, not via cstring, because a Nim js
+# string <-> JS string conversion transcodes UTF-8/UTF-16 and mangles bytes > 127.
+# Both directions are a single bulk array copy: nim's js backend represents a
+# `string` as a plain JS array of byte values, so `Array.prototype.slice.call` on a
+# Uint8Array already IS a Nim string and `new Uint8Array(nimStr)` already IS its
+# bytes. The old code paid one jsffi property access per byte in each direction
+# (#412), which made a multi-MB message orders of magnitude slower than the copy.
 proc dataIsString(ev: JsObject): bool {.importjs: "(typeof #.data === 'string')".}
 proc dataAsString(ev: JsObject): cstring {.importjs: "#.data".}
 proc evCode(ev: JsObject): int {.importjs: "#.code".}
-proc u8View(ev: JsObject): JsObject {.importjs: "new Uint8Array(#.data)".}
-proc u8Len(v: JsObject): int {.importjs: "#.length".}
-proc u8At(v: JsObject, i: int): int {.importjs: "#[#]".}
-proc u8New(n: int): JsObject {.importjs: "new Uint8Array(#)".}
-proc u8Set(v: JsObject, i, b: int) {.importjs: "#[#] = #".}
 
-proc bytesOf(ev: JsObject): string =
-  ## Copy the message's ArrayBuffer into a Nim string, one byte per char.
-  let v = u8View(ev)
-  let n = u8Len(v)
-  result = newString(n)
-  for i in 0 ..< n: result[i] = char(u8At(v, i))
+proc bytesOf(ev: JsObject): string
+  {.importjs: "Array.prototype.slice.call(new Uint8Array(#.data))".}
+  ## The message's ArrayBuffer as a Nim string, one byte per char, in one copy.
 
-proc toU8(s: string): JsObject =
-  ## A Uint8Array of `s`'s bytes (ord of each char), byte-exact.
-  result = u8New(s.len)
-  for i in 0 ..< s.len: result.u8Set(i, ord(s[i]))
+proc toU8(s: string): JsObject {.importjs: "new Uint8Array(#)".}
+  ## A Uint8Array of `s`'s bytes, byte-exact, in one copy.
 
 proc deliver(ws: WebSocket, m: WsMessage) =
   ## Hand a message to a waiting `receive`, or queue it for the next one.
@@ -93,7 +90,7 @@ proc deliver(ws: WebSocket, m: WsMessage) =
     ws.resolve = nil
     r(m)
   else:
-    ws.queue.add(m)
+    ws.queue.addLast(m)
 
 proc openWebSocket*(url: string, maxMessageBytes = 0): Future[WebSocket] {.async.} =
   ## Construct the native WebSocket and resolve once it opens (or raise on error).
@@ -128,8 +125,7 @@ proc receive*(ws: WebSocket): Future[WsMessage] {.async.} =
   ## raises `WsMessageTooLarge`.
   var m: WsMessage
   if ws.queue.len > 0:
-    m = ws.queue[0]
-    ws.queue.delete(0)
+    m = ws.queue.popFirst()
   else:
     m = await newPromise(proc(resolve: proc(msg: WsMessage)) =
       ws.resolve = resolve)

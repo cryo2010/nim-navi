@@ -179,8 +179,7 @@ proc runCore(client: Navi, req0: Request, cancel: CancelToken,
   # from `.text()`, so this shares that path's text lossiness (the streamed sink path
   # above stays binary-clean); a gate miss on js is the rare exception, not the norm.
   if not userSink.isNil and resp.body.len > 0 and not resp.bodyTruncated:
-    var bytes = newSeq[byte](resp.body.len)
-    for i in 0 ..< resp.body.len: bytes[i] = byte(resp.body[i])
+    let bytes = bytesOfBody(resp.body)   # one array copy, not a char at a time
     try:
       await userSink(bytes)
     except SinkStopSignal:

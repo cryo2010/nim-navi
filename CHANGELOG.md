@@ -84,6 +84,22 @@ onward (pre-1.0, minor versions may include breaking changes).
   `BodySink`), since the `Future` type differs per backend (#367).
 
 ### Changed
+- **`navi/js` marshals body and WebSocket bytes with bulk typed-array copies, and
+  its WebSocket queue is a deque.** Every byte of a streamed response body used to
+  cross the jsffi boundary through its own dynamic `JsObject` index plus a
+  `.to(int)` conversion, and a WebSocket payload through its own `Uint8Array` read
+  or write, so a 50 MB download ran 50 million property lookups and int conversions
+  and blocked the event loop for the whole of each chunk. Nim's js backend already
+  represents a `string` and a `seq[byte]` as a plain JS array of byte values, so
+  each conversion is now a single native array copy: `Array.prototype.slice.call`
+  from a `Uint8Array` (sink chunks, pull-stream chunks, WebSocket binary receive),
+  `new Uint8Array(s)` back out (WebSocket binary send), and one array copy for the
+  buffered-body fallback that hands a `.text()` body to a `seq[byte]` sink. It is
+  byte-exact for arbitrary binary (no UTF-16 round trip, no `fromCharCode.apply`
+  argument-count limit), and a new Node test asserts all 256 byte values survive a
+  1 MiB multi-chunk download and a 64 KiB WebSocket echo. `receive` also pops the
+  pending-message queue from the head in O(1) instead of `delete(0)`, which was
+  O(queue) per message and quadratic under a flooding peer (#412).
 - **The streaming WebSocket UTF-8 scanner validates each chunk in place.**
   `scanUtf8` used to build `carry & chunk` and validate that copy, so every streamed
   text frame was copied once more into a chunk-sized temporary just to prepend at
