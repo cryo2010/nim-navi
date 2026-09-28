@@ -84,6 +84,20 @@ onward (pre-1.0, minor versions may include breaking changes).
   `BodySink`), since the `Future` type differs per backend (#367).
 
 ### Changed
+- **The SSE parser copies each line's value once and moves the event out on
+  dispatch.** A line used to be materialized as a string slice, its value sliced out
+  of that, and the leading space sliced off again before being appended to the data
+  buffer, which `dispatch` then copied into the event: about five copies of every
+  payload byte, each one an allocation plus a byte-at-a-time loop. The colon and the
+  optional single leading space are now located in the parse buffer and the value is
+  copied straight into its field (setLen + copyMem, the shape #400 gave h2), the
+  field name is compared in place, `retry:` is accumulated in place with the same
+  range check, and the event's buffers are moved rather than copied on dispatch. A
+  16 MiB event (the `maxSseEventBytes` ceiling) no longer costs ~80 MB of byte-loop
+  copying before delivery: a one-core parse of that event goes from ~41 MB/s to
+  ~665 MB/s, and a 100k-small-event stream from ~16 MB/s to ~119 MB/s. Line endings
+  (LF, CR, CRLF, and a CRLF split across feeds), the BOM strip, the `data:` join,
+  the id-at-dispatch promotion and every size cap are unchanged (#410).
 - **The WebSocket frame decoder advances a read cursor instead of front-deleting
   per frame.** `WsDecoder.next` deleted the consumed prefix after every frame, so a
   burst of small messages arriving in one read shifted the whole remainder down once
