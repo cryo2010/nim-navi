@@ -58,11 +58,12 @@ when defined(ssl):
     ## The underlying SSL, for `negotiatedProtocol` / `verifyPeer` after handshake.
 
   proc newChronosTls*(transport: StreamTransport, ctx: SslContext, host: string,
-                      slot: SessionSlot = nil): ChronosTls =
+                      verify: bool, slot: SessionSlot = nil): ChronosTls =
     ## Build a client TLS pump over `transport` using the shared `ctx` (ALPN,
-    ## versions, ciphers, client cert already wired). SNI and any cached session
-    ## are set here; the caller then `await`s `handshake`.
-    let (ssl, rbio, wbio) = newClientSslMem(ctx, host, slot)
+    ## versions, ciphers, client cert already wired). SNI, the expected peer
+    ## identity (when `verify` is on) and any cached session are set here; the
+    ## caller then `await`s `handshake`.
+    let (ssl, rbio, wbio) = newClientSslMem(ctx, host, verify, slot)
     ChronosTls(transport: transport, sslp: ssl, rbio: rbio, wbio: wbio,
                slot: slot, writeLock: newAsyncLock(),
                inBuf: newStringUninit(tlsBufSize))   # overwritten by every readOnce

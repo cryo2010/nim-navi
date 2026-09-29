@@ -238,7 +238,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
           var ok = false
           try:
             let slot = resumeSlot(cfg, host & ":" & $port)
-            let tlsc = newChronosTls(transport, ctx, host, slot)
+            let tlsc = newChronosTls(transport, ctx, host, cfg.wantsVerify, slot)
             conn.tls = tlsc
             await tlsc.handshake()
             verifyPeer(tlsc.sslPtr, host, cfg.wantsVerify)
@@ -301,7 +301,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
               await proxyConnect(transport, host, port, proxy.user, proxy.pass)
             if tls:
               let slot = resumeSlot(cfg, host & ":" & $port)
-              let tlsc = newChronosTls(transport, ctx, host, slot)
+              let tlsc = newChronosTls(transport, ctx, host, cfg.wantsVerify, slot)
               conn.tls = tlsc
               # Drive the handshake now so a verification failure raises here, not
               # mid-read; verifyPeer re-checks the chain + hostname/IP identity.

@@ -418,7 +418,8 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
           when defined(ssl):
             (conn.ctx, conn.ownsCtx) = obtainContext(cfg.contextStore, cfg, alpn)
             conn.slot = resumeSlot(cfg, host & ":" & $port)
-            conn.ssl = newClientSsl(conn.ctx, conn.fd.SocketHandle, host, conn.slot)
+            conn.ssl = newClientSsl(conn.ctx, conn.fd.SocketHandle, host,
+                                    cfg.wantsVerify, conn.slot)
             await driveHandshake(conn.ssl, conn.fd, host)
             verifyPeer(conn.ssl, host, cfg.wantsVerify)
             postHandshakeVerify(conn.ssl, host, cfg)
@@ -459,7 +460,8 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
             # sync and chronos backends).
             (conn.ctx, conn.ownsCtx) = obtainContext(cfg.contextStore, cfg, alpn)
             conn.slot = resumeSlot(cfg, host & ":" & $port)
-            conn.ssl = newClientSsl(conn.ctx, fd.SocketHandle, host, conn.slot)
+            conn.ssl = newClientSsl(conn.ctx, fd.SocketHandle, host,
+                                    cfg.wantsVerify, conn.slot)
             await driveHandshake(conn.ssl, fd, host)
             verifyPeer(conn.ssl, host, cfg.wantsVerify)
             postHandshakeVerify(conn.ssl, host, cfg)   # SPKI pin + verify callback

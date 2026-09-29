@@ -222,6 +222,26 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **The expected hostname is now bound into the TLS handshake, and a subject CN no
+  longer rescues a certificate whose SANs all mismatch (#423).** On the sync,
+  asyncdispatch and chronos backends nothing was written into the SSL's
+  `X509_VERIFY_PARAM` before connecting: the chain was checked during the handshake
+  but the identity only afterwards, by `verifyPeer`. A peer presenting a chain-valid
+  certificate for some other name therefore passed OpenSSL's in-handshake
+  verification, and an mTLS client sent it the client `Certificate` and
+  `CertificateVerify` before the mismatch was noticed, disclosing its identity to a
+  party hostname verification would have rejected. `newClientSsl` / `newClientSslMem`
+  now call `SSL_set1_host` (DNS names) or `X509_VERIFY_PARAM_set1_ip_asc` (IP
+  literals) before the handshake, so a mismatch aborts it before the client's second
+  flight; `verifyPeer` stays as the redundant post-handshake check. The host-match
+  flags also changed: `X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT` (inherited from std/net)
+  is gone and `X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS` is set, matching the HTTP/3
+  transport, so a certificate carrying dNSName SANs is judged on those SANs alone
+  (RFC 9525) and partial wildcards such as `fo*.example.com` are rejected. A
+  SAN-less certificate still matches on its CN, so private CAs that issue CN-only
+  certificates keep working. Libraries too old to export the binding entry points
+  (some LibreSSL builds) keep the previous post-handshake-only behaviour rather than
+  failing to start.
 - **The QUIC handshake is bounded by `connectMs`, and an h3 endpoint that will not
   connect is no longer retried on every request.** ngtcp2's `settings.handshake_timeout`
   was left at its `UINT64_MAX` default and neither the sync `drive_until` loop nor the

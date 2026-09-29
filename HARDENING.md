@@ -96,9 +96,13 @@ Field names and types match `TlsConfig` in `src/navi/backend/api.nim` and the
 | Default | `config.tls.insecureSkipVerify = false` (chain **and** hostname are checked) |
 | Hardened | leave it unset; never set `true` outside tests |
 
-Verification is on for every config, including a bare `TlsConfig()`, and covers
-both the certificate chain and the hostname. `insecureSkipVerify = true`
-disables both and is intended only for tests against self-signed servers. If you need to trust a non-public CA, do **not** disable
+Verification is on for every config, including a bare `TlsConfig()`, and covers both the certificate chain and the
+hostname. The hostname (or IP literal) is bound into the handshake, so a mismatch
+aborts it before any client certificate is sent, and the match follows RFC 9525:
+partial wildcards such as `fo*.example.com` are rejected, and a certificate that
+carries dNSName SANs is judged on those alone -- its subject CN counts only when it
+has no SAN at all. `insecureSkipVerify = true` disables both and is intended only for tests
+against self-signed servers. If you need to trust a non-public CA, do **not** disable
 verification; set `caFile` instead.
 
 ### Custom trust anchor (`caFile`)
