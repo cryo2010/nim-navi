@@ -278,6 +278,13 @@ jobs:
       - name: Run the private-CA verification test
         run: bash tests/interop/ca_verify.sh
 
+      # Readiness waits above FD_SETSIZE (#429): the client burns ~1100
+      # descriptors so its socket lands above 1024, then requests with a read
+      # timeout armed. Built fortified, so the old select() path aborts in
+      # glibc's FD_SET rather than corrupting memory quietly.
+      - name: Run the high-descriptor readiness test
+        run: bash tests/interop/highfd.sh
+
       # A TLS write racing a connection close: a server that completes the
       # handshake and then never reads parks a large SSL_write on WANT_WRITE, and
       # closing under it must raise instead of calling SSL_write on the freed SSL.

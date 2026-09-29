@@ -146,6 +146,11 @@ task caVerify, "Private-CA (TlsConfig.caFile) verification, sync client (needs o
   # reject it without the CA (private root is not in the system trust store).
   exec "bash tests/interop/ca_verify.sh"
 
+task highFd, "Readiness waits on descriptors above FD_SETSIZE, sync client (POSIX; needs openssl)":
+  # ~1100 descriptors burned so navi's socket lands above 1024, then a request
+  # with a read timeout armed: the wait must poll, not select (issue #429).
+  exec "bash tests/interop/highfd.sh"
+
 task tlsPinning, "In-memory CA bundle + SPKI pinning + verify callback, sync client (needs openssl)":
   # A server signed by a throwaway CA: navi must trust it via an in-memory
   # caBundle, honor a matching SPKI pin (reject a wrong one), and run the verify

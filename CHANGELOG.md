@@ -222,6 +222,28 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **The sync backend's readiness waits use `poll(2)` (`WSAPoll` on Windows) instead of
+  `select(2)`, so a connection on a descriptor above `FD_SETSIZE` no longer aborts the
+  process or reports a bogus timeout (#429).** `waitReadable`, `waitWritable` and the
+  Happy-Eyeballs race went through `std/nativesockets`' `selectRead`/`selectWrite`,
+  which `FD_SET` the raw descriptor into a fixed 1024-bit `fd_set` with no range check.
+  Inside a process already holding ~1024 descriptors (a server or worker with a raised
+  `RLIMIT_NOFILE` that also makes outbound requests), navi's socket lands above that
+  ceiling and the `FD_SET` either aborts the process on a fortified glibc build
+  (`bit out of range 0 - FD_SETSIZE on fd_set`), corrupts the stack, or makes `select`
+  fail with `EINVAL`. Since every call site only tested `> 0`, the `-1` was
+  indistinguishable from an expiry, so a ready connection raised `TimeoutError`
+  ("read timed out", or a connect timeout) on every request. It affected TLS and plain
+  http alike, but only when a read, total or connect timeout was armed: with no
+  timeout the wait is skipped entirely. The waits now poll a stack `pollfd` (the
+  Happy-Eyeballs race reuses one buffer across rounds, so a wait still allocates
+  nothing), `POLLHUP`/`POLLERR` count as ready so the following `recv`/`SO_ERROR`
+  surfaces the real error exactly as before, `EINTR` retries with the time that is
+  left, and a genuine poll failure now raises `IOError` with the errno text rather
+  than passing for a timeout. Timeout semantics are unchanged. Windows was never
+  affected (its `fd_set` is a counted array) and keeps an `SO_ERROR` fallback on the
+  connect wait, because `WSAPoll` before Windows 10 2004 does not signal a failed
+  connect.
 - **A failed TLS handshake over a Unix socket no longer leaks a descriptor, an SSL
   and an SSL_CTX on the asyncdispatch client (#427).** The `pkUnix` branch of the
   backend's `connect` had no exception handler, so when `newClientSsl`,
