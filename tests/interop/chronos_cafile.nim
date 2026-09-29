@@ -7,7 +7,7 @@
 ## falls back to the default system trust store (chronos now runs OpenSSL).
 
 import unittest
-import std/os
+import std/[os, strutils]
 import pkg/chronos
 import navi/chronos
 
@@ -32,9 +32,32 @@ proc rejectedWithoutCa(url: string): Future[bool] {.async.} =
   except CatchableError:
     return true                     # TLS verify error -> rejected
 
+proc errorWithoutCa(url: string, connectMs: int): Future[string] {.async.} =
+  ## The message navi surfaces for a server whose chain does not verify, with a
+  ## connect timeout armed. chronos's `withTimeout` completes `true` when the inner
+  ## future FAILED (asyncfutures `completeFuture`), so `connect` used to discard the
+  ## TLS error and return a half-built Conn; the caller then saw a generic "send on
+  ## a closed connection" from `sendAll` and the engine reclassified it as a
+  ## keep-alive race (#420).
+  var cfg = initNaviConfig()
+  cfg.timeouts.connect = connectMs
+  cfg.retry.limit = 0
+  let api = newNavi(cfg)
+  try:
+    discard await api.get(url)
+    return ""                       # handshake unexpectedly succeeded
+  except CatchableError as e:
+    return e.msg
+
 suite "chronos custom-CA (caFile) interop":
   test "verifies the server against a custom CA and completes the handshake":
     check waitFor(statusWithCa(base & "/", ca)) == 200   # openssl s_server -www answers 200
 
   test "the same server is rejected without the custom CA (default anchors)":
     check waitFor rejectedWithoutCa(base & "/")
+
+  test "a connect timeout must not swallow the TLS failure":
+    let msg = waitFor errorWithoutCa(base & "/", 5000)
+    check msg.len > 0                             # it must still be rejected
+    check "closed connection" notin msg           # the generic symptom of a lost error
+    check ("TLS" in msg or "certificate" in msg)  # the real reason reaches the caller

@@ -222,6 +222,22 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **The chronos backend no longer discards establishment errors when a connect timeout
+  is set, and never hands back an unverified Unix-socket TLS session (#420).** With
+  `timeouts.connect` configured, `connect` called `withTimeout(establish(), ...)` and
+  never read the establish future back. chronos completes `withTimeout` with `true`
+  whenever the inner future has *finished*, a failure included, so every establishment
+  error -- DNS, connection refused, handshake failure, chain or hostname verification,
+  an SPKI pin mismatch, a rejecting verify callback -- was dropped and a half-built
+  connection was returned. On the TCP path the caller then saw a generic "send on a
+  closed connection" instead of the real reason, which the engine reclassifies as a
+  keep-alive race and may replay; on the Unix-socket path, whose TLS branch had no
+  failure teardown at all, `conn.tls` was still pointing at a live, fully handshaken
+  SSL, so the request went out over a connection whose identity check had FAILED.
+  `connect` now keeps the establish future and awaits it after the timeout check (the
+  shape the asyncdispatch backend already used), and the Unix-socket branch runs the
+  same teardown as the TCP one (close the SSL and the transport, clear `conn.tls`),
+  which also stops it leaking an fd, an SSL and its BIOs on every failed handshake.
 - **A PKCS#12 client credential now presents the intermediates the bundle carries
   (#425).** `usePkcs12` passed a nil CA out-param to `PKCS12_parse` and installed
   only the leaf and the key, so a client certificate issued by an intermediate CA

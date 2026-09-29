@@ -27,7 +27,7 @@ proc attempt(sock: string): Future[string] {.async.} =
     return e.msg
 
 proc main() {.async.} =
-  let sock = getEnv("NAVI_UDS_TLS_PATH")
+  let sock = getEnv("NAVI_UDS_TLS_LEAK_PATH")
   let first = await attempt(sock)
   doAssert first.len > 0, "a self-signed cert should fail verification over a Unix socket"
   echo "OK  unix TLS verification failed as expected: ", first.splitLines[0]

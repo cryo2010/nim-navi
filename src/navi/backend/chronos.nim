@@ -247,6 +247,18 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
             conn.ctx = ctx
             conn.ownsCtx = owned
             ok = true
+          except CatchableError:
+            # The same teardown the TCP branch runs. Without it a failed handshake
+            # or a failed chain/hostname/pin check leaves `conn.tls` pointing at a
+            # live, fully handshaken SSL (and leaks it, its BIOs and the fd): the
+            # caller would then send the request over a session whose identity check
+            # did NOT pass. Nil it so no Conn ever leaves `connect` unverified.
+            if not conn.tls.isNil:
+              await conn.tls.close()               # frees the ssl + the transport
+              conn.tls = nil
+            else:
+              (try: await transport.closeWait() except CatchableError: discard)
+            raise
           finally:
             if owned and not ok and not ctx.isNil: destroyCtx(ctx)
         else:
@@ -329,11 +341,22 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
         if tls and owned and not keepCtx and not ctx.isNil:
           destroyCtx(ctx)
 
-  if connectMs > 0:
-    if not await withTimeout(establish(), connectMs.milliseconds):
-      raise newException(response.TimeoutError, connectTimeoutMsg(connectMs))
-  else:
-    await establish()
+  # Keep the establish future and await it after the timeout check (the same shape
+  # as the asyncdispatch backend). chronos's `withTimeout` completes `false` ONLY on
+  # the timeout: a FAILED inner future completes it with `true` and its exception is
+  # discarded (asyncfutures `completeFuture`: `if fut.failed() or fut.completed():
+  # retFuture.complete(true)`). Reading the future back is therefore what makes every
+  # establishment error -- DNS, refused, handshake, chain/hostname verification, SPKI
+  # pin -- reach the caller instead of `connect` returning a half-built Conn that
+  # fails later with a generic "send on a closed connection".
+  let est = establish()
+  if connectMs > 0 and not await withTimeout(est, connectMs.milliseconds):
+    # `withTimeout` cancelled `est` and waited for it to settle before completing
+    # false, so establish's own teardown has already run; cancelAndWait is the
+    # belt-and-braces no-op that also covers a cancel still in flight.
+    await noCancel est.cancelAndWait()
+    raise newException(response.TimeoutError, connectTimeoutMsg(connectMs))
+  await est
   return conn
 
 proc sendAll*(c: Conn, data: string): Future[void] {.async.} =
