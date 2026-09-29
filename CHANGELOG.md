@@ -222,6 +222,22 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **A failed TLS handshake over a Unix socket no longer leaks a descriptor, an SSL
+  and an SSL_CTX on the asyncdispatch client (#427).** The `pkUnix` branch of the
+  backend's `connect` had no exception handler, so when `newClientSsl`,
+  `driveHandshake`, `verifyPeer` or `postHandshakeVerify` raised (bad chain, hostname
+  mismatch, SPKI pin failure, handshake error) the just-connected socket stayed
+  registered on the dispatcher, the SSL was never freed, and with a bare `TlsConfig`
+  (no client context store) the unshared SSL_CTX was never destroyed. Nothing
+  downstream could reclaim them: the exception propagates out of `establish` before
+  the connection is returned, a value-type `Conn` has no destructor, and the
+  `connectMs` backstop only covers an establish that TIMED OUT, not one that failed.
+  Every retry leaked another set. Both branches of `establish` now share one
+  `tearDownAttempt` helper that frees the SSL, destroys an owned context and closes
+  the socket, so the Unix path reclaims exactly what the TCP path always did (and,
+  as a side effect, so does the `https` over a Unix socket without `-d:ssl` error).
+  Measured over the new interop leg: 40 failing handshakes used to leak 40
+  descriptors and now leave the count unchanged.
 - **A send racing a connection close on the asyncdispatch client no longer writes
   through a freed TLS session (#421).** `sslRead` has long refused to read once the
   shared teardown flag reaches `csClosed`, because `freeConn` calls `SSL_free` before

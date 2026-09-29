@@ -171,10 +171,11 @@ task httpConnect, "HTTP CONNECT proxy tunnelling, all native clients (needs open
   # status line for the third, on the sync, asyncdispatch and chronos clients.
   exec "bash tests/interop/http_connect.sh"
 
-task unixSocket, "Unix domain socket transport, all native clients (POSIX; needs python3)":
+task unixSocket, "Unix domain socket transport, all native clients (POSIX; needs python3 + openssl)":
   # An AF_UNIX HTTP server that echoes the Host header: navi must dial the socket
   # path, send the URL host as Host, and reject an over-long path, on the sync,
-  # asyncdispatch and chronos clients.
+  # asyncdispatch and chronos clients. Then (Linux) an AF_UNIX TLS server with an
+  # untrusted cert: a failed handshake must not leak the fd, the SSL or the ctx.
   exec "bash tests/interop/unixsocket.sh"
 
 task streaming, "File-streaming interop: http1/http2 x upload/download (needs nghttpd + openssl)":

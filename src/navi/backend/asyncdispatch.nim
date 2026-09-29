@@ -396,20 +396,43 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   conn.state = new(ConnectionState)   # csOpen; shared teardown state (see Conn.state)
   conn.parked = new(ParkedRead)       # empty; filled only by an expired `recvWithin`
 
+  proc tearDownAttempt(fd: AsyncFD) =
+    ## Release a half-built connection. Nothing here has a destructor and a
+    ## value-type `Conn` is simply dropped when `establish` raises, so a failed
+    ## handshake or verification must hand back the SSL, an UNSHARED SSL_CTX (a
+    ## shared one belongs to the client's context store) and the socket itself, or
+    ## every retry leaks one of each. Used by both branches of `establish`.
+    when defined(ssl):
+      if not conn.ssl.isNil: SSL_free(conn.ssl); conn.ssl = nil
+      if conn.ownsCtx and not conn.ctx.isNil: conn.ctx.destroyContext()
+      conn.ctx = nil
+      conn.ownsCtx = false
+    if fd != invalidFd: closeSocket(fd)
+    conn.fd = invalidFd
+
   proc establish() {.async.} =
     if proxy.kind == pkUnix:
       conn.fd = await unixConnect(proxy.host)
       if tls:
-        when defined(ssl):
-          (conn.ctx, conn.ownsCtx) = obtainContext(cfg.contextStore, cfg, alpn)
-          conn.slot = resumeSlot(cfg, host & ":" & $port)
-          conn.ssl = newClientSsl(conn.ctx, conn.fd.SocketHandle, host, conn.slot)
-          await driveHandshake(conn.ssl, conn.fd, host)
-          verifyPeer(conn.ssl, host, cfg.wantsVerify)
-          postHandshakeVerify(conn.ssl, host, cfg)
-          conn.protocol = negotiatedProtocol(conn.ssl)
-        else:
-          raise newException(ValueError, "navi: https requires compiling with -d:ssl")
+        try:
+          when defined(ssl):
+            (conn.ctx, conn.ownsCtx) = obtainContext(cfg.contextStore, cfg, alpn)
+            conn.slot = resumeSlot(cfg, host & ":" & $port)
+            conn.ssl = newClientSsl(conn.ctx, conn.fd.SocketHandle, host, conn.slot)
+            await driveHandshake(conn.ssl, conn.fd, host)
+            verifyPeer(conn.ssl, host, cfg.wantsVerify)
+            postHandshakeVerify(conn.ssl, host, cfg)
+            conn.protocol = negotiatedProtocol(conn.ssl)
+          else:
+            raise newException(ValueError, "navi: https requires compiling with -d:ssl")
+        except CatchableError:
+          # Unlike the TCP branch there is no second address to fall back to, so
+          # reclaim the attempt and let the failure propagate. The caller is
+          # unwinding on it and cannot reach the conn, which is why this has to
+          # happen here (the connectMs backstop below only covers a TIMED-OUT
+          # establish, not a failed one).
+          tearDownAttempt(conn.fd)
+          raise
       return
     let dialHost = if proxy.isSet: proxy.host else: host
     let dialPort = if proxy.isSet: proxy.port else: port
@@ -447,11 +470,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
       except CatchableError as e:
         # Tear down this attempt (the SSL_CTX has no destructor, so a failed
         # handshake would leak an unshared one), then try the remaining addresses.
-        when defined(ssl):
-          if not conn.ssl.isNil: SSL_free(conn.ssl); conn.ssl = nil
-          if conn.ownsCtx and not conn.ctx.isNil: conn.ctx.destroyContext()
-          conn.ctx = nil
-        closeSocket(fd); conn.fd = invalidFd
+        tearDownAttempt(fd)
         pool.delete(idx)
         lastErr = e
     raise lastErr

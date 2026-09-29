@@ -40,7 +40,7 @@ nimble tlsPinning         # in-memory CA + SPKI pinning + verify callback (needs
 nimble tlsWriteClose      # a TLS write racing a close, asyncdispatch client (needs openssl + python3)
 nimble socks              # SOCKS5 proxy + user/pass auth, all native clients (needs python3)
 nimble httpConnect        # HTTP CONNECT proxy: split / oversized / 407 replies (needs openssl + python3)
-nimble unixSocket         # Unix domain socket transport, native clients (needs python3)
+nimble unixSocket         # Unix socket transport + failed-TLS teardown (needs python3 + openssl)
 nimble servers            # h2 vs nginx / Caddy / h2o (needs Docker + openssl)
 nimble streamConcurrent   # 50x simultaneous streamed up+down over the h2 mux (needs Docker)
 nimble sse                # SSE reconnect + Last-Event-ID resume over the h2 mux (needs Docker)
