@@ -30,6 +30,7 @@ typedef struct {
   int verify;                // verify the chain + hostname after the handshake
   int min_version;           // 0 unset, else 10/11/12/13 for TLS 1.0 .. 1.3
   int max_version;           // 0 unset, else 10/11/12/13 for TLS 1.0 .. 1.3
+  unsigned long long handshake_timeout_ms;  // 0 = unset (ngtcp2's UINT64_MAX default)
 } NaviH3Tls;
 
 #ifdef __cplusplus

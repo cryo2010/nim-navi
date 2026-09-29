@@ -185,6 +185,8 @@ struct H3Conn {
                             // draining): a clean end, not a transport error
   unsigned long long max_body = 0;  // navi maxResponseBytes: cap on a single response
                                     // body the driver will buffer (0 = unlimited)
+  unsigned long long handshake_timeout_ms = 0;  // navi connectMs; bounds the blocking
+                                    // handshake drive loop (0 = the 120s safety net)
   // The peer's SETTINGS (RFC 9114 7.2.4), recorded by on_recv_settings.
   // `peer_settings` flips once the server's SETTINGS frame has been received, and
   // `peer_connect_protocol` carries its SETTINGS_ENABLE_CONNECT_PROTOCOL. The
@@ -705,7 +707,8 @@ ngtcp2_ssize send_step(H3Conn *c, std::span<std::uint8_t> buf) {
 
 // Blocking driver for the sync wrappers: advance the step functions with a poll
 // loop until *flag is set (handshake completed / request done).
-int drive_until(H3Conn *c, const bool *flag);  // fwd decl (uses the extern "C" steps)
+int drive_until(H3Conn *c, const bool *flag, unsigned long long budget_ms = 0);
+  // fwd decl (uses the extern "C" steps)
 
 // --- TLS configuration (NaviH3Tls -> SSL_CTX) --------------------------------
 // The QUIC leg used to receive only a CA file and a verify flag, so caBundle, the
@@ -1180,6 +1183,14 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
     ngtcp2_settings settings;
     ngtcp2_settings_default(&settings);
     settings.initial_ts = now_ns();
+    // Bound the QUIC handshake by navi's connect budget. ngtcp2 defaults this to
+    // UINT64_MAX, so a black-holed UDP port used to stall until the 30s idle timer
+    // fired no matter what connectMs said (#432); with it set, ngtcp2 fails the
+    // connection itself and the drive loops below observe that immediately.
+    if (tls->handshake_timeout_ms > 0)
+      settings.handshake_timeout =
+        tls->handshake_timeout_ms * NGTCP2_MILLISECONDS;
+    c->handshake_timeout_ms = tls->handshake_timeout_ms;
 
     ngtcp2_transport_params params;
     ngtcp2_transport_params_default(&params);
@@ -1275,7 +1286,12 @@ H3Conn *navi_h3_open(const char *host, const char *port, const char *sni,
                      const NaviH3Tls *tls, unsigned long long max_body) {
   H3Conn *c = navi_h3_new(host, port, sni, tls, max_body);
   if (!c) return nullptr;
-  if (drive_until(c, &c->handshake_done) != 0 || navi_h3_bind(c) != 0) {
+  // The handshake drive loop is bounded by the caller's connectMs when one is
+  // configured, so a black-holed UDP path fails inside the connect budget instead
+  // of waiting out the 30s idle timer (#432). navi_h3_bind runs the post-handshake
+  // certificate + hostname check before any stream is opened.
+  if (drive_until(c, &c->handshake_done, c->handshake_timeout_ms) != 0 ||
+      navi_h3_bind(c) != 0) {
     navi_h3_close(c);
     return nullptr;
   }
@@ -1616,13 +1632,15 @@ namespace {
 // Drive the blocking loops (handshake, buffered request, streamed upload) until
 // `*flag`. Bounded by wall-clock, not an iteration count: a large streamed upload
 // legitimately needs many cycles, but a genuinely stuck connection must still fail
-// rather than hang forever. 120s is a generous safety net (higher layers enforce
-// navi's own timeouts).
-int drive_until(H3Conn *c, const bool *flag) {
-  std::uint64_t start = now_ns();
+// rather than hang forever. `budget_ms` is the caller's own bound (the handshake
+// uses navi's connectMs, #432); 0 falls back to a generous 120s safety net.
+int drive_until(H3Conn *c, const bool *flag, unsigned long long budget_ms) {
+  const std::uint64_t start = now_ns();
+  const std::uint64_t budget = budget_ms > 0
+    ? budget_ms * NGTCP2_MILLISECONDS : 120ULL * NGTCP2_SECONDS;
   while (!*flag) {
     if (navi_h3_pump(c) != 0) return -1;
-    if (now_ns() - start > 120ULL * NGTCP2_SECONDS) return -1;
+    if (now_ns() - start > budget) return -1;
   }
   return 0;
 }

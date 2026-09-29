@@ -251,6 +251,11 @@ the connection is used. QUIC is TLS 1.3 only, so a `maxVersion` below TLS 1.3 ru
 h3 out: navi skips the advertised endpoint and stays on h2/h1 rather than failing
 the request.
 
+The QUIC handshake is bounded by `connectMs` (then `totalMs`, else 30 s), and an h3
+endpoint whose handshake fails before anything is submitted is marked broken for a
+doubling backoff window (RFC 7838 2.4), so a network that drops UDP/443 costs one
+stalled handshake rather than one per request.
+
 ### Proxy
 
 ```nim

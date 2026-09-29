@@ -11,9 +11,10 @@
 when not defined(naviHttp3):
   {.error: "navi/backend/quic_async is a -d:naviHttp3-only module.".}
 
-import std/[asyncdispatch, strutils, tables]
+import std/[asyncdispatch, strutils, tables, times]
 import ../core/response   # ResponseTooLargeError, used by the shared quic_common fragment
 import ./quic
+import ./timing   # establishMs precedence + shared timeout wording
 export quic
 
 proc sockSend(fd: cint, buf: pointer, len: csize_t, flags: cint): int
@@ -133,15 +134,18 @@ proc waitProgress(qc: QuicConn, sid: int64) {.async.} =
   await f
 
 proc openConnAsync*(host: string, port: int, sni: string, tls: TlsConfig,
-                    maxBody: uint64 = 0): Future[QuicConnAsync] {.async.} =
+                    maxBody: uint64 = 0, connectMs = 0,
+                    totalMs = 0): Future[QuicConnAsync] {.async.} =
   ## Open a QUIC connection, complete the handshake, bind the h3 session, and
   ## start the background reader. `tls` is navi's full TLS policy, honoured as in
   ## `h3Open` (trust store, client credential, cipher bounds, SPKI pins and verify
   ## callback). `maxBody` caps a buffered response body (0 = unlimited, navi
-  ## maxResponseBytes). Raises `QuicError` on failure and `ValueError` on a pin /
-  ## callback rejection.
+  ## maxResponseBytes). The handshake is bounded by `connectMs`, else `totalMs`,
+  ## else `h3HandshakeDefaultMs`. Raises `QuicError` on failure and `ValueError`
+  ## on a pin / callback rejection.
   let name = if sni.len > 0: sni else: host
-  var t = toH3Tls(tls)
+  let handshakeMs = establishMs(connectMs, totalMs, h3HandshakeDefaultMs)
+  var t = toH3Tls(tls, handshakeMs)
   let c = navi_h3_new(host.cstring, ($port).cstring, name.cstring, addr t,
                       culonglong(maxBody))
   if c == nil:
@@ -160,7 +164,14 @@ proc openConnAsync*(host: string, port: int, sni: string, tls: TlsConfig,
   addRead(fd, proc(a: AsyncFD): bool =
     (if qc.wakeup != nil and not qc.wakeup.finished: qc.wakeup.complete()); false)
   try:
+    # Bound by the same budget the driver gave ngtcp2 (settings.handshake_timeout),
+    # so a black-holed UDP path fails inside connectMs instead of waiting out the
+    # 30s idle timer (#432). The C side fails the connection at the deadline too;
+    # this is the belt to that braces, and owns the error wording.
+    let hsDeadline = epochTime() + float(handshakeMs) / 1000.0
     while navi_h3_handshake_done(c) == 0:
+      if epochTime() > hsDeadline:
+        raise newException(QuicError, connectTimeoutMsg(handshakeMs))
       await step(qc)
     if navi_h3_bind(c) != 0:
       raise newException(QuicError, "navi HTTP/3 bind failed")

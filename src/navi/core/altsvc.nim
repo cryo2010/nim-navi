@@ -12,6 +12,10 @@ import ./url
 
 const defaultMaxAge = 86_400   ## RFC 7838: `ma` defaults to 24h when absent.
 
+const
+  brokenBackoffSecs* = 60      ## First backoff after an h3 endpoint fails to connect.
+  brokenBackoffMaxSecs* = 960  ## Ceiling for the doubling (16 minutes).
+
 type
   AltSvcEndpoint* = object
     ## Where h3 is offered for an origin. An empty `host` means "same host as the
@@ -29,6 +33,8 @@ type
   CacheEntry = object
     endpoint: AltSvcEndpoint
     expires: MonoTime
+    brokenUntil: MonoTime  ## while in the future, the endpoint is suppressed
+    failures: int          ## consecutive connect failures, for the doubling backoff
 
   AltSvcCache* = ref object
     ## Per-client origin -> h3-endpoint cache, keyed by `scheme://host:port`.
@@ -101,9 +107,41 @@ proc record*(c: AltSvcCache, scheme, host: string, port: int, header: string) =
     return
   var ep = a.endpoint
   if ep.host.len == 0: ep.host = host   # ":443" means same host as the origin
+  # A re-advertisement of the SAME endpoint must not clear an active backoff: an
+  # origin repeats its Alt-Svc header on every TCP response, so resetting here would
+  # put the client straight back on the UDP path it just failed to reach (#432). A
+  # different alt-authority is a genuinely new alternative, so it starts clean.
+  let prior = c.entries.getOrDefault(key)
+  let same = prior.endpoint == ep
   c.entries[key] = CacheEntry(
     endpoint: ep,
-    expires: getMonoTime() + initDuration(seconds = a.maxAge))
+    expires: getMonoTime() + initDuration(seconds = a.maxAge),
+    brokenUntil: (if same: prior.brokenUntil else: default(MonoTime)),
+    failures: (if same: prior.failures else: 0))
+
+proc markBroken*(c: AltSvcCache, scheme, host: string, port: int) =
+  ## Note the origin's h3 alternative as broken (RFC 7838 2.4): the QUIC handshake
+  ## failed before anything was submitted, so `h3Endpoint` suppresses it for a
+  ## backoff window and requests go straight to h2/h1. The window doubles from
+  ## `brokenBackoffSecs` with each consecutive failure, up to `brokenBackoffMaxSecs`,
+  ## so a permanently UDP-blocked network stops paying a handshake per request. A
+  ## no-op when the origin has no cached advertisement.
+  if c == nil: return
+  let key = originKey(scheme, host, port)
+  c.entries.withValue(key, e):
+    e.failures = min(e.failures + 1, 16)      # clamped so the shift below cannot overflow
+    let secs = min(brokenBackoffSecs shl (e.failures - 1), brokenBackoffMaxSecs)
+    e.brokenUntil = getMonoTime() + initDuration(seconds = secs)
+
+proc markWorking*(c: AltSvcCache, scheme, host: string, port: int) =
+  ## Clear an origin's h3 backoff after a successful QUIC connection, so a network
+  ## that recovers is used again immediately instead of serving out the window.
+  if c == nil: return
+  let key = originKey(scheme, host, port)
+  c.entries.withValue(key, e):
+    if e.failures > 0:
+      e.failures = 0
+      e.brokenUntil = default(MonoTime)
 
 proc h3Endpoint*(c: AltSvcCache, scheme, host: string, port: int): Option[AltSvcEndpoint] =
   ## The cached, unexpired h3 endpoint for an origin, or `none`. Expired entries
@@ -112,9 +150,11 @@ proc h3Endpoint*(c: AltSvcCache, scheme, host: string, port: int): Option[AltSvc
   let key = originKey(scheme, host, port)
   let entry = c.entries.getOrDefault(key)
   if entry.endpoint.port == 0: return   # miss (zeroed default)
-  if getMonoTime() >= entry.expires:
+  let now = getMonoTime()
+  if now >= entry.expires:
     c.entries.del(key)
     return
+  if now < entry.brokenUntil: return    # in the RFC 7838 2.4 backoff: stay on h2/h1
   some(entry.endpoint)
 
 proc clear*(c: AltSvcCache) =

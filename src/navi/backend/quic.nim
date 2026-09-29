@@ -105,6 +105,8 @@ type NaviH3Tls* {.importc: "NaviH3Tls", header: "h3client.h", bycopy.} = object
   verify* {.importc: "verify".}: cint
   minVersion* {.importc: "min_version".}: cint   ## 0 unset, else 10/11/12/13
   maxVersion* {.importc: "max_version".}: cint
+  handshakeTimeoutMs* {.importc: "handshake_timeout_ms".}: culonglong
+    ## 0 = unset (ngtcp2's unbounded default)
 
 proc navi_h3_open(host, port, sni: cstring, tls: ptr NaviH3Tls,
                   maxBody: culonglong): pointer {.importc, cdecl.}
@@ -218,6 +220,11 @@ proc navi_h3_flush*(c: pointer): cint {.importc, cdecl.}
 proc ngtcp2VersionStr*(): string = $ngtcp2_version(0).version_str
 proc nghttp3VersionStr*(): string = $nghttp3_version(0).version_str
 
+const h3HandshakeDefaultMs* = 30_000
+  ## Handshake bound used when neither `connectMs` nor `totalMs` is configured.
+  ## Matches the QUIC idle timeout the driver advertises, so the default behaviour
+  ## is unchanged; an explicit `connectMs` now genuinely bounds the handshake (#432).
+
 proc h3VersionCode(v: TlsVersion): cint =
   ## The wire code `NaviH3Tls` uses for a `TlsVersion` (0 = unset).
   case v
@@ -227,7 +234,7 @@ proc h3VersionCode(v: TlsVersion): cint =
   of tls12: 12
   of tls13: 13
 
-proc toH3Tls*(cfg: TlsConfig): NaviH3Tls =
+proc toH3Tls*(cfg: TlsConfig, handshakeMs = 0): NaviH3Tls =
   ## Flatten navi's `TlsConfig` for the h3 driver. The result BORROWS `cfg`'s
   ## strings, so `cfg` must outlive every navi_h3_new / navi_h3_open call made with
   ## it (the driver copies what it needs during the call and nothing after).
@@ -239,7 +246,8 @@ proc toH3Tls*(cfg: TlsConfig): NaviH3Tls =
     ciphers: cfg.ciphers.cstring, cipherSuites: cfg.cipherSuites.cstring,
     verify: cint(cfg.wantsVerify),
     minVersion: h3VersionCode(cfg.minVersion),
-    maxVersion: h3VersionCode(cfg.maxVersion))
+    maxVersion: h3VersionCode(cfg.maxVersion),
+    handshakeTimeoutMs: culonglong(max(0, handshakeMs)))
 
 proc h3TlsFail(msg: string) {.noreturn, raises: [ValueError].} =
   ## Same exception and wording as the TCP backends' `fail` (backend/openssl_ctx),
@@ -286,7 +294,7 @@ proc h3PostHandshakeVerify*(handle: pointer, host: string, cfg: TlsConfig)
       h3TlsFail("the verify callback rejected the certificate for " & host)
 
 proc h3Open*(host: string, port: int, sni = "", tls = TlsConfig(),
-             maxBody: uint64 = 0): QuicConn =
+             maxBody: uint64 = 0, connectMs = 0, totalMs = 0): QuicConn =
   ## Open a persistent HTTP/3 connection and complete the handshake. `sni`
   ## defaults to `host`. `tls` is navi's full TLS policy and is honoured here as it
   ## is on the TCP backends: the chain and hostname are verified unless `verify` is
@@ -294,10 +302,11 @@ proc h3Open*(host: string, port: int, sni = "", tls = TlsConfig(),
   ## credential is presented for mTLS, the cipher bounds are applied, and
   ## `pinnedKeys`/`verifyCallback` are checked on the peer leaf before the
   ## connection is usable. `maxBody` caps a buffered response body (0 = unlimited,
-  ## navi maxResponseBytes). Raises `QuicError` on a connect failure and
-  ## `ValueError` on a pin / callback rejection.
+  ## navi maxResponseBytes). The handshake is bounded by `connectMs`, else
+  ## `totalMs`, else `h3HandshakeDefaultMs`. Raises `QuicError` on a connect
+  ## failure and `ValueError` on a pin / callback rejection.
   let name = if sni.len > 0: sni else: host
-  var t = toH3Tls(tls)
+  var t = toH3Tls(tls, establishMs(connectMs, totalMs, h3HandshakeDefaultMs))
   let h = navi_h3_open(host.cstring, ($port).cstring, name.cstring,
                        addr t, culonglong(maxBody))
   if h == nil:
@@ -623,14 +632,19 @@ proc openWsH3*(host: string, port: int, sni: string, tls: TlsConfig,
   ## (single) thread, then hand the connection to a pump thread. Returns the pump
   ## and the response :status (the caller checks 200). `tls` is navi's full TLS
   ## policy, honoured exactly as in `h3Open` (trust store, client credential,
-  ## cipher bounds, SPKI pins and verify callback). The handshake is bounded by
+  ## cipher bounds, SPKI pins and verify callback). Every stage is bounded by
   ## `connectMs` (or, falling back like the sync `connect`, `totalMs`; 0 = a 30s
-  ## default) so a server that stalls after QUIC completes cannot hang the caller
-  ## forever. `readMs` (0 = block indefinitely) is carried to the pump as the
-  ## per-read stall bound `wsRecv` enforces, mirroring h1/h2 where each read is
-  ## bounded by the configured readMs.
+  ## default): the QUIC handshake itself, the wait for the peer's SETTINGS, and the
+  ## wait for the CONNECT response, so neither a black-holed UDP path nor a server
+  ## that stalls after QUIC completes can hang the caller past that budget.
+  ## `readMs` (0 = block indefinitely) is carried to the pump as the per-read stall
+  ## bound `wsRecv` enforces, mirroring h1/h2 where each read is bounded by the
+  ## configured readMs.
   let name = if sni.len > 0: sni else: host
-  var t = toH3Tls(tls)
+  # connectMs wins, then totalMs, else a 30s handshake default (mirroring how the
+  # sync `connect` resolves establishMs, but with an explicit backend floor).
+  let handshakeMs = establishMs(connectMs, totalMs, h3HandshakeDefaultMs)
+  var t = toH3Tls(tls, handshakeMs)
   let h = navi_h3_open(host.cstring, ($port).cstring, name.cstring,
                        addr t,
                        culonglong(0))   # WebSocket frames stream via read_body: no buffered cap
@@ -640,11 +654,6 @@ proc openWsH3*(host: string, port: int, sni: string, tls: TlsConfig,
   except CatchableError:
     navi_h3_close(h)                    # fail closed before the CONNECT is sent
     raise
-  # connectMs wins, then totalMs, else a 30s handshake default (mirroring how the
-  # sync `connect` resolves establishMs, but with an explicit backend floor). It
-  # bounds both halves of the handshake: the wait for the peer's SETTINGS and the
-  # wait for the CONNECT response.
-  let handshakeMs = establishMs(connectMs, totalMs, 30_000)
   let deadline = epochTime() + float(handshakeMs) / 1000.0
   # RFC 9220 / RFC 8441 3: an Extended CONNECT may only be sent once the peer's
   # SETTINGS has arrived AND enabled SETTINGS_ENABLE_CONNECT_PROTOCOL. Drive the

@@ -113,3 +113,65 @@ suite "AltSvcCache":
   test "h3Endpoint on a nil cache should be none":
     var c: AltSvcCache = nil
     check c.h3Endpoint("https", "example.com", 443).isNone
+
+suite "alt-svc broken-endpoint backoff":
+  test "markBroken should suppress the endpoint for the backoff window":
+    let c = newAltSvcCache()
+    c.record("https", "example.com", 443, "h3=\":443\"; ma=3600")
+    check c.h3Endpoint("https", "example.com", 443).isSome
+    c.markBroken("https", "example.com", 443)
+    check c.h3Endpoint("https", "example.com", 443).isNone
+
+  test "markWorking should clear an active backoff":
+    let c = newAltSvcCache()
+    c.record("https", "example.com", 443, "h3=\":443\"; ma=3600")
+    c.markBroken("https", "example.com", 443)
+    check c.h3Endpoint("https", "example.com", 443).isNone
+    c.markWorking("https", "example.com", 443)
+    check c.h3Endpoint("https", "example.com", 443).isSome
+
+  test "re-advertising the same endpoint should not clear the backoff":
+    # An origin repeats its Alt-Svc header on every TCP response, so a plain
+    # re-record must not put the client straight back on the dead UDP path.
+    let c = newAltSvcCache()
+    c.record("https", "example.com", 443, "h3=\":443\"; ma=3600")
+    c.markBroken("https", "example.com", 443)
+    c.record("https", "example.com", 443, "h3=\":443\"; ma=3600")
+    check c.h3Endpoint("https", "example.com", 443).isNone
+
+  test "advertising a different alt-authority should start clean":
+    let c = newAltSvcCache()
+    c.record("https", "example.com", 443, "h3=\":443\"; ma=3600")
+    c.markBroken("https", "example.com", 443)
+    c.record("https", "example.com", 443, "h3=\"alt.example.com:8443\"; ma=3600")
+    let ep = c.h3Endpoint("https", "example.com", 443)
+    check ep.isSome
+    check ep.get.host == "alt.example.com"
+    check ep.get.port == 8443
+
+  test "the backoff should only affect the origin that failed":
+    let c = newAltSvcCache()
+    c.record("https", "a.com", 443, "h3=\":443\"; ma=3600")
+    c.record("https", "b.com", 443, "h3=\":443\"; ma=3600")
+    c.markBroken("https", "a.com", 443)
+    check c.h3Endpoint("https", "a.com", 443).isNone
+    check c.h3Endpoint("https", "b.com", 443).isSome
+
+  test "markBroken and markWorking on an unknown origin should be no-ops":
+    let c = newAltSvcCache()
+    c.markBroken("https", "example.com", 443)
+    c.markWorking("https", "example.com", 443)
+    check c.h3Endpoint("https", "example.com", 443).isNone
+
+  test "markBroken and markWorking on a nil cache should not raise":
+    var c: AltSvcCache = nil
+    c.markBroken("https", "example.com", 443)
+    c.markWorking("https", "example.com", 443)
+    check c.h3Endpoint("https", "example.com", 443).isNone
+
+  test "the backoff window should double with consecutive failures":
+    check brokenBackoffSecs == 60
+    check brokenBackoffMaxSecs == 960
+    # 60 << 4 == 960, so the ceiling is reached at the fifth failure and holds.
+    check min(brokenBackoffSecs shl 4, brokenBackoffMaxSecs) == brokenBackoffMaxSecs
+    check min(brokenBackoffSecs shl 5, brokenBackoffMaxSecs) == brokenBackoffMaxSecs

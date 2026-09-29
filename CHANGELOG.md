@@ -222,6 +222,25 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **The QUIC handshake is bounded by `connectMs`, and an h3 endpoint that will not
+  connect is no longer retried on every request.** ngtcp2's `settings.handshake_timeout`
+  was left at its `UINT64_MAX` default and neither the sync `drive_until` loop nor the
+  asyncdispatch/chronos handshake loops carried a deadline, so the h3 leg was bounded
+  only by the 30 s QUIC idle timer no matter what `connectMs` said. On the very common
+  network that drops outbound UDP/443 to an origin advertising `Alt-Svc: h3`, that cost
+  a ~30 s stall before the TCP fallback, and the Alt-Svc cache was only ever mutated on
+  success, so the *next* request paid it again, and the one after that, until the
+  advertisement's `ma` expired. `connectMs` (then `totalMs`, else a 30 s default) is now
+  plumbed into the QUIC handshake as `settings.handshake_timeout` and bounds all three
+  backends' handshake loops, and a handshake that fails before anything is submitted
+  marks that origin's h3 alternative broken (RFC 7838 2.4) for a backoff window that
+  doubles from 60 s up to 16 minutes, so later requests go straight to h2/h1. A
+  successful h3 connection clears the backoff, and a re-advertisement of the same
+  alt-authority deliberately does not (an origin repeats its `Alt-Svc` header on every
+  TCP response, which would otherwise put the client straight back on the dead path);
+  a *different* alt-authority starts clean. `openWsH3`'s docstring now matches what it
+  does, since its `connectMs` bound previously started only after the QUIC handshake
+  had already completed (#432).
 - **HTTP/3 now honors the whole `TlsConfig`, not just `caFile` and `verify`.** The
   QUIC leg built its own `SSL_CTX` in `h3client.cpp` from those two fields alone, so
   `pinnedKeys`, `verifyCallback`, `caBundle`, the client credential

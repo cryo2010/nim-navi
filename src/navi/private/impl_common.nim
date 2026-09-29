@@ -521,9 +521,17 @@ when defined(naviHttp3):
       let pending = newFuture[QuicConn]("navi.pendingH3")
       client.pendingH3[origin] = pending
       try:
-        let qc = await openQuicConn(ep.host, ep.port, req.url.host,
-                                    client.config.tls,
-                                    uint64(max(0, client.config.maxResponseBytes)))
+        let qc = try:
+            await openQuicConn(ep.host, ep.port, req.url.host, client.config.tls,
+                               uint64(max(0, client.config.maxResponseBytes)),
+                               client.config.connectMs, client.config.totalMs)
+          except QuicError:
+            # RFC 7838 2.4: an alternative that fails to connect is marked broken for
+            # a backoff window, so the next request goes straight to TCP instead of
+            # stalling on the same dead QUIC path again (#432).
+            client.altSvc.markBroken("https", req.url.host, req.url.port)
+            raise
+        client.altSvc.markWorking("https", req.url.host, req.url.port)
         # A dead-but-uncleaned prior conn can occupy this slot: the loop above only
         # returns a cached entry when it is `alive`, so a `not alive` one falls
         # through to here and would be silently overwritten. Its background reader may

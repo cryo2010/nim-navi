@@ -253,9 +253,19 @@ when defined(naviHttp3):
       var conn = client.liveH3Conn(origin)
       if conn == nil:
         reused = false
-        conn = h3Open(ep.host, ep.port, sni = req.url.host,
-                      tls = client.config.tls,
-                      maxBody = uint64(max(0, client.config.maxResponseBytes)))
+        try:
+          conn = h3Open(ep.host, ep.port, sni = req.url.host,
+                        tls = client.config.tls,
+                        maxBody = uint64(max(0, client.config.maxResponseBytes)),
+                        connectMs = client.config.connectMs,
+                        totalMs = client.config.totalMs)
+        except QuicError:
+          # RFC 7838 2.4: an alternative that fails to connect is marked broken, so
+          # the next request goes straight to TCP instead of paying the same stalled
+          # QUIC handshake again until the advertisement's `ma` expires (#432).
+          client.altSvc.markBroken("https", req.url.host, req.url.port)
+          raise
+        client.altSvc.markWorking("https", req.url.host, req.url.port)
         client.h3conns[origin] = H3Cached(conn: conn, lastUse: epochTime())
       try:
         let r = conn.request($req.verb, req.url.requestTarget, fwd, req.body,
