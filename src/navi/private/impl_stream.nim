@@ -84,7 +84,8 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
     # while a `QuicSubmittedError` (raised by `awaitHeaders` once the stream is on
     # the wire) only falls back when the request is replayable and idempotent --
     # otherwise a submitted-then-reset POST would be silently re-sent over h2/h1.
-    if client.config.wantsH3 and req.url.isTls and req.bodyStream == nil:
+    if client.config.wantsH3 and req.url.isTls and req.bodyStream == nil and
+       client.config.tls.h3TlsUsable:
       let ep = client.altSvc.h3Endpoint("https", req.url.host, req.url.port)
       if ep.isSome:
         try:

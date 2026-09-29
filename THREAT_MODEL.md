@@ -37,7 +37,7 @@ Defaults are secure. The security-relevant behaviors that are **on by default**:
 
 | On by default | Mechanism |
 |---------------|-----------|
-| Certificate chain + hostname verification | `tls.insecureSkipVerify = false` (the zero value) |
+| Certificate chain + hostname verification | `tls.verify = true` (`defaultTls()`) |
 | TLS session resumption, scoped per origin | `tls.resumeSessions = true` |
 | Cross-origin `Authorization` stripping on redirect | `core/redirect.nim` |
 | Cookie re-scoping by domain/path (RFC 6265) | `core/cookies.nim` |
@@ -78,10 +78,13 @@ matches the requested host against the certificate's SAN/CN with `X509_check_hos
 (skipped for IP literals, as std/net does). See `src/navi/backend/openssl_ctx.nim`
 and `defaultTls()` in `src/navi/backend/api.nim`. A private CA is trusted via
 `tls.caFile`; mutual authentication uses a client certificate
-(`certFile`/`pkcs12File`/`certPem`). HTTP/3 performs the same certificate
-verification against the QUIC handshake in the shared C driver
-(`src/navi/backend/h3client.cpp`, driven by `quic.nim`/`quic_async.nim`/`quic_chronos.nim`). Turning
-verification off is a deliberate, explicit `tls.insecureSkipVerify = true`.
+(`certFile`/`pkcs12File`/`certPem`). HTTP/3 applies the same `TlsConfig` to the
+QUIC handshake in the shared C driver (`src/navi/backend/h3client.cpp`, driven by
+`quic.nim`/`quic_async.nim`/`quic_chronos.nim`): trust store, `caBundle`, client
+credential and cipher selection are configured on the QUIC `SSL_CTX`, the chain and
+hostname are checked before the h3 session is bound, and the pins/verify callback run
+from Nim on the exported leaf before the connection carries a request or is pooled
+(#419). Turning verification off is a deliberate, explicit `tls.insecureSkipVerify = true`.
 
 **Verified by:** `badssl.nim` (rejects invalid certificates, accepts a valid one),
 `mtls.sh` (client-certificate handshake).
@@ -231,7 +234,7 @@ These are documented boundaries, not open holes:
 ## Backend differences
 
 - **chronos** now runs OpenSSL (driven over its `StreamTransport` via a memory-BIO
-  pump), reaching parity with the sync/asyncdispatch backends: `tls.insecureSkipVerify`,
+  pump), reaching parity with the sync/asyncdispatch backends: `tls.verify`,
   `caFile`/`caBundle`, cipher selection, TLS 1.3, mTLS client certificates, HTTP/2
   (ALPN), and HTTP/3 (`-d:naviHttp3`) all work. An invalid cipher surfaces OpenSSL's
   error rather than silently falling back.

@@ -175,14 +175,18 @@ proc waitProgress(qc: QuicConn, sid: int64) {.async.} =
   if qc.flushPending: wake(qc)
   await f
 
-proc openConnChronos*(host: string, port: int, sni, caFile: string,
-                      verify: bool, maxBody: uint64 = 0): Future[QuicConnChronos] {.async.} =
+proc openConnChronos*(host: string, port: int, sni: string, tls: TlsConfig,
+                      maxBody: uint64 = 0): Future[QuicConnChronos] {.async.} =
   ## Open a QUIC connection, complete the handshake, bind the h3 session, and start
-  ## the background reader. `maxBody` caps a buffered response body (0 = unlimited,
-  ## navi maxResponseBytes). Raises `QuicError` on failure.
+  ## the background reader. `tls` is navi's full TLS policy, honoured as in
+  ## `h3Open` (trust store, client credential, cipher bounds, SPKI pins and verify
+  ## callback). `maxBody` caps a buffered response body (0 = unlimited, navi
+  ## maxResponseBytes). Raises `QuicError` on failure and `ValueError` on a pin /
+  ## callback rejection.
   let name = if sni.len > 0: sni else: host
-  let c = navi_h3_new(host.cstring, ($port).cstring, name.cstring, caFile.cstring,
-                      cint(verify), culonglong(maxBody))
+  var t = toH3Tls(tls)
+  let c = navi_h3_new(host.cstring, ($port).cstring, name.cstring, addr t,
+                      culonglong(maxBody))
   if c == nil:
     raise newException(QuicError,
       "navi HTTP/3 connect to " & host & ":" & $port & " failed")
@@ -203,6 +207,9 @@ proc openConnChronos*(host: string, port: int, sni, caFile: string,
       discard await step(qc)
     if navi_h3_bind(c) != 0:
       raise newException(QuicError, "navi HTTP/3 bind failed")
+    # Pins / verify callback on the peer leaf, before the connection is returned
+    # (and therefore before it can be cached or carry a request) -- #419.
+    h3PostHandshakeVerify(c, name, tls)
   except CatchableError:
     qc.alive = false
     discard removeReader2(fd)

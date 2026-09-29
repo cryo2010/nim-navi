@@ -19,14 +19,17 @@ when not defined(naviHttp3):
 import std/[strutils, atomics, os, times]
 import ../core/altsvc
 import ../core/response   # ResponseTooLargeError, raised when a body exceeds maxResponseBytes
+import ./api              # TlsConfig: the full TLS policy the QUIC leg honours (#419)
 import ./timing           # establishMs precedence + shared timeout wording
 export altsvc.AltSvcEndpoint
+export api.TlsConfig
 
 # Link the h3 stack via pkg-config so the build follows wherever the libraries
 # are installed (the interop image exposes them via PKG_CONFIG_PATH). A
 # -d:naviHttp3 build requires ngtcp2, nghttp3, and OpenSSL >= 3.5 present.
 {.passC: "-std=c++20".}   # h3client.cpp is C++20 (std::span, RAII); Nim's -w hides
                           # the "not valid for C" note this adds to the .c files.
+{.passC: "-I\"" & parentDir(currentSourcePath()) & "\"".}   # h3client.h (the NaviH3Tls struct)
 {.passC: gorge("pkg-config --cflags libngtcp2 libngtcp2_crypto_ossl libnghttp3 libssl").}
 {.passL: gorge("pkg-config --libs libngtcp2 libngtcp2_crypto_ossl libnghttp3 libssl libcrypto").}
 {.passL: "-lstdc++".}     # the C++ standard library, for the C++ driver
@@ -84,9 +87,32 @@ type H3BodyPull* = proc(env: pointer, outPtr: ptr cstring): int {.cdecl.}
   ## C-callable pull for a streamed request body: returns the next chunk's length
   ## and sets `outPtr[]` to its bytes (valid only for the call); 0 = end, < 0 = error.
 
-proc navi_h3_open(host, port, sni, caFile: cstring, verify: cint,
+type NaviH3Tls* {.importc: "NaviH3Tls", header: "h3client.h", bycopy.} = object
+  ## navi's `TlsConfig` flattened for the h3 driver (see backend/h3client.h, which
+  ## defines the layout both sides share). Built by `toH3Tls`; the cstrings borrow
+  ## the caller's strings, so the `TlsConfig` they come from must outlive the
+  ## navi_h3_new / navi_h3_open call.
+  caFile* {.importc: "ca_file".}: cstring
+  caBundle* {.importc: "ca_bundle".}: cstring
+  pkcs12File* {.importc: "pkcs12_file".}: cstring
+  certPem* {.importc: "cert_pem".}: cstring
+  keyPem* {.importc: "key_pem".}: cstring
+  certFile* {.importc: "cert_file".}: cstring
+  keyFile* {.importc: "key_file".}: cstring
+  password* {.importc: "password".}: cstring
+  ciphers* {.importc: "ciphers".}: cstring
+  cipherSuites* {.importc: "cipher_suites".}: cstring
+  verify* {.importc: "verify".}: cint
+  minVersion* {.importc: "min_version".}: cint   ## 0 unset, else 10/11/12/13
+  maxVersion* {.importc: "max_version".}: cint
+
+proc navi_h3_open(host, port, sni: cstring, tls: ptr NaviH3Tls,
                   maxBody: culonglong): pointer {.importc, cdecl.}
 proc navi_h3_close*(c: pointer) {.importc, cdecl.}
+proc navi_h3_peer_cert_der(c: pointer, outBuf: ptr char, cap: csize_t): clong
+  {.importc, cdecl.}   ## leaf DER length (writes it when it fits), -1 if there is none
+proc navi_h3_peer_spki_pin(c: pointer, outBuf: ptr char, cap: csize_t): clong
+  {.importc, cdecl.}   ## base64 SHA-256 of the leaf SPKI (HPKP pin form), or -1
 
 # --- streamed request body (navi bodyStream) over h3 -------------------------
 # A small env carries navi's synchronous producer across the FFI: the C data reader
@@ -112,7 +138,7 @@ proc h3PullThunk*(env: pointer, outPtr: ptr cstring): int {.cdecl.} =
 # Non-blocking step functions (exported for the asyncdispatch driver in
 # quic_async.nim): create without driving the handshake, then pump send/recv/timer
 # from the caller's event loop until handshake / request completion.
-proc navi_h3_new*(host, port, sni, caFile: cstring, verify: cint,
+proc navi_h3_new*(host, port, sni: cstring, tls: ptr NaviH3Tls,
                   maxBody: culonglong): pointer {.importc, cdecl.}
 proc navi_h3_fd*(c: pointer): cint {.importc, cdecl.}
 proc navi_h3_send*(c: pointer, buf: pointer, buflen: csize_t): int {.importc, cdecl.}
@@ -192,19 +218,96 @@ proc navi_h3_flush*(c: pointer): cint {.importc, cdecl.}
 proc ngtcp2VersionStr*(): string = $ngtcp2_version(0).version_str
 proc nghttp3VersionStr*(): string = $nghttp3_version(0).version_str
 
-proc h3Open*(host: string, port: int, sni = "", caFile = "",
-             verify = true, maxBody: uint64 = 0): QuicConn =
+proc h3VersionCode(v: TlsVersion): cint =
+  ## The wire code `NaviH3Tls` uses for a `TlsVersion` (0 = unset).
+  case v
+  of tlsDefault: 0
+  of tls10: 10
+  of tls11: 11
+  of tls12: 12
+  of tls13: 13
+
+proc toH3Tls*(cfg: TlsConfig): NaviH3Tls =
+  ## Flatten navi's `TlsConfig` for the h3 driver. The result BORROWS `cfg`'s
+  ## strings, so `cfg` must outlive every navi_h3_new / navi_h3_open call made with
+  ## it (the driver copies what it needs during the call and nothing after).
+  NaviH3Tls(
+    caFile: cfg.caFile.cstring, caBundle: cfg.caBundle.cstring,
+    pkcs12File: cfg.pkcs12File.cstring, certPem: cfg.certPem.cstring,
+    keyPem: cfg.keyPem.cstring, certFile: cfg.certFile.cstring,
+    keyFile: cfg.keyFile.cstring, password: cfg.password.cstring,
+    ciphers: cfg.ciphers.cstring, cipherSuites: cfg.cipherSuites.cstring,
+    verify: cint(cfg.wantsVerify),
+    minVersion: h3VersionCode(cfg.minVersion),
+    maxVersion: h3VersionCode(cfg.maxVersion))
+
+proc h3TlsFail(msg: string) {.noreturn, raises: [ValueError].} =
+  ## Same exception and wording as the TCP backends' `fail` (backend/openssl_ctx),
+  ## so a pin or callback rejection looks identical whichever leg hit it -- and, not
+  ## being a `QuicError`, is never mistaken for a transport hiccup worth retrying
+  ## over h2/h1.
+  raise newException(ValueError, "navi: " & msg)
+
+proc h3PeerSpkiPin*(handle: pointer): string =
+  ## Base64 SHA-256 of the QUIC peer leaf's SubjectPublicKeyInfo (HPKP pin form),
+  ## or "" when the peer presented no usable certificate.
+  var buf = newString(128)             # a SHA-256 pin is 44 bytes + NUL
+  let n = navi_h3_peer_spki_pin(handle, cast[ptr char](addr buf[0]), csize_t(buf.len))
+  if n <= 0: return ""
+  buf.setLen(n)
+  buf
+
+proc h3PeerCertDer*(handle: pointer): string =
+  ## The QUIC peer leaf certificate in DER form, or "" when there is none.
+  let need = navi_h3_peer_cert_der(handle, nil, 0)
+  if need <= 0: return ""
+  result = newString(need)
+  if navi_h3_peer_cert_der(handle, cast[ptr char](addr result[0]),
+                           csize_t(result.len)) != need:
+    return ""
+
+proc h3PostHandshakeVerify*(handle: pointer, host: string, cfg: TlsConfig)
+    {.raises: [ValueError, CatchableError].} =
+  ## SPKI pinning and the user's verify callback on the QUIC peer leaf -- the h3
+  ## twin of `openssl_ctx.postHandshakeVerify`, which cannot run here because the
+  ## QUIC `SSL` lives behind the C driver. Both checks run even when `verify` is
+  ## off, so an app that replaces verification entirely is still honoured on h3
+  ## (#419). Called by every opener before the connection is handed out or pooled;
+  ## a no-op when neither is configured. Raises `ValueError` on rejection.
+  if cfg.pinnedKeys.len == 0 and cfg.verifyCallback == nil: return
+  if cfg.pinnedKeys.len > 0:
+    let pin = h3PeerSpkiPin(handle)
+    if pin.len == 0 or pin notin cfg.pinnedKeys:
+      h3TlsFail("certificate public key does not match any pin for " & host)
+  if cfg.verifyCallback != nil:
+    let der = h3PeerCertDer(handle)
+    if der.len == 0: h3TlsFail("server presented no certificate")
+    if not cfg.verifyCallback(der):
+      h3TlsFail("the verify callback rejected the certificate for " & host)
+
+proc h3Open*(host: string, port: int, sni = "", tls = TlsConfig(),
+             maxBody: uint64 = 0): QuicConn =
   ## Open a persistent HTTP/3 connection and complete the handshake. `sni`
-  ## defaults to `host`; the server certificate and hostname are verified by
-  ## default (`caFile` adds a custom CA, `verify=false` disables checking).
-  ## `maxBody` caps a buffered response body (0 = unlimited, navi maxResponseBytes).
-  ## Raises `QuicError` on connect or verification failure.
+  ## defaults to `host`. `tls` is navi's full TLS policy and is honoured here as it
+  ## is on the TCP backends: the chain and hostname are verified unless `verify` is
+  ## off, `caFile`/`caBundle` extend the trust store, any configured client
+  ## credential is presented for mTLS, the cipher bounds are applied, and
+  ## `pinnedKeys`/`verifyCallback` are checked on the peer leaf before the
+  ## connection is usable. `maxBody` caps a buffered response body (0 = unlimited,
+  ## navi maxResponseBytes). Raises `QuicError` on a connect failure and
+  ## `ValueError` on a pin / callback rejection.
   let name = if sni.len > 0: sni else: host
+  var t = toH3Tls(tls)
   let h = navi_h3_open(host.cstring, ($port).cstring, name.cstring,
-                       caFile.cstring, cint(verify), culonglong(maxBody))
+                       addr t, culonglong(maxBody))
   if h == nil:
     raise newException(QuicError,
       "navi HTTP/3 connect to " & host & ":" & $port & " failed")
+  try:
+    h3PostHandshakeVerify(h, name, tls)
+  except CatchableError:
+    navi_h3_close(h)                   # fail closed: nothing was sent on this conn
+    raise
   QuicConn(handle: h)
 
 proc alive*(c: QuicConn): bool =
@@ -445,10 +548,13 @@ proc freeStream*(c: QuicConn, sid: int64) =
   if c.handle != nil: navi_h3_stream_free(c.handle, sid)
 
 proc h3Get*(host: string, port: int, sni = "", path = "/", caFile = "",
-            verify = true): Http3Response =
+            verify = true, pinnedKeys: seq[string] = @[]): Http3Response =
   ## One-shot convenience: open a connection, issue one GET, and close. For
-  ## several requests to one origin, use `h3Open` + `get` + `close`.
-  let c = h3Open(host, port, sni, caFile, verify)
+  ## several requests to one origin, use `h3Open` + `get` + `close`. `caFile`,
+  ## `verify` and `pinnedKeys` cover the common cases; pass a full `TlsConfig` to
+  ## `h3Open` for anything else.
+  let c = h3Open(host, port, sni,
+                 TlsConfig(insecureSkipVerify: not verify, caFile: caFile, pinnedKeys: pinnedKeys))
   defer: c.close()
   result = c.get(path)
 
@@ -509,23 +615,31 @@ proc wsPumpLoop(p: ptr WsH3PumpObj) {.thread.} =
   discard navi_h3_flush(p.conn)
   p.toApp.send("")                               # unblock a parked wsRecv with eof
 
-proc openWsH3*(host: string, port: int, sni, caFile: string, verify: bool,
+proc openWsH3*(host: string, port: int, sni: string, tls: TlsConfig,
                path: string, headers: seq[(string, string)],
                connectMs = 0, readMs = 0, totalMs = 0):
                tuple[pump: WsH3Pump, status: int] =
   ## Open a dedicated h3 connection, do the Extended CONNECT handshake on this
   ## (single) thread, then hand the connection to a pump thread. Returns the pump
-  ## and the response :status (the caller checks 200). The handshake is bounded by
+  ## and the response :status (the caller checks 200). `tls` is navi's full TLS
+  ## policy, honoured exactly as in `h3Open` (trust store, client credential,
+  ## cipher bounds, SPKI pins and verify callback). The handshake is bounded by
   ## `connectMs` (or, falling back like the sync `connect`, `totalMs`; 0 = a 30s
   ## default) so a server that stalls after QUIC completes cannot hang the caller
   ## forever. `readMs` (0 = block indefinitely) is carried to the pump as the
   ## per-read stall bound `wsRecv` enforces, mirroring h1/h2 where each read is
   ## bounded by the configured readMs.
   let name = if sni.len > 0: sni else: host
+  var t = toH3Tls(tls)
   let h = navi_h3_open(host.cstring, ($port).cstring, name.cstring,
-                       caFile.cstring, (if verify: 1.cint else: 0.cint),
+                       addr t,
                        culonglong(0))   # WebSocket frames stream via read_body: no buffered cap
   if h == nil: raise newException(QuicError, "navi: HTTP/3 connect failed")
+  try:
+    h3PostHandshakeVerify(h, name, tls)
+  except CatchableError:
+    navi_h3_close(h)                    # fail closed before the CONNECT is sent
+    raise
   # connectMs wins, then totalMs, else a 30s handshake default (mirroring how the
   # sync `connect` resolves establishMs, but with an explicit backend floor). It
   # bounds both halves of the handshake: the wait for the peer's SETTINGS and the

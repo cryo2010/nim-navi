@@ -28,8 +28,29 @@ sleep 1
 
 echo ">>> building and running the navi HTTP/3 GET test"
 export NAVI_H3_CA="$WORK/cert.pem"   # the origin's CA, for the verified GET case
+# The origin leaf's SPKI pin, in the canonical HPKP form (base64 SHA-256 of the
+# SubjectPublicKeyInfo). Derived with the openssl CLI so the pin tests check navi's
+# own derivation against the standard recipe rather than against itself.
+NAVI_H3_PIN=$(OPENSSL_CONF=/dev/null "$OSSL/bin/openssl" x509 -in "$WORK/cert.pem" -pubkey -noout \
+  | OPENSSL_CONF=/dev/null "$OSSL/bin/openssl" pkey -pubin -outform der \
+  | OPENSSL_CONF=/dev/null "$OSSL/bin/openssl" dgst -sha256 -binary \
+  | OPENSSL_CONF=/dev/null "$OSSL/bin/openssl" base64)
+export NAVI_H3_PIN
+echo "origin SPKI pin: $NAVI_H3_PIN"
 nim c --hints:off --path:"$ROOT/src" -d:naviHttp3 -o:/tmp/h3get_test "$DIR/h3get_test.nim"
 /tmp/h3get_test
+
+echo ">>> building and running the h3 SPKI pin / verifyCallback test (sync client)"
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/pin_test "$DIR/pin_test.nim"
+/tmp/pin_test
+
+echo ">>> building and running the h3 SPKI pin test (asyncdispatch client)"
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/pin_async_test "$DIR/pin_async_test.nim"
+/tmp/pin_async_test
+
+echo ">>> building and running the h3 SPKI pin test (chronos client)"
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/pin_chronos_test "$DIR/pin_chronos_test.nim"
+/tmp/pin_chronos_test
 
 echo ">>> building and running the transparent h3 dispatch test (sync client)"
 nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/dispatch_test "$DIR/dispatch_test.nim"

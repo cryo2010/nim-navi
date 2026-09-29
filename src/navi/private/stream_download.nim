@@ -79,13 +79,13 @@ proc openStream(client: Navi, req0: Request): StreamResponse =
     # the request is replayable and idempotent. `stream` takes no request body here,
     # but the verb still may be non-idempotent (a streamed POST response), so the
     # gate matters: otherwise a submitted-then-reset POST is silently re-sent.
-    if client.config.wantsH3 and rq.url.isTls and client.altSvc != nil:
+    if client.config.wantsH3 and rq.url.isTls and client.altSvc != nil and
+       client.config.tls.h3TlsUsable:
       let ep = client.altSvc.h3Endpoint("https", rq.url.host, rq.url.port)
       if ep.isSome:
         try:
           let conn = h3Open(ep.get.host, ep.get.port, sni = rq.url.host,
-                            caFile = client.config.tls.caFile,
-                            verify = client.config.tls.wantsVerify,
+                            tls = client.config.tls,
                             maxBody = uint64(max(0, client.config.maxResponseBytes)))
           var fwd: seq[(string, string)]
           for k, v in rq.headers:

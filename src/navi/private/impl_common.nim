@@ -522,9 +522,8 @@ when defined(naviHttp3):
       client.pendingH3[origin] = pending
       try:
         let qc = await openQuicConn(ep.host, ep.port, req.url.host,
-                                     client.config.tls.caFile,
-                                     client.config.tls.wantsVerify,
-                                     uint64(max(0, client.config.maxResponseBytes)))
+                                    client.config.tls,
+                                    uint64(max(0, client.config.maxResponseBytes)))
         # A dead-but-uncleaned prior conn can occupy this slot: the loop above only
         # returns a cached entry when it is `alive`, so a `not alive` one falls
         # through to here and would be silently overwritten. Its background reader may
@@ -601,7 +600,8 @@ proc transport(client: Navi, req: Request, sink: BodySink,
   var rq = req
   var producer = asyncStream
   when defined(naviHttp3):
-    if client.config.wantsH3 and rq.url.isTls:   # buffered or streamed body
+    if client.config.wantsH3 and rq.url.isTls and client.config.tls.h3TlsUsable:
+      # buffered or streamed body
       let ep = client.altSvc.h3Endpoint("https", rq.url.host, rq.url.port)
       if ep.isSome:
         # The h3 request body is pulled by a synchronous C callback (h3PullThunk),

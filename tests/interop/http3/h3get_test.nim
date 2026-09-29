@@ -31,7 +31,8 @@ doAssert r2.status == 200
 echo "ok: verify=false opt-out"
 
 # 4. Connection reuse: open once, issue several GETs, then close.
-let conn = h3Open("localhost", 4433, sni = "localhost", caFile = ca)
+let conn = h3Open("localhost", 4433, sni = "localhost",
+                  tls = TlsConfig(caFile: ca))
 try:
   for i in 1 .. 3:
     let g = conn.get("/")

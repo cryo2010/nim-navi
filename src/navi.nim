@@ -254,8 +254,7 @@ when defined(naviHttp3):
       if conn == nil:
         reused = false
         conn = h3Open(ep.host, ep.port, sni = req.url.host,
-                      caFile = client.config.tls.caFile,
-                      verify = client.config.tls.wantsVerify,
+                      tls = client.config.tls,
                       maxBody = uint64(max(0, client.config.maxResponseBytes)))
         client.h3conns[origin] = H3Cached(conn: conn, lastUse: epochTime())
       try:
@@ -306,7 +305,7 @@ proc transport(client: Navi, req: Request, sink: BodySink,
     # Any verb may use h3, whether its body is buffered or streamed (bodyStream is
     # pulled over the h3 request stream, just like h2). The h3 body is buffered here;
     # the gated sink is fed by the performRequest fallback, not this leg.
-    if client.config.wantsH3 and req.url.isTls:
+    if client.config.wantsH3 and req.url.isTls and client.config.tls.h3TlsUsable:
       let ep = client.altSvc.h3Endpoint("https", req.url.host, req.url.port)
       if ep.isSome:
         try: return h3Transport(client, req, ep.get)

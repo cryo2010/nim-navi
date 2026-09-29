@@ -143,6 +143,13 @@ proc `verify=`*(tls: var TlsConfig, v: bool) =
   ## the same as `tls.insecureSkipVerify = true`.
   tls.insecureSkipVerify = not v
 
+proc h3TlsUsable*(tls: TlsConfig): bool =
+  ## Whether an HTTP/3 leg can be taken at all under this TLS policy. QUIC always
+  ## uses TLS 1.3 (RFC 9001 4.2), so a `maxVersion` below it can never be met on
+  ## h3. The dispatcher then skips the advertised h3 endpoint and stays on h2/h1
+  ## rather than failing a request over a bound the TCP legs satisfy fine.
+  tls.maxVersion == tlsDefault or tls.maxVersion >= tls13
+
 proc wantsResume*(tls: TlsConfig): bool = tls.resumeSessions
   ## Whether to reuse TLS sessions across connections to the same origin (a
   ## resumed handshake skips the certificate exchange and the server's signature).

@@ -222,6 +222,31 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **HTTP/3 now honors the whole `TlsConfig`, not just `caFile` and `verify`.** The
+  QUIC leg built its own `SSL_CTX` in `h3client.cpp` from those two fields alone, so
+  `pinnedKeys`, `verifyCallback`, `caBundle`, the client credential
+  (`pkcs12File`/`certPem`/`certFile`) and `ciphers`/`cipherSuites` were all silently
+  dropped on h3 and `postHandshakeVerify` never ran there. In a `-d:naviHttp3` build
+  H3 is in the default `http` set and the client upgrades to it after any `Alt-Svc`
+  header, so the documented "replace verification entirely" mode (`verify = false`
+  plus `pinnedKeys` or a `verifyCallback`) produced an *unauthenticated* QUIC
+  connection to anything answering on UDP 443, and with `verify = true` a pin was
+  bypassed on h3 exactly where a mis-issued certificate would have been caught. A
+  `caBundle`-only private CA and mTLS instead failed the h3 handshake and fell back
+  to h2/h1 with no signal, and an mTLS client was anonymous over QUIC. The FFI now
+  carries navi's full TLS policy across as one struct (`NaviH3Tls`, in the new
+  `backend/h3client.h`): the QUIC context adds the `caBundle` roots to its store,
+  installs the client credential (PKCS#12 including its chain, or a PEM/DER chain and
+  key, with an explicit password callback that fails rather than prompting on a tty),
+  and applies the cipher selection. The peer's leaf is exported through two new FFI
+  calls, so the SPKI pin comparison and the `verifyCallback` run from Nim right after
+  the handshake and before the connection is bound into the pool or carries a
+  request, on all three openers (`h3Open`, `openConnAsync`, `openConnChronos`) and
+  `openWsH3`; a rejection raises the same `ValueError` with the same wording as the
+  TCP backends, so the error surface does not depend on which leg was taken. QUIC is
+  TLS 1.3 only (RFC 9001), so a `maxVersion` below TLS 1.3 now makes navi skip the
+  advertised h3 endpoint and stay on h2/h1 rather than fail the request. With
+  `verify` off and no pins or callback configured, behavior is unchanged (#419).
 - **The sync backend's readiness waits use `poll(2)` (`WSAPoll` on Windows) instead of
   `select(2)`, so a connection on a descriptor above `FD_SETSIZE` no longer aborts the
   process or reports a bogus timeout (#429).** `waitReadable`, `waitWritable` and the

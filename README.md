@@ -353,6 +353,8 @@ let api = newNavi(config)
 
 Verification is on for every `TlsConfig`, including a bare one: the opt-out is `tls.insecureSkipVerify = true`. `caFile` is honored by all three native clients, each through OpenSSL (chronos included; without a `caFile` they verify against the system trust store). All three negotiate modern TLS (up to the library's maximum, typically TLS 1.3) and support client certificates (mTLS).
 
+The whole `TlsConfig` applies to the HTTP/3 leg too (`-d:naviHttp3`): trust store, `caBundle`, client credential, pins, verify callback and cipher selection all reach the QUIC handshake. The one bound QUIC cannot honor is a `maxVersion` below TLS 1.3, since QUIC always uses TLS 1.3 (RFC 9001); with such a bound set navi simply skips the advertised h3 endpoint and stays on h2/h1.
+
 #### Trusting a CA in memory
 
 `caBundle` adds trusted CA certificates from an in-memory PEM string, alongside
@@ -383,7 +385,9 @@ config.tls.verifyCallback = proc(leafDer: string): bool =
 
 A non-matching pin, or a callback returning false, rejects the connection at
 connect time. Both are honored on the three native clients (`navi/js` defers TLS
-to the runtime).
+to the runtime), on every protocol they speak: in a `-d:naviHttp3` build the
+HTTP/3 leg checks the pin and runs the callback on the QUIC peer's leaf right
+after the handshake, before the connection carries a request or enters the pool.
 
 #### Session resumption
 
