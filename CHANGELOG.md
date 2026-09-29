@@ -222,6 +222,26 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **A send racing a connection close on the asyncdispatch client no longer writes
+  through a freed TLS session (#421).** `sslRead` has long refused to read once the
+  shared teardown flag reaches `csClosed`, because `freeConn` calls `SSL_free` before
+  `closeSocket` and a parked read is woken by that `closeSocket`, i.e. after the free.
+  The write side had no such guard. A `sslWrite` parked on `WANT_WRITE` (a body upload
+  against a stalled peer, or the h2 mux's serialised writes when the reader hits a peer
+  reset in the same tick) is not woken by the shutdown on Linux, where a reset reports
+  readability and error but never `EPOLLOUT`: it stays parked right through
+  `close`, and its continuation then called `SSL_write` on the dangling pointer. The
+  same `csClosed` check now sits at the top of `sslWrite`'s loop, so it is re-run after
+  every `WANT_READ`/`WANT_WRITE` retry as well as on entry, and the plaintext `sendAll`
+  path consults the flag too (it only tested `fd == invalidFd`, which `freeConn` never
+  sets on the Conn value copies the stream layers hold, so it could write to a
+  descriptor number the process had already reused). Two neighbouring paths that could
+  also run after `freeConn` were closed the same way: `shutdownConn` is now a no-op on
+  a closed connection rather than shutting down a recycled descriptor, and an expired
+  `recvWithin` no longer parks its abandoned read on a connection that was closed under
+  it (which left the read unowned and its failure unobserved). Both parked writes and
+  post-close sends now fail with a plain `IOError`, which the stream layers already
+  treat as a connection drop.
 - **A `TlsConfig` built with the object constructor no longer silently skips peer
   verification (#422).** `TlsConfig.verify` was a plain `bool`, so its zero value was
   `false` and the documented `TlsConfig(caFile: "corp-ca.pem")` hardening idiom (which

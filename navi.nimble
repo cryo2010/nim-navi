@@ -152,6 +152,12 @@ task tlsPinning, "In-memory CA bundle + SPKI pinning + verify callback, sync cli
   # callback (accept/reject, and even with chain verification disabled).
   exec "bash tests/interop/tls_pin.sh"
 
+task tlsWriteClose, "A TLS write racing a close on the asyncdispatch client (needs openssl + python3)":
+  # A TLS server that finishes the handshake and never reads, so a large SSL_write
+  # parks on WANT_WRITE; closing the connection under it must raise rather than
+  # write through the SSL that freeConn already freed (issue #421).
+  exec "bash tests/interop/tls_write_close.sh"
+
 task socks, "SOCKS5 proxy tunnelling + user/pass auth, all native clients (needs python3)":
   # A local HTTP origin behind two SOCKS5 proxies (no-auth and user/pass): navi
   # must tunnel through, authenticate, and reject wrong credentials, on the sync,

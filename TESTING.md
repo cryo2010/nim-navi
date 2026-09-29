@@ -37,6 +37,7 @@ nimble tlsVersion         # TLS min/max version pinning (needs openssl w/ TLS 1.
 nimble happyEyeballs      # RFC 8305 address racing (needs openssl)
 nimble cipherSuite        # cipher / ciphersuite selection (needs openssl w/ TLS 1.3)
 nimble tlsPinning         # in-memory CA + SPKI pinning + verify callback (needs openssl)
+nimble tlsWriteClose      # a TLS write racing a close, asyncdispatch client (needs openssl + python3)
 nimble socks              # SOCKS5 proxy + user/pass auth, all native clients (needs python3)
 nimble httpConnect        # HTTP CONNECT proxy: split / oversized / 407 replies (needs openssl + python3)
 nimble unixSocket         # Unix domain socket transport, native clients (needs python3)

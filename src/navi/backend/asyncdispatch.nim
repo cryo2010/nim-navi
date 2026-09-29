@@ -148,6 +148,16 @@ when defined(ssl):
   proc sslWrite(c: Conn, data: string) {.async.} =
     var off = 0
     while off < data.len:
+      # If `close` ran while we were parked, the SSL is already freed and SSL_write
+      # would dereference the dangling pointer -- the same UAF `sslRead` guards
+      # against, reached from the write side. A parked write survives the teardown
+      # on Linux: a peer reset reports {Read, Error} with no EPOLLOUT, so the
+      # dispatcher never walks the writeList, and the wake finally arrives from
+      # `closeSocket` inside `freeConn`, i.e. after SSL_free. The check is at the
+      # top of the loop, so it is re-run after every WANT_READ/WANT_WRITE await as
+      # well as on entry. The stream layer treats the raise as a drop.
+      if not c.state.isNil and c.state[] == csClosed:
+        raise newException(IOError, "navi: connection closed")
       # OpenSSL requires the same buffer+len when retrying after WANT_WRITE; `data`
       # is captured by this async proc, so the pointer stays valid across awaits.
       ErrClearError()   # see `sslRead`: SSL_get_error is only reliable on an empty queue
@@ -481,7 +491,11 @@ proc sendAll*(c: Conn, data: string): Future[void] {.async.} =
   # connection whose ALPN never resolved under event-loop starvation, mis-routed
   # onto the h1 path). Raise a typed transport error instead of writing to a dead
   # fd, so the h1 write-time classifier tears it down and retries on a fresh conn.
-  if c.fd == invalidFd:
+  # `freeConn` closes the fd without clearing the value copies' `fd` field, so a
+  # send that raced a close still holds a live-looking descriptor number that the
+  # process may already have handed to something else: the shared state flag, not
+  # the number, is the authority (the plaintext twin of the `sslWrite` guard).
+  if c.fd == invalidFd or (not c.state.isNil and c.state[] == csClosed):
     raise newException(IOError, "navi: send on a closed connection")
   await send(c.fd, data)
 
@@ -504,6 +518,14 @@ proc startRead(c: Conn): Future[string] =
   when defined(ssl):
     if not c.ssl.isNil: return sslRead(c)
   recv(c.fd, naviReadBufSize)
+
+proc retireRead(fut: Future[string]) =
+  ## Observe an abandoned read's outcome from a callback and drop it. Nobody will
+  ## await it, and an asyncdispatch future that fails unobserved orphans its
+  ## injected stack trace at process exit (a valgrind-visible leak).
+  if fut.isNil: return
+  fut.addCallback(proc() {.gcsafe.} =
+    if fut.failed: discard fut.error)
 
 proc recvSome*(c: Conn): Future[string] {.async.} =
   ## One chunk of up to `naviReadBufSize` bytes; "" means the peer closed. Bounded by
@@ -529,7 +551,13 @@ proc recvWithin*(c: Conn, ms: int): Future[tuple[timedOut: bool, data: string]] 
   if ms <= 0: return (true, "")
   let readFut = c.startRead()
   if not await withTimeout(readFut, ms):
-    if not c.parked.isNil: c.parked.fut = readFut
+    # A `close` that landed while we were waiting has already run `discardParked`,
+    # so parking here would leave the read unowned on a freed connection and its
+    # failure unobserved (the orphaned-stack-trace leak). Retire it instead.
+    if c.parked.isNil or (not c.state.isNil and c.state[] == csClosed):
+      retireRead(readFut)
+    else:
+      c.parked.fut = readFut
     return (true, "")
   return (false, await readFut)
 
@@ -540,8 +568,17 @@ proc discardParked(c: Conn) =
   if c.parked.isNil or c.parked.fut.isNil: return
   let fut = c.parked.fut
   c.parked.fut = nil
-  fut.addCallback(proc() {.gcsafe.} =
-    if fut.failed: discard fut.error)
+  retireRead(fut)
+
+proc shutdownFd(c: Conn) =
+  ## The raw SHUT_RDWR, with no state check: `close` flags `csClosed` before it
+  ## shuts the socket down to wake a parked read, so it cannot go through the
+  ## guarded `shutdownConn` below.
+  if c.fd == invalidFd: return
+  when defined(windows):
+    discard winlean.shutdown(c.fd.SocketHandle, 2)          # SD_BOTH
+  else:
+    discard posix.shutdown(c.fd.SocketHandle, posix.SHUT_RDWR)
 
 proc shutdownConn*(c: Conn) =
   ## Shut the socket down in both directions so a pending read or write unblocks
@@ -552,12 +589,14 @@ proc shutdownConn*(c: Conn) =
   ## parked sslRead woken by the shutdown treats the decrypt error on our truncated
   ## final record as clean EOF (teardown noise) rather than raising a failed future
   ## whose stack trace would be orphaned at exit; the SSL itself is still valid here.
-  if c.fd == invalidFd: return
+  ##
+  ## A no-op once the connection is closed: `freeConn` does not clear the value
+  ## copies' `fd`, so shutting down after it ran would hit whatever descriptor the
+  ## process was handed next. The h2 mux drives this from several teardown paths,
+  ## which can land after `close` has already freed the conn.
+  if not c.state.isNil and c.state[] == csClosed: return
   if not c.state.isNil and c.state[] == csOpen: c.state[] = csShutdown
-  when defined(windows):
-    discard winlean.shutdown(c.fd.SocketHandle, 2)          # SD_BOTH
-  else:
-    discard posix.shutdown(c.fd.SocketHandle, posix.SHUT_RDWR)
+  c.shutdownFd()
 
 proc freeConn(c: Conn) =
   ## The raw teardown: free the SSL and close the fd. Callers set/guard the
@@ -591,7 +630,7 @@ proc close*(c: Conn): Future[void] {.async.} =
   if not c.state.isNil:
     if c.state[] == csClosed: return
     c.state[] = csClosed
-    shutdownConn(c)
+    c.shutdownFd()          # state is already csClosed, so shutdownConn would no-op
     await sleepAsync(0)
   c.discardParked()
   freeConn(c)

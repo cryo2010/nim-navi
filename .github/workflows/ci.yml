@@ -278,6 +278,12 @@ jobs:
       - name: Run the private-CA verification test
         run: bash tests/interop/ca_verify.sh
 
+      # A TLS write racing a connection close: a server that completes the
+      # handshake and then never reads parks a large SSL_write on WANT_WRITE, and
+      # closing under it must raise instead of calling SSL_write on the freed SSL.
+      - name: Run the TLS write-racing-close test
+        run: bash tests/interop/tls_write_close.sh
+
       # WebSocket over HTTP/2 Extended CONNECT (RFC 8441): a Node h2 TLS server
       # that advertises SETTINGS_ENABLE_CONNECT_PROTOCOL and echoes frames,
       # driven by the sync, asyncdispatch, and chronos clients (config.http={H2}).
