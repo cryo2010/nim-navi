@@ -291,6 +291,13 @@ jobs:
       - name: Run the TLS write-racing-close test
         run: bash tests/interop/tls_write_close.sh
 
+      # An unclean TLS close (#426): a server that answers with a body delimited
+      # only by the connection close and then cuts it with a RST or a bare FIN
+      # instead of a close_notify. navi must refuse the short body instead of
+      # returning it as a complete 200, on all three native clients.
+      - name: Run the unclean-TLS-close truncation test
+        run: bash tests/interop/tls_truncate.sh
+
       # WebSocket over HTTP/2 Extended CONNECT (RFC 8441): a Node h2 TLS server
       # that advertises SETTINGS_ENABLE_CONNECT_PROTOCOL and echoes frames,
       # driven by the sync, asyncdispatch, and chronos clients (config.http={H2}).

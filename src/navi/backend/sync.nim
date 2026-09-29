@@ -160,6 +160,12 @@ type
       ctx: SslContext   ## the (usually shared) SSL_CTX this connection used
       ownsCtx: bool     ## true only for an unshared ctx `close` must destroy
       slot: SessionSlot ## keeps the resumption link alive for the SSL's lifetime
+      uncleanEof: ref bool
+                        ## set when the transport ended without a TLS close_notify (a
+                        ## RST, a bare FIN, a dead peer). A `ref` so every value copy
+                        ## of the Conn observes it, like the async backends' `state`:
+                        ## the reader that sees the unclean close and the engine that
+                        ## has to reject a read-until-close body are different copies
 
 template await*(x: untyped): untyped = x
 
@@ -486,7 +492,11 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   when defined(ssl):
     # SPKI pinning + the user's verify callback (no-op unless configured). Runs
     # before `established`, so a rejection cleans up the fd/SSL via the defer.
-    if tls: postHandshakeVerify(result.ssl, host, cfg)
+    if tls:
+      postHandshakeVerify(result.ssl, host, cfg)
+      # One cell per TLS connection, allocated here (never on a read path): the
+      # close_notify verdict `closedCleanly` reports (issue #426).
+      result.uncleanEof = new(bool)
   established = true
 
 proc rearm*(c: var Conn, readMs = 0, totalMs = 0) =
@@ -532,6 +542,15 @@ proc dataWaiting*(c: Conn, ms: int): bool =
   ## bytes already buffered inside OpenSSL, which a raw `select` would miss.
   c.waitReadable(ms)
 
+proc closedCleanly*(c: Conn): bool =
+  ## Whether the end of this connection was authenticated. True until a TLS read
+  ## sees the transport die without a close_notify, and always true for plain http,
+  ## which has no close_notify to look for. The engine consults it before accepting
+  ## a body that is delimited by the close itself (issue #426).
+  when defined(ssl):
+    if not c.uncleanEof.isNil: return not c.uncleanEof[]
+  true
+
 proc readBudgetMs(c: Conn): int =
   ## The wait budget for one read: the per-read stall limit capped by the time left
   ## to the overall deadline. Raises navi's TimeoutError up front when the total
@@ -552,6 +571,11 @@ proc readTimedOut(c: Conn) {.noreturn.} =
   raise newException(response.TimeoutError, "navi: read timed out")
 
 when defined(ssl):
+  proc markUncleanEof(c: Conn) {.inline.} =
+    ## Remember that the TLS stream ended without a close_notify. Writes through the
+    ## shared cell, so the flag survives the Conn being passed by value.
+    if not c.uncleanEof.isNil: c.uncleanEof[] = true
+
   proc sslReadSome(c: Conn, buf: var string): int =
     ## One SSL_read of up to `buf.len` bytes, bounded by the read budget. Returns the
     ## byte count (>0), or 0 for a clean peer EOF; raises navi's TimeoutError when the
@@ -607,10 +631,17 @@ when defined(ssl):
         else:
           if n < 0 and osLastError().int32 == WSAEWOULDBLOCK:
             c.readTimedOut()
-        return 0   # n == 0 (unexpected EOF) or a real errno: treat as a close
+        # n == 0 (unexpected EOF) or a real errno. Still reported as a close, so an
+        # EOF before any response keeps being classified as a keep-alive race and
+        # replayed, but it is NOT a close_notify: record that so the engine can
+        # reject a read-until-close body that ends here (issue #426).
+        c.markUncleanEof()
+        return 0
       of SSL_ERROR_SSL:
         raise newException(IOError, "navi: TLS read failed")
-      else: return 0   # any other code -> treat as EOF
+      else:
+        c.markUncleanEof()
+        return 0   # any other code -> treat as EOF, and an unauthenticated one
 
 proc recvSome*(c: Conn): string =
   ## One chunk of up to `naviReadBufSize` bytes; "" means the peer closed. Waits up to

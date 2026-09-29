@@ -427,6 +427,23 @@ suite "h1 parse":
     let r = parseAll("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\nrawbytes")
     check r.body == "rawbytes"
 
+  test "untilCloseBody should mark only a body delimited by the close itself (#426)":
+    # The engine keys the unclean-EOF rejection off this: a body with no framing of
+    # its own is complete only if the close that ended it was authenticated, while a
+    # length- or chunk-delimited body is checked by the parser instead.
+    var p = initH1Parser()
+    p.feed("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\npartial")
+    check p.untilCloseBody()
+    check not p.finished
+    p.eof()
+    check p.finished                       # the close is what ends this body
+    var q = initH1Parser()
+    q.feed("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+    check not q.untilCloseBody()
+    var r = initH1Parser()
+    r.feed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+    check not r.untilCloseBody()
+
   test "keepAliveAfter should see a second Connection: close line (#272)":
     check not parseKA("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n" &
                       "Connection: keep-alive\r\nConnection: close\r\n\r\n")

@@ -163,6 +163,14 @@ task tlsWriteClose, "A TLS write racing a close on the asyncdispatch client (nee
   # write through the SSL that freeConn already freed (issue #421).
   exec "bash tests/interop/tls_write_close.sh"
 
+task tlsTruncate, "Unclean TLS close vs a body delimited by the close, all native clients (needs openssl + python3)":
+  # A TLS server that answers with an un-framed body and then cuts the connection
+  # with a RST (and with a bare FIN) instead of a close_notify: navi must refuse
+  # the short body rather than return it as a complete 200, while the clean
+  # endings, a short Content-Length body and a keep-alive pair keep working
+  # (issue #426).
+  exec "bash tests/interop/tls_truncate.sh"
+
 task socks, "SOCKS5 proxy tunnelling + user/pass auth, all native clients (needs python3)":
   # A local HTTP origin behind two SOCKS5 proxies (no-auth and user/pass): navi
   # must tunnel through, authenticate, and reject wrong credentials, on the sync,

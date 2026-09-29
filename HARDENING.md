@@ -182,6 +182,20 @@ On by default and scoped per origin (a cached session is only presented back to
 the server it came from), so it is safe to leave on. Disable it only if your
 threat model forbids session reuse.
 
+### Truncation of a body delimited by the connection close
+
+No knob: navi always rejects it. A response with neither `Content-Length` nor
+chunked framing (an HTTP/1.0 origin, a `Connection: close` error page, an
+un-chunked event stream) ends where the connection ends, so the only proof that
+the body is complete is TLS's `close_notify` alert. Over https navi refuses such
+a body when the transport died without one -- an injected RST, a bare FIN, a
+crashed origin -- and raises `IOError` ("TLS connection closed without
+close_notify; response may be truncated") instead of returning a short body as a
+complete 200. Length- and chunk-delimited bodies are unaffected (their framing
+already detects a short read), plain http cannot be protected this way, and an
+EOF that arrives before any response bytes is still treated as a keep-alive race
+and retried on a fresh connection.
+
 ### Response body cap
 
 ```nim

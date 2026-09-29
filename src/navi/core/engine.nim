@@ -23,6 +23,8 @@ const h1TruncatedErr* =
   "navi: http/1.1 response truncated (connection closed before the body completed)"
 const h2TruncatedErr* =
   "navi: http/2 response truncated (connection closed before the stream completed)"
+const uncleanEofErr* =
+  "navi: TLS connection closed without close_notify; response may be truncated"
   # bodyLengthErr is defined in proto/h2/conn (shared with the h2 muxes).
 
 proc raiseHttpError(req: Request, resp: Response) =
@@ -336,6 +338,19 @@ template deliverChunk*(cd, sink, rawBody, encoding: typed) =
       {.cast(raises: [CatchableError]).}:
         await sink(decoded)
 
+template h1RequireCleanEof*(transport, parser: typed) =
+  ## Guard a body that ended because the connection did. A read-until-close body has
+  ## no end marker of its own, so the only proof that the peer meant to stop there is
+  ## TLS's close_notify: without it an injected RST (or a bare FIN) truncates the body
+  ## and the response still looks complete. `closedCleanly` is false exactly when the
+  ## TLS transport died before OpenSSL saw a close_notify, and is always true for a
+  ## plaintext connection, which has nothing to authenticate the close with.
+  ## Length- and chunk-delimited bodies carry their own framing and are already
+  ## checked by the parser, so they keep their behaviour and never reach this.
+  mixin closedCleanly
+  if parser.untilCloseBody() and not closedCleanly(transport):
+    raise newException(IOError, uncleanEofErr)
+
 template h1DrainBody*(transport, parser, sink, keep, decompress, cap: typed) =
   ## Read and parse the response body over `transport`. When `sink` is set the body
   ## is drained per read, decoded (if `decompress`), size-capped at `cap` decoded
@@ -344,7 +359,7 @@ template h1DrainBody*(transport, parser, sink, keep, decompress, cap: typed) =
   ## With a nil sink the body accumulates in the parser (buffered request). Sets
   ## `keep` to whether the connection may be reused. Body bytes buffered during the
   ## header read are delivered first.
-  mixin await, recvSome, BodySink
+  mixin await, recvSome, closedCleanly, BodySink
   block:
     let streaming = not sink.isNil
     var cd = initCappedDecoder(decompress, cap)   # lazy decoder + running size cap
@@ -364,6 +379,7 @@ template h1DrainBody*(transport, parser, sink, keep, decompress, cap: typed) =
         # read-until-close body, so `finished` here means a clean end.
         if not parser.finished:
           raise newException(IOError, h1TruncatedErr)
+        h1RequireCleanEof(transport, parser)
         break
     if streaming and not cd.streamComplete:   # compressed stream cut short mid-decode
       raise newException(IOError, truncatedBodyErr)
@@ -377,7 +393,7 @@ template h1ReadChunk*(transport, parser, capped: typed): string =
   ## more. The caller does the terminal pool/close once "" comes back
   ## (`keepAliveAfter` is valid then). The single read/decode/cap path `drain` loops
   ## over.
-  mixin await, recvSome
+  mixin await, recvSome, closedCleanly
   block:
     var res = ""
     while true:
@@ -395,6 +411,7 @@ template h1ReadChunk*(transport, parser, capped: typed): string =
           # silently with a truncated body.
           if not parser.finished:
             raise newException(IOError, h1TruncatedErr)
+          h1RequireCleanEof(transport, parser)
         else: parser.feed(chunk)
         continue
       let decoded = capped.feed(raw,
@@ -730,7 +747,7 @@ template h1GatedFinish*(transport, parser, sink, gate, keep,
   ## On a gated stop (the sink returned false -> SinkStopSignal) the body is left ""
   ## and `bodyTruncated` set, and the connection is not kept (keep = false), since a
   ## partially-read h1 response cannot be pooled.
-  mixin await, recvSome, BodySink
+  mixin await, recvSome, closedCleanly, BodySink
   block:
     let snap = parser.toResponse()      # headers-only snapshot for the gate
     let eff = effectiveSink(sink, gate, snap.httpVersion, snap.status, snap.headers)

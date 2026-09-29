@@ -222,6 +222,31 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **A TLS connection that ends without `close_notify` can no longer truncate a
+  read-until-close body (#426).** All three native TLS read paths reported a
+  transport close that arrives without a TLS `close_notify` -- an injected RST, a
+  bare FIN, a crashed origin -- as the same clean EOF that `SSL_ERROR_ZERO_RETURN`
+  produces. For a response with no `Content-Length` and no chunked framing (an
+  HTTP/1.0 origin, a `Connection: close` error page, an un-chunked event stream)
+  the close is the only body delimiter, so the h1 parser marked the body complete
+  and navi returned a silently truncated 200. Length- and chunk-delimited bodies
+  were never exposed: the parser already rejects those when they end early.
+  The clean-vs-unclean distinction is now kept instead of discarded. Each native
+  connection records whether its TLS stream ended with a `close_notify` (the sync
+  and asyncdispatch backends in the `SSL_ERROR_SYSCALL` and catch-all branches of
+  their `SSL_read` loops, the chronos pump when the transport EOFs or fails before
+  OpenSSL reports `ZERO_RETURN`) and exposes it as a `closedCleanly` transport op,
+  which is always true for a plaintext connection. The h1 body drain and the
+  streamed-body/SSE chunk reader consult it and raise `IOError` ("TLS connection
+  closed without close_notify; response may be truncated") when a read-until-close
+  body ends on an unauthenticated close. Reads still return an EOF rather than
+  raising at the primitive, so an EOF before any response bytes stays a keep-alive
+  race the engine replays on a fresh connection, and servers that close idle
+  keep-alive connections with a bare FIN keep working. Such a connection is never
+  pooled (an until-close body is not reusable in the first place). A new interop
+  test, `nimble tlsTruncate`, drives a Python TLS server that cuts the stream with
+  and without `unwrap()` and asserts the rejection and the control case on all
+  three native clients.
 - **TLS session resumption now works on the chronos backend (#431).** `ChronosTls`
   freed its `SSL` without ever calling `SSL_shutdown`, and OpenSSL treats that as a
   bad session: `SSL_free` runs `ssl_clear_bad_session`, which marks the `SSL_SESSION`

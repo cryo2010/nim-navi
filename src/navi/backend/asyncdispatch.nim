@@ -108,6 +108,12 @@ type
       ctx: SslContext   ## the (usually shared) SSL_CTX this connection used
       ownsCtx: bool     ## true only for an unshared ctx `close` must destroy
       slot: SessionSlot ## keeps the resumption link alive for the SSL's lifetime
+      uncleanEof: ref bool
+                        ## set when the transport ended without a TLS close_notify (a
+                        ## RST, a bare FIN, a dead peer). Shared across value copies
+                        ## like `state`, because the read that sees the unclean close
+                        ## and the engine that has to reject a read-until-close body
+                        ## hold different copies of the Conn
 
 var openedConnections* {.threadvar.}: int
   ## diagnostic: TCP connections opened by this backend, counted per thread (one navi
@@ -171,6 +177,11 @@ when defined(ssl):
         of SSL_ERROR_WANT_WRITE: await waitWrite(c.fd)
         else: raise newException(IOError, "navi: SSL_write failed")
 
+  proc markUncleanEof(c: Conn) {.inline.} =
+    ## Remember that the TLS stream ended without a close_notify. Writes through the
+    ## shared cell, so the flag survives the Conn being passed by value.
+    if not c.uncleanEof.isNil: c.uncleanEof[] = true
+
   proc sslRead(c: Conn): Future[string] {.async.} =
     ## One chunk of up to `naviReadBufSize` bytes; "" means the peer closed.
     result = newStringUninit(naviReadBufSize)   # overwritten by SSL_read then setLen: no zero-fill
@@ -212,12 +223,19 @@ when defined(ssl):
         # transport EOF (n == 0, or any other errno) is a real close. Chronos never
         # hits this because it drives OpenSSL over memory BIOs (no fd for OpenSSL to
         # EAGAIN on), which is why only the asyncdispatch backend was affected.
+        #
+        # A genuine EOF here carries no close_notify, so it is recorded before it is
+        # reported: the engine still gets "" (an EOF before any response must keep
+        # being classified as a keep-alive race and replayed), but it can now refuse
+        # a read-until-close body that ends on it (issue #426).
         when defined(posix):
           if n < 0 and (errno == EAGAIN or errno == EWOULDBLOCK):
             await waitRead(c.fd)
           else:
+            c.markUncleanEof()
             result.setLen(0); return
         else:
+          c.markUncleanEof()
           result.setLen(0); return
       of SSL_ERROR_SSL:
         # A decrypt/protocol error. When WE initiated teardown (shutdownConn flipped
@@ -231,7 +249,9 @@ when defined(ssl):
         if not c.state.isNil and c.state[] != csOpen:
           result.setLen(0); return
         raise newException(IOError, "navi: TLS read failed")
-      else: result.setLen(0); return   # any other code -> treat as EOF
+      else:
+        c.markUncleanEof()
+        result.setLen(0); return   # any other code -> treat as EOF, unauthenticated
 
 # Byte-I/O primitives the shared tunnel drivers (backend/tunnel) mix in.
 proc sockWrite(fd: AsyncFD, s: string): Future[void] = send(fd, s)
@@ -395,6 +415,8 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   conn.readMs = readMs
   conn.state = new(ConnectionState)   # csOpen; shared teardown state (see Conn.state)
   conn.parked = new(ParkedRead)       # empty; filled only by an expired `recvWithin`
+  when defined(ssl):
+    if tls: conn.uncleanEof = new(bool)   # close_notify verdict (see closedCleanly)
 
   proc tearDownAttempt(fd: AsyncFD) =
     ## Release a half-built connection. Nothing here has a destructor and a
@@ -528,6 +550,15 @@ proc rearm*(c: var Conn, readMs = 0, totalMs = 0) =
   ## whole-request deadline, so there is no per-conn deadline to re-arm here.
   discard totalMs
   c.readMs = readMs
+
+proc closedCleanly*(c: Conn): bool =
+  ## Whether the end of this connection was authenticated. True until a TLS read
+  ## sees the transport die without a close_notify, and always true for plain http,
+  ## which has no close_notify to look for. The engine consults it before accepting
+  ## a body that is delimited by the close itself (issue #426).
+  when defined(ssl):
+    if not c.uncleanEof.isNil: return not c.uncleanEof[]
+  true
 
 proc startRead(c: Conn): Future[string] =
   ## Begin one read, resuming the one a previous `recvWithin` parked rather than

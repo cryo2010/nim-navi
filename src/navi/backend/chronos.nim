@@ -407,6 +407,15 @@ proc rearm*(c: var Conn, readMs = 0, totalMs = 0) =
   discard totalMs
   c.readMs = readMs
 
+proc closedCleanly*(c: Conn): bool =
+  ## Whether the end of this connection was authenticated. True until a TLS read
+  ## sees the transport die without a close_notify, and always true for plain http,
+  ## which has no close_notify to look for. The engine consults it before accepting
+  ## a body that is delimited by the close itself (issue #426).
+  when defined(ssl):
+    if not c.tls.isNil: return c.tls.closedCleanly()
+  true
+
 proc startRead(c: Conn): Future[string] =
   ## Begin one read, resuming the one a previous `recvWithin` parked rather than
   ## starting a second read on the same transport (which would race it for the bytes).

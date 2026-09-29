@@ -36,6 +36,9 @@ when defined(ssl):
                             ## mutually exclusive with the read path (see FeedSide).
                             ## Allocated lazily: only a renegotiation/key update
                             ## during a write ever needs it
+      uncleanEof: bool      ## the transport ended before OpenSSL reported a
+                            ## close_notify, so the end of the byte stream is not
+                            ## authenticated (see `closedCleanly`)
 
   const tlsBufSize = 65536   # drain multiple TLS records per read (see naviReadBufSize)
   const closeNotifyMs = 1000
@@ -59,6 +62,13 @@ when defined(ssl):
 
   proc sslPtr*(t: ChronosTls): SslPtr = t.sslp
     ## The underlying SSL, for `negotiatedProtocol` / `verifyPeer` after handshake.
+
+  proc closedCleanly*(t: ChronosTls): bool {.inline.} =
+    ## False once the transport died without a TLS close_notify. The backend Conn
+    ## forwards this to the engine, which refuses a read-until-close body that ends
+    ## on such a close (issue #426): with no framing of its own, that body's only
+    ## proof of completeness is the alert the peer never sent.
+    not t.uncleanEof
 
   proc newChronosTls*(transport: StreamTransport, ctx: SslContext, host: string,
                       verify: bool, slot: SessionSlot = nil): ChronosTls =
@@ -118,8 +128,16 @@ when defined(ssl):
     except CancelledError:
       raise               # never an EOF: see the note above
     except CatchableError:
+      t.uncleanEof = true
       return false
-    if n <= 0: return false
+    if n <= 0:
+      # The transport ended before OpenSSL reported a close_notify (SSL_ERROR_ZERO_
+      # RETURN would have come back from SSL_read without ever reaching feedIn), so
+      # this EOF is unauthenticated. It is still reported as an EOF -- one before any
+      # response has to stay a keep-alive race the engine replays -- but the flag lets
+      # the engine reject a read-until-close body that ends here (issue #426).
+      t.uncleanEof = true
+      return false
     discard bioWrite(t.rbio, cast[cstring](addr buf[][0]), n.cint)
     return true
 
@@ -202,6 +220,7 @@ when defined(ssl):
       of SSL_ERROR_SSL:
         raise newException(IOError, "navi: TLS read failed")
       else:
+        t.uncleanEof = true
         return ""                            # SYSCALL/unexpected EOF: EOF for the parser
 
   proc close*(t: ChronosTls) {.async.} =

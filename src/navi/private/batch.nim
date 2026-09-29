@@ -97,6 +97,7 @@ proc transportGroup(client: Navi, items: seq[BatchItem],
           # complete response (silent truncation), mirroring h1DrainBody in engine.nim.
           if not parser.finished:
             raise newException(IOError, h1TruncatedErr)
+          h1RequireCleanEof(transport, parser)
           break
         parser.feed(chunk)
       result[k] = parser.toResponse()
