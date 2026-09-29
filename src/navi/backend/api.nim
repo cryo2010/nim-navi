@@ -35,7 +35,8 @@ type
     ## User hook run after the built-in chain + hostname checks pass, receiving the
     ## peer's leaf certificate in DER form. Return false to reject the connection.
     ## Use it for extra checks (custom pinning, CT, name policy). To replace
-    ## verification entirely, set `verify=false` and do all the checking here.
+    ## verification entirely, set `insecureSkipVerify = true` and do all the
+    ## checking here.
 
   TlsConfig* = object
     ## TLS options, including the client certificate for mTLS. Honored on all
@@ -45,11 +46,18 @@ type
     ## The fields fall into four groups, laid out in order below: peer
     ## verification, the client credential (mTLS), session/context reuse, and
     ## protocol/cipher selection. (They are kept as flat fields rather than
-    ## nested sub-objects so the documented `TlsConfig(caFile: "ca.pem")`
-    ## construction idiom keeps working; the grouping is expressed by layout.)
+    ## nested sub-objects so the `TlsConfig(caFile: "ca.pem")` construction
+    ## idiom keeps working; the grouping is expressed by layout.)
+    ##
+    ## Every field's zero value is the safe one, so a bare `TlsConfig()` or
+    ## `TlsConfig(caFile: "ca.pem")` still verifies the peer. `defaultTls()` adds
+    ## the performance defaults on top (session resumption).
 
     # --- Peer verification -------------------------------------------------
-    verify*: bool          ## verify the cert chain and hostname (default on)
+    insecureSkipVerify*: bool ## skip the cert chain and hostname checks entirely.
+                           ## Off by default (the zero value verifies), and meant
+                           ## only for tests against a self-signed server. The
+                           ## legacy `verify` accessor below is its inverse.
     caFile*: string        ## custom CA bundle path; "" uses the system trust store
     caBundle*: string      ## additional trusted CA certificates as an in-memory PEM
                            ## string; added to the trust store alongside `caFile` /
@@ -120,10 +128,27 @@ type
     httpsTarget*: ProxyTarget
     noProxy*: seq[string]
 
-proc wantsVerify*(tls: TlsConfig): bool = tls.verify
-  ## Whether to verify the cert chain and hostname. `defaultTls()` /
-  ## `initNaviConfig()` turn it on; a bare `TlsConfig()` leaves it off, so build
-  ## configs through those to stay secure by default.
+proc wantsVerify*(tls: TlsConfig): bool = not tls.insecureSkipVerify
+  ## Whether to verify the cert chain and hostname. On unless
+  ## `insecureSkipVerify` was set, so every way of building a `TlsConfig`
+  ## (including a bare one) authenticates the peer.
+
+proc verify*(tls: TlsConfig): bool = not tls.insecureSkipVerify
+  ## Compatibility accessor for the old `verify` field, which was replaced by
+  ## `insecureSkipVerify` so the zero value would be the secure one. Prefer
+  ## `insecureSkipVerify` (or `wantsVerify` to read it) in new code.
+
+proc `verify=`*(tls: var TlsConfig, v: bool) =
+  ## Compatibility setter for the old `verify` field: `tls.verify = false` is
+  ## the same as `tls.insecureSkipVerify = true`.
+  tls.insecureSkipVerify = not v
+
+proc h3TlsUsable*(tls: TlsConfig): bool =
+  ## Whether an HTTP/3 leg can be taken at all under this TLS policy. QUIC always
+  ## uses TLS 1.3 (RFC 9001 4.2), so a `maxVersion` below it can never be met on
+  ## h3. The dispatcher then skips the advertised h3 endpoint and stays on h2/h1
+  ## rather than failing a request over a bound the TCP legs satisfy fine.
+  tls.maxVersion == tlsDefault or tls.maxVersion >= tls13
 
 proc wantsResume*(tls: TlsConfig): bool = tls.resumeSessions
   ## Whether to reuse TLS sessions across connections to the same origin (a
@@ -136,7 +161,7 @@ proc clientKeyFile*(tls: TlsConfig): string =
   if tls.keyFile.len > 0: tls.keyFile else: tls.certFile
 
 proc defaultTls*(): TlsConfig =
-  TlsConfig(verify: true, resumeSessions: true)  # secure + fast by default
+  TlsConfig(resumeSessions: true)  # verification is on by default; add resumption
 
 proc direct*(): ProxyTarget = ProxyTarget()
 proc isSet*(p: ProxyTarget): bool = p.host.len > 0

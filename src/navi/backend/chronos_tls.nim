@@ -36,8 +36,14 @@ when defined(ssl):
                             ## mutually exclusive with the read path (see FeedSide).
                             ## Allocated lazily: only a renegotiation/key update
                             ## during a write ever needs it
+      uncleanEof: bool      ## the transport ended before OpenSSL reported a
+                            ## close_notify, so the end of the byte stream is not
+                            ## authenticated (see `closedCleanly`)
 
   const tlsBufSize = 65536   # drain multiple TLS records per read (see naviReadBufSize)
+  const closeNotifyMs = 1000
+    ## upper bound on pushing the close_notify alert out in `close`, so a peer that
+    ## has stopped reading cannot stall a teardown
 
   type FeedSide = enum
     ## Which pump is reading ciphertext, and so which scratch buffer it owns.
@@ -57,12 +63,20 @@ when defined(ssl):
   proc sslPtr*(t: ChronosTls): SslPtr = t.sslp
     ## The underlying SSL, for `negotiatedProtocol` / `verifyPeer` after handshake.
 
+  proc closedCleanly*(t: ChronosTls): bool {.inline.} =
+    ## False once the transport died without a TLS close_notify. The backend Conn
+    ## forwards this to the engine, which refuses a read-until-close body that ends
+    ## on such a close (issue #426): with no framing of its own, that body's only
+    ## proof of completeness is the alert the peer never sent.
+    not t.uncleanEof
+
   proc newChronosTls*(transport: StreamTransport, ctx: SslContext, host: string,
-                      slot: SessionSlot = nil): ChronosTls =
+                      verify: bool, slot: SessionSlot = nil): ChronosTls =
     ## Build a client TLS pump over `transport` using the shared `ctx` (ALPN,
-    ## versions, ciphers, client cert already wired). SNI and any cached session
-    ## are set here; the caller then `await`s `handshake`.
-    let (ssl, rbio, wbio) = newClientSslMem(ctx, host, slot)
+    ## versions, ciphers, client cert already wired). SNI, the expected peer
+    ## identity (when `verify` is on) and any cached session are set here; the
+    ## caller then `await`s `handshake`.
+    let (ssl, rbio, wbio) = newClientSslMem(ctx, host, verify, slot)
     ChronosTls(transport: transport, sslp: ssl, rbio: rbio, wbio: wbio,
                slot: slot, writeLock: newAsyncLock(),
                inBuf: newStringUninit(tlsBufSize))   # overwritten by every readOnce
@@ -91,6 +105,16 @@ when defined(ssl):
     ## than letting it propagate up through readSome/recvSome) lets chronos retire
     ## the in-flight read cleanly instead of leaking its future + our stack trace.
     ##
+    ## `CancelledError` is the one exception that must NOT become an EOF. In chronos
+    ## it derives from CatchableError, so the blanket handler used to turn a
+    ## structured cancel -- a `timeouts.total` guard, a CancelToken, or the
+    ## `timeouts.connect` bound -- into a clean EOF here: `readSome` returned "", the
+    ## engine saw an EOF before any response and raised KeepAliveRaceError, and the
+    ## retry layer replayed the request on a fresh connection while the cancel that
+    ## was supposed to stop it waited in `cancelAndWait`. Re-raising keeps the
+    ## cancellation flowing out through `handshake`/`readSome` so the guard returns
+    ## promptly and reports the real error.
+    ##
     ## The ciphertext lands in one of the connection's own scratch buffers rather than
     ## a fresh 64 KiB string per read: the bytes are copied straight into the read-BIO
     ## and the buffer is never handed to a caller, so reuse cannot alias anything.
@@ -101,9 +125,19 @@ when defined(ssl):
     var n = 0
     try:
       n = await t.transport.readOnce(addr buf[][0], buf[].len)
+    except CancelledError:
+      raise               # never an EOF: see the note above
     except CatchableError:
+      t.uncleanEof = true
       return false
-    if n <= 0: return false
+    if n <= 0:
+      # The transport ended before OpenSSL reported a close_notify (SSL_ERROR_ZERO_
+      # RETURN would have come back from SSL_read without ever reaching feedIn), so
+      # this EOF is unauthenticated. It is still reported as an EOF -- one before any
+      # response has to stay a keep-alive race the engine replays -- but the flag lets
+      # the engine reject a read-until-close body that ends here (issue #426).
+      t.uncleanEof = true
+      return false
     discard bioWrite(t.rbio, cast[cstring](addr buf[][0]), n.cint)
     return true
 
@@ -186,6 +220,7 @@ when defined(ssl):
       of SSL_ERROR_SSL:
         raise newException(IOError, "navi: TLS read failed")
       else:
+        t.uncleanEof = true
         return ""                            # SYSCALL/unexpected EOF: EOF for the parser
 
   proc close*(t: ChronosTls) {.async.} =
@@ -193,14 +228,36 @@ when defined(ssl):
     ## Order matters: closing the transport first lets a background reader parked
     ## in `readOnce` complete with a clean EOF and unwind, rather than racing a
     ## freed SSL; it also avoids leaking the reader's in-flight read future.
+    # close_notify first, and not only out of politeness to the peer: SSL_free on an
+    # SSL that never shut down runs OpenSSL's ssl_clear_bad_session, which marks the
+    # SSL_SESSION not_resumable. That object is the very one navi cached for this
+    # origin (openssl_ctx's new-session callback stores the pointer the callback was
+    # handed), so re-presenting it would get a full handshake every time and TLS
+    # session resumption would be silently dead on this backend. SSL_shutdown queues
+    # the alert into the write BIO; the drain below is what puts it on the wire.
+    # Best effort and bounded: a dead or blocked peer must not turn `close` into a
+    # raise or a hang, and the SSL_SENT_SHUTDOWN flag SSL_shutdown sets is what
+    # preserves resumability even if the alert itself never gets out.
+    if not t.sslp.isNil:
+      ErrClearError()          # see `readSome`: keep the thread's error queue clean
+      discard SSL_shutdown(t.sslp)
+      try:
+        discard await noCancel withTimeout(t.flushOut(), closeNotifyMs.milliseconds)
+      except CatchableError: discard
     # FIN before closesocket, so the close_notify (and any last record) written just
     # before this is delivered rather than dropped with the socket (see
     # `gracefulShutdown` in chronos.nim for the Windows failure this prevents).
+    # `noCancel`, not a blanket `except CatchableError`: this runs from teardown
+    # paths that are themselves often being cancelled, and a CancelledError caught
+    # here would either be swallowed (hiding the cancel) or re-raised before the SSL
+    # is freed (leaking it and its BIOs). Shielding the awaits instead means the
+    # teardown always finishes and no cancellation is lost.
     if not t.transport.isNil:
       try:
-        discard await withTimeout(t.transport.shutdownWait(), 1000.milliseconds)
+        discard await noCancel withTimeout(t.transport.shutdownWait(),
+                                           1000.milliseconds)
       except CatchableError: discard
-    try: await t.transport.closeWait()
+    try: await noCancel t.transport.closeWait()
     except CatchableError: discard
     if not t.sslp.isNil:
       SSL_free(t.sslp); t.sslp = nil
@@ -209,6 +266,13 @@ when defined(ssl):
     ## Non-awaiting teardown for a GC-reclaimed handle: free the SSL and initiate
     ## transport close (the loop frees it afterwards).
     if not t.sslp.isNil:
+      # As in `close`: without SSL_shutdown, SSL_free marks the cached SSL_SESSION
+      # not_resumable. Nothing can be drained here (there is nothing to await on),
+      # so the peer may not see the alert, but SSL_SENT_SHUTDOWN is still set and
+      # the session stays resumable. Same order as the sync and asyncdispatch
+      # backends' teardown.
+      ErrClearError()
+      discard SSL_shutdown(t.sslp)
       SSL_free(t.sslp); t.sslp = nil
     if not t.transport.isNil: t.transport.close()
 

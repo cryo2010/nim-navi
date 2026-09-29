@@ -8,9 +8,10 @@ import navi/asyncdispatch
 const message = "hello from the asyncdispatch backend (wss)"
 
 proc main() {.async.} =
-  # verify is off for the demo's self-signed cert (use caFile in production).
+  # Verification is off for the demo's self-signed cert. In production leave it
+  # on (the default) and set `cfg.tls.caFile` to the trusted CA bundle.
   var cfg = initNaviConfig()
-  cfg.tls.verify = false
+  cfg.tls.insecureSkipVerify = true
   let api = newNavi(cfg)
   let ws = await api.websocket("wss://127.0.0.1:9701/")
   await ws.send(message)

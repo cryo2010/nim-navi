@@ -146,11 +146,30 @@ task caVerify, "Private-CA (TlsConfig.caFile) verification, sync client (needs o
   # reject it without the CA (private root is not in the system trust store).
   exec "bash tests/interop/ca_verify.sh"
 
+task highFd, "Readiness waits on descriptors above FD_SETSIZE, sync client (POSIX; needs openssl)":
+  # ~1100 descriptors burned so navi's socket lands above 1024, then a request
+  # with a read timeout armed: the wait must poll, not select (issue #429).
+  exec "bash tests/interop/highfd.sh"
+
 task tlsPinning, "In-memory CA bundle + SPKI pinning + verify callback, sync client (needs openssl)":
   # A server signed by a throwaway CA: navi must trust it via an in-memory
   # caBundle, honor a matching SPKI pin (reject a wrong one), and run the verify
   # callback (accept/reject, and even with chain verification disabled).
   exec "bash tests/interop/tls_pin.sh"
+
+task tlsWriteClose, "A TLS write racing a close on the asyncdispatch client (needs openssl + python3)":
+  # A TLS server that finishes the handshake and never reads, so a large SSL_write
+  # parks on WANT_WRITE; closing the connection under it must raise rather than
+  # write through the SSL that freeConn already freed (issue #421).
+  exec "bash tests/interop/tls_write_close.sh"
+
+task tlsTruncate, "Unclean TLS close vs a body delimited by the close, all native clients (needs openssl + python3)":
+  # A TLS server that answers with an un-framed body and then cuts the connection
+  # with a RST (and with a bare FIN) instead of a close_notify: navi must refuse
+  # the short body rather than return it as a complete 200, while the clean
+  # endings, a short Content-Length body and a keep-alive pair keep working
+  # (issue #426).
+  exec "bash tests/interop/tls_truncate.sh"
 
 task socks, "SOCKS5 proxy tunnelling + user/pass auth, all native clients (needs python3)":
   # A local HTTP origin behind two SOCKS5 proxies (no-auth and user/pass): navi
@@ -158,10 +177,18 @@ task socks, "SOCKS5 proxy tunnelling + user/pass auth, all native clients (needs
   # asyncdispatch and chronos clients.
   exec "bash tests/interop/socks5.sh"
 
-task unixSocket, "Unix domain socket transport, all native clients (POSIX; needs python3)":
+task httpConnect, "HTTP CONNECT proxy tunnelling, all native clients (needs openssl + python3)":
+  # A TLS origin behind three CONNECT proxies: one that splits the 200 reply
+  # across two TCP segments, one whose 200 reply exceeds a single read, and one
+  # that answers 407. navi must tunnel through the first two and report the proxy
+  # status line for the third, on the sync, asyncdispatch and chronos clients.
+  exec "bash tests/interop/http_connect.sh"
+
+task unixSocket, "Unix domain socket transport, all native clients (POSIX; needs python3 + openssl)":
   # An AF_UNIX HTTP server that echoes the Host header: navi must dial the socket
   # path, send the URL host as Host, and reject an over-long path, on the sync,
-  # asyncdispatch and chronos clients.
+  # asyncdispatch and chronos clients. Then (Linux) an AF_UNIX TLS server with an
+  # untrusted cert: a failed handshake must not leak the fd, the SSL or the ctx.
   exec "bash tests/interop/unixsocket.sh"
 
 task streaming, "File-streaming interop: http1/http2 x upload/download (needs nghttpd + openssl)":

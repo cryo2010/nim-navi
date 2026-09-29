@@ -64,11 +64,43 @@ template runAll() =
     except CatchableError: raised = true
     raised
 
+  check "encrypted PEM key with no passphrase fails instead of prompting":
+    # With no password configured OpenSSL would fall back to PEM_def_callback and
+    # prompt on /dev/tty (then stdin). mtls.sh runs this binary with stdin held
+    # open by a pipe nobody writes to, under a timeout, so a prompt shows up as a
+    # hang rather than passing unnoticed.
+    var cfg = mtlsCfg()
+    cfg.tls.certFile = getEnv("NAVI_MTLS_CERT")
+    cfg.tls.keyFile = getEnv("NAVI_MTLS_ENCKEY")
+    cfg.tls.password = ""
+    var raised = false
+    try: discard await newNavi(cfg).get(base & "/")
+    except CatchableError: raised = true
+    raised
+
+  check "a key with no certificate is rejected, not handed to std/net":
+    # keyFile without certFile used to reach newContext's prompting loader.
+    var cfg = mtlsCfg()
+    cfg.tls.keyFile = getEnv("NAVI_MTLS_ENCKEY")
+    var raised = false
+    try: discard await newNavi(cfg).get(base & "/")
+    except CatchableError: raised = true
+    raised
+
   check "PKCS#12 / PFX bundle":
     var cfg = mtlsCfg()
     cfg.tls.pkcs12File = getEnv("NAVI_MTLS_P12")
     cfg.tls.password = getEnv("NAVI_MTLS_PASS")
     (await newNavi(cfg).get(base & "/")).status == 200
+
+  check "PKCS#12 with an intermediate, against a root-only server":
+    # root -> issuing CA -> client, exported with `openssl pkcs12 -certfile`. The
+    # server trusts only the root, so it can build the path only if navi presents
+    # the bundle's intermediate as well as its leaf.
+    var cfg = mtlsCfg()
+    cfg.tls.pkcs12File = getEnv("NAVI_MTLS_P12_CHAIN")
+    cfg.tls.password = getEnv("NAVI_MTLS_PASS")
+    (await newNavi(cfg).get(getEnv("NAVI_MTLS_CHAIN_URL") & "/")).status == 200
 
   check "DER-encoded cert and key (auto-detected)":
     var cfg = mtlsCfg()

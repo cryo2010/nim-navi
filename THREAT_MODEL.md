@@ -73,15 +73,22 @@ mismatched certificate.
 **Mitigation:** on the native OpenSSL backends (sync, asyncdispatch, chronos) navi builds
 the `SSL_CTX` through std/net's `newContext`, then seeds `CVerifyPeer`
 (`SSL_VERIFY_PEER`) from `tls.verify`, so the handshake aborts on an untrusted
-chain. navi additionally confirms `SSL_get_verify_result == X509_V_OK` and
-matches the requested host against the certificate's SAN/CN with `X509_check_host`
-(skipped for IP literals, as std/net does). See `src/navi/backend/openssl_ctx.nim`
+chain. The expected identity is bound into the SSL before the handshake
+(`SSL_set1_host` for DNS names, `X509_VERIFY_PARAM_set1_ip_asc` for IP literals), so
+a name mismatch aborts the handshake before a client certificate is sent; navi then
+confirms `SSL_get_verify_result == X509_V_OK` and repeats the identity match
+(`X509_check_host`, or `X509_check_ip_asc` for IP literals). Partial wildcards are
+rejected and a certificate that carries dNSName SANs is matched on those alone, the
+subject CN being consulted only for a SAN-less certificate (RFC 9525). See `src/navi/backend/openssl_ctx.nim`
 and `defaultTls()` in `src/navi/backend/api.nim`. A private CA is trusted via
 `tls.caFile`; mutual authentication uses a client certificate
-(`certFile`/`pkcs12File`/`certPem`). HTTP/3 performs the same certificate
-verification against the QUIC handshake in the shared C driver
-(`src/navi/backend/h3client.cpp`, driven by `quic.nim`/`quic_async.nim`/`quic_chronos.nim`). Turning
-verification off is a deliberate, explicit `tls.verify = false`.
+(`certFile`/`pkcs12File`/`certPem`). HTTP/3 applies the same `TlsConfig` to the
+QUIC handshake in the shared C driver (`src/navi/backend/h3client.cpp`, driven by
+`quic.nim`/`quic_async.nim`/`quic_chronos.nim`): trust store, `caBundle`, client
+credential and cipher selection are configured on the QUIC `SSL_CTX`, the chain and
+hostname are checked before the h3 session is bound, and the pins/verify callback run
+from Nim on the exported leaf before the connection carries a request or is pooled
+(#419). Turning verification off is a deliberate, explicit `tls.insecureSkipVerify = true`.
 
 **Verified by:** `badssl.nim` (rejects invalid certificates, accepts a valid one),
 `mtls.sh` (client-certificate handshake).

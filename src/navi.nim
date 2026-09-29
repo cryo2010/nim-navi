@@ -65,8 +65,8 @@ type
 
   NaviConfig* {.requiresInit.} = object of NaviConfigBase
     ## `requiresInit`, so it cannot be built with a bare/partial `NaviConfig(...)`
-    ## (which would leave fields zeroed, e.g. verify off). Build it with
-    ## `initNaviConfig()`.
+    ## (which would leave fields zeroed, e.g. no retries and no redirects).
+    ## Build it with `initNaviConfig()`.
     middleware*: seq[NaviMiddleware]
 
   NaviObj = object
@@ -253,10 +253,19 @@ when defined(naviHttp3):
       var conn = client.liveH3Conn(origin)
       if conn == nil:
         reused = false
-        conn = h3Open(ep.host, ep.port, sni = req.url.host,
-                      caFile = client.config.tls.caFile,
-                      verify = client.config.tls.wantsVerify,
-                      maxBody = uint64(max(0, client.config.maxResponseBytes)))
+        try:
+          conn = h3Open(ep.host, ep.port, sni = req.url.host,
+                        tls = client.config.tls,
+                        maxBody = uint64(max(0, client.config.maxResponseBytes)),
+                        connectMs = client.config.connectMs,
+                        totalMs = client.config.totalMs)
+        except QuicError:
+          # RFC 7838 2.4: an alternative that fails to connect is marked broken, so
+          # the next request goes straight to TCP instead of paying the same stalled
+          # QUIC handshake again until the advertisement's `ma` expires (#432).
+          client.altSvc.markBroken("https", req.url.host, req.url.port)
+          raise
+        client.altSvc.markWorking("https", req.url.host, req.url.port)
         client.h3conns[origin] = H3Cached(conn: conn, lastUse: epochTime())
       try:
         let r = conn.request($req.verb, req.url.requestTarget, fwd, req.body,
@@ -306,7 +315,7 @@ proc transport(client: Navi, req: Request, sink: BodySink,
     # Any verb may use h3, whether its body is buffered or streamed (bodyStream is
     # pulled over the h3 request stream, just like h2). The h3 body is buffered here;
     # the gated sink is fed by the performRequest fallback, not this leg.
-    if client.config.wantsH3 and req.url.isTls:
+    if client.config.wantsH3 and req.url.isTls and client.config.tls.h3TlsUsable:
       let ep = client.altSvc.h3Endpoint("https", req.url.host, req.url.port)
       if ep.isSome:
         try: return h3Transport(client, req, ep.get)

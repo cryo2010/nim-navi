@@ -4,7 +4,9 @@
 ## cert with it, starts an OpenSSL HTTPS server, and exports NAVI_CAFILE_URL /
 ## NAVI_CAFILE_CA. Validates that navi verifies the server against the supplied
 ## CA (positive), and rejects the same server when it falls back to the system
-## trust store, which does not contain our private CA (negative).
+## trust store, which does not contain our private CA (negative). The certificate
+## identity rules (SAN vs CN, wildcards) are covered by host_verify.nim and
+## host_wildcard.nim, which the same script drives.
 import unittest
 import std/os
 import navi

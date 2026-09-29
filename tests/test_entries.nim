@@ -1109,6 +1109,33 @@ suite "per-phase timeouts":
     check raised
     joinThread(th)
 
+suite "TLS peer verification defaults":
+  # The zero value of TlsConfig has to be the secure one: a bare TlsConfig() and
+  # the TlsConfig(caFile: ...) construction idiom must both authenticate the peer.
+  test "every way of building a TlsConfig should verify the peer":
+    check TlsConfig().wantsVerify
+    check not TlsConfig().insecureSkipVerify
+    let custom = TlsConfig(caFile: "corp-ca.pem")
+    check custom.wantsVerify
+    check custom.caFile == "corp-ca.pem"
+    check defaultTls().wantsVerify
+    check initNaviConfig().tls.wantsVerify
+
+  test "the verify accessor should round-trip through insecureSkipVerify":
+    var tls = TlsConfig()
+    check tls.verify
+    tls.verify = false
+    check tls.insecureSkipVerify
+    check not tls.verify
+    check not tls.wantsVerify
+    tls.verify = true
+    check not tls.insecureSkipVerify
+    check tls.verify
+    check tls.wantsVerify
+    var cfg = initNaviConfig()
+    cfg.tls.insecureSkipVerify = true
+    check not cfg.tls.verify
+
 suite "TLS version pinning config":
   test "tls minVersion and maxVersion should default to tlsDefault and be settable":
     var cfg = initNaviConfig()

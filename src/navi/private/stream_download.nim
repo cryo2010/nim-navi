@@ -79,14 +79,25 @@ proc openStream(client: Navi, req0: Request): StreamResponse =
     # the request is replayable and idempotent. `stream` takes no request body here,
     # but the verb still may be non-idempotent (a streamed POST response), so the
     # gate matters: otherwise a submitted-then-reset POST is silently re-sent.
-    if client.config.wantsH3 and rq.url.isTls and client.altSvc != nil:
+    if client.config.wantsH3 and rq.url.isTls and client.altSvc != nil and
+       client.config.tls.h3TlsUsable:
       let ep = client.altSvc.h3Endpoint("https", rq.url.host, rq.url.port)
       if ep.isSome:
         try:
-          let conn = h3Open(ep.get.host, ep.get.port, sni = rq.url.host,
-                            caFile = client.config.tls.caFile,
-                            verify = client.config.tls.wantsVerify,
-                            maxBody = uint64(max(0, client.config.maxResponseBytes)))
+          let conn = block:
+            var c: QuicConn
+            try:
+              c = h3Open(ep.get.host, ep.get.port, sni = rq.url.host,
+                         tls = client.config.tls,
+                         maxBody = uint64(max(0, client.config.maxResponseBytes)),
+                         connectMs = client.config.connectMs,
+                         totalMs = client.config.totalMs)
+            except QuicError:
+              # RFC 7838 2.4: stop dialling an alternative that will not connect (#432).
+              client.altSvc.markBroken("https", rq.url.host, rq.url.port)
+              raise
+            client.altSvc.markWorking("https", rq.url.host, rq.url.port)
+            c
           var fwd: seq[(string, string)]
           for k, v in rq.headers:
             let lk = k.toLowerAscii

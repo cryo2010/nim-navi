@@ -302,8 +302,8 @@ when defined(naviHttp3):
         "navi: sync WebSocket over h3 needs a --threads:on build (its connection is " &
         "kept alive by a background pump thread); or use navi/asyncdispatch")
     else:
-      let (pump, status) = openWsH3(u.host, u.port, u.host, client.config.tls.caFile,
-                                    client.config.tls.verify, u.requestTarget,
+      let (pump, status) = openWsH3(u.host, u.port, u.host, client.config.tls,
+                                    u.requestTarget,
                                     wsExtraFields(headers), client.config.connectMs,
                                     client.config.readMs, client.config.totalMs)
       if status < 200 or status >= 300:  # RFC 9220 / 8441 5: any 2xx accepts it

@@ -108,6 +108,12 @@ type
       ctx: SslContext   ## the (usually shared) SSL_CTX this connection used
       ownsCtx: bool     ## true only for an unshared ctx `close` must destroy
       slot: SessionSlot ## keeps the resumption link alive for the SSL's lifetime
+      uncleanEof: ref bool
+                        ## set when the transport ended without a TLS close_notify (a
+                        ## RST, a bare FIN, a dead peer). Shared across value copies
+                        ## like `state`, because the read that sees the unclean close
+                        ## and the engine that has to reject a read-until-close body
+                        ## hold different copies of the Conn
 
 var openedConnections* {.threadvar.}: int
   ## diagnostic: TCP connections opened by this backend, counted per thread (one navi
@@ -148,6 +154,16 @@ when defined(ssl):
   proc sslWrite(c: Conn, data: string) {.async.} =
     var off = 0
     while off < data.len:
+      # If `close` ran while we were parked, the SSL is already freed and SSL_write
+      # would dereference the dangling pointer -- the same UAF `sslRead` guards
+      # against, reached from the write side. A parked write survives the teardown
+      # on Linux: a peer reset reports {Read, Error} with no EPOLLOUT, so the
+      # dispatcher never walks the writeList, and the wake finally arrives from
+      # `closeSocket` inside `freeConn`, i.e. after SSL_free. The check is at the
+      # top of the loop, so it is re-run after every WANT_READ/WANT_WRITE await as
+      # well as on entry. The stream layer treats the raise as a drop.
+      if not c.state.isNil and c.state[] == csClosed:
+        raise newException(IOError, "navi: connection closed")
       # OpenSSL requires the same buffer+len when retrying after WANT_WRITE; `data`
       # is captured by this async proc, so the pointer stays valid across awaits.
       ErrClearError()   # see `sslRead`: SSL_get_error is only reliable on an empty queue
@@ -160,6 +176,11 @@ when defined(ssl):
         of SSL_ERROR_WANT_READ: await waitRead(c.fd)
         of SSL_ERROR_WANT_WRITE: await waitWrite(c.fd)
         else: raise newException(IOError, "navi: SSL_write failed")
+
+  proc markUncleanEof(c: Conn) {.inline.} =
+    ## Remember that the TLS stream ended without a close_notify. Writes through the
+    ## shared cell, so the flag survives the Conn being passed by value.
+    if not c.uncleanEof.isNil: c.uncleanEof[] = true
 
   proc sslRead(c: Conn): Future[string] {.async.} =
     ## One chunk of up to `naviReadBufSize` bytes; "" means the peer closed.
@@ -202,12 +223,19 @@ when defined(ssl):
         # transport EOF (n == 0, or any other errno) is a real close. Chronos never
         # hits this because it drives OpenSSL over memory BIOs (no fd for OpenSSL to
         # EAGAIN on), which is why only the asyncdispatch backend was affected.
+        #
+        # A genuine EOF here carries no close_notify, so it is recorded before it is
+        # reported: the engine still gets "" (an EOF before any response must keep
+        # being classified as a keep-alive race and replayed), but it can now refuse
+        # a read-until-close body that ends on it (issue #426).
         when defined(posix):
           if n < 0 and (errno == EAGAIN or errno == EWOULDBLOCK):
             await waitRead(c.fd)
           else:
+            c.markUncleanEof()
             result.setLen(0); return
         else:
+          c.markUncleanEof()
           result.setLen(0); return
       of SSL_ERROR_SSL:
         # A decrypt/protocol error. When WE initiated teardown (shutdownConn flipped
@@ -221,7 +249,9 @@ when defined(ssl):
         if not c.state.isNil and c.state[] != csOpen:
           result.setLen(0); return
         raise newException(IOError, "navi: TLS read failed")
-      else: result.setLen(0); return   # any other code -> treat as EOF
+      else:
+        c.markUncleanEof()
+        result.setLen(0); return   # any other code -> treat as EOF, unauthenticated
 
 # Byte-I/O primitives the shared tunnel drivers (backend/tunnel) mix in.
 proc sockWrite(fd: AsyncFD, s: string): Future[void] = send(fd, s)
@@ -235,7 +265,8 @@ proc sockReadExactly(fd: AsyncFD, n: int): Future[string] {.async.} =
     result.add chunk
 
 proc sockReadSome(fd: AsyncFD, max: int): Future[string] = recv(fd, max)
-  ## One read of up to `max` bytes (the proxy CONNECT reply fits in one recv).
+  ## One read of up to `max` bytes; returns "" at EOF. The CONNECT driver loops
+  ## on this until the reply head is terminated, so a short read is expected.
 
 proc proxyConnect(fd: AsyncFD, host: string, port: int, user, pass: string) {.async.} =
   proxyConnectDriver(fd, host, port, user, pass)
@@ -384,21 +415,47 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   conn.readMs = readMs
   conn.state = new(ConnectionState)   # csOpen; shared teardown state (see Conn.state)
   conn.parked = new(ParkedRead)       # empty; filled only by an expired `recvWithin`
+  when defined(ssl):
+    if tls: conn.uncleanEof = new(bool)   # close_notify verdict (see closedCleanly)
+
+  proc tearDownAttempt(fd: AsyncFD) =
+    ## Release a half-built connection. Nothing here has a destructor and a
+    ## value-type `Conn` is simply dropped when `establish` raises, so a failed
+    ## handshake or verification must hand back the SSL, an UNSHARED SSL_CTX (a
+    ## shared one belongs to the client's context store) and the socket itself, or
+    ## every retry leaks one of each. Used by both branches of `establish`.
+    when defined(ssl):
+      if not conn.ssl.isNil: SSL_free(conn.ssl); conn.ssl = nil
+      if conn.ownsCtx and not conn.ctx.isNil: conn.ctx.destroyContext()
+      conn.ctx = nil
+      conn.ownsCtx = false
+    if fd != invalidFd: closeSocket(fd)
+    conn.fd = invalidFd
 
   proc establish() {.async.} =
     if proxy.kind == pkUnix:
       conn.fd = await unixConnect(proxy.host)
       if tls:
-        when defined(ssl):
-          (conn.ctx, conn.ownsCtx) = obtainContext(cfg.contextStore, cfg, alpn)
-          conn.slot = resumeSlot(cfg, host & ":" & $port)
-          conn.ssl = newClientSsl(conn.ctx, conn.fd.SocketHandle, host, conn.slot)
-          await driveHandshake(conn.ssl, conn.fd, host)
-          verifyPeer(conn.ssl, host, cfg.wantsVerify)
-          postHandshakeVerify(conn.ssl, host, cfg)
-          conn.protocol = negotiatedProtocol(conn.ssl)
-        else:
-          raise newException(ValueError, "navi: https requires compiling with -d:ssl")
+        try:
+          when defined(ssl):
+            (conn.ctx, conn.ownsCtx) = obtainContext(cfg.contextStore, cfg, alpn)
+            conn.slot = resumeSlot(cfg, host & ":" & $port)
+            conn.ssl = newClientSsl(conn.ctx, conn.fd.SocketHandle, host,
+                                    cfg.wantsVerify, conn.slot)
+            await driveHandshake(conn.ssl, conn.fd, host)
+            verifyPeer(conn.ssl, host, cfg.wantsVerify)
+            postHandshakeVerify(conn.ssl, host, cfg)
+            conn.protocol = negotiatedProtocol(conn.ssl)
+          else:
+            raise newException(ValueError, "navi: https requires compiling with -d:ssl")
+        except CatchableError:
+          # Unlike the TCP branch there is no second address to fall back to, so
+          # reclaim the attempt and let the failure propagate. The caller is
+          # unwinding on it and cannot reach the conn, which is why this has to
+          # happen here (the connectMs backstop below only covers a TIMED-OUT
+          # establish, not a failed one).
+          tearDownAttempt(conn.fd)
+          raise
       return
     let dialHost = if proxy.isSet: proxy.host else: host
     let dialPort = if proxy.isSet: proxy.port else: port
@@ -425,7 +482,8 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
             # sync and chronos backends).
             (conn.ctx, conn.ownsCtx) = obtainContext(cfg.contextStore, cfg, alpn)
             conn.slot = resumeSlot(cfg, host & ":" & $port)
-            conn.ssl = newClientSsl(conn.ctx, fd.SocketHandle, host, conn.slot)
+            conn.ssl = newClientSsl(conn.ctx, fd.SocketHandle, host,
+                                    cfg.wantsVerify, conn.slot)
             await driveHandshake(conn.ssl, fd, host)
             verifyPeer(conn.ssl, host, cfg.wantsVerify)
             postHandshakeVerify(conn.ssl, host, cfg)   # SPKI pin + verify callback
@@ -436,11 +494,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
       except CatchableError as e:
         # Tear down this attempt (the SSL_CTX has no destructor, so a failed
         # handshake would leak an unshared one), then try the remaining addresses.
-        when defined(ssl):
-          if not conn.ssl.isNil: SSL_free(conn.ssl); conn.ssl = nil
-          if conn.ownsCtx and not conn.ctx.isNil: conn.ctx.destroyContext()
-          conn.ctx = nil
-        closeSocket(fd); conn.fd = invalidFd
+        tearDownAttempt(fd)
         pool.delete(idx)
         lastErr = e
     raise lastErr
@@ -480,7 +534,11 @@ proc sendAll*(c: Conn, data: string): Future[void] {.async.} =
   # connection whose ALPN never resolved under event-loop starvation, mis-routed
   # onto the h1 path). Raise a typed transport error instead of writing to a dead
   # fd, so the h1 write-time classifier tears it down and retries on a fresh conn.
-  if c.fd == invalidFd:
+  # `freeConn` closes the fd without clearing the value copies' `fd` field, so a
+  # send that raced a close still holds a live-looking descriptor number that the
+  # process may already have handed to something else: the shared state flag, not
+  # the number, is the authority (the plaintext twin of the `sslWrite` guard).
+  if c.fd == invalidFd or (not c.state.isNil and c.state[] == csClosed):
     raise newException(IOError, "navi: send on a closed connection")
   await send(c.fd, data)
 
@@ -493,6 +551,15 @@ proc rearm*(c: var Conn, readMs = 0, totalMs = 0) =
   discard totalMs
   c.readMs = readMs
 
+proc closedCleanly*(c: Conn): bool =
+  ## Whether the end of this connection was authenticated. True until a TLS read
+  ## sees the transport die without a close_notify, and always true for plain http,
+  ## which has no close_notify to look for. The engine consults it before accepting
+  ## a body that is delimited by the close itself (issue #426).
+  when defined(ssl):
+    if not c.uncleanEof.isNil: return not c.uncleanEof[]
+  true
+
 proc startRead(c: Conn): Future[string] =
   ## Begin one read, resuming the one a previous `recvWithin` parked rather than
   ## starting a second read on the same socket (which would race it for the bytes).
@@ -503,6 +570,14 @@ proc startRead(c: Conn): Future[string] =
   when defined(ssl):
     if not c.ssl.isNil: return sslRead(c)
   recv(c.fd, naviReadBufSize)
+
+proc retireRead(fut: Future[string]) =
+  ## Observe an abandoned read's outcome from a callback and drop it. Nobody will
+  ## await it, and an asyncdispatch future that fails unobserved orphans its
+  ## injected stack trace at process exit (a valgrind-visible leak).
+  if fut.isNil: return
+  fut.addCallback(proc() {.gcsafe.} =
+    if fut.failed: discard fut.error)
 
 proc recvSome*(c: Conn): Future[string] {.async.} =
   ## One chunk of up to `naviReadBufSize` bytes; "" means the peer closed. Bounded by
@@ -528,7 +603,13 @@ proc recvWithin*(c: Conn, ms: int): Future[tuple[timedOut: bool, data: string]] 
   if ms <= 0: return (true, "")
   let readFut = c.startRead()
   if not await withTimeout(readFut, ms):
-    if not c.parked.isNil: c.parked.fut = readFut
+    # A `close` that landed while we were waiting has already run `discardParked`,
+    # so parking here would leave the read unowned on a freed connection and its
+    # failure unobserved (the orphaned-stack-trace leak). Retire it instead.
+    if c.parked.isNil or (not c.state.isNil and c.state[] == csClosed):
+      retireRead(readFut)
+    else:
+      c.parked.fut = readFut
     return (true, "")
   return (false, await readFut)
 
@@ -539,8 +620,17 @@ proc discardParked(c: Conn) =
   if c.parked.isNil or c.parked.fut.isNil: return
   let fut = c.parked.fut
   c.parked.fut = nil
-  fut.addCallback(proc() {.gcsafe.} =
-    if fut.failed: discard fut.error)
+  retireRead(fut)
+
+proc shutdownFd(c: Conn) =
+  ## The raw SHUT_RDWR, with no state check: `close` flags `csClosed` before it
+  ## shuts the socket down to wake a parked read, so it cannot go through the
+  ## guarded `shutdownConn` below.
+  if c.fd == invalidFd: return
+  when defined(windows):
+    discard winlean.shutdown(c.fd.SocketHandle, 2)          # SD_BOTH
+  else:
+    discard posix.shutdown(c.fd.SocketHandle, posix.SHUT_RDWR)
 
 proc shutdownConn*(c: Conn) =
   ## Shut the socket down in both directions so a pending read or write unblocks
@@ -551,12 +641,14 @@ proc shutdownConn*(c: Conn) =
   ## parked sslRead woken by the shutdown treats the decrypt error on our truncated
   ## final record as clean EOF (teardown noise) rather than raising a failed future
   ## whose stack trace would be orphaned at exit; the SSL itself is still valid here.
-  if c.fd == invalidFd: return
+  ##
+  ## A no-op once the connection is closed: `freeConn` does not clear the value
+  ## copies' `fd`, so shutting down after it ran would hit whatever descriptor the
+  ## process was handed next. The h2 mux drives this from several teardown paths,
+  ## which can land after `close` has already freed the conn.
+  if not c.state.isNil and c.state[] == csClosed: return
   if not c.state.isNil and c.state[] == csOpen: c.state[] = csShutdown
-  when defined(windows):
-    discard winlean.shutdown(c.fd.SocketHandle, 2)          # SD_BOTH
-  else:
-    discard posix.shutdown(c.fd.SocketHandle, posix.SHUT_RDWR)
+  c.shutdownFd()
 
 proc freeConn(c: Conn) =
   ## The raw teardown: free the SSL and close the fd. Callers set/guard the
@@ -590,7 +682,7 @@ proc close*(c: Conn): Future[void] {.async.} =
   if not c.state.isNil:
     if c.state[] == csClosed: return
     c.state[] = csClosed
-    shutdownConn(c)
+    c.shutdownFd()          # state is already csClosed, so shutdownConn would no-op
     await sleepAsync(0)
   c.discardParked()
   freeConn(c)

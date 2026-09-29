@@ -46,7 +46,7 @@ optionally with mutual TLS.
 import navi
 
 var config = initNaviConfig()
-config.tls.caFile   = "/etc/navi/internal-ca.pem"    # trust only this CA (verify stays on)
+config.tls.caFile   = "/etc/navi/internal-ca.pem"    # trust only this CA (verification stays on)
 config.tls.minVersion = tls12
 # Optional mutual TLS: present a client certificate.
 config.tls.certFile = "/etc/navi/client.pem"
@@ -58,7 +58,9 @@ Why: `caFile` replaces the system trust store, so navi accepts only certificates
 that chain to your private root; verification stays on. The client certificate
 lets the server authenticate navi in return. A PKCS#12 bundle
 (`config.tls.pkcs12File = "client.p12"; config.tls.password = "..."`) is an
-alternative to the cert/key pair.
+alternative to the cert/key pair, and the intermediates inside it are presented
+along with the leaf, so a server that trusts only your root can still build the
+path.
 
 ### 3. Untrusted or hostile endpoint
 
@@ -93,12 +95,16 @@ Field names and types match `TlsConfig` in `src/navi/backend/api.nim` and the
 
 | | |
 |---|---|
-| Default | `config.tls.verify = true` (chain **and** hostname) |
-| Hardened | leave on; never set `false` outside tests |
+| Default | `config.tls.insecureSkipVerify = false` (chain **and** hostname are checked) |
+| Hardened | leave it unset; never set `true` outside tests |
 
-Verification is on by default and covers both the certificate chain and the
-hostname. `verify = false` disables both and is intended only for tests against
-self-signed servers. If you need to trust a non-public CA, do **not** disable
+Verification is on for every config, including a bare `TlsConfig()`, and covers both the certificate chain and the
+hostname. The hostname (or IP literal) is bound into the handshake, so a mismatch
+aborts it before any client certificate is sent, and the match follows RFC 9525:
+partial wildcards such as `fo*.example.com` are rejected, and a certificate that
+carries dNSName SANs is judged on those alone -- its subject CN counts only when it
+has no SAN at all. `insecureSkipVerify = true` disables both and is intended only for tests
+against self-signed servers. If you need to trust a non-public CA, do **not** disable
 verification; set `caFile` instead.
 
 ### Custom trust anchor (`caFile`)
@@ -176,6 +182,20 @@ On by default and scoped per origin (a cached session is only presented back to
 the server it came from), so it is safe to leave on. Disable it only if your
 threat model forbids session reuse.
 
+### Truncation of a body delimited by the connection close
+
+No knob: navi always rejects it. A response with neither `Content-Length` nor
+chunked framing (an HTTP/1.0 origin, a `Connection: close` error page, an
+un-chunked event stream) ends where the connection ends, so the only proof that
+the body is complete is TLS's `close_notify` alert. Over https navi refuses such
+a body when the transport died without one -- an injected RST, a bare FIN, a
+crashed origin -- and raises `IOError` ("TLS connection closed without
+close_notify; response may be truncated") instead of returning a short body as a
+complete 200. Length- and chunk-delimited bodies are unaffected (their framing
+already detects a short read), plain http cannot be protected this way, and an
+EOF that arrives before any response bytes is still treated as a keep-alive race
+and retried on a fresh connection.
+
 ### Response body cap
 
 ```nim
@@ -244,8 +264,17 @@ config.http = {H1, H2, H3}   # requires a -d:naviHttp3 build
 
 Opt-in: HTTP/3 is honored only in a `-d:naviHttp3` build and must be listed
 explicitly in `http` (an empty set does not imply it). It is reached per origin
-after Alt-Svc discovery and performs the same certificate verification as the
-other backends.
+after Alt-Svc discovery and honors the same `TlsConfig` as the other backends:
+`caFile`/`caBundle`, the client credential (mTLS), `ciphers`/`cipherSuites`, the
+chain and hostname check, and `pinnedKeys`/`verifyCallback` on the peer leaf before
+the connection is used. QUIC is TLS 1.3 only, so a `maxVersion` below TLS 1.3 rules
+h3 out: navi skips the advertised endpoint and stays on h2/h1 rather than failing
+the request.
+
+The QUIC handshake is bounded by `connectMs` (then `totalMs`, else 30 s), and an h3
+endpoint whose handshake fails before anything is submitted is marked broken for a
+doubling backoff window (RFC 7838 2.4), so a network that drops UDP/443 costs one
+stalled handshake rather than one per request.
 
 ### Proxy
 

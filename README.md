@@ -278,6 +278,7 @@ let api = newNavi(config)
 | `tls.certPem` | `string` | `""` | Client certificate as an in-memory PEM string. |
 | `tls.cipherSuites` | `string` | `""` | TLS 1.3 ciphersuites (colon-separated); `""` = library default. |
 | `tls.ciphers` | `string` | `""` | TLS <=1.2 cipher list (OpenSSL colon format); `""` = library default. |
+| `tls.insecureSkipVerify` | `bool` | `false` | Skip the certificate chain and hostname checks. Off by default, so every config verifies; for tests against self-signed servers only. The legacy `tls.verify` accessor is its inverse. |
 | `tls.keyFile` | `string` | `""` | Private key file for `certFile`; `""` reuses `certFile`. |
 | `tls.keyPem` | `string` | `""` | Private key as an in-memory PEM string; `""` reuses `certPem`. |
 | `tls.maxVersion` | `TlsVersion` | `tlsDefault` | Highest TLS version to negotiate (`tlsDefault` = unset). |
@@ -286,7 +287,6 @@ let api = newNavi(config)
 | `tls.pinnedKeys` | `seq[string]` | `@[]` | SPKI SHA-256 pins (base64, HPKP form); the peer public key must match one or the connection is rejected. |
 | `tls.pkcs12File` | `string` | `""` | PKCS#12/PFX bundle (cert + key + chain); highest precedence. |
 | `tls.resumeSessions` | `bool` | `true` | Reuse TLS sessions across connections (abbreviated handshake). |
-| `tls.verify` | `bool` | `true` | Verify the certificate chain and hostname. |
 | `tls.verifyCallback` | `proc` | `nil` | Hook run after the chain + hostname checks; receives the peer leaf cert (DER), returns whether to accept. |
 
 ### Requests
@@ -347,11 +347,13 @@ for (name, value) in h.pairs:
 
 ```nim
 var config = initNaviConfig()
-config.tls.caFile = "/path/to/ca-bundle.pem"   # verify is already on
+config.tls.caFile = "/path/to/ca-bundle.pem"   # verification is already on
 let api = newNavi(config)
 ```
 
-`verify` defaults to on. `caFile` is honored by all three native clients, each through OpenSSL (chronos included; without a `caFile` they verify against the system trust store). All three negotiate modern TLS (up to the library's maximum, typically TLS 1.3) and support client certificates (mTLS).
+Verification is on for every `TlsConfig`, including a bare one: the opt-out is `tls.insecureSkipVerify = true`. `caFile` is honored by all three native clients, each through OpenSSL (chronos included; without a `caFile` they verify against the system trust store). All three negotiate modern TLS (up to the library's maximum, typically TLS 1.3) and support client certificates (mTLS).
+
+The whole `TlsConfig` applies to the HTTP/3 leg too (`-d:naviHttp3`): trust store, `caBundle`, client credential, pins, verify callback and cipher selection all reach the QUIC handshake. The one bound QUIC cannot honor is a `maxVersion` below TLS 1.3, since QUIC always uses TLS 1.3 (RFC 9001); with such a bound set navi simply skips the advertised h3 endpoint and stays on h2/h1.
 
 #### Trusting a CA in memory
 
@@ -367,7 +369,8 @@ config.tls.caBundle = readFile("corp-root.pem")   # or an embedded const
 
 For an extra check beyond chain + hostname verification, pin the peer's public
 key or inspect the leaf certificate yourself. Both run after the standard checks
-(and still run when `verify` is off, so you can replace verification entirely).
+(and still run when `insecureSkipVerify` is set, so you can replace verification
+entirely).
 
 ```nim
 # SPKI SHA-256 pins (base64, the HPKP form). Compute one with:
@@ -382,7 +385,9 @@ config.tls.verifyCallback = proc(leafDer: string): bool =
 
 A non-matching pin, or a callback returning false, rejects the connection at
 connect time. Both are honored on the three native clients (`navi/js` defers TLS
-to the runtime).
+to the runtime), on every protocol they speak: in a `-d:naviHttp3` build the
+HTTP/3 leg checks the pin and runs the callback on the QUIC peer's leaf right
+after the handshake, before the connection carries a request or enters the pool.
 
 #### Session resumption
 
@@ -447,7 +452,11 @@ config.tls.certPem = certString
 config.tls.keyPem  = keyString
 ```
 
-Key algorithms (RSA, ECDSA, Ed25519) work in any of these as long as OpenSSL supports them. In-memory PEM may carry an intermediate chain; a PKCS#12 bundle's extra chain certs are not installed (only its leaf and key), which is all a client needs to present.
+An encrypted key needs `tls.password`; without one the load fails immediately rather
+than prompting for a passphrase on the terminal. A key configured without a
+certificate is rejected.
+
+Key algorithms (RSA, ECDSA, Ed25519) work in any of these as long as OpenSSL supports them. In-memory PEM may carry an intermediate chain, and a PKCS#12 bundle's intermediates are installed too, so a client certificate issued by an intermediate CA is presented with the chain a root-only server needs to validate it.
 
 ### Errors
 

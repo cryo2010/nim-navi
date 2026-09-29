@@ -114,7 +114,8 @@ proc sockReadExactly(transport: StreamTransport, n: int): Future[string] {.async
   buf
 
 proc sockReadSome(transport: StreamTransport, max: int): Future[string] {.async.} =
-  ## One read of up to `max` bytes (the proxy CONNECT reply fits in one read).
+  ## One read of up to `max` bytes; `readOnce` yields 0 only at EOF, so "" means
+  ## EOF. The CONNECT driver loops on this until the reply head is terminated.
   var buf = newString(max)
   let n = await transport.readOnce(addr buf[0], max)
   buf.setLen(n)
@@ -237,7 +238,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
           var ok = false
           try:
             let slot = resumeSlot(cfg, host & ":" & $port)
-            let tlsc = newChronosTls(transport, ctx, host, slot)
+            let tlsc = newChronosTls(transport, ctx, host, cfg.wantsVerify, slot)
             conn.tls = tlsc
             await tlsc.handshake()
             verifyPeer(tlsc.sslPtr, host, cfg.wantsVerify)
@@ -246,6 +247,19 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
             conn.ctx = ctx
             conn.ownsCtx = owned
             ok = true
+          except CatchableError:
+            # The same teardown the TCP branch runs, and it must run on a cancel too.
+            # Without it a failed handshake or a failed chain/hostname/pin check
+            # leaves `conn.tls` pointing at a live, fully handshaken SSL (and leaks
+            # it, its BIOs and the fd): the caller would then send the request over a
+            # session whose identity check did NOT pass. Nil it so no Conn ever
+            # leaves `connect` unverified.
+            if not conn.tls.isNil:
+              await noCancel conn.tls.close()      # frees the ssl + the transport
+              conn.tls = nil
+            else:
+              (try: await noCancel transport.closeWait() except CatchableError: discard)
+            raise
           finally:
             if owned and not ok and not ctx.isNil: destroyCtx(ctx)
         else:
@@ -300,7 +314,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
               await proxyConnect(transport, host, port, proxy.user, proxy.pass)
             if tls:
               let slot = resumeSlot(cfg, host & ":" & $port)
-              let tlsc = newChronosTls(transport, ctx, host, slot)
+              let tlsc = newChronosTls(transport, ctx, host, cfg.wantsVerify, slot)
               conn.tls = tlsc
               # Drive the handshake now so a verification failure raises here, not
               # mid-read; verifyPeer re-checks the chain + hostname/IP identity.
@@ -315,6 +329,19 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
               conn.reader = newAsyncStreamReader(transport)
               conn.writer = newAsyncStreamWriter(transport)
             return                                   # established
+          except CancelledError:
+            # A structured cancel (a `timeouts.total` guard, a CancelToken, or the
+            # connect bound) is not an address that failed: tearing the attempt down
+            # and carrying on would re-race the remaining addresses with no bound
+            # left, so a cancelled connect could run for minutes. Clean up this
+            # attempt and let the cancellation out.
+            if not conn.tls.isNil:
+              await noCancel conn.tls.close()        # frees ssl + transport
+              conn.tls = nil
+            else:
+              (try: await noCancel transport.closeWait() except CatchableError: discard)
+            conn.reader = nil; conn.writer = nil
+            raise
           except CatchableError as e:
             if not conn.tls.isNil:
               await conn.tls.close()                 # frees ssl + transport
@@ -328,11 +355,22 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
         if tls and owned and not keepCtx and not ctx.isNil:
           destroyCtx(ctx)
 
-  if connectMs > 0:
-    if not await withTimeout(establish(), connectMs.milliseconds):
-      raise newException(response.TimeoutError, connectTimeoutMsg(connectMs))
-  else:
-    await establish()
+  # Keep the establish future and await it after the timeout check (the same shape
+  # as the asyncdispatch backend). chronos's `withTimeout` completes `false` ONLY on
+  # the timeout: a FAILED inner future completes it with `true` and its exception is
+  # discarded (asyncfutures `completeFuture`: `if fut.failed() or fut.completed():
+  # retFuture.complete(true)`). Reading the future back is therefore what makes every
+  # establishment error -- DNS, refused, handshake, chain/hostname verification, SPKI
+  # pin -- reach the caller instead of `connect` returning a half-built Conn that
+  # fails later with a generic "send on a closed connection".
+  let est = establish()
+  if connectMs > 0 and not await withTimeout(est, connectMs.milliseconds):
+    # `withTimeout` cancelled `est` and waited for it to settle before completing
+    # false, so establish's own teardown has already run; cancelAndWait is the
+    # belt-and-braces no-op that also covers a cancel still in flight.
+    await noCancel est.cancelAndWait()
+    raise newException(response.TimeoutError, connectTimeoutMsg(connectMs))
+  await est
   return conn
 
 proc sendAll*(c: Conn, data: string): Future[void] {.async.} =
@@ -368,6 +406,15 @@ proc rearm*(c: var Conn, readMs = 0, totalMs = 0) =
   ## whole-request deadline, so there is no per-conn deadline to re-arm here.
   discard totalMs
   c.readMs = readMs
+
+proc closedCleanly*(c: Conn): bool =
+  ## Whether the end of this connection was authenticated. True until a TLS read
+  ## sees the transport die without a close_notify, and always true for plain http,
+  ## which has no close_notify to look for. The engine consults it before accepting
+  ## a body that is delimited by the close itself (issue #426).
+  when defined(ssl):
+    if not c.tls.isNil: return c.tls.closedCleanly()
+  true
 
 proc startRead(c: Conn): Future[string] =
   ## Begin one read, resuming the one a previous `recvWithin` parked rather than

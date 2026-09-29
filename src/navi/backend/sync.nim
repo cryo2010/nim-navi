@@ -71,11 +71,82 @@ else:
     discard setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, addr tv, SockLen(sizeof tv))
     discard setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, addr tv, SockLen(sizeof tv))
 
+# --- readiness waits ----------------------------------------------------
+# poll(2) on POSIX, WSAPoll on Windows; never select(2). select FD_SETs the raw
+# descriptor into a fixed 1024-bit fd_set with no range check, so a socket that
+# landed above FD_SETSIZE -- routine in a process already holding ~1024
+# descriptors under a raised RLIMIT_NOFILE -- aborts the process on fortified
+# builds, smashes the stack otherwise, or fails with EINVAL. And because every
+# call site only tested `> 0`, that -1 was indistinguishable from an expiry and
+# turned a ready connection into a bogus read/connect timeout (issue #429).
+# poll takes the descriptor as a plain int, so it has no such ceiling, and a
+# genuine failure raises here instead of being swallowed as a timeout.
+
+when defined(windows):
+  # winlean carries no WSAPoll binding, so declare it against ws2_32 the way
+  # winlean declares the rest of Winsock (Vista and later export it).
+  type
+    PollFd {.pure, final.} = object
+      fd: SocketHandle
+      events: cshort
+      revents: cshort
+  const
+    pollRead = cshort(0x0100)   # POLLRDNORM; WSAPoll's POLLIN is RDNORM|RDBAND
+    pollWrite = cshort(0x0010)  # POLLWRNORM
+    pollFail = cshort(0x0001) or cshort(0x0002) or cshort(0x0004)  # ERR|HUP|NVAL
+  proc wsaPoll(fds: ptr PollFd, nfds: culong, timeout: cint): cint {.
+    stdcall, importc: "WSAPoll", dynlib: "ws2_32.dll".}
+else:
+  type PollFd = TPollfd
+  # The POLL* symbols are plain consts on Linux but importc'd vars on the BSDs
+  # and macOS, so these are templates rather than consts.
+  template pollRead: cshort = POLLIN
+  template pollWrite: cshort = POLLOUT
+  template pollFail: cshort = POLLERR or POLLHUP or POLLNVAL
+
+proc initPollFd(fd: SocketHandle, events: cshort): PollFd {.inline.} =
+  when defined(windows): PollFd(fd: fd, events: events, revents: 0)
+  else: PollFd(fd: cint(fd), events: events, revents: 0)
+
+proc pollWait(fds: ptr PollFd, n, ms: int): int =
+  ## One readiness wait over `n` descriptors: the count that became ready, or 0
+  ## when the wait expired. `ms` == 0 returns at once and `ms` < 0 blocks
+  ## indefinitely -- the timeout semantics the select-based waits had. A real
+  ## failure raises IOError rather than passing for an expiry; EINTR is retried
+  ## with whatever is left of the budget. Callers pass a stack `PollFd` (or the
+  ## Happy-Eyeballs buffer), so a wait allocates nothing.
+  let timeout = if ms < 0: -1 else: ms
+  when defined(windows):
+    result = wsaPoll(fds, culong(n), cint(timeout)).int
+    if result < 0:
+      raise newException(IOError,
+        "navi: WSAPoll failed: " & osErrorMsg(osLastError()))
+  else:
+    var left = timeout
+    var deadline: MonoTime
+    if left > 0: deadline = getMonoTime() + initDuration(milliseconds = left)
+    while true:
+      result = posix.poll(fds, Tnfds(n), cint(left)).int
+      if result >= 0: return
+      if errno != EINTR:
+        raise newException(IOError,
+          "navi: poll failed: " & osErrorMsg(osLastError()))
+      if left == 0: return 0              # interrupted, nothing left to wait
+      if left > 0:
+        left = remainingMs(deadline)      # retry with the remaining time
+        if left <= 0: return 0
+
 proc waitWritable(fd: SocketHandle, ms: int): bool =
   ## True once the (non-blocking) socket becomes writable within `ms` ms -- i.e.
-  ## the async connect finished. selectWrite mutates its seq, so pass a fresh one.
-  var fds = @[fd]
-  selectWrite(fds, ms) > 0
+  ## the async connect finished. A hangup or error counts as finished too: the
+  ## caller's SO_ERROR check then reports the real failure, which is what the
+  ## select-based wait did.
+  var pfd = initPollFd(fd, pollWrite)
+  if pollWait(addr pfd, 1, ms) > 0: return true
+  when defined(windows):
+    # WSAPoll before Windows 10 2004 never signals a failed connect. Ask the
+    # socket itself, so a refused connection is still reported as refused.
+    if getSockOptInt(fd, SOL_SOCKET.int, SO_ERROR.int) != 0: return true
 
 type
   Conn* = object
@@ -89,6 +160,12 @@ type
       ctx: SslContext   ## the (usually shared) SSL_CTX this connection used
       ownsCtx: bool     ## true only for an unshared ctx `close` must destroy
       slot: SessionSlot ## keeps the resumption link alive for the SSL's lifetime
+      uncleanEof: ref bool
+                        ## set when the transport ended without a TLS close_notify (a
+                        ## RST, a bare FIN, a dead peer). A `ref` so every value copy
+                        ## of the Conn observes it, like the async backends' `state`:
+                        ## the reader that sees the unclean close and the engine that
+                        ## has to reject a read-until-close body are different copies
 
 template await*(x: untyped): untyped = x
 
@@ -168,7 +245,8 @@ proc sockReadExactly(fd: SocketHandle, n: int): string =
     off += r
 
 proc sockReadSome(fd: SocketHandle, max: int): string =
-  ## One read of up to `max` bytes (the proxy CONNECT reply fits in one recv).
+  ## One read of up to `max` bytes; returns "" at EOF. The CONNECT driver loops
+  ## on this until the reply head is terminated, so a short read is expected.
   result = newString(max)
   let n = sysRecv(fd, addr result[0], max)
   result.setLen(system.max(n, 0))
@@ -185,7 +263,7 @@ proc socksConnect(fd: SocketHandle, host: string, port: int, user, pass: string)
 
 proc unixConnect(path: string, connectMs = 0): SocketHandle =
   ## Connect a blocking AF_UNIX/SOCK_STREAM socket to `path`, honoring `connectMs`
-  ## (non-blocking connect + select) exactly as `tcpConnect` does for TCP.
+  ## (non-blocking connect + poll) exactly as `tcpConnect` does for TCP.
   when not defined(posix):
     raise newException(ValueError,
       "navi: Unix domain sockets are only supported on POSIX")
@@ -233,6 +311,7 @@ proc happyConnect(ips: seq[string], port: int,
   ## `connectMs` > 0 bounds the whole race. Raises `TimeoutError` / `IOError`.
   var
     inflight: seq[tuple[fd: SocketHandle, idx: int]]
+    pfds: seq[PollFd]
     nextIdx = 0
     lastStart: MonoTime
     began = false
@@ -269,22 +348,27 @@ proc happyConnect(ips: seq[string], port: int,
       let remaining = remainingMs(start + initDuration(milliseconds = connectMs))
       if remaining <= 0: timedOut = true; break
       waitMs = min(waitMs, remaining)
-    var fds = newSeq[SocketHandle](inflight.len)
-    for i, e in inflight: fds[i] = e.fd
-    if selectWrite(fds, waitMs) > 0:
-      for ready in fds:                  # `fds` now holds only the writable sockets
-        var pos = -1
-        for i, e in inflight:
-          if e.fd == ready: pos = i; break
-        if pos < 0: continue
+    pfds.setLen(inflight.len)            # reused across rounds: no per-round alloc
+    for i, e in inflight: pfds[i] = initPollFd(e.fd, pollWrite)
+    if pollWait(addr pfds[0], inflight.len, waitMs) > 0:
+      var i = 0
+      while i < inflight.len:
+        # Writable, hung up or errored: either way that attempt finished, and
+        # SO_ERROR says whether it finished well.
+        if (pfds[i].revents and (pollWrite or pollFail)) == 0:
+          inc i
+          continue
+        let ready = inflight[i].fd
         if getSockOptInt(ready, SOL_SOCKET.int, SO_ERROR.int) == 0:
           ready.setBlocking(true)
-          let idx = inflight[pos].idx
-          for i, e in inflight:
-            if i != pos: close(e.fd)      # cancel the losing attempts
+          let idx = inflight[i].idx
+          for j, e in inflight:
+            if j != i: close(e.fd)        # cancel the losing attempts
           return (ready, idx)
-        else:
-          lastErr = "connection refused"; close(ready); inflight.delete(pos)
+        lastErr = "connection refused"
+        close(ready)
+        inflight.delete(i)
+        pfds.delete(i)                    # keep the two in step
   for e in inflight: close(e.fd)
   if timedOut:
     raise newException(response.TimeoutError, connectTimeoutMsg(connectMs))
@@ -311,7 +395,7 @@ when defined(ssl):
       try:
         if connectMs > 0: setIoTimeout(fd, connectMs)   # bound the blocking handshake
         result.ssl = startClientTls(ctx, fd, sni, verify, slot)
-        if connectMs > 0: setIoTimeout(fd, 0)           # clear; reads use selectRead
+        if connectMs > 0: setIoTimeout(fd, 0)           # clear; reads poll instead
         result.fd = fd
         result.slot = slot
         result.protocol = negotiatedProtocol(result.ssl)
@@ -408,7 +492,11 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   when defined(ssl):
     # SPKI pinning + the user's verify callback (no-op unless configured). Runs
     # before `established`, so a rejection cleans up the fd/SSL via the defer.
-    if tls: postHandshakeVerify(result.ssl, host, cfg)
+    if tls:
+      postHandshakeVerify(result.ssl, host, cfg)
+      # One cell per TLS connection, allocated here (never on a read path): the
+      # close_notify verdict `closedCleanly` reports (issue #426).
+      result.uncleanEof = new(bool)
   established = true
 
 proc rearm*(c: var Conn, readMs = 0, totalMs = 0) =
@@ -439,19 +527,29 @@ proc sendAll*(c: Conn, data: string) =
 
 proc waitReadable(c: Conn, ms: int): bool =
   ## True when the socket has data ready within `ms`. Checks OpenSSL's decrypted
-  ## buffer first: `select` sees the raw fd, so bytes SSL already drained off it
-  ## and buffered would otherwise be missed.
+  ## buffer first: `poll` sees the raw fd, so bytes SSL already drained off it
+  ## and buffered would otherwise be missed. A hangup or error reads as ready so
+  ## the recv that follows surfaces the real error instead of a stray timeout.
   when defined(ssl):
     if not c.ssl.isNil and SSL_pending(c.ssl) > 0:
       return true
-  var fds = @[c.fd]
-  selectRead(fds, ms) > 0
+  var pfd = initPollFd(c.fd, pollRead)
+  pollWait(addr pfd, 1, ms) > 0
 
 proc dataWaiting*(c: Conn, ms: int): bool =
   ## True when the socket has data ready within `ms` (the WebSocket keepalive poll
   ## reads only once this says so, so it never blocks past the interval). Also sees
   ## bytes already buffered inside OpenSSL, which a raw `select` would miss.
   c.waitReadable(ms)
+
+proc closedCleanly*(c: Conn): bool =
+  ## Whether the end of this connection was authenticated. True until a TLS read
+  ## sees the transport die without a close_notify, and always true for plain http,
+  ## which has no close_notify to look for. The engine consults it before accepting
+  ## a body that is delimited by the close itself (issue #426).
+  when defined(ssl):
+    if not c.uncleanEof.isNil: return not c.uncleanEof[]
+  true
 
 proc readBudgetMs(c: Conn): int =
   ## The wait budget for one read: the per-read stall limit capped by the time left
@@ -473,6 +571,11 @@ proc readTimedOut(c: Conn) {.noreturn.} =
   raise newException(response.TimeoutError, "navi: read timed out")
 
 when defined(ssl):
+  proc markUncleanEof(c: Conn) {.inline.} =
+    ## Remember that the TLS stream ended without a close_notify. Writes through the
+    ## shared cell, so the flag survives the Conn being passed by value.
+    if not c.uncleanEof.isNil: c.uncleanEof[] = true
+
   proc sslReadSome(c: Conn, buf: var string): int =
     ## One SSL_read of up to `buf.len` bytes, bounded by the read budget. Returns the
     ## byte count (>0), or 0 for a clean peer EOF; raises navi's TimeoutError when the
@@ -528,10 +631,17 @@ when defined(ssl):
         else:
           if n < 0 and osLastError().int32 == WSAEWOULDBLOCK:
             c.readTimedOut()
-        return 0   # n == 0 (unexpected EOF) or a real errno: treat as a close
+        # n == 0 (unexpected EOF) or a real errno. Still reported as a close, so an
+        # EOF before any response keeps being classified as a keep-alive race and
+        # replayed, but it is NOT a close_notify: record that so the engine can
+        # reject a read-until-close body that ends here (issue #426).
+        c.markUncleanEof()
+        return 0
       of SSL_ERROR_SSL:
         raise newException(IOError, "navi: TLS read failed")
-      else: return 0   # any other code -> treat as EOF
+      else:
+        c.markUncleanEof()
+        return 0   # any other code -> treat as EOF, and an unauthenticated one
 
 proc recvSome*(c: Conn): string =
   ## One chunk of up to `naviReadBufSize` bytes; "" means the peer closed. Waits up to

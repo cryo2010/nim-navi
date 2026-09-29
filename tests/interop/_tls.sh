@@ -27,9 +27,11 @@ navi_wait_tls() {
   ## Poll until a TLS server answers on host:port, or give up. Usage:
   ##   navi_wait_tls <host:port> [openssl s_client flags...]
   ## Returns 0 once the server presents a certificate, non-zero if it never did.
+  ## Waits up to 30 s: a loaded CI runner (or a host building a Docker image next
+  ## door) can take well over 10 s to get an s_server to its first handshake.
   local hostport="$1"; shift
   local _
-  for _ in $(seq 1 60); do
+  for _ in $(seq 1 150); do
     if echo | openssl s_client -connect "$hostport" "$@" 2>/dev/null | grep -q "BEGIN CERT"; then
       return 0
     fi

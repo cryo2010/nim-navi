@@ -22,6 +22,12 @@
 #include <openssl/ssl.h>
 #include <openssl/rand.h>
 #include <openssl/x509v3.h>
+#include <openssl/pem.h>
+#include <openssl/pkcs12.h>
+#include <openssl/evp.h>
+#include <openssl/err.h>
+
+#include "h3client.h"   // NaviH3Tls: navi's TlsConfig across the FFI (#419)
 
 #include <fcntl.h>
 #include <netdb.h>
@@ -58,6 +64,17 @@ namespace {
 // on every path (including early returns and future edits) without a manual free.
 struct X509Deleter { void operator()(X509 *p) const noexcept { X509_free(p); } };
 using X509Ptr = std::unique_ptr<X509, X509Deleter>;
+
+struct BioDeleter { void operator()(BIO *p) const noexcept { BIO_free(p); } };
+using BioPtr = std::unique_ptr<BIO, BioDeleter>;
+struct Pkcs12Deleter { void operator()(PKCS12 *p) const noexcept { PKCS12_free(p); } };
+using Pkcs12Ptr = std::unique_ptr<PKCS12, Pkcs12Deleter>;
+struct EvpPkeyDeleter { void operator()(EVP_PKEY *p) const noexcept { EVP_PKEY_free(p); } };
+using EvpPkeyPtr = std::unique_ptr<EVP_PKEY, EvpPkeyDeleter>;
+struct X509StackDeleter {
+  void operator()(STACK_OF(X509) *p) const noexcept { sk_X509_pop_free(p, X509_free); }
+};
+using X509StackPtr = std::unique_ptr<STACK_OF(X509), X509StackDeleter>;
 
 struct AddrInfoDeleter {
   void operator()(addrinfo *p) const noexcept { freeaddrinfo(p); }
@@ -168,6 +185,8 @@ struct H3Conn {
                             // draining): a clean end, not a transport error
   unsigned long long max_body = 0;  // navi maxResponseBytes: cap on a single response
                                     // body the driver will buffer (0 = unlimited)
+  unsigned long long handshake_timeout_ms = 0;  // navi connectMs; bounds the blocking
+                                    // handshake drive loop (0 = the 120s safety net)
   // The peer's SETTINGS (RFC 9114 7.2.4), recorded by on_recv_settings.
   // `peer_settings` flips once the server's SETTINGS frame has been received, and
   // `peer_connect_protocol` carries its SETTINGS_ENABLE_CONNECT_PROTOCOL. The
@@ -688,7 +707,178 @@ ngtcp2_ssize send_step(H3Conn *c, std::span<std::uint8_t> buf) {
 
 // Blocking driver for the sync wrappers: advance the step functions with a poll
 // loop until *flag is set (handshake completed / request done).
-int drive_until(H3Conn *c, const bool *flag);  // fwd decl (uses the extern "C" steps)
+int drive_until(H3Conn *c, const bool *flag, unsigned long long budget_ms = 0);
+  // fwd decl (uses the extern "C" steps)
+
+// --- TLS configuration (NaviH3Tls -> SSL_CTX) --------------------------------
+// The QUIC leg used to receive only a CA file and a verify flag, so caBundle, the
+// client credential and the cipher/version bounds were silently dropped on h3 while
+// the TCP backends honoured them (#419). These helpers apply the same policy to the
+// QUIC SSL_CTX; each one reports the reason on stderr and returns false so
+// navi_h3_new fails closed rather than connecting with a weaker configuration.
+
+bool is_set(const char *s) { return s != nullptr && s[0] != '\0'; }
+
+// Passphrase source for encrypted PEM material. OpenSSL's default callback prompts
+// on the controlling terminal, which would hang a server process; this one fails
+// instead when no password is configured.
+int navi_pw_cb(char *buf, int size, int /*rwflag*/, void *u) {
+  const char *pw = static_cast<const char *>(u);
+  if (!is_set(pw)) return -1;
+  const int n = static_cast<int>(std::strlen(pw));
+  if (n > size) return -1;
+  std::memcpy(buf, pw, static_cast<std::size_t>(n));
+  return n;
+}
+
+bool read_whole_file(const char *path, std::string &out) {
+  BioPtr bio{BIO_new_file(path, "rb")};
+  if (!bio) return false;
+  char chunk[8192];
+  int n;
+  while ((n = BIO_read(bio.get(), chunk, sizeof(chunk))) > 0)
+    out.append(chunk, static_cast<std::size_t>(n));
+  return true;
+}
+
+// Add every certificate in an in-memory PEM string to the context's trust store, so
+// a chain anchored at one of them verifies. Supplements caFile / the system roots
+// rather than replacing them (same contract as openssl_ctx.addCaBundle).
+bool apply_ca_bundle(SSL_CTX *ctx, const char *pem) {
+  X509_STORE *store = SSL_CTX_get_cert_store(ctx);
+  if (!store) return false;
+  BioPtr bio{BIO_new_mem_buf(pem, -1)};
+  if (!bio) return false;
+  int added = 0;
+  while (true) {
+    X509Ptr cert{PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr)};
+    if (!cert) break;
+    // X509_STORE_add_cert bumps the refcount, so our reference is still ours to free.
+    X509_STORE_add_cert(store, cert.get());
+    ++added;
+  }
+  ERR_clear_error();   // the loop always ends on a PEM "no start line" error
+  if (added == 0) {
+    std::fprintf(stderr, "h3 tls: no certificate found in TlsConfig.caBundle\n");
+    return false;
+  }
+  return true;
+}
+
+// Install the leaf + any chain certificates from a PEM blob (the first certificate
+// is the leaf; the rest extend the chain, matching openssl_ctx.useCertChainPem).
+bool use_cert_chain_pem(SSL_CTX *ctx, const std::string &pem) {
+  BioPtr bio{BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()))};
+  if (!bio) return false;
+  X509Ptr leaf{PEM_read_bio_X509(bio.get(), nullptr, navi_pw_cb, nullptr)};
+  if (!leaf) return false;
+  if (SSL_CTX_use_certificate(ctx, leaf.get()) != 1) return false;
+  SSL_CTX_clear_chain_certs(ctx);
+  while (true) {
+    X509Ptr extra{PEM_read_bio_X509(bio.get(), nullptr, navi_pw_cb, nullptr)};
+    if (!extra) break;
+    if (SSL_CTX_add1_chain_cert(ctx, extra.get()) != 1) return false;
+  }
+  ERR_clear_error();
+  return true;
+}
+
+bool use_key_pem(SSL_CTX *ctx, const std::string &pem, const char *password) {
+  BioPtr bio{BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()))};
+  if (!bio) return false;
+  EvpPkeyPtr key{PEM_read_bio_PrivateKey(bio.get(), nullptr, navi_pw_cb,
+                                         const_cast<char *>(password))};
+  if (!key) return false;
+  return SSL_CTX_use_PrivateKey(ctx, key.get()) == 1;
+}
+
+// A PKCS#12 bundle: leaf + key + any CA certificates it carries, which become the
+// presented chain (PKCS12_parse hands them back in `ca`).
+bool use_pkcs12(SSL_CTX *ctx, const std::string &der, const char *password) {
+  BioPtr bio{BIO_new_mem_buf(der.data(), static_cast<int>(der.size()))};
+  if (!bio) return false;
+  Pkcs12Ptr p12{d2i_PKCS12_bio(bio.get(), nullptr)};
+  if (!p12) return false;
+  EVP_PKEY *rawKey = nullptr;
+  X509 *rawCert = nullptr;
+  STACK_OF(X509) *rawCa = nullptr;
+  if (PKCS12_parse(p12.get(), is_set(password) ? password : "", &rawKey, &rawCert,
+                   &rawCa) != 1)
+    return false;
+  EvpPkeyPtr key{rawKey};
+  X509Ptr cert{rawCert};
+  X509StackPtr ca{rawCa};
+  if (!cert || !key) return false;
+  if (SSL_CTX_use_certificate(ctx, cert.get()) != 1) return false;
+  if (SSL_CTX_use_PrivateKey(ctx, key.get()) != 1) return false;
+  SSL_CTX_clear_chain_certs(ctx);
+  for (int i = 0; ca && i < sk_X509_num(ca.get()); ++i)
+    if (SSL_CTX_add1_chain_cert(ctx, sk_X509_value(ca.get(), i)) != 1) return false;
+  return true;
+}
+
+// Install the client credential described by `t`. Precedence matches the TCP path
+// (openssl_ctx.loadClientCert): PKCS#12, then in-memory PEM, then the file pair.
+// Files may be PEM or DER; PEM is tried first and DER is the fallback.
+bool apply_client_cert(SSL_CTX *ctx, const NaviH3Tls *t) {
+  if (!is_set(t->pkcs12_file) && !is_set(t->cert_pem) && !is_set(t->cert_file))
+    return true;   // no credential configured
+  SSL_CTX_set_default_passwd_cb(ctx, navi_pw_cb);
+  SSL_CTX_set_default_passwd_cb_userdata(ctx, const_cast<char *>(t->password));
+  bool ok = false;
+  if (is_set(t->pkcs12_file)) {
+    std::string der;
+    ok = read_whole_file(t->pkcs12_file, der) && use_pkcs12(ctx, der, t->password);
+  } else if (is_set(t->cert_pem)) {
+    ok = use_cert_chain_pem(ctx, t->cert_pem) &&
+         use_key_pem(ctx, is_set(t->key_pem) ? t->key_pem : t->cert_pem, t->password);
+  } else {
+    const char *keyPath = is_set(t->key_file) ? t->key_file : t->cert_file;
+    ok = SSL_CTX_use_certificate_chain_file(ctx, t->cert_file) == 1 ||
+         SSL_CTX_use_certificate_file(ctx, t->cert_file, SSL_FILETYPE_ASN1) == 1;
+    if (ok)
+      ok = SSL_CTX_use_PrivateKey_file(ctx, keyPath, SSL_FILETYPE_PEM) == 1 ||
+           SSL_CTX_use_PrivateKey_file(ctx, keyPath, SSL_FILETYPE_ASN1) == 1;
+  }
+  if (!ok) {
+    std::fprintf(stderr, "h3 tls: could not load the client certificate/key\n");
+    return false;
+  }
+  if (SSL_CTX_check_private_key(ctx) != 1) {
+    std::fprintf(stderr, "h3 tls: the client certificate and private key do not match\n");
+    return false;
+  }
+  ERR_clear_error();
+  return true;
+}
+
+// QUIC is TLS 1.3 only (RFC 9001 4.2), so a version bound can only ever confirm or
+// exclude 1.3. A maxVersion below 1.3 makes the h3 leg unusable; the Nim side skips
+// the h3 endpoint in that case, and this is the backstop for a direct FFI caller.
+bool apply_versions(SSL_CTX *ctx, const NaviH3Tls *t) {
+  if (t->max_version != 0 && t->max_version < 13) {
+    std::fprintf(stderr, "h3 tls: HTTP/3 requires TLS 1.3, but maxVersion is lower\n");
+    return false;
+  }
+  if (SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION) != 1) return false;
+  if (SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION) != 1) return false;
+  return true;
+}
+
+bool apply_ciphers(SSL_CTX *ctx, const NaviH3Tls *t) {
+  // `ciphers` selects TLS <= 1.2 suites, which QUIC never negotiates; it is still
+  // validated and applied so a typo is reported rather than silently ignored.
+  if (is_set(t->ciphers) && SSL_CTX_set_cipher_list(ctx, t->ciphers) != 1) {
+    std::fprintf(stderr, "h3 tls: no usable cipher in TlsConfig.ciphers\n");
+    return false;
+  }
+  if (is_set(t->cipher_suites) &&
+      SSL_CTX_set_ciphersuites(ctx, t->cipher_suites) != 1) {
+    std::fprintf(stderr, "h3 tls: no usable ciphersuite in TlsConfig.cipherSuites\n");
+    return false;
+  }
+  return true;
+}
 
 nghttp3_nv method_nv(const char *method) {  // :method value is a C string param
   return nghttp3_nv{reinterpret_cast<std::uint8_t *>(const_cast<char *>(":method")),
@@ -870,7 +1060,11 @@ int navi_h3_bind(H3Conn *c) {
 // Create a connection and set up ngtcp2/nghttp3 + TLS, but do NOT drive the
 // handshake (no I/O, non-blocking).
 H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
-                    const char *ca_file, int verify, unsigned long long max_body) {
+                    const NaviH3Tls *tls, unsigned long long max_body) {
+  static const NaviH3Tls defaultTls{};   // all-unset: no verification, no credential
+  if (!tls) tls = &defaultTls;
+  const char *ca_file = tls->ca_file;
+  const int verify = tls->verify;
   static bool crypto_inited = false;
   if (!crypto_inited) {
     if (ngtcp2_crypto_ossl_init() != 0) {
@@ -920,7 +1114,7 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
     SSL_CTX_set_verify(c->ssl_ctx, SSL_VERIFY_NONE, nullptr);
     c->want_verify = verify != 0;
     if (verify) {
-      if (ca_file && ca_file[0]) {
+      if (is_set(ca_file)) {
         if (SSL_CTX_load_verify_locations(c->ssl_ctx, ca_file, nullptr) != 1) {
           std::fprintf(stderr, "failed to load CA file %s\n", ca_file);
           return nullptr;
@@ -928,7 +1122,17 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
       } else {
         SSL_CTX_set_default_verify_paths(c->ssl_ctx);
       }
+      // Extra in-memory roots supplement caFile / the system store, exactly as on
+      // the TCP backends; only meaningful when a chain is actually being built.
+      if (is_set(tls->ca_bundle) && !apply_ca_bundle(c->ssl_ctx, tls->ca_bundle))
+        return nullptr;
     }
+    // The client credential, the version bounds and the cipher selection apply
+    // whether or not the peer is verified: they describe what navi offers, not what
+    // it accepts. Each fails closed rather than connecting under a weaker policy.
+    if (!apply_client_cert(c->ssl_ctx, tls)) return nullptr;
+    if (!apply_versions(c->ssl_ctx, tls)) return nullptr;
+    if (!apply_ciphers(c->ssl_ctx, tls)) return nullptr;
     c->ssl = SSL_new(c->ssl_ctx);
     if (!c->ssl) {
       std::fprintf(stderr, "SSL_new failed\n");
@@ -979,6 +1183,14 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
     ngtcp2_settings settings;
     ngtcp2_settings_default(&settings);
     settings.initial_ts = now_ns();
+    // Bound the QUIC handshake by navi's connect budget. ngtcp2 defaults this to
+    // UINT64_MAX, so a black-holed UDP port used to stall until the 30s idle timer
+    // fired no matter what connectMs said (#432); with it set, ngtcp2 fails the
+    // connection itself and the drive loops below observe that immediately.
+    if (tls->handshake_timeout_ms > 0)
+      settings.handshake_timeout =
+        tls->handshake_timeout_ms * NGTCP2_MILLISECONDS;
+    c->handshake_timeout_ms = tls->handshake_timeout_ms;
 
     ngtcp2_transport_params params;
     ngtcp2_transport_params_default(&params);
@@ -1071,14 +1283,63 @@ void navi_h3_close(H3Conn *c) {
 // Sync convenience: create, drive the handshake to completion with a blocking
 // poll loop, and bind the h3 session. Returns nullptr on failure.
 H3Conn *navi_h3_open(const char *host, const char *port, const char *sni,
-                     const char *ca_file, int verify, unsigned long long max_body) {
-  H3Conn *c = navi_h3_new(host, port, sni, ca_file, verify, max_body);
+                     const NaviH3Tls *tls, unsigned long long max_body) {
+  H3Conn *c = navi_h3_new(host, port, sni, tls, max_body);
   if (!c) return nullptr;
-  if (drive_until(c, &c->handshake_done) != 0 || navi_h3_bind(c) != 0) {
+  // The handshake drive loop is bounded by the caller's connectMs when one is
+  // configured, so a black-holed UDP path fails inside the connect budget instead
+  // of waiting out the 30s idle timer (#432). navi_h3_bind runs the post-handshake
+  // certificate + hostname check before any stream is opened.
+  if (drive_until(c, &c->handshake_done, c->handshake_timeout_ms) != 0 ||
+      navi_h3_bind(c) != 0) {
     navi_h3_close(c);
     return nullptr;
   }
   return c;
+}
+
+// The peer's leaf certificate in DER form, for navi's Nim-side post-handshake
+// checks (TlsConfig.verifyCallback). Writes up to `cap` bytes into `out` and
+// returns the full DER length, so a caller that got a short buffer can grow and
+// retry; -1 when the peer presented no certificate or it could not be encoded.
+long navi_h3_peer_cert_der(H3Conn *c, char *out, size_t cap) {
+  if (!c || !c->ssl) return -1;
+  X509Ptr cert{SSL_get1_peer_certificate(c->ssl)};
+  if (!cert) return -1;
+  const int n = i2d_X509(cert.get(), nullptr);
+  if (n <= 0) return -1;
+  if (out && cap >= static_cast<size_t>(n)) {
+    unsigned char *p = reinterpret_cast<unsigned char *>(out);
+    if (i2d_X509(cert.get(), &p) <= 0) return -1;
+  }
+  return n;
+}
+
+// Base64 SHA-256 of the peer leaf's SubjectPublicKeyInfo: the HPKP pin form navi's
+// TlsConfig.pinnedKeys uses (`openssl ... | openssl dgst -sha256 -binary | base64`),
+// computed here because the QUIC SSL lives on this side of the FFI. Writes the
+// NUL-free pin into `out` and returns its length, or -1 on failure.
+long navi_h3_peer_spki_pin(H3Conn *c, char *out, size_t cap) {
+  if (!c || !c->ssl || !out) return -1;
+  X509Ptr cert{SSL_get1_peer_certificate(c->ssl)};
+  if (!cert) return -1;
+  EvpPkeyPtr pkey{X509_get_pubkey(cert.get())};
+  if (!pkey) return -1;
+  const int n = i2d_PUBKEY(pkey.get(), nullptr);
+  if (n <= 0) return -1;
+  std::string der(static_cast<std::size_t>(n), '\0');
+  unsigned char *p = reinterpret_cast<unsigned char *>(der.data());
+  if (i2d_PUBKEY(pkey.get(), &p) <= 0) return -1;
+  unsigned char digest[EVP_MAX_MD_SIZE];
+  unsigned int dlen = 0;
+  if (EVP_Digest(der.data(), der.size(), digest, &dlen, EVP_sha256(), nullptr) != 1)
+    return -1;
+  // EVP_EncodeBlock writes 4 bytes per 3 input bytes plus a NUL terminator.
+  const std::size_t need = 4 * ((dlen + 2) / 3);
+  if (cap < need + 1) return -1;
+  const int written = EVP_EncodeBlock(reinterpret_cast<unsigned char *>(out), digest,
+                                      static_cast<int>(dlen));
+  return written <= 0 ? -1 : written;
 }
 
 // Submit one request on the connection (non-blocking): open a bidi stream, queue
@@ -1371,13 +1632,15 @@ namespace {
 // Drive the blocking loops (handshake, buffered request, streamed upload) until
 // `*flag`. Bounded by wall-clock, not an iteration count: a large streamed upload
 // legitimately needs many cycles, but a genuinely stuck connection must still fail
-// rather than hang forever. 120s is a generous safety net (higher layers enforce
-// navi's own timeouts).
-int drive_until(H3Conn *c, const bool *flag) {
-  std::uint64_t start = now_ns();
+// rather than hang forever. `budget_ms` is the caller's own bound (the handshake
+// uses navi's connectMs, #432); 0 falls back to a generous 120s safety net.
+int drive_until(H3Conn *c, const bool *flag, unsigned long long budget_ms) {
+  const std::uint64_t start = now_ns();
+  const std::uint64_t budget = budget_ms > 0
+    ? budget_ms * NGTCP2_MILLISECONDS : 120ULL * NGTCP2_SECONDS;
   while (!*flag) {
     if (navi_h3_pump(c) != 0) return -1;
-    if (now_ns() - start > 120ULL * NGTCP2_SECONDS) return -1;
+    if (now_ns() - start > budget) return -1;
   }
   return 0;
 }

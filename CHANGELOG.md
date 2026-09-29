@@ -84,6 +84,12 @@ onward (pre-1.0, minor versions may include breaking changes).
   `BodySink`), since the `Future` type differs per backend (#367).
 
 ### Changed
+- **`TlsConfig.verify` became `TlsConfig.insecureSkipVerify` (#422).** The flag was
+  inverted so the zero value is the secure one. Field assignment is unaffected
+  (`cfg.tls.verify = false` still compiles, via a `verify`/`verify=` accessor pair),
+  but object construction that named the field, `TlsConfig(verify: true, ...)`, no
+  longer compiles: pass `insecureSkipVerify: true` to opt out, or drop the field
+  entirely to verify. `wantsVerify` is unchanged and still the way to read the flag.
 - **`navi/js` marshals body and WebSocket bytes with bulk typed-array copies, and
   its WebSocket queue is a deque.** Every byte of a streamed response body used to
   cross the jsffi boundary through its own dynamic `JsObject` index plus a
@@ -216,6 +222,258 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **A TLS connection that ends without `close_notify` can no longer truncate a
+  read-until-close body (#426).** All three native TLS read paths reported a
+  transport close that arrives without a TLS `close_notify` -- an injected RST, a
+  bare FIN, a crashed origin -- as the same clean EOF that `SSL_ERROR_ZERO_RETURN`
+  produces. For a response with no `Content-Length` and no chunked framing (an
+  HTTP/1.0 origin, a `Connection: close` error page, an un-chunked event stream)
+  the close is the only body delimiter, so the h1 parser marked the body complete
+  and navi returned a silently truncated 200. Length- and chunk-delimited bodies
+  were never exposed: the parser already rejects those when they end early.
+  The clean-vs-unclean distinction is now kept instead of discarded. Each native
+  connection records whether its TLS stream ended with a `close_notify` (the sync
+  and asyncdispatch backends in the `SSL_ERROR_SYSCALL` and catch-all branches of
+  their `SSL_read` loops, the chronos pump when the transport EOFs or fails before
+  OpenSSL reports `ZERO_RETURN`) and exposes it as a `closedCleanly` transport op,
+  which is always true for a plaintext connection. The h1 body drain and the
+  streamed-body/SSE chunk reader consult it and raise `IOError` ("TLS connection
+  closed without close_notify; response may be truncated") when a read-until-close
+  body ends on an unauthenticated close. Reads still return an EOF rather than
+  raising at the primitive, so an EOF before any response bytes stays a keep-alive
+  race the engine replays on a fresh connection, and servers that close idle
+  keep-alive connections with a bare FIN keep working. Such a connection is never
+  pooled (an until-close body is not reusable in the first place). A new interop
+  test, `nimble tlsTruncate`, drives a Python TLS server that cuts the stream with
+  and without `unwrap()` and asserts the rejection and the control case on all
+  three native clients.
+- **TLS session resumption now works on the chronos backend (#431).** `ChronosTls`
+  freed its `SSL` without ever calling `SSL_shutdown`, and OpenSSL treats that as a
+  bad session: `SSL_free` runs `ssl_clear_bad_session`, which marks the `SSL_SESSION`
+  not_resumable. That object is the very one navi cached for the origin (the
+  new-session callback stores the pointer OpenSSL handed it), so re-presenting it on
+  the next connection bought nothing and every chronos connection did a full
+  handshake -- a certificate chain and an extra round trip each time -- while the
+  sync and asyncdispatch clients with the same config resumed. Peers also never
+  received a `close_notify`. Both `close` and `closeSync` now clear the error queue
+  and call `SSL_shutdown` before `SSL_free`, and `close` drains the write-BIO onto
+  the transport first (bounded, best effort) so the alert actually reaches the peer.
+  `resumeSessions` is on by default, so this is a latency win on the chronos client
+  with no configuration change. A new interop check asserts the second connection to
+  an origin reports a reused session, on all three native backends.
+- **Cancellation is no longer swallowed by the chronos TLS pump (#430).** `feedIn`,
+  the read that moves ciphertext off the transport into OpenSSL's read-BIO, caught
+  `CatchableError` -- which in chronos includes `CancelledError` -- and reported it as
+  a clean EOF. A structured cancel that landed while the pump was parked in `readOnce`
+  therefore never reached the caller: with `timeouts.read` set, a stalled TLS response
+  came back as an empty read instead of a `TimeoutError`, the engine saw an EOF before
+  any response and raised `KeepAliveRaceError`, and the retry layer **replayed the
+  request on a fresh connection** (any idempotent method, or any method carrying an
+  `Idempotency-Key`) while the cancel that was meant to stop it sat in `cancelAndWait`;
+  with a `timeouts.total` deadline or a `CancelToken`, the right error was still raised
+  but only after that replay had run its course. The same blanket handler in the
+  connect loop turned a cancelled handshake into "this address failed", so a cancelled
+  connect went on to re-race the remaining addresses with no bound left. `feedIn` now
+  re-raises `CancelledError` so it propagates out through `handshake`/`readSome`, the
+  connect loop tears the attempt down and re-raises rather than moving to the next
+  address, and `ChronosTls.close` shields its transport teardown with `noCancel`
+  instead of catching the cancel (re-raising there would have leaked the SSL and its
+  BIOs). The plaintext read path, which only ever caught `AsyncStreamError`, was
+  already correct.
+- **The chronos backend no longer discards establishment errors when a connect timeout
+  is set, and never hands back an unverified Unix-socket TLS session (#420).** With
+  `timeouts.connect` configured, `connect` called `withTimeout(establish(), ...)` and
+  never read the establish future back. chronos completes `withTimeout` with `true`
+  whenever the inner future has *finished*, a failure included, so every establishment
+  error -- DNS, connection refused, handshake failure, chain or hostname verification,
+  an SPKI pin mismatch, a rejecting verify callback -- was dropped and a half-built
+  connection was returned. On the TCP path the caller then saw a generic "send on a
+  closed connection" instead of the real reason, which the engine reclassifies as a
+  keep-alive race and may replay; on the Unix-socket path, whose TLS branch had no
+  failure teardown at all, `conn.tls` was still pointing at a live, fully handshaken
+  SSL, so the request went out over a connection whose identity check had FAILED.
+  `connect` now keeps the establish future and awaits it after the timeout check (the
+  shape the asyncdispatch backend already used), and the Unix-socket branch runs the
+  same teardown as the TCP one (close the SSL and the transport, clear `conn.tls`),
+  which also stops it leaking an fd, an SSL and its BIOs on every failed handshake.
+- **A PKCS#12 client credential now presents the intermediates the bundle carries
+  (#425).** `usePkcs12` passed a nil CA out-param to `PKCS12_parse` and installed
+  only the leaf and the key, so a client certificate issued by an intermediate CA
+  and exported as `.p12` (the usual corporate shape: root -> issuing CA -> client,
+  `openssl pkcs12 -export -certfile`) went on the wire bare. Servers that trust only
+  the root -- `openssl s_server -CAfile root.pem`, nginx `ssl_client_certificate
+  root.pem` -- could not build the path and rejected the handshake with "unable to
+  get local issuer certificate", while the identical credential converted to PEM
+  worked, because `useCertChainPem` does install the chain. Since `pkcs12File` has
+  the highest precedence in `loadClientCert`, no other `TlsConfig` field could
+  supply the missing intermediates. navi now asks `PKCS12_parse` for the CA stack
+  and installs it with `SSL_CTX_set0_chain`, freeing it if the install fails.
+- **An encrypted client key with no configured passphrase now fails instead of
+  prompting on the terminal (#424).** `useKeyPem` passed a nil password callback to
+  `PEM_read_bio_PrivateKey` whenever `tls.password` was empty, so OpenSSL fell back
+  to `PEM_def_callback`, which prints `Enter PEM pass phrase:` on `/dev/tty` (or
+  stdin) and reads synchronously. A service whose secret injection yielded an empty
+  password therefore blocked inside `newTlsContext` -- and under asyncdispatch or
+  chronos that is the whole event loop -- for as long as stdin stayed open, rather
+  than raising the intended "could not read the private key (wrong password?)". navi
+  now always installs its own `{.cdecl.}` callback, which hands OpenSSL the
+  configured password or returns 0 (`PEM_R_BAD_PASSWORD_READ`) when there is none.
+  A `keyFile` or `keyPem` configured without any certificate no longer reaches
+  std/net's `newContext`, whose `SSL_CTX_use_PrivateKey_file` prompts the same way;
+  it is now rejected up front as the misconfiguration it is (`keyPem` alone was
+  previously ignored in silence).
+- **The expected hostname is now bound into the TLS handshake, and a subject CN no
+  longer rescues a certificate whose SANs all mismatch (#423).** On the sync,
+  asyncdispatch and chronos backends nothing was written into the SSL's
+  `X509_VERIFY_PARAM` before connecting: the chain was checked during the handshake
+  but the identity only afterwards, by `verifyPeer`. A peer presenting a chain-valid
+  certificate for some other name therefore passed OpenSSL's in-handshake
+  verification, and an mTLS client sent it the client `Certificate` and
+  `CertificateVerify` before the mismatch was noticed, disclosing its identity to a
+  party hostname verification would have rejected. `newClientSsl` / `newClientSslMem`
+  now call `SSL_set1_host` (DNS names) or `X509_VERIFY_PARAM_set1_ip_asc` (IP
+  literals) before the handshake, so a mismatch aborts it before the client's second
+  flight; `verifyPeer` stays as the redundant post-handshake check. The host-match
+  flags also changed: `X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT` (inherited from std/net)
+  is gone and `X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS` is set, matching the HTTP/3
+  transport, so a certificate carrying dNSName SANs is judged on those SANs alone
+  (RFC 9525) and partial wildcards such as `fo*.example.com` are rejected. A
+  SAN-less certificate still matches on its CN, so private CAs that issue CN-only
+  certificates keep working. Libraries too old to export the binding entry points
+  (some LibreSSL builds) keep the previous post-handshake-only behaviour rather than
+  failing to start.
+- **The QUIC handshake is bounded by `connectMs`, and an h3 endpoint that will not
+  connect is no longer retried on every request.** ngtcp2's `settings.handshake_timeout`
+  was left at its `UINT64_MAX` default and neither the sync `drive_until` loop nor the
+  asyncdispatch/chronos handshake loops carried a deadline, so the h3 leg was bounded
+  only by the 30 s QUIC idle timer no matter what `connectMs` said. On the very common
+  network that drops outbound UDP/443 to an origin advertising `Alt-Svc: h3`, that cost
+  a ~30 s stall before the TCP fallback, and the Alt-Svc cache was only ever mutated on
+  success, so the *next* request paid it again, and the one after that, until the
+  advertisement's `ma` expired. `connectMs` (then `totalMs`, else a 30 s default) is now
+  plumbed into the QUIC handshake as `settings.handshake_timeout` and bounds all three
+  backends' handshake loops, and a handshake that fails before anything is submitted
+  marks that origin's h3 alternative broken (RFC 7838 2.4) for a backoff window that
+  doubles from 60 s up to 16 minutes, so later requests go straight to h2/h1. A
+  successful h3 connection clears the backoff, and a re-advertisement of the same
+  alt-authority deliberately does not (an origin repeats its `Alt-Svc` header on every
+  TCP response, which would otherwise put the client straight back on the dead path);
+  a *different* alt-authority starts clean. `openWsH3`'s docstring now matches what it
+  does, since its `connectMs` bound previously started only after the QUIC handshake
+  had already completed (#432).
+- **HTTP/3 now honors the whole `TlsConfig`, not just `caFile` and `verify`.** The
+  QUIC leg built its own `SSL_CTX` in `h3client.cpp` from those two fields alone, so
+  `pinnedKeys`, `verifyCallback`, `caBundle`, the client credential
+  (`pkcs12File`/`certPem`/`certFile`) and `ciphers`/`cipherSuites` were all silently
+  dropped on h3 and `postHandshakeVerify` never ran there. In a `-d:naviHttp3` build
+  H3 is in the default `http` set and the client upgrades to it after any `Alt-Svc`
+  header, so the documented "replace verification entirely" mode (`verify = false`
+  plus `pinnedKeys` or a `verifyCallback`) produced an *unauthenticated* QUIC
+  connection to anything answering on UDP 443, and with `verify = true` a pin was
+  bypassed on h3 exactly where a mis-issued certificate would have been caught. A
+  `caBundle`-only private CA and mTLS instead failed the h3 handshake and fell back
+  to h2/h1 with no signal, and an mTLS client was anonymous over QUIC. The FFI now
+  carries navi's full TLS policy across as one struct (`NaviH3Tls`, in the new
+  `backend/h3client.h`): the QUIC context adds the `caBundle` roots to its store,
+  installs the client credential (PKCS#12 including its chain, or a PEM/DER chain and
+  key, with an explicit password callback that fails rather than prompting on a tty),
+  and applies the cipher selection. The peer's leaf is exported through two new FFI
+  calls, so the SPKI pin comparison and the `verifyCallback` run from Nim right after
+  the handshake and before the connection is bound into the pool or carries a
+  request, on all three openers (`h3Open`, `openConnAsync`, `openConnChronos`) and
+  `openWsH3`; a rejection raises the same `ValueError` with the same wording as the
+  TCP backends, so the error surface does not depend on which leg was taken. QUIC is
+  TLS 1.3 only (RFC 9001), so a `maxVersion` below TLS 1.3 now makes navi skip the
+  advertised h3 endpoint and stay on h2/h1 rather than fail the request. With
+  `verify` off and no pins or callback configured, behavior is unchanged (#419).
+- **The sync backend's readiness waits use `poll(2)` (`WSAPoll` on Windows) instead of
+  `select(2)`, so a connection on a descriptor above `FD_SETSIZE` no longer aborts the
+  process or reports a bogus timeout (#429).** `waitReadable`, `waitWritable` and the
+  Happy-Eyeballs race went through `std/nativesockets`' `selectRead`/`selectWrite`,
+  which `FD_SET` the raw descriptor into a fixed 1024-bit `fd_set` with no range check.
+  Inside a process already holding ~1024 descriptors (a server or worker with a raised
+  `RLIMIT_NOFILE` that also makes outbound requests), navi's socket lands above that
+  ceiling and the `FD_SET` either aborts the process on a fortified glibc build
+  (`bit out of range 0 - FD_SETSIZE on fd_set`), corrupts the stack, or makes `select`
+  fail with `EINVAL`. Since every call site only tested `> 0`, the `-1` was
+  indistinguishable from an expiry, so a ready connection raised `TimeoutError`
+  ("read timed out", or a connect timeout) on every request. It affected TLS and plain
+  http alike, but only when a read, total or connect timeout was armed: with no
+  timeout the wait is skipped entirely. The waits now poll a stack `pollfd` (the
+  Happy-Eyeballs race reuses one buffer across rounds, so a wait still allocates
+  nothing), `POLLHUP`/`POLLERR` count as ready so the following `recv`/`SO_ERROR`
+  surfaces the real error exactly as before, `EINTR` retries with the time that is
+  left, and a genuine poll failure now raises `IOError` with the errno text rather
+  than passing for a timeout. Timeout semantics are unchanged. Windows was never
+  affected (its `fd_set` is a counted array) and keeps an `SO_ERROR` fallback on the
+  connect wait, because `WSAPoll` before Windows 10 2004 does not signal a failed
+  connect.
+- **A failed TLS handshake over a Unix socket no longer leaks a descriptor, an SSL
+  and an SSL_CTX on the asyncdispatch client (#427).** The `pkUnix` branch of the
+  backend's `connect` had no exception handler, so when `newClientSsl`,
+  `driveHandshake`, `verifyPeer` or `postHandshakeVerify` raised (bad chain, hostname
+  mismatch, SPKI pin failure, handshake error) the just-connected socket stayed
+  registered on the dispatcher, the SSL was never freed, and with a bare `TlsConfig`
+  (no client context store) the unshared SSL_CTX was never destroyed. Nothing
+  downstream could reclaim them: the exception propagates out of `establish` before
+  the connection is returned, a value-type `Conn` has no destructor, and the
+  `connectMs` backstop only covers an establish that TIMED OUT, not one that failed.
+  Every retry leaked another set. Both branches of `establish` now share one
+  `tearDownAttempt` helper that frees the SSL, destroys an owned context and closes
+  the socket, so the Unix path reclaims exactly what the TCP path always did (and,
+  as a side effect, so does the `https` over a Unix socket without `-d:ssl` error).
+  Measured over the new interop leg: 40 failing handshakes used to leak 40
+  descriptors and now leave the count unchanged.
+- **A send racing a connection close on the asyncdispatch client no longer writes
+  through a freed TLS session (#421).** `sslRead` has long refused to read once the
+  shared teardown flag reaches `csClosed`, because `freeConn` calls `SSL_free` before
+  `closeSocket` and a parked read is woken by that `closeSocket`, i.e. after the free.
+  The write side had no such guard. A `sslWrite` parked on `WANT_WRITE` (a body upload
+  against a stalled peer, or the h2 mux's serialised writes when the reader hits a peer
+  reset in the same tick) is not woken by the shutdown on Linux, where a reset reports
+  readability and error but never `EPOLLOUT`: it stays parked right through
+  `close`, and its continuation then called `SSL_write` on the dangling pointer. The
+  same `csClosed` check now sits at the top of `sslWrite`'s loop, so it is re-run after
+  every `WANT_READ`/`WANT_WRITE` retry as well as on entry, and the plaintext `sendAll`
+  path consults the flag too (it only tested `fd == invalidFd`, which `freeConn` never
+  sets on the Conn value copies the stream layers hold, so it could write to a
+  descriptor number the process had already reused). Two neighbouring paths that could
+  also run after `freeConn` were closed the same way: `shutdownConn` is now a no-op on
+  a closed connection rather than shutting down a recycled descriptor, and an expired
+  `recvWithin` no longer parks its abandoned read on a connection that was closed under
+  it (which left the read unowned and its failure unobserved). Both parked writes and
+  post-close sends now fail with a plain `IOError`, which the stream layers already
+  treat as a connection drop.
+- **A `TlsConfig` built with the object constructor no longer silently skips peer
+  verification (#422).** `TlsConfig.verify` was a plain `bool`, so its zero value was
+  `false` and the documented `TlsConfig(caFile: "corp-ca.pem")` hardening idiom (which
+  the api.nim doc comment and the three wss examples recommended) produced a config
+  with verification off: `newTlsContext` built a `CVerifyNone` context, `verifyPeer`
+  returned before any chain, hostname or IP-SAN check, std/net never even loaded the
+  supplied CA bundle, session resumption was off, and the same `wantsVerify = false`
+  was forwarded to the HTTP/3 client. Any certificate from any peer was accepted with
+  no error, while the field's own doc comment claimed the default was on. The field is
+  now `insecureSkipVerify`, whose zero value (`false`) verifies, so a bare
+  `TlsConfig()`, `TlsConfig(caFile: ...)`, `defaultTls()` and `initNaviConfig()` all
+  authenticate the peer. `wantsVerify` is its inverse, the examples and the
+  README/HARDENING/THREAT_MODEL prose were corrected, and `tls.verify` survives as a
+  getter/setter pair so existing `cfg.tls.verify = false` opt-outs keep compiling.
+- **The HTTP `CONNECT` proxy reply is now read to its blank line instead of with a
+  single `recv`.** `proxyConnectDriver` took one read of at most 1024 bytes and only
+  prefix-matched `HTTP/1.1 200` / `HTTP/1.0 200`. TCP does not guarantee the status
+  line and the headers arrive together, so a proxy that flushes the status line first,
+  or replies with more than 1024 bytes of `Via`/`X-Cache`/`Proxy-Agent` headers, left
+  header bytes on the socket; OpenSSL then read them as the ServerHello and the
+  request failed with a TLS handshake error rather than a tunnel error. The driver now
+  loops on the backend read primitive until it sees `\r\n\r\n`, capped at 16 KiB
+  (a longer head, or EOF before the terminator, raises a clear proxy error), parses the
+  three-digit status code and accepts any 2xx per RFC 9110 9.3.6 instead of matching two
+  literals, and puts the status line in the error text so a 407 or 403 is diagnosable.
+  Bytes arriving after the blank line are now rejected with an explicit error rather
+  than silently dropped: no backend can push them back into its TLS read path, and a
+  conforming proxy never sends them because the TLS client speaks first. Covered by a
+  new `tests/interop/http_connect.sh` (`nimble httpConnect`) that drives all three
+  native clients through a split reply, an oversized reply and a 407 (#428).
 - **`navi/js` request bodies now go on the wire as the Nim string's bytes, like every
   native backend.** `buildInit` handed the body to `fetch` as a `cstring`, and on the
   js backend that conversion decodes the string's bytes as UTF-8 into a JS (UTF-16)

@@ -254,6 +254,12 @@ proc contentEncoding*(p: H1Parser): string =
 
 proc finished*(p: H1Parser): bool {.inline.} = p.state == stDone
 
+proc untilCloseBody*(p: H1Parser): bool {.inline.} =
+  ## Whether the response body is delimited only by the connection close (no
+  ## Content-Length, no chunked framing). Such a body has no end marker of its own,
+  ## so the engine has to decide whether the close that ended it was trustworthy.
+  p.bodyMode == bmUntilClose
+
 proc headersReady*(p: H1Parser): bool {.inline.} =
   ## True once the status line and all headers are parsed (the body may still be
   ## pending). Lets a streaming caller inspect status/headers, via `toResponse`,

@@ -5,7 +5,7 @@
 #
 #   bash examples/websocket/wss_demo.sh <sync|asyncdispatch|chronos>
 #
-# No mkcert needed: the native clients use verify:false, so they accept the
+# No mkcert needed: the native clients set insecureSkipVerify, so they accept the
 # self-signed cert the server generates on first run.
 set -euo pipefail
 

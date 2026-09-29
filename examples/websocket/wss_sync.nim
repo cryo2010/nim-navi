@@ -8,10 +8,11 @@ import navi
 
 const message = "hello from the sync backend (wss)"
 
-# verify is off because the demo server uses a self-signed cert. A real
-# deployment would verify against a trusted CA: TlsConfig(caFile: "ca.pem").
+# Verification is off because the demo server uses a self-signed cert. A real
+# deployment leaves it on (the default) and points navi at the trusted CA with
+# `cfg.tls.caFile = "ca.pem"`.
 var cfg = initNaviConfig()
-cfg.tls.verify = false   # the demo server uses a self-signed cert
+cfg.tls.insecureSkipVerify = true   # the demo server uses a self-signed cert
 let api = newNavi(cfg)
 let ws = api.websocket("wss://127.0.0.1:9701/")
 ws.send(message)

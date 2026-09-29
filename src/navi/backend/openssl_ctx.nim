@@ -14,7 +14,7 @@
 import ./api
 
 when defined(ssl):
-  import std/[net, openssl, nativesockets, tables, strutils, base64]
+  import std/[net, openssl, nativesockets, tables, strutils, base64, dynlib]
   import checksums/sha2
   # Re-export the context type + destructor so backends can own the socket and
   # handshake while still building the (verified) context through newContext.
@@ -49,9 +49,17 @@ when defined(ssl):
   # add_extra_chain_cert (via SSL_CTX_ctrl) transfers ownership, so we do not.
 
   const SSL_CTRL_EXTRA_CHAIN_CERT = 14
-  const X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT = 0x1.cuint
-    ## X509_VERIFY_PARAM flag: always compare the subject CN, not only when the
-    ## certificate carries no subjectAltName. Passed to X509_check_host below.
+  const SSL_CTRL_CHAIN = 88   # SSL_CTX_set0_chain; takes ownership of the stack
+  const X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS = 0x4.cuint
+    ## X509_VERIFY_PARAM flag: reject partial wildcards (`fo*.example.com`), which
+    ## RFC 6125 6.4.4 / RFC 9525 forbid; only `*.example.com` stays valid. This is the one hostname policy every
+    ## navi transport uses: the pre-handshake `SSL_set_hostflags` below and the
+    ## post-handshake `X509_check_host` both pass it, matching the h3 transport
+    ## (h3client.cpp). We deliberately do not add X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT
+    ## (std/net does): with it a certificate whose dNSName SANs all mismatch is
+    ## still accepted when its subject CN happens to match. Without it OpenSSL
+    ## applies its default, consulting the CN only when the certificate carries no
+    ## dNSName SAN, so CN-only certificates from private CAs keep working.
 
   proc SSL_CTX_use_certificate(ctx: SslCtx, x: PX509): cint
     {.cdecl, dynlib: DLLSSLName, importc.}
@@ -69,6 +77,53 @@ when defined(ssl):
   # wraps X509_check_host (DNS names) but not this IP variant.
   proc X509_check_ip_asc(cert: PX509, ipasc: cstring, flags: cuint): cint
     {.cdecl, dynlib: DLLUtilName, importc.}
+  # Optional entry points: the pre-handshake identity binding
+  # (SSL_set1_host and friends, OpenSSL 1.1.0+ / LibreSSL 2.9+). A `dynlib`
+  # importc is resolved when this module initialises and kills the process if the
+  # symbol is absent, and old LibreSSL builds -- the one macOS resolves among
+  # them -- export none of these four. So they are looked up by hand, once per
+  # thread, and `bindExpectedIdentity` falls back to the post-handshake check
+  # when the loaded library is too old. X509_VERIFY_PARAM is an opaque handle.
+  type
+    Set1HostProc = proc(ssl: SslPtr, hostname: cstring): cint {.cdecl, gcsafe, raises: [].}
+    SetHostflagsProc = proc(ssl: SslPtr, flags: cuint) {.cdecl, gcsafe, raises: [].}
+    Get0ParamProc = proc(ssl: SslPtr): pointer {.cdecl, gcsafe, raises: [].}
+    Set1IpAscProc = proc(param: pointer, ipasc: cstring): cint {.cdecl, gcsafe, raises: [].}
+
+  var
+    sslSet1Host {.threadvar.}: Set1HostProc
+    sslSetHostflags {.threadvar.}: SetHostflagsProc
+    sslGet0Param {.threadvar.}: Get0ParamProc
+    paramSet1IpAsc {.threadvar.}: Set1IpAscProc
+    identityApiReady {.threadvar.}: bool
+
+  proc tlsLib(pattern: string): LibHandle {.raises: [].} =
+    ## The already-loaded libssl / libcrypto: `loadLibPattern` walks the same
+    ## name list std/openssl bound to, so it returns that same handle. Wrapped
+    ## because std/dynlib forward-declares `loadLib` without a raises annotation,
+    ## which infers `Exception` and the strict async paths reject (see `certDer`);
+    ## it only ever returns nil on failure.
+    try: loadLibPattern(pattern)
+    except Exception: nil
+
+  proc tlsSym(lib: LibHandle, name: cstring): pointer {.raises: [].} =
+    ## `lib`'s `name`, or nil when the library does not export it. Wrapped for
+    ## the same reason as `tlsLib`.
+    if lib.isNil: return nil
+    try: lib.symAddr(name)
+    except Exception: nil
+
+  proc resolveIdentityApi() {.raises: [].} =
+    ## Look the four identity-binding symbols up once per thread; they stay nil
+    ## when the loaded library predates them.
+    if identityApiReady: return
+    identityApiReady = true
+    let ssl = tlsLib(DLLSSLName)
+    sslSet1Host = cast[Set1HostProc](ssl.tlsSym("SSL_set1_host"))
+    sslSetHostflags = cast[SetHostflagsProc](ssl.tlsSym("SSL_set_hostflags"))
+    sslGet0Param = cast[Get0ParamProc](ssl.tlsSym("SSL_get0_param"))
+    paramSet1IpAsc = cast[Set1IpAscProc](
+      tlsLib(DLLUtilName).tlsSym("X509_VERIFY_PARAM_set1_ip_asc"))
   when defined(windows):
     # std/openssl hides its X509_STORE type and DER helpers behind
     # `not defined(windows)` (like the X509 block below), so declare the ones the
@@ -116,6 +171,25 @@ when defined(ssl):
     result = BIO_new_mem_buf(unsafeAddr data[0], data.len.cint)
     if result.isNil: fail("could not allocate a memory BIO")
 
+  type SkPopFreeProc =
+    proc(st: PSTACK, freeFunc: pointer) {.cdecl, gcsafe, raises: [].}
+  var skPopFree {.threadvar.}: SkPopFreeProc
+  var skPopFreeReady {.threadvar.}: bool
+
+  proc freeCertStack(ca: PSTACK) =
+    ## Free a PKCS12_parse CA stack and the certificates it holds. Resolved by
+    ## hand like the identity entry points: old LibreSSL does not export
+    ## OPENSSL_sk_pop_free and a dynlib importc would abort the process at
+    ## startup there. Without it the stack leaks once, on a path only an
+    ## SSL_CTX_ctrl the library does not implement can reach.
+    if ca.isNil: return
+    if not skPopFreeReady:
+      skPopFreeReady = true
+      skPopFree = cast[SkPopFreeProc](
+        tlsLib(DLLUtilName).tlsSym("OPENSSL_sk_pop_free"))
+    if skPopFree.isNil: return
+    skPopFree(ca, cast[pointer](X509_free))
+
   proc addChainCert(ctx: SslCtx, x: PX509): bool =
     ## Transfers ownership of `x` to `ctx` on success.
     SSL_CTX_ctrl(ctx, SSL_CTRL_EXTRA_CHAIN_CERT.cint, 0, cast[pointer](x)) > 0
@@ -145,12 +219,29 @@ when defined(ssl):
       else:
         fail("could not add an intermediate certificate")
 
+  proc pemPassword(buf: cstring, size: cint, rwflag: cint, u: pointer): cint {.cdecl.} =
+    ## PEM passphrase callback. `u` is the configured password as a C string, or
+    ## nil when none is configured; then we return 0, which OpenSSL turns into
+    ## PEM_R_BAD_PASSWORD_READ. Installing this unconditionally is the point: with
+    ## a nil callback OpenSSL substitutes PEM_def_callback, which prompts for the
+    ## passphrase on /dev/tty (falling back to stdin) and blocks there -- inside
+    ## `newTlsContext`, so under asyncdispatch or chronos the whole event loop
+    ## stops until someone types into a terminal that, in a service, is a pipe
+    ## nobody is writing to.
+    if u.isNil or size <= 0: return 0
+    let pw = cast[cstring](u)
+    let n = pw.len
+    if n == 0 or n > size.int: return 0
+    copyMem(buf, pw, n)
+    n.cint
+
   proc useKeyPem(ctx: SslCtx, pem, password: string) =
     let bio = memBio(pem)
     defer: discard BIO_free(bio)
-    # OpenSSL treats a non-nil `u` with a nil callback as the passphrase itself.
-    let u = if password.len > 0: password.cstring else: nil
-    let pkey = PEM_read_bio_PrivateKey(bio, nil, nil, u)
+    # Never a nil callback: see pemPassword. `u` stays alive for the call, which
+    # is the only time OpenSSL dereferences it.
+    let u = if password.len > 0: cast[pointer](password.cstring) else: nil
+    let pkey = PEM_read_bio_PrivateKey(bio, nil, cast[pointer](pemPassword), u)
     if pkey.isNil: fail("could not read the private key (wrong password?)")
     # SSL_CTX_use_PrivateKey bumps the object's refcount, so we free our
     # reference on every exit path (success or failure) once the key exists.
@@ -159,10 +250,10 @@ when defined(ssl):
       fail("the private key does not match the certificate")
 
   proc usePkcs12(ctx: SslCtx, data, password: string) =
-    ## Install the leaf certificate and key from a PKCS#12 bundle. The bundle's
-    ## extra chain certs are not installed (nil chain out-param): the stack
-    ## helpers needed to walk them are not portably exported across
-    ## OpenSSL/LibreSSL, and a client only needs to present its leaf + key.
+    ## Install the leaf certificate, the key, and any intermediates the bundle
+    ## carries. The chain matters: a server that trusts only the root cannot build
+    ## a path from a bare leaf issued by an intermediate CA, which is how a
+    ## corporate `.p12` (root -> issuing CA -> client) is usually shaped.
     let bio = memBio(data)
     defer: discard BIO_free(bio)
     let p12 = d2i_PKCS12_bio(bio, nil)
@@ -170,7 +261,14 @@ when defined(ssl):
     defer: PKCS12_free(p12)
     var pkey: EVP_PKEY
     var cert: PX509
-    if PKCS12_parse(p12, password.cstring, addr pkey, addr cert, nil) != 1:
+    var ca: PSTACK
+    # PKCS12_parse hands us a fresh stack of the bundle's other certificates.
+    # SSL_CTRL_CHAIN transfers it to the context; until then (and on every
+    # failure exit) it is ours to free.
+    var caOwned = true
+    defer:
+      if caOwned: freeCertStack(ca)
+    if PKCS12_parse(p12, password.cstring, addr pkey, addr cert, addr ca) != 1:
       fail("could not decrypt the PKCS#12 bundle (wrong password?)")
     if cert.isNil or pkey.isNil: fail("the PKCS#12 bundle lacks a cert or key")
     # PKCS12_parse hands us fresh references to both the cert and the key.
@@ -182,6 +280,12 @@ when defined(ssl):
       fail("could not use the PKCS#12 certificate")
     if SSL_CTX_use_PrivateKey(ctx, pkey) != 1:
       fail("the PKCS#12 key does not match the certificate")
+    if not ca.isNil:
+      # SSL_CTX_set0_chain: replaces the context's chain and takes ownership of
+      # the stack and the certificates in it.
+      if SSL_CTX_ctrl(ctx, SSL_CTRL_CHAIN.cint, 0, cast[pointer](ca)) <= 0:
+        fail("could not install the PKCS#12 certificate chain")
+      caOwned = false
 
   proc isDer(data: string): bool =
     ## DER starts with the ASN.1 SEQUENCE tag (0x30); PEM starts with '-'.
@@ -299,6 +403,13 @@ when defined(ssl):
     ## handed an empty cert/key and every credential form (plain PEM included)
     ## takes one path. Raises `ValueError` on malformed or mismatched TLS material.
     let custom = hasClientCert(cfg)
+    # A key with no certificate cannot be used, and handing it to `newContext`
+    # would run it through std/net's SSL_CTX_use_PrivateKey_file, whose default
+    # PEM callback prompts for the passphrase on /dev/tty and blocks (see
+    # pemPassword). Reject the misconfiguration instead.
+    if not custom and (cfg.keyFile.len > 0 or cfg.keyPem.len > 0):
+      fail("TlsConfig has a client key but no certificate " &
+           "(set certFile, certPem or pkcs12File)")
     result = newContext(
       verifyMode = if cfg.wantsVerify: CVerifyPeer else: CVerifyNone,
       certFile = if custom: "" else: cfg.certFile,
@@ -454,13 +565,15 @@ when defined(ssl):
   # --- per-connection handshake ------------------------------------------
 
   proc checkCertName(ssl: SslPtr, host: string) =
-    ## Match the peer certificate's SAN/CN against `host` with X509_check_host,
-    ## the same identity check std/net's `wrapConnectedSocket` runs. Callers skip
-    ## it for IP literals (as std/net does): X509_check_host matches DNS names.
+    ## Match the peer certificate's SAN (or, for a SAN-less certificate, its
+    ## subject CN) against `host` with X509_check_host. Redundant once
+    ## `bindExpectedIdentity` has bound the same name into the handshake, and kept
+    ## as the belt-and-braces check. Callers skip it for IP literals:
+    ## X509_check_host matches DNS names, `checkCertIp` matches iPAddress SANs.
     let cert = SSL_get_peer_certificate(ssl)
     if cert.isNil: fail("server presented no certificate")
     let match = X509_check_host(cert, host.cstring, host.len.cint,
-                                X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT, nil)
+                                X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS, nil)
     X509_free(cert)
     if match != 1: fail("certificate does not match host " & host)
 
@@ -474,27 +587,55 @@ when defined(ssl):
     X509_free(cert)
     if match != 1: fail("certificate does not match IP " & host)
 
+  proc bindExpectedIdentity(ssl: SslPtr, host: string, verify: bool): bool =
+    ## Bind the identity we expect the peer to prove into the SSL's
+    ## X509_VERIFY_PARAM *before* the handshake: the DNS name through
+    ## SSL_set1_host (with the shared host-check flags) or, for an IP literal,
+    ## the address through X509_VERIFY_PARAM_set1_ip_asc. OpenSSL then folds the
+    ## identity check into its in-handshake verification, so a mismatched peer is
+    ## rejected before the client sends its Certificate/CertificateVerify -- with
+    ## the post-handshake check alone, an mTLS client disclosed its identity to
+    ## any chain-valid impostor. `verifyPeer` still re-checks afterwards, so on a
+    ## library too old to offer these entry points we simply keep that check (the
+    ## identity is then enforced one flight later, as it was before). A no-op
+    ## (true) when verification is off or there is no host to match.
+    if not verify or host.len == 0: return true
+    resolveIdentityApi()
+    if isIpAddress(host):
+      if paramSet1IpAsc.isNil or sslGet0Param.isNil: return true
+      let param = sslGet0Param(ssl)
+      if param.isNil: return false
+      return paramSet1IpAsc(param, host.cstring) == 1
+    if sslSet1Host.isNil or sslSetHostflags.isNil: return true
+    sslSetHostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS)
+    sslSet1Host(ssl, host.cstring) == 1
+
   proc newClientSsl*(ctx: SslContext, fd: SocketHandle, host: string,
-                     slot: SessionSlot = nil): SslPtr =
+                     verify: bool, slot: SessionSlot = nil): SslPtr =
     ## Create a client SSL bound to `fd`, set SNI (DNS-name hosts only, as
-    ## std/net does), and present any cached session for resumption. The caller
-    ## drives the handshake (blocking in the sync backend, await-based in the
-    ## async one) and frees the SSL on failure.
+    ## std/net does), bind the expected peer identity when `verify` is on, and
+    ## present any cached session for resumption. The caller drives the handshake
+    ## (blocking in the sync backend, await-based in the async one) and frees the
+    ## SSL on failure.
     result = SSL_new(ctx.context)
     if result.isNil: fail("SSL_new failed")
     discard SSL_set_fd(result, fd)
     applySession(result, slot)   # present a cached session before the handshake
     if host.len > 0 and not isIpAddress(host):
       discard SSL_set_tlsext_host_name(result, host.cstring)   # SNI
+    if not bindExpectedIdentity(result, host, verify):
+      SSL_free(result)
+      fail("could not require the certificate to match " & host)
 
-  proc newClientSslMem*(ctx: SslContext, host: string,
+  proc newClientSslMem*(ctx: SslContext, host: string, verify: bool,
                         slot: SessionSlot = nil): tuple[ssl: SslPtr, rbio, wbio: BIO] =
     ## Create a client SSL driven through a pair of memory BIOs instead of a
     ## socket fd, for an async backend that owns the ciphertext transport itself
-    ## (chronos over a `StreamTransport`). Sets SNI, presents any cached session,
-    ## and puts the SSL in connect state. The caller drives the handshake by
-    ## feeding `rbio` (ciphertext in) and draining `wbio` (ciphertext out), then
-    ## runs `verifyPeer`. `SSL_set_bio` transfers BIO ownership to the SSL, so the
+    ## (chronos over a `StreamTransport`). Sets SNI, binds the expected peer
+    ## identity when `verify` is on, presents any cached session, and puts the SSL
+    ## in connect state. The caller drives the handshake by feeding `rbio`
+    ## (ciphertext in) and draining `wbio` (ciphertext out), then runs
+    ## `verifyPeer`. `SSL_set_bio` transfers BIO ownership to the SSL, so the
     ## returned `rbio`/`wbio` are for pumping only -- freeing the SSL frees them.
     let ssl = SSL_new(ctx.context)
     if ssl.isNil: fail("SSL_new failed")
@@ -506,14 +647,18 @@ when defined(ssl):
     applySession(ssl, slot)      # present a cached session before the handshake
     if host.len > 0 and not isIpAddress(host):
       discard SSL_set_tlsext_host_name(ssl, host.cstring)   # SNI
+    if not bindExpectedIdentity(ssl, host, verify):
+      SSL_free(ssl)
+      fail("could not require the certificate to match " & host)
     sslSetConnectState(ssl)
     (ssl, rbio, wbio)
 
   proc verifyPeer*(ssl: SslPtr, host: string, verify: bool) =
-    ## After a completed handshake, confirm the chain (SSL_VERIFY_PEER already
-    ## aborts the handshake on a bad chain; this is the belt-and-suspenders check)
-    ## and the certificate identity: the SAN/CN for a DNS host, or the iPAddress
-    ## SAN for an IP literal. No-op when `verify` is off. Raises `ValueError` on
+    ## After a completed handshake, confirm the chain and the certificate
+    ## identity. Both are already enforced during the handshake (SSL_VERIFY_PEER
+    ## for the chain, `bindExpectedIdentity` for the name), so this is the
+    ## belt-and-suspenders repeat: the SAN/CN for a DNS host, or the iPAddress SAN
+    ## for an IP literal. No-op when `verify` is off. Raises `ValueError` on
     ## mismatch.
     if not verify: return
     if SSL_get_verify_result(ssl) != X509_V_OK:
@@ -570,12 +715,13 @@ when defined(ssl):
 
   proc startClientTls*(ctx: SslContext, fd: SocketHandle, host: string,
                        verify: bool, slot: SessionSlot = nil): SslPtr =
-    ## Blocking client handshake (sync backend): bind + SNI + resume, drive the
+    ## Blocking client handshake (sync backend): bind + SNI + expected identity +
+    ## resume, drive the
     ## handshake, verify. Replaces std/net's `wrapConnectedSocket` so SNI and the
     ## verified hostname stay under navi's control. Raises `ValueError` on failure;
     ## `negotiatedProtocol(result)` reads the ALPN. The async backend composes
     ## `newClientSsl` + an await-based handshake + `verifyPeer` itself.
-    result = newClientSsl(ctx, fd, host, slot)
+    result = newClientSsl(ctx, fd, host, verify, slot)
     var ok = false
     defer:
       if not ok: SSL_free(result)
