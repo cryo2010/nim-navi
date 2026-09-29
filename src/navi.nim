@@ -65,8 +65,8 @@ type
 
   NaviConfig* {.requiresInit.} = object of NaviConfigBase
     ## `requiresInit`, so it cannot be built with a bare/partial `NaviConfig(...)`
-    ## (which would leave fields zeroed, e.g. verify off). Build it with
-    ## `initNaviConfig()`.
+    ## (which would leave fields zeroed, e.g. no retries and no redirects).
+    ## Build it with `initNaviConfig()`.
     middleware*: seq[NaviMiddleware]
 
   NaviObj = object

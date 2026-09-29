@@ -46,7 +46,7 @@ optionally with mutual TLS.
 import navi
 
 var config = initNaviConfig()
-config.tls.caFile   = "/etc/navi/internal-ca.pem"    # trust only this CA (verify stays on)
+config.tls.caFile   = "/etc/navi/internal-ca.pem"    # trust only this CA (verification stays on)
 config.tls.minVersion = tls12
 # Optional mutual TLS: present a client certificate.
 config.tls.certFile = "/etc/navi/client.pem"
@@ -93,12 +93,12 @@ Field names and types match `TlsConfig` in `src/navi/backend/api.nim` and the
 
 | | |
 |---|---|
-| Default | `config.tls.verify = true` (chain **and** hostname) |
-| Hardened | leave on; never set `false` outside tests |
+| Default | `config.tls.insecureSkipVerify = false` (chain **and** hostname are checked) |
+| Hardened | leave it unset; never set `true` outside tests |
 
-Verification is on by default and covers both the certificate chain and the
-hostname. `verify = false` disables both and is intended only for tests against
-self-signed servers. If you need to trust a non-public CA, do **not** disable
+Verification is on for every config, including a bare `TlsConfig()`, and covers
+both the certificate chain and the hostname. `insecureSkipVerify = true`
+disables both and is intended only for tests against self-signed servers. If you need to trust a non-public CA, do **not** disable
 verification; set `caFile` instead.
 
 ### Custom trust anchor (`caFile`)

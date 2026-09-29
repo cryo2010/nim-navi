@@ -37,7 +37,7 @@ Defaults are secure. The security-relevant behaviors that are **on by default**:
 
 | On by default | Mechanism |
 |---------------|-----------|
-| Certificate chain + hostname verification | `tls.verify = true` (`defaultTls()`) |
+| Certificate chain + hostname verification | `tls.insecureSkipVerify = false` (the zero value) |
 | TLS session resumption, scoped per origin | `tls.resumeSessions = true` |
 | Cross-origin `Authorization` stripping on redirect | `core/redirect.nim` |
 | Cookie re-scoping by domain/path (RFC 6265) | `core/cookies.nim` |
@@ -81,7 +81,7 @@ and `defaultTls()` in `src/navi/backend/api.nim`. A private CA is trusted via
 (`certFile`/`pkcs12File`/`certPem`). HTTP/3 performs the same certificate
 verification against the QUIC handshake in the shared C driver
 (`src/navi/backend/h3client.cpp`, driven by `quic.nim`/`quic_async.nim`/`quic_chronos.nim`). Turning
-verification off is a deliberate, explicit `tls.verify = false`.
+verification off is a deliberate, explicit `tls.insecureSkipVerify = true`.
 
 **Verified by:** `badssl.nim` (rejects invalid certificates, accepts a valid one),
 `mtls.sh` (client-certificate handshake).
@@ -231,7 +231,7 @@ These are documented boundaries, not open holes:
 ## Backend differences
 
 - **chronos** now runs OpenSSL (driven over its `StreamTransport` via a memory-BIO
-  pump), reaching parity with the sync/asyncdispatch backends: `tls.verify`,
+  pump), reaching parity with the sync/asyncdispatch backends: `tls.insecureSkipVerify`,
   `caFile`/`caBundle`, cipher selection, TLS 1.3, mTLS client certificates, HTTP/2
   (ALPN), and HTTP/3 (`-d:naviHttp3`) all work. An invalid cipher surfaces OpenSSL's
   error rather than silently falling back.

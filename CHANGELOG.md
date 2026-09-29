@@ -84,6 +84,12 @@ onward (pre-1.0, minor versions may include breaking changes).
   `BodySink`), since the `Future` type differs per backend (#367).
 
 ### Changed
+- **`TlsConfig.verify` became `TlsConfig.insecureSkipVerify` (#422).** The flag was
+  inverted so the zero value is the secure one. Field assignment is unaffected
+  (`cfg.tls.verify = false` still compiles, via a `verify`/`verify=` accessor pair),
+  but object construction that named the field, `TlsConfig(verify: true, ...)`, no
+  longer compiles: pass `insecureSkipVerify: true` to opt out, or drop the field
+  entirely to verify. `wantsVerify` is unchanged and still the way to read the flag.
 - **`navi/js` marshals body and WebSocket bytes with bulk typed-array copies, and
   its WebSocket queue is a deque.** Every byte of a streamed response body used to
   cross the jsffi boundary through its own dynamic `JsObject` index plus a
@@ -216,6 +222,20 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **A `TlsConfig` built with the object constructor no longer silently skips peer
+  verification (#422).** `TlsConfig.verify` was a plain `bool`, so its zero value was
+  `false` and the documented `TlsConfig(caFile: "corp-ca.pem")` hardening idiom (which
+  the api.nim doc comment and the three wss examples recommended) produced a config
+  with verification off: `newTlsContext` built a `CVerifyNone` context, `verifyPeer`
+  returned before any chain, hostname or IP-SAN check, std/net never even loaded the
+  supplied CA bundle, session resumption was off, and the same `wantsVerify = false`
+  was forwarded to the HTTP/3 client. Any certificate from any peer was accepted with
+  no error, while the field's own doc comment claimed the default was on. The field is
+  now `insecureSkipVerify`, whose zero value (`false`) verifies, so a bare
+  `TlsConfig()`, `TlsConfig(caFile: ...)`, `defaultTls()` and `initNaviConfig()` all
+  authenticate the peer. `wantsVerify` is its inverse, the examples and the
+  README/HARDENING/THREAT_MODEL prose were corrected, and `tls.verify` survives as a
+  getter/setter pair so existing `cfg.tls.verify = false` opt-outs keep compiling.
 - **The HTTP `CONNECT` proxy reply is now read to its blank line instead of with a
   single `recv`.** `proxyConnectDriver` took one read of at most 1024 bytes and only
   prefix-matched `HTTP/1.1 200` / `HTTP/1.0 200`. TCP does not guarantee the status

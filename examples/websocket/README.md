@@ -96,20 +96,20 @@ The only difference from the plain clients is the URL and:
 
 ```nim
 var cfg = initNaviConfig()
-cfg.tls.verify = false
+cfg.tls.insecureSkipVerify = true
 let api = newNavi(cfg)
 ```
 
-`verify` is off because the demo cert is self-signed — a real deployment would
-verify against a trusted CA (`TlsConfig(caFile: "ca.pem")`), which every backend
-supports, chronos included. Client certificates (mTLS) remain sync/asyncdispatch
-only.
+Verification is off because the demo cert is self-signed. A real deployment
+leaves it on (the default on every config) and points navi at the trusted CA
+with `cfg.tls.caFile = "ca.pem"`, which every backend supports, chronos
+included. Client certificates (mTLS) remain sync/asyncdispatch only.
 
 ### Browser (navi/js) over wss
 
 The js client speaks wss unchanged — the page just points at a `wss://` URL. But
 the browser owns TLS trust and **rejects a self-signed cert from a script**
-(there's no `verify: false`, and clicking through the address-bar warning does
+(there's no `insecureSkipVerify`, and clicking through the address-bar warning does
 *not* carry over to a script WebSocket). So browser wss needs a cert the browser
 actually trusts — [`mkcert`](https://github.com/FiloSottile/mkcert) makes one.
 
@@ -143,8 +143,8 @@ the target from `window.NAVI_WS_URL`) but points it at `wss://127.0.0.1:9701/`.
 It then behaves exactly like the `ws` page — status, send box, reconnect, and
 live disconnect — just over TLS, with no cert warnings.
 
-The same `mkcert` cert works for the native clients too (they use `verify:
-false`, so they accept any cert). A self-signed cert works for the native
+The same `mkcert` cert works for the native clients too (they set
+`insecureSkipVerify`, so they accept any cert). A self-signed cert works for the native
 clients but **not** for the browser.
 
 ## Notes

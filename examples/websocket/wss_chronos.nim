@@ -3,9 +3,9 @@
 ##   nim c -r -d:ssl examples/websocket/wss_echo_server.nim   # in one terminal
 ##   nim c -r -d:ssl examples/websocket/wss_chronos.nim        # in another
 ##
-## chronos (BearSSL) can verify against a custom CA via TlsConfig(caFile: ...),
-## but the demo server's cert is self-signed with no separate CA, so this uses
-## verify off. Client certificates (mTLS) are still not supported on this backend.
+## chronos can verify against a custom CA via `cfg.tls.caFile`, but the demo
+## server's cert is self-signed with no separate CA, so this skips verification.
+## Client certificates (mTLS) are still not supported on this backend.
 
 import pkg/chronos
 import navi/chronos
@@ -14,7 +14,7 @@ const message = "hello from the chronos backend (wss)"
 
 proc main() {.async.} =
   var cfg = initNaviConfig()
-  cfg.tls.verify = false   # the demo server uses a self-signed cert
+  cfg.tls.insecureSkipVerify = true   # the demo server uses a self-signed cert
   let api = newNavi(cfg)
   let ws = await api.websocket("wss://127.0.0.1:9701/")
   await ws.send(message)

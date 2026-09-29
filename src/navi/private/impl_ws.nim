@@ -155,7 +155,7 @@ when defined(naviHttp3):
     ## (QUIC) connection to the origin and opens a CONNECT `:protocol=websocket`
     ## stream, tunnelling frames as DATA. Sec-WebSocket-Key/Accept are not used.
     let qc = await openQuicConn(u.host, u.port, u.host, client.config.tls.caFile,
-                                 client.config.tls.verify, 0'u64)  # WS frames stream, no body cap
+                                 client.config.tls.wantsVerify, 0'u64)  # WS frames stream, no body cap
     try:
       let (sid, status) = await qc.openConnect(u.requestTarget,
                                                wsExtraFields(headers), "websocket")

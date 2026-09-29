@@ -303,7 +303,7 @@ when defined(naviHttp3):
         "kept alive by a background pump thread); or use navi/asyncdispatch")
     else:
       let (pump, status) = openWsH3(u.host, u.port, u.host, client.config.tls.caFile,
-                                    client.config.tls.verify, u.requestTarget,
+                                    client.config.tls.wantsVerify, u.requestTarget,
                                     wsExtraFields(headers), client.config.connectMs,
                                     client.config.readMs, client.config.totalMs)
       if status < 200 or status >= 300:  # RFC 9220 / 8441 5: any 2xx accepts it
