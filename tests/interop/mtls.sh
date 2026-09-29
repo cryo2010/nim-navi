@@ -13,8 +13,11 @@ command -v openssl >/dev/null || { echo "openssl not found"; exit 127; }
 
 work="$(mktemp -d)"
 srv=""
+srv_chain=""
 cleanup() {
-  [ -n "$srv" ] && kill "$srv" 2>/dev/null || true
+  for p in "$srv" "$srv_chain"; do
+    [ -n "$p" ] && kill "$p" 2>/dev/null || true
+  done
   cd "$root"          # Windows cannot remove the shell's own cwd
   navi_rmtree "$work"
 }
@@ -22,6 +25,7 @@ trap cleanup EXIT
 cd "$work"
 
 port=9455
+chain_port=9484
 
 # A CA that signs both the server and the client certificate.
 navi_certgen ca.key ca.pem navi-test-CA
@@ -65,6 +69,38 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 [ -n "$ready" ] || { echo "s_server did not become ready on :$port"; cat "$work/s_server.log"; exit 1; }
+
+# --- two-tier client PKI: root -> issuing CA -> client ----------------------
+# The common corporate shape. The .p12 carries the issuing CA through -certfile,
+# and the second server trusts only the root (-CAfile ca.pem -Verify 2), so the
+# handshake succeeds only if navi presents the intermediate along with its leaf.
+printf "basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign" > sub.ext
+openssl req -newkey rsa:2048 -nodes -keyout sub.key -out sub.csr \
+  -subj "$(navi_subj CN=navi-issuing-CA)" >/dev/null 2>&1
+openssl x509 -req -in sub.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 1 \
+  -extfile sub.ext -out sub.pem >/dev/null 2>&1
+openssl req -newkey rsa:2048 -nodes -keyout client2.key -out client2.csr \
+  -subj "$(navi_subj CN=navi-client-2tier)" >/dev/null 2>&1
+openssl x509 -req -in client2.csr -CA sub.pem -CAkey sub.key -CAcreateserial -days 1 \
+  -out client2.pem >/dev/null 2>&1
+openssl pkcs12 -export -inkey client2.key -in client2.pem -certfile sub.pem \
+  -passout "pass:$pass" -out client2.p12 >/dev/null 2>&1
+
+# -verify_return_error matters: without it s_server's default verify callback
+# only logs a failed client-chain build and serves the page anyway.
+openssl s_server -accept "$chain_port" -cert server.pem -key server.key \
+  -CAfile ca.pem -Verify 2 -verify_return_error -www -quiet \
+  >"$work/s_server_chain.log" 2>&1 &
+srv_chain=$!
+disown 2>/dev/null || true
+# Probe with a credential the server trusts (the root-signed client.pem): with
+# -Verify plus -verify_return_error a bare probe is aborted before s_client prints
+# the server certificate on some OpenSSL builds, so it would never look ready.
+navi_wait_tls "localhost:$chain_port" -cert client.pem -key client.key -CAfile ca.pem \
+  || { echo "s_server did not become ready on :$chain_port"; cat "$work/s_server_chain.log"; exit 1; }
+
+export NAVI_MTLS_CHAIN_URL="https://localhost:$chain_port"
+export NAVI_MTLS_P12_CHAIN="$(navi_path "$work/client2.p12")"
 
 export NAVI_MTLS_URL="https://localhost:$port"
 export NAVI_MTLS_CA="$(navi_path "$work/ca.pem")"

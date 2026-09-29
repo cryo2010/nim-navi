@@ -58,7 +58,9 @@ Why: `caFile` replaces the system trust store, so navi accepts only certificates
 that chain to your private root; verification stays on. The client certificate
 lets the server authenticate navi in return. A PKCS#12 bundle
 (`config.tls.pkcs12File = "client.p12"; config.tls.password = "..."`) is an
-alternative to the cert/key pair.
+alternative to the cert/key pair, and the intermediates inside it are presented
+along with the leaf, so a server that trusts only your root can still build the
+path.
 
 ### 3. Untrusted or hostile endpoint
 

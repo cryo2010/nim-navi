@@ -49,6 +49,7 @@ when defined(ssl):
   # add_extra_chain_cert (via SSL_CTX_ctrl) transfers ownership, so we do not.
 
   const SSL_CTRL_EXTRA_CHAIN_CERT = 14
+  const SSL_CTRL_CHAIN = 88   # SSL_CTX_set0_chain; takes ownership of the stack
   const X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS = 0x4.cuint
     ## X509_VERIFY_PARAM flag: reject partial wildcards (`fo*.example.com`), which
     ## RFC 6125 6.4.4 / RFC 9525 forbid; only `*.example.com` stays valid. This is the one hostname policy every
@@ -170,6 +171,25 @@ when defined(ssl):
     result = BIO_new_mem_buf(unsafeAddr data[0], data.len.cint)
     if result.isNil: fail("could not allocate a memory BIO")
 
+  type SkPopFreeProc =
+    proc(st: PSTACK, freeFunc: pointer) {.cdecl, gcsafe, raises: [].}
+  var skPopFree {.threadvar.}: SkPopFreeProc
+  var skPopFreeReady {.threadvar.}: bool
+
+  proc freeCertStack(ca: PSTACK) =
+    ## Free a PKCS12_parse CA stack and the certificates it holds. Resolved by
+    ## hand like the identity entry points: old LibreSSL does not export
+    ## OPENSSL_sk_pop_free and a dynlib importc would abort the process at
+    ## startup there. Without it the stack leaks once, on a path only an
+    ## SSL_CTX_ctrl the library does not implement can reach.
+    if ca.isNil: return
+    if not skPopFreeReady:
+      skPopFreeReady = true
+      skPopFree = cast[SkPopFreeProc](
+        tlsLib(DLLUtilName).tlsSym("OPENSSL_sk_pop_free"))
+    if skPopFree.isNil: return
+    skPopFree(ca, cast[pointer](X509_free))
+
   proc addChainCert(ctx: SslCtx, x: PX509): bool =
     ## Transfers ownership of `x` to `ctx` on success.
     SSL_CTX_ctrl(ctx, SSL_CTRL_EXTRA_CHAIN_CERT.cint, 0, cast[pointer](x)) > 0
@@ -230,10 +250,10 @@ when defined(ssl):
       fail("the private key does not match the certificate")
 
   proc usePkcs12(ctx: SslCtx, data, password: string) =
-    ## Install the leaf certificate and key from a PKCS#12 bundle. The bundle's
-    ## extra chain certs are not installed (nil chain out-param): the stack
-    ## helpers needed to walk them are not portably exported across
-    ## OpenSSL/LibreSSL, and a client only needs to present its leaf + key.
+    ## Install the leaf certificate, the key, and any intermediates the bundle
+    ## carries. The chain matters: a server that trusts only the root cannot build
+    ## a path from a bare leaf issued by an intermediate CA, which is how a
+    ## corporate `.p12` (root -> issuing CA -> client) is usually shaped.
     let bio = memBio(data)
     defer: discard BIO_free(bio)
     let p12 = d2i_PKCS12_bio(bio, nil)
@@ -241,7 +261,14 @@ when defined(ssl):
     defer: PKCS12_free(p12)
     var pkey: EVP_PKEY
     var cert: PX509
-    if PKCS12_parse(p12, password.cstring, addr pkey, addr cert, nil) != 1:
+    var ca: PSTACK
+    # PKCS12_parse hands us a fresh stack of the bundle's other certificates.
+    # SSL_CTRL_CHAIN transfers it to the context; until then (and on every
+    # failure exit) it is ours to free.
+    var caOwned = true
+    defer:
+      if caOwned: freeCertStack(ca)
+    if PKCS12_parse(p12, password.cstring, addr pkey, addr cert, addr ca) != 1:
       fail("could not decrypt the PKCS#12 bundle (wrong password?)")
     if cert.isNil or pkey.isNil: fail("the PKCS#12 bundle lacks a cert or key")
     # PKCS12_parse hands us fresh references to both the cert and the key.
@@ -253,6 +280,12 @@ when defined(ssl):
       fail("could not use the PKCS#12 certificate")
     if SSL_CTX_use_PrivateKey(ctx, pkey) != 1:
       fail("the PKCS#12 key does not match the certificate")
+    if not ca.isNil:
+      # SSL_CTX_set0_chain: replaces the context's chain and takes ownership of
+      # the stack and the certificates in it.
+      if SSL_CTX_ctrl(ctx, SSL_CTRL_CHAIN.cint, 0, cast[pointer](ca)) <= 0:
+        fail("could not install the PKCS#12 certificate chain")
+      caOwned = false
 
   proc isDer(data: string): bool =
     ## DER starts with the ASN.1 SEQUENCE tag (0x30); PEM starts with '-'.

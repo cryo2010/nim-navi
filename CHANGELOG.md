@@ -222,6 +222,18 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **A PKCS#12 client credential now presents the intermediates the bundle carries
+  (#425).** `usePkcs12` passed a nil CA out-param to `PKCS12_parse` and installed
+  only the leaf and the key, so a client certificate issued by an intermediate CA
+  and exported as `.p12` (the usual corporate shape: root -> issuing CA -> client,
+  `openssl pkcs12 -export -certfile`) went on the wire bare. Servers that trust only
+  the root -- `openssl s_server -CAfile root.pem`, nginx `ssl_client_certificate
+  root.pem` -- could not build the path and rejected the handshake with "unable to
+  get local issuer certificate", while the identical credential converted to PEM
+  worked, because `useCertChainPem` does install the chain. Since `pkcs12File` has
+  the highest precedence in `loadClientCert`, no other `TlsConfig` field could
+  supply the missing intermediates. navi now asks `PKCS12_parse` for the CA stack
+  and installs it with `SSL_CTX_set0_chain`, freeing it if the install fails.
 - **An encrypted client key with no configured passphrase now fails instead of
   prompting on the terminal (#424).** `useKeyPem` passed a nil password callback to
   `PEM_read_bio_PrivateKey` whenever `tls.password` was empty, so OpenSSL fell back

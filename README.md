@@ -456,7 +456,7 @@ An encrypted key needs `tls.password`; without one the load fails immediately ra
 than prompting for a passphrase on the terminal. A key configured without a
 certificate is rejected.
 
-Key algorithms (RSA, ECDSA, Ed25519) work in any of these as long as OpenSSL supports them. In-memory PEM may carry an intermediate chain; a PKCS#12 bundle's extra chain certs are not installed (only its leaf and key), which is all a client needs to present.
+Key algorithms (RSA, ECDSA, Ed25519) work in any of these as long as OpenSSL supports them. In-memory PEM may carry an intermediate chain, and a PKCS#12 bundle's intermediates are installed too, so a client certificate issued by an intermediate CA is presented with the chain a root-only server needs to validate it.
 
 ### Errors
 
