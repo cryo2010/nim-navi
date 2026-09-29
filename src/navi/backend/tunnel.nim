@@ -9,9 +9,26 @@
 import std/[strutils, base64]
 import ../core/socks
 
-const proxyConnectReplyBuf = 1024
-  ## One recv suffices for a proxy CONNECT status line + headers; a well-behaved
-  ## proxy replies with a short "HTTP/1.x 200 ..." head that fits comfortably.
+const
+  proxyConnectChunk = 1024
+    ## Size of each read while pulling in the proxy CONNECT reply head.
+  proxyConnectHeadMax = 16 * 1024
+    ## Cap on the accumulated CONNECT reply head. TCP is free to split the reply
+    ## across segments and a proxy may stack up Via/X-Cache headers, so the head
+    ## has to be read to its CRLFCRLF terminator; this bounds that loop.
+
+proc proxyStatusOk(line: string): bool =
+  ## True when `line` is an "HTTP/1.x <2xx> ..." status line. RFC 9110 9.3.6 says
+  ## any 2xx on CONNECT means the tunnel is established, so the three-digit code
+  ## is parsed rather than prefix-matched against "200".
+  if line.len < 12 or not line.startsWith("HTTP/1."): return false
+  if not isDigit(line[7]) or line[8] != ' ': return false
+  for i in 9 .. 11:
+    if not isDigit(line[i]): return false
+  if line.len > 12 and line[12] != ' ': return false   # 4-digit code is not a status
+  let code = (ord(line[9]) - ord('0')) * 100 + (ord(line[10]) - ord('0')) * 10 +
+             (ord(line[11]) - ord('0'))
+  code >= 200 and code <= 299
 
 template proxyConnectDriver*(conn, host, port, user, pass: typed) =
   ## Establish a CONNECT tunnel to `host:port` through an already-connected HTTP
@@ -25,9 +42,32 @@ template proxyConnectDriver*(conn, host, port, user, pass: typed) =
     req.add("Proxy-Authorization: Basic " & encode(user & ":" & pass) & "\r\n")
   req.add("\r\n")
   await sockWrite(conn, req)
-  let resp = await sockReadSome(conn, proxyConnectReplyBuf)
-  if not (resp.startsWith("HTTP/1.1 200") or resp.startsWith("HTTP/1.0 200")):
-    raise newException(ValueError, "navi: proxy CONNECT failed: " & resp.splitLines()[0])
+  # Read the reply head to its CRLFCRLF terminator instead of trusting one recv:
+  # a status line and headers split across TCP segments, or a head larger than one
+  # read, would otherwise leave proxy bytes on the socket for OpenSSL to parse as
+  # the ServerHello (and a short first segment would look like a CONNECT failure).
+  var resp = ""
+  var head = -1
+  while true:
+    let chunk = await sockReadSome(conn, proxyConnectChunk)
+    if chunk.len == 0:
+      raise newException(IOError,
+        "navi: proxy closed the connection before the CONNECT reply was complete")
+    resp.add chunk
+    head = resp.find("\r\n\r\n")
+    if head >= 0: break
+    if resp.len >= proxyConnectHeadMax:
+      raise newException(ValueError, "navi: proxy CONNECT reply head exceeded " &
+        $proxyConnectHeadMax & " bytes without a blank line")
+  let statusLine = resp[0 ..< resp.find("\r\n")]
+  if not proxyStatusOk(statusLine):
+    raise newException(ValueError, "navi: proxy CONNECT failed: " & statusLine)
+  # TLS clients speak first, so a conforming proxy sends nothing between the blank
+  # line and the tunnelled bytes. Nothing here can push leftovers back into the
+  # backend's TLS read path, so fail loudly rather than silently dropping them.
+  if resp.len > head + 4:
+    raise newException(ValueError, "navi: proxy sent " & $(resp.len - head - 4) &
+      " bytes after the CONNECT reply, before the tunnel was handed to TLS")
 
 template socksConnectDriver*(conn, host, port, user, pass: typed) =
   ## Perform the SOCKS5 handshake (RFC 1928 + RFC 1929 user/pass) to tunnel to

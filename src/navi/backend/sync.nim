@@ -168,7 +168,8 @@ proc sockReadExactly(fd: SocketHandle, n: int): string =
     off += r
 
 proc sockReadSome(fd: SocketHandle, max: int): string =
-  ## One read of up to `max` bytes (the proxy CONNECT reply fits in one recv).
+  ## One read of up to `max` bytes; returns "" at EOF. The CONNECT driver loops
+  ## on this until the reply head is terminated, so a short read is expected.
   result = newString(max)
   let n = sysRecv(fd, addr result[0], max)
   result.setLen(system.max(n, 0))

@@ -158,6 +158,13 @@ task socks, "SOCKS5 proxy tunnelling + user/pass auth, all native clients (needs
   # asyncdispatch and chronos clients.
   exec "bash tests/interop/socks5.sh"
 
+task httpConnect, "HTTP CONNECT proxy tunnelling, all native clients (needs openssl + python3)":
+  # A TLS origin behind three CONNECT proxies: one that splits the 200 reply
+  # across two TCP segments, one whose 200 reply exceeds a single read, and one
+  # that answers 407. navi must tunnel through the first two and report the proxy
+  # status line for the third, on the sync, asyncdispatch and chronos clients.
+  exec "bash tests/interop/http_connect.sh"
+
 task unixSocket, "Unix domain socket transport, all native clients (POSIX; needs python3)":
   # An AF_UNIX HTTP server that echoes the Host header: navi must dial the socket
   # path, send the URL host as Host, and reject an over-long path, on the sync,

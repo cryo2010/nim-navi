@@ -216,6 +216,22 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **The HTTP `CONNECT` proxy reply is now read to its blank line instead of with a
+  single `recv`.** `proxyConnectDriver` took one read of at most 1024 bytes and only
+  prefix-matched `HTTP/1.1 200` / `HTTP/1.0 200`. TCP does not guarantee the status
+  line and the headers arrive together, so a proxy that flushes the status line first,
+  or replies with more than 1024 bytes of `Via`/`X-Cache`/`Proxy-Agent` headers, left
+  header bytes on the socket; OpenSSL then read them as the ServerHello and the
+  request failed with a TLS handshake error rather than a tunnel error. The driver now
+  loops on the backend read primitive until it sees `\r\n\r\n`, capped at 16 KiB
+  (a longer head, or EOF before the terminator, raises a clear proxy error), parses the
+  three-digit status code and accepts any 2xx per RFC 9110 9.3.6 instead of matching two
+  literals, and puts the status line in the error text so a 407 or 403 is diagnosable.
+  Bytes arriving after the blank line are now rejected with an explicit error rather
+  than silently dropped: no backend can push them back into its TLS read path, and a
+  conforming proxy never sends them because the TLS client speaks first. Covered by a
+  new `tests/interop/http_connect.sh` (`nimble httpConnect`) that drives all three
+  native clients through a split reply, an oversized reply and a 407 (#428).
 - **`navi/js` request bodies now go on the wire as the Nim string's bytes, like every
   native backend.** `buildInit` handed the body to `fetch` as a `cstring`, and on the
   js backend that conversion decodes the string's bytes as UTF-8 into a JS (UTF-16)

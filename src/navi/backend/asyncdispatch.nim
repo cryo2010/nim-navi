@@ -235,7 +235,8 @@ proc sockReadExactly(fd: AsyncFD, n: int): Future[string] {.async.} =
     result.add chunk
 
 proc sockReadSome(fd: AsyncFD, max: int): Future[string] = recv(fd, max)
-  ## One read of up to `max` bytes (the proxy CONNECT reply fits in one recv).
+  ## One read of up to `max` bytes; returns "" at EOF. The CONNECT driver loops
+  ## on this until the reply head is terminated, so a short read is expected.
 
 proc proxyConnect(fd: AsyncFD, host: string, port: int, user, pass: string) {.async.} =
   proxyConnectDriver(fd, host, port, user, pass)

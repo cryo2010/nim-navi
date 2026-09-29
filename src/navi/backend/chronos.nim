@@ -114,7 +114,8 @@ proc sockReadExactly(transport: StreamTransport, n: int): Future[string] {.async
   buf
 
 proc sockReadSome(transport: StreamTransport, max: int): Future[string] {.async.} =
-  ## One read of up to `max` bytes (the proxy CONNECT reply fits in one read).
+  ## One read of up to `max` bytes; `readOnce` yields 0 only at EOF, so "" means
+  ## EOF. The CONNECT driver loops on this until the reply head is terminated.
   var buf = newString(max)
   let n = await transport.readOnce(addr buf[0], max)
   buf.setLen(n)
