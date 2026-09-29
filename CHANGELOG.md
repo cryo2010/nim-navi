@@ -222,6 +222,25 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **Cancellation is no longer swallowed by the chronos TLS pump (#430).** `feedIn`,
+  the read that moves ciphertext off the transport into OpenSSL's read-BIO, caught
+  `CatchableError` -- which in chronos includes `CancelledError` -- and reported it as
+  a clean EOF. A structured cancel that landed while the pump was parked in `readOnce`
+  therefore never reached the caller: with `timeouts.read` set, a stalled TLS response
+  came back as an empty read instead of a `TimeoutError`, the engine saw an EOF before
+  any response and raised `KeepAliveRaceError`, and the retry layer **replayed the
+  request on a fresh connection** (any idempotent method, or any method carrying an
+  `Idempotency-Key`) while the cancel that was meant to stop it sat in `cancelAndWait`;
+  with a `timeouts.total` deadline or a `CancelToken`, the right error was still raised
+  but only after that replay had run its course. The same blanket handler in the
+  connect loop turned a cancelled handshake into "this address failed", so a cancelled
+  connect went on to re-race the remaining addresses with no bound left. `feedIn` now
+  re-raises `CancelledError` so it propagates out through `handshake`/`readSome`, the
+  connect loop tears the attempt down and re-raises rather than moving to the next
+  address, and `ChronosTls.close` shields its transport teardown with `noCancel`
+  instead of catching the cancel (re-raising there would have leaked the SSL and its
+  BIOs). The plaintext read path, which only ever caught `AsyncStreamError`, was
+  already correct.
 - **The chronos backend no longer discards establishment errors when a connect timeout
   is set, and never hands back an unverified Unix-socket TLS session (#420).** With
   `timeouts.connect` configured, `connect` called `withTimeout(establish(), ...)` and

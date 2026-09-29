@@ -92,6 +92,16 @@ when defined(ssl):
     ## than letting it propagate up through readSome/recvSome) lets chronos retire
     ## the in-flight read cleanly instead of leaking its future + our stack trace.
     ##
+    ## `CancelledError` is the one exception that must NOT become an EOF. In chronos
+    ## it derives from CatchableError, so the blanket handler used to turn a
+    ## structured cancel -- a `timeouts.total` guard, a CancelToken, or the
+    ## `timeouts.connect` bound -- into a clean EOF here: `readSome` returned "", the
+    ## engine saw an EOF before any response and raised KeepAliveRaceError, and the
+    ## retry layer replayed the request on a fresh connection while the cancel that
+    ## was supposed to stop it waited in `cancelAndWait`. Re-raising keeps the
+    ## cancellation flowing out through `handshake`/`readSome` so the guard returns
+    ## promptly and reports the real error.
+    ##
     ## The ciphertext lands in one of the connection's own scratch buffers rather than
     ## a fresh 64 KiB string per read: the bytes are copied straight into the read-BIO
     ## and the buffer is never handed to a caller, so reuse cannot alias anything.
@@ -102,6 +112,8 @@ when defined(ssl):
     var n = 0
     try:
       n = await t.transport.readOnce(addr buf[][0], buf[].len)
+    except CancelledError:
+      raise               # never an EOF: see the note above
     except CatchableError:
       return false
     if n <= 0: return false
@@ -197,11 +209,17 @@ when defined(ssl):
     # FIN before closesocket, so the close_notify (and any last record) written just
     # before this is delivered rather than dropped with the socket (see
     # `gracefulShutdown` in chronos.nim for the Windows failure this prevents).
+    # `noCancel`, not a blanket `except CatchableError`: this runs from teardown
+    # paths that are themselves often being cancelled, and a CancelledError caught
+    # here would either be swallowed (hiding the cancel) or re-raised before the SSL
+    # is freed (leaking it and its BIOs). Shielding the awaits instead means the
+    # teardown always finishes and no cancellation is lost.
     if not t.transport.isNil:
       try:
-        discard await withTimeout(t.transport.shutdownWait(), 1000.milliseconds)
+        discard await noCancel withTimeout(t.transport.shutdownWait(),
+                                           1000.milliseconds)
       except CatchableError: discard
-    try: await t.transport.closeWait()
+    try: await noCancel t.transport.closeWait()
     except CatchableError: discard
     if not t.sslp.isNil:
       SSL_free(t.sslp); t.sslp = nil

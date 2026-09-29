@@ -248,16 +248,17 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
             conn.ownsCtx = owned
             ok = true
           except CatchableError:
-            # The same teardown the TCP branch runs. Without it a failed handshake
-            # or a failed chain/hostname/pin check leaves `conn.tls` pointing at a
-            # live, fully handshaken SSL (and leaks it, its BIOs and the fd): the
-            # caller would then send the request over a session whose identity check
-            # did NOT pass. Nil it so no Conn ever leaves `connect` unverified.
+            # The same teardown the TCP branch runs, and it must run on a cancel too.
+            # Without it a failed handshake or a failed chain/hostname/pin check
+            # leaves `conn.tls` pointing at a live, fully handshaken SSL (and leaks
+            # it, its BIOs and the fd): the caller would then send the request over a
+            # session whose identity check did NOT pass. Nil it so no Conn ever
+            # leaves `connect` unverified.
             if not conn.tls.isNil:
-              await conn.tls.close()               # frees the ssl + the transport
+              await noCancel conn.tls.close()      # frees the ssl + the transport
               conn.tls = nil
             else:
-              (try: await transport.closeWait() except CatchableError: discard)
+              (try: await noCancel transport.closeWait() except CatchableError: discard)
             raise
           finally:
             if owned and not ok and not ctx.isNil: destroyCtx(ctx)
@@ -328,6 +329,19 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
               conn.reader = newAsyncStreamReader(transport)
               conn.writer = newAsyncStreamWriter(transport)
             return                                   # established
+          except CancelledError:
+            # A structured cancel (a `timeouts.total` guard, a CancelToken, or the
+            # connect bound) is not an address that failed: tearing the attempt down
+            # and carrying on would re-race the remaining addresses with no bound
+            # left, so a cancelled connect could run for minutes. Clean up this
+            # attempt and let the cancellation out.
+            if not conn.tls.isNil:
+              await noCancel conn.tls.close()        # frees ssl + transport
+              conn.tls = nil
+            else:
+              (try: await noCancel transport.closeWait() except CatchableError: discard)
+            conn.reader = nil; conn.writer = nil
+            raise
           except CatchableError as e:
             if not conn.tls.isNil:
               await conn.tls.close()                 # frees ssl + transport
