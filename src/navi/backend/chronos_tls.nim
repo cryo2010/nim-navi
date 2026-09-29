@@ -38,6 +38,9 @@ when defined(ssl):
                             ## during a write ever needs it
 
   const tlsBufSize = 65536   # drain multiple TLS records per read (see naviReadBufSize)
+  const closeNotifyMs = 1000
+    ## upper bound on pushing the close_notify alert out in `close`, so a peer that
+    ## has stopped reading cannot stall a teardown
 
   type FeedSide = enum
     ## Which pump is reading ciphertext, and so which scratch buffer it owns.
@@ -206,6 +209,22 @@ when defined(ssl):
     ## Order matters: closing the transport first lets a background reader parked
     ## in `readOnce` complete with a clean EOF and unwind, rather than racing a
     ## freed SSL; it also avoids leaking the reader's in-flight read future.
+    # close_notify first, and not only out of politeness to the peer: SSL_free on an
+    # SSL that never shut down runs OpenSSL's ssl_clear_bad_session, which marks the
+    # SSL_SESSION not_resumable. That object is the very one navi cached for this
+    # origin (openssl_ctx's new-session callback stores the pointer the callback was
+    # handed), so re-presenting it would get a full handshake every time and TLS
+    # session resumption would be silently dead on this backend. SSL_shutdown queues
+    # the alert into the write BIO; the drain below is what puts it on the wire.
+    # Best effort and bounded: a dead or blocked peer must not turn `close` into a
+    # raise or a hang, and the SSL_SENT_SHUTDOWN flag SSL_shutdown sets is what
+    # preserves resumability even if the alert itself never gets out.
+    if not t.sslp.isNil:
+      ErrClearError()          # see `readSome`: keep the thread's error queue clean
+      discard SSL_shutdown(t.sslp)
+      try:
+        discard await noCancel withTimeout(t.flushOut(), closeNotifyMs.milliseconds)
+      except CatchableError: discard
     # FIN before closesocket, so the close_notify (and any last record) written just
     # before this is delivered rather than dropped with the socket (see
     # `gracefulShutdown` in chronos.nim for the Windows failure this prevents).
@@ -228,6 +247,13 @@ when defined(ssl):
     ## Non-awaiting teardown for a GC-reclaimed handle: free the SSL and initiate
     ## transport close (the loop frees it afterwards).
     if not t.sslp.isNil:
+      # As in `close`: without SSL_shutdown, SSL_free marks the cached SSL_SESSION
+      # not_resumable. Nothing can be drained here (there is nothing to await on),
+      # so the peer may not see the alert, but SSL_SENT_SHUTDOWN is still set and
+      # the session stays resumable. Same order as the sync and asyncdispatch
+      # backends' teardown.
+      ErrClearError()
+      discard SSL_shutdown(t.sslp)
       SSL_free(t.sslp); t.sslp = nil
     if not t.transport.isNil: t.transport.close()
 

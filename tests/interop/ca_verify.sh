@@ -66,6 +66,15 @@ export NAVI_CAFILE_CA="$(navi_path "$work/ca.pem")"
 echo "== private-CA verification: server signed by a private CA on 127.0.0.1:$port =="
 nim c -r --hints:off -d:ssl --path:"$root/src" -o:"$work/ca_verify" "$root/tests/interop/ca_verify.nim"
 
+# TLS session resumption, on all three native backends against the same server:
+# `s_server -www` names the session state of the connection it answers on in the
+# page it serves, and closes that connection afterwards, so a second request from
+# the same client is a second handshake that can only report "Reused" if the
+# cached session was presented and accepted (#431).
+echo "== TLS session resumption on the second connection (sync/asyncdispatch/chronos) =="
+nim c -r --hints:off -d:ssl --path:"$root/src" -o:"$work/resume_sync" "$root/tests/interop/tls_resume.nim"
+nim c -r --hints:off -d:ssl -d:naviAsync --path:"$root/src" -o:"$work/resume_async" "$root/tests/interop/tls_resume.nim"
+nim c -r --hints:off -d:ssl -d:naviChronos --path:"$root/src" -o:"$work/resume_chronos" "$root/tests/interop/tls_resume.nim"
 # --- certificate identity: CN must not rescue a SAN mismatch ----------------
 # CN=localhost, but the only SAN names a host we never ask for (and there is no
 # iPAddress SAN at all). Chain-valid against the same CA, so only the identity

@@ -222,6 +222,20 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **TLS session resumption now works on the chronos backend (#431).** `ChronosTls`
+  freed its `SSL` without ever calling `SSL_shutdown`, and OpenSSL treats that as a
+  bad session: `SSL_free` runs `ssl_clear_bad_session`, which marks the `SSL_SESSION`
+  not_resumable. That object is the very one navi cached for the origin (the
+  new-session callback stores the pointer OpenSSL handed it), so re-presenting it on
+  the next connection bought nothing and every chronos connection did a full
+  handshake -- a certificate chain and an extra round trip each time -- while the
+  sync and asyncdispatch clients with the same config resumed. Peers also never
+  received a `close_notify`. Both `close` and `closeSync` now clear the error queue
+  and call `SSL_shutdown` before `SSL_free`, and `close` drains the write-BIO onto
+  the transport first (bounded, best effort) so the alert actually reaches the peer.
+  `resumeSessions` is on by default, so this is a latency win on the chronos client
+  with no configuration change. A new interop check asserts the second connection to
+  an origin reports a reused session, on all three native backends.
 - **Cancellation is no longer swallowed by the chronos TLS pump (#430).** `feedIn`,
   the read that moves ciphertext off the transport into OpenSSL's read-BIO, caught
   `CatchableError` -- which in chronos includes `CancelledError` -- and reported it as
