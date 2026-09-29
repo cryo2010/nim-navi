@@ -452,6 +452,10 @@ config.tls.certPem = certString
 config.tls.keyPem  = keyString
 ```
 
+An encrypted key needs `tls.password`; without one the load fails immediately rather
+than prompting for a passphrase on the terminal. A key configured without a
+certificate is rejected.
+
 Key algorithms (RSA, ECDSA, Ed25519) work in any of these as long as OpenSSL supports them. In-memory PEM may carry an intermediate chain; a PKCS#12 bundle's extra chain certs are not installed (only its leaf and key), which is all a client needs to present.
 
 ### Errors

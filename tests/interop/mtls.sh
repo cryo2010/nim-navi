@@ -86,3 +86,25 @@ if nimble path chronos >/dev/null 2>&1; then
 else
   echo "note: chronos not installed; skipping the chronos mTLS leg"
 fi
+
+# An encrypted key with no configured passphrase must fail fast. OpenSSL's default
+# PEM callback prompts on /dev/tty and falls back to stdin, so re-run the sync
+# binary with stdin held open by a pipe nobody ever writes to: a prompt would block
+# there forever, and the timeout turns that into a failure instead of a hung job.
+if command -v timeout >/dev/null 2>&1 && command -v mkfifo >/dev/null 2>&1; then
+  echo "== encrypted key with no passphrase must not prompt =="
+  mkfifo "$work/stdin.fifo"
+  sleep 60 > "$work/stdin.fifo" &          # holds the write end open, sends nothing
+  holder=$!
+  rc=0
+  timeout 30 "$work/mtls_sync" < "$work/stdin.fifo" >"$work/noprompt.log" 2>&1 || rc=$?
+  kill "$holder" 2>/dev/null || true
+  if [ "$rc" -eq 124 ]; then
+    echo "FAIL: the client blocked on a PEM passphrase prompt"; cat "$work/noprompt.log"; exit 1
+  elif [ "$rc" -ne 0 ]; then
+    echo "FAIL: the no-prompt run exited $rc"; cat "$work/noprompt.log"; exit 1
+  fi
+  echo "no-prompt run passed (stdin was an open pipe)"
+else
+  echo "note: timeout/mkfifo unavailable; skipping the PEM no-prompt leg"
+fi

@@ -199,12 +199,29 @@ when defined(ssl):
       else:
         fail("could not add an intermediate certificate")
 
+  proc pemPassword(buf: cstring, size: cint, rwflag: cint, u: pointer): cint {.cdecl.} =
+    ## PEM passphrase callback. `u` is the configured password as a C string, or
+    ## nil when none is configured; then we return 0, which OpenSSL turns into
+    ## PEM_R_BAD_PASSWORD_READ. Installing this unconditionally is the point: with
+    ## a nil callback OpenSSL substitutes PEM_def_callback, which prompts for the
+    ## passphrase on /dev/tty (falling back to stdin) and blocks there -- inside
+    ## `newTlsContext`, so under asyncdispatch or chronos the whole event loop
+    ## stops until someone types into a terminal that, in a service, is a pipe
+    ## nobody is writing to.
+    if u.isNil or size <= 0: return 0
+    let pw = cast[cstring](u)
+    let n = pw.len
+    if n == 0 or n > size.int: return 0
+    copyMem(buf, pw, n)
+    n.cint
+
   proc useKeyPem(ctx: SslCtx, pem, password: string) =
     let bio = memBio(pem)
     defer: discard BIO_free(bio)
-    # OpenSSL treats a non-nil `u` with a nil callback as the passphrase itself.
-    let u = if password.len > 0: password.cstring else: nil
-    let pkey = PEM_read_bio_PrivateKey(bio, nil, nil, u)
+    # Never a nil callback: see pemPassword. `u` stays alive for the call, which
+    # is the only time OpenSSL dereferences it.
+    let u = if password.len > 0: cast[pointer](password.cstring) else: nil
+    let pkey = PEM_read_bio_PrivateKey(bio, nil, cast[pointer](pemPassword), u)
     if pkey.isNil: fail("could not read the private key (wrong password?)")
     # SSL_CTX_use_PrivateKey bumps the object's refcount, so we free our
     # reference on every exit path (success or failure) once the key exists.
@@ -353,6 +370,13 @@ when defined(ssl):
     ## handed an empty cert/key and every credential form (plain PEM included)
     ## takes one path. Raises `ValueError` on malformed or mismatched TLS material.
     let custom = hasClientCert(cfg)
+    # A key with no certificate cannot be used, and handing it to `newContext`
+    # would run it through std/net's SSL_CTX_use_PrivateKey_file, whose default
+    # PEM callback prompts for the passphrase on /dev/tty and blocks (see
+    # pemPassword). Reject the misconfiguration instead.
+    if not custom and (cfg.keyFile.len > 0 or cfg.keyPem.len > 0):
+      fail("TlsConfig has a client key but no certificate " &
+           "(set certFile, certPem or pkcs12File)")
     result = newContext(
       verifyMode = if cfg.wantsVerify: CVerifyPeer else: CVerifyNone,
       certFile = if custom: "" else: cfg.certFile,

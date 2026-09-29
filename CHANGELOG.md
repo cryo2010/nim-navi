@@ -222,6 +222,20 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **An encrypted client key with no configured passphrase now fails instead of
+  prompting on the terminal (#424).** `useKeyPem` passed a nil password callback to
+  `PEM_read_bio_PrivateKey` whenever `tls.password` was empty, so OpenSSL fell back
+  to `PEM_def_callback`, which prints `Enter PEM pass phrase:` on `/dev/tty` (or
+  stdin) and reads synchronously. A service whose secret injection yielded an empty
+  password therefore blocked inside `newTlsContext` -- and under asyncdispatch or
+  chronos that is the whole event loop -- for as long as stdin stayed open, rather
+  than raising the intended "could not read the private key (wrong password?)". navi
+  now always installs its own `{.cdecl.}` callback, which hands OpenSSL the
+  configured password or returns 0 (`PEM_R_BAD_PASSWORD_READ`) when there is none.
+  A `keyFile` or `keyPem` configured without any certificate no longer reaches
+  std/net's `newContext`, whose `SSL_CTX_use_PrivateKey_file` prompts the same way;
+  it is now rejected up front as the misconfiguration it is (`keyPem` alone was
+  previously ignored in silence).
 - **The expected hostname is now bound into the TLS handshake, and a subject CN no
   longer rescues a certificate whose SANs all mismatch (#423).** On the sync,
   asyncdispatch and chronos backends nothing was written into the SSL's
