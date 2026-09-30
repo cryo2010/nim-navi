@@ -358,7 +358,10 @@ task demoWs, "Run the WebSocket demos for every client + browser page (Docker)":
 
 task mtls, "Run the mutual-TLS (client certificate) interop test (needs openssl)":
   # Starts an OpenSSL server that requires a client certificate and runs navi's
-  # mTLS test against it.
+  # mTLS test against it. Also tls_clear_secrets.nim, on all three native
+  # backends: every request is made AFTER `clearTlsSecrets` has wiped the
+  # credential, so a server that mandates a client certificate proves the
+  # eagerly built TLS contexts keep mTLS working (issue #438).
   exec "bash tests/interop/mtls.sh"
 
 task chronosCafile, "chronos custom-CA (caFile) interop test (needs openssl + chronos)":

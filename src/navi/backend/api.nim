@@ -81,13 +81,26 @@ type
     # a `-----BEGIN` boundary starts one of the file's lines (RFC 7468 allows
     # explanatory text before it), DER otherwise. An encrypted key is decrypted
     # with `password` in either encoding, PEM or PKCS#8 DER.
+    #
+    # `certPem`, `keyPem` and `password` hold secret material in ordinary Nim
+    # strings, and a client keeps its copy of them for its whole lifetime because
+    # the SSL_CTXs are built lazily, on the first connect of each ALPN shape. A
+    # long-running process therefore exposes the passphrase and the PEM key to a
+    # heap dump or a core file even after OpenSSL holds the decrypted key. Once a
+    # client has been built, `client.clearTlsSecrets()` builds the remaining
+    # contexts eagerly and then zeroes navi's copy; `cfg.tls.clearTlsSecrets()`
+    # does the same for a `TlsConfig` you still hold yourself (navi cannot reach
+    # it, since the config was copied by value). See `clearTlsSecrets` below.
     pkcs12File*: string    ## a PKCS#12/PFX bundle (cert + key + chain); highest precedence
-    certPem*: string       ## client certificate as an in-memory PEM string (may hold a chain)
-    keyPem*: string        ## private key as an in-memory PEM string ("" reuses `certPem`)
+    certPem*: string       ## client certificate as an in-memory PEM string (may hold a chain).
+                           ## Secret when it also carries the key (`keyPem` = "")
+    keyPem*: string        ## private key as an in-memory PEM string ("" reuses `certPem`).
+                           ## SECRET; see the note above and `clearTlsSecrets`
     certFile*: string      ## client certificate file (PEM or DER) for mTLS
     keyFile*: string       ## private key file for `certFile`; "" reuses certFile
     password*: string      ## passphrase for an encrypted key (PEM or an encrypted
-                           ## PKCS#8 DER key), or the PKCS#12 bundle password
+                           ## PKCS#8 DER key), or the PKCS#12 bundle password.
+                           ## SECRET; see the note above and `clearTlsSecrets`
 
     # --- Session + context reuse (performance) -----------------------------
     resumeSessions*: bool  ## reuse TLS sessions across connections to the same origin
@@ -197,6 +210,66 @@ proc clientKeyFile*(tls: TlsConfig): string =
   ## Path to the client private key: `keyFile` when set, otherwise `certFile`
   ## (a single PEM commonly holds both the certificate and its key).
   if tls.keyFile.len > 0: tls.keyFile else: tls.certFile
+
+proc cleanse*(s: var string) {.raises: [].} =
+  ## Overwrite `s`'s bytes with zeroes and then empty it, so the secret is gone
+  ## from the heap before the payload is freed or reused (issue #438). Use it on
+  ## key material -- a passphrase, a PEM/DER private key, a PKCS#12 bundle -- that
+  ## your own code is finished with.
+  ##
+  ## `setLen 0` alone only moves the length: the bytes stay in the allocator's
+  ## free list until something else happens to overwrite them, which is exactly
+  ## what a heap dump or a core file picks up.
+  ##
+  ## It cannot wipe a string that is backed by a LITERAL, a `const`, or
+  ## `staticRead`: that payload lives in the binary's read-only data and is shared
+  ## by every copy, so under `--mm:arc`/`--mm:orc` the write goes to a private
+  ## copy (`prepareMutation`) and the original stays readable for the life of the
+  ## process, while under `--mm:refc` it would fault. `cleanse` empties the string
+  ## either way and never faults, but the secret is still in the image: read
+  ## secrets at RUN TIME (a file, an environment variable, a secrets API) rather
+  ## than compiling them in. Nothing can undo a compiled-in secret, which is why
+  ## this is a documented limitation and not a check.
+  ##
+  ## On the JavaScript backend it can only empty the string: a JS string is an
+  ## engine-managed value with no buffer navi can reach, and nothing here could
+  ## affect the copies the engine keeps. `navi/js` presents no client certificate,
+  ## so no key material reaches it through navi in the first place.
+  when not defined(js):
+    if s.len > 0:
+      prepareMutation(s)   # a literal-backed string shares an immutable payload
+      # The pointer is `volatile`, which is what makes the stores through it
+      # survive: zeroing a buffer that is about to be freed or shortened is a dead
+      # store, and an optimising build is entitled to drop it (that is exactly what
+      # happened to the earlier version of this loop, whose accumulator the compiler
+      # folded to a constant, leaving nothing behind but a store of 0 to a global).
+      # A volatile pointer must be re-read from memory on every iteration, so the
+      # compiler cannot know which object is being written and cannot prove the
+      # write dead. This is the trick `OPENSSL_cleanse` plays, done in Nim so it
+      # also works in a build without `-d:ssl` (`api` stays OpenSSL-free).
+      var p {.volatile.} = cast[ptr UncheckedArray[byte]](addr s[0])
+      for i in 0 ..< s.len:
+        p[i] = 0
+  s.setLen(0)
+
+proc clearTlsSecrets*(tls: var TlsConfig) {.raises: [].} =
+  ## `cleanse` the in-memory secret material this config carries -- `password`,
+  ## `keyPem` and `certPem` -- leaving every other field untouched. `certPem` goes
+  ## too because a single PEM commonly holds the certificate and its key, and the
+  ## certificate alone is public anyway.
+  ##
+  ## This is the raw wipe, for a `TlsConfig` YOU still hold: `newNavi` copies the
+  ## config by value, so navi can never reach your copy. For navi's own copy call
+  ## `client.clearTlsSecrets()` instead -- it builds the remaining TLS contexts
+  ## first, so the client keeps working afterwards. Calling this on a config a
+  ## client was built from is safe and does not affect that client.
+  ##
+  ## After it, this config can no longer build a TLS context that needs the
+  ## in-memory credential; `certFile`/`keyFile`/`pkcs12File` still work unless the
+  ## key on disk is passphrase-protected.
+  cleanse(tls.password)
+  cleanse(tls.keyPem)
+  cleanse(tls.certPem)
 
 proc defaultTls*(): TlsConfig =
   TlsConfig(resumeSessions: true)  # verification is on by default; add resumption

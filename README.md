@@ -280,10 +280,10 @@ let api = newNavi(config)
 | `tls.ciphers` | `string` | `""` | TLS <=1.2 cipher list (OpenSSL colon format); `""` = library default. |
 | `tls.insecureSkipVerify` | `bool` | `false` | Skip the certificate chain and hostname checks. Off by default, so every config verifies; for tests against self-signed servers only. The legacy `tls.verify` accessor is its inverse. |
 | `tls.keyFile` | `string` | `""` | Private key file for `certFile`; `""` reuses `certFile`. |
-| `tls.keyPem` | `string` | `""` | Private key as an in-memory PEM string; `""` reuses `certPem`. |
+| `tls.keyPem` | `string` | `""` | Private key as an in-memory PEM string; `""` reuses `certPem`. Secret; see [Clearing the key material from memory](#clearing-the-key-material-from-memory). |
 | `tls.maxVersion` | `TlsVersion` | `tlsDefault` | Highest TLS version to negotiate (`tlsDefault` = unset). |
 | `tls.minVersion` | `TlsVersion` | `tlsDefault` | Lowest TLS version to negotiate (`tlsDefault` = unset). |
-| `tls.password` | `string` | `""` | Passphrase for an encrypted key (PEM or PKCS#8 DER), or the PKCS#12 password. |
+| `tls.password` | `string` | `""` | Passphrase for an encrypted key (PEM or PKCS#8 DER), or the PKCS#12 password. Secret; see [Clearing the key material from memory](#clearing-the-key-material-from-memory). |
 | `tls.pinnedKeys` | `seq[string]` | `@[]` | SPKI SHA-256 pins (base64, HPKP form); the peer public key must match one or the connection is rejected. |
 | `tls.pkcs12File` | `string` | `""` | PKCS#12/PFX bundle (cert + key + chain); highest precedence. |
 | `tls.resumeSessions` | `bool` | `true` | Reuse TLS sessions across connections (abbreviated handshake). |
@@ -482,6 +482,50 @@ when a `-----BEGIN` boundary starts one of its lines (explanatory text before it
 allowed, per RFC 7468) and as DER otherwise.
 
 Key algorithms (RSA, ECDSA, Ed25519) work in any of these as long as OpenSSL supports them. In-memory PEM may carry an intermediate chain, and a PKCS#12 bundle's intermediates are installed too, so a client certificate issued by an intermediate CA is presented with the chain a root-only server needs to validate it.
+
+##### Clearing the key material from memory
+
+`certPem`, `keyPem` and `password` are ordinary Nim strings, and a client keeps its copy of them
+for its whole lifetime: the TLS contexts are built lazily, one per ALPN shape on first connect, so
+navi cannot drop the material after the first one. In a long-running process that means a core
+file, a heap dump or a memory-disclosure bug reads the passphrase and the PEM private key in
+cleartext, at more than one address, long after OpenSSL holds the decrypted key.
+
+`clearTlsSecrets` closes that window once the client exists. It builds the remaining contexts
+eagerly and then zeroes navi's copy, so the client (mTLS included) keeps working:
+
+```nim
+let api = newNavi(config)
+api.clearTlsSecrets()      # navi's copy of password/keyPem/certPem is zeroed
+config.tls.clearTlsSecrets()   # and yours: newNavi copied the config by value
+```
+
+Notes:
+
+- It clears navi's copy only. `newNavi` takes the config **by value**, so the `NaviConfig` you
+  built is beyond navi's reach; `cfg.tls.clearTlsSecrets()` is the same wipe for your own copy
+  (and `cleanse(mySecret)` for any other secret string you hold).
+- `navi/js` has the same two calls, so cross-backend code can wipe unconditionally, but there
+  they only drop the strings: `fetch` owns TLS, and a JS string is an engine-managed value with
+  no buffer navi can overwrite.
+- **Read the secret at run time.** A string that came from a literal, a `const` or `staticRead`
+  is backed by the binary's read-only data, and under `--mm:arc`/`--mm:orc` every copy shares
+  that payload: the wipe then lands on a private copy and the original stays readable for the
+  life of the process (and it is in the binary on disk besides). Load the passphrase and the key
+  from a file, an environment variable or a secrets API instead, and nothing compiles them in.
+- Because the contexts are built there, it can raise what the first connect would have raised: a
+  `ValueError` for a malformed or mismatched credential, an `IOError` for an unreadable file. The
+  material is left intact when it does.
+- `extend` copies the merged config into the derived client, which builds its own contexts: clear
+  the derived client too, and derive it *before* clearing the parent, or the derived client has no
+  credential at all.
+- It is refused with a `ValueError` while HTTP/3 is enabled on a `-d:naviHttp3` build, because the
+  h3 driver rebuilds its TLS context from these fields per connection (and keys its context cache
+  on their values), so the wipe would break mTLS over h3 on the next connection rather than at a
+  point you could see. Drop `H3` from `config.http` if you want the wipe.
+- The file-based inputs (`certFile`, `keyFile`, `pkcs12File`) are paths, not secrets, and are left
+  alone -- but the plaintext navi reads out of those files is now zeroed before the buffer is
+  freed, whether the load succeeded or not.
 
 ### Errors
 

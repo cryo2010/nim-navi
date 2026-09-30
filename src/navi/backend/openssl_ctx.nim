@@ -319,7 +319,11 @@ when defined(ssl):
     data.len > 0 and not isPem(data)
 
   proc useCertFile(ctx: SslCtx, path: string) =
-    let data = readFile(path)
+    # Cleansed on the way out even though a certificate is public: a single PEM
+    # commonly holds the certificate AND its key (which is why `clientKeyFile`
+    # falls back to `certFile`), so this buffer can be secret (issue #438).
+    var data = readFile(path)
+    defer: cleanse(data)
     if isDer(data):                           # single DER cert (no chain)
       if SSL_CTX_use_certificate_file(ctx, path.cstring, SSL_FILETYPE_ASN1) != 1:
         fail("could not load the DER certificate: " & path)
@@ -362,7 +366,13 @@ when defined(ssl):
       fail("the DER private key does not match the certificate: " & path)
 
   proc useKeyFile(ctx: SslCtx, path, password: string) =
-    let data = readFile(path)
+    # The key file's plaintext, zeroed before the buffer is freed: OpenSSL holds
+    # the decoded key by now and nothing should be able to read the PEM/DER back
+    # out of the heap (issue #438). The `defer` covers the failure paths too, and
+    # deliberately wraps the whole body rather than each branch, so it keeps
+    # covering a loader that decodes `data` itself instead of re-reading `path`.
+    var data = readFile(path)
+    defer: cleanse(data)
     if isDer(data):
       useKeyDer(ctx, data, password, path)    # DER, possibly encrypted PKCS#8
     else:
@@ -377,11 +387,20 @@ when defined(ssl):
     ## detected from the content. Raises `ValueError` if the material is missing,
     ## malformed, or mismatched.
     if tls.pkcs12File.len > 0:
-      usePkcs12(ctx, readFile(tls.pkcs12File), tls.password)
+      # Named so it can be cleansed: a PKCS#12 bundle is the encrypted key, and
+      # `readFile(...)` inline leaves that plaintext in a temporary navi never
+      # gets to zero (issue #438).
+      var p12 = readFile(tls.pkcs12File)
+      defer: cleanse(p12)
+      usePkcs12(ctx, p12, tls.password)
     elif tls.certPem.len > 0:
       useCertChainPem(ctx, tls.certPem)
-      useKeyPem(ctx, (if tls.keyPem.len > 0: tls.keyPem else: tls.certPem),
-                tls.password)
+      # Two calls rather than `useKeyPem(ctx, (if ...: tls.keyPem else: ...))`:
+      # the `if` expression materialises a COPY of the key in a temporary, and a
+      # temporary is precisely what cannot be cleansed. Passing the field itself
+      # hands OpenSSL the one buffer the config already holds.
+      if tls.keyPem.len > 0: useKeyPem(ctx, tls.keyPem, tls.password)
+      else: useKeyPem(ctx, tls.certPem, tls.password)
     else:
       useCertFile(ctx, tls.certFile)
       useKeyFile(ctx, clientKeyFile(tls), tls.password)
@@ -573,12 +592,24 @@ when defined(ssl):
       certFile = if custom: "" else: cfg.certFile,
       keyFile = if custom: "" else: cfg.clientKeyFile,
       caFile = cfg.caFile)
+    # Every step below can raise: a malformed or mismatched credential, a CA
+    # bundle that will not parse, a version bound or a cipher name the loaded
+    # library refuses. The caller is then handed an exception instead of a
+    # context, so nothing else can ever free the SSL_CTX `newContext` just built
+    # -- and that is not a small object: it carries the whole trust store the
+    # verify locations loaded (measured at ~700 KB with the system roots). A
+    # caller that retries after fixing its config, or one that probes a
+    # credential per tenant, leaked one per attempt.
+    var ok = false
+    defer:
+      if not ok: destroyContext(result)
     if custom: loadClientCert(result.context, cfg)
     if cfg.caBundle.len > 0: addCaBundle(result.context, cfg.caBundle)
     setAlpn(result.context, alpn)
     setVersionBounds(result.context, cfg)
     setCiphers(result.context, cfg)
     addCtxOptions(result.context, SSL_OP_NO_RENEGOTIATION)
+    ok = true
 
   # --- TLS session resumption --------------------------------------------
   #
@@ -853,6 +884,12 @@ when defined(ssl):
   proc newTlsContextStore*(): TlsContextStore =
     TlsContextStore(contexts: initTable[string, SslContext]())
 
+  proc contextCount*(store: TlsContextStore): int =
+    ## Shared contexts built so far, i.e. how many ALPN shapes this client has
+    ## dialled. For tests and introspection, in the spirit of `sessionCount` and
+    ## `h3CtxCacheStats`; `prebuildContexts` brings it to `naviAlpnShapes.len`.
+    if store.isNil: 0 else: store.contexts.len
+
   proc close*(store: TlsContextStore) =
     ## Free every shared context. Call when the client is closed, after its pooled
     ## connections have been closed (so no live SSL still references a context).
@@ -882,6 +919,27 @@ when defined(ssl):
       ctx = buildContext(cfg, alpn)
       s.contexts[key] = ctx
     (ctx, false)
+
+  const naviAlpnShapes*: array[2, seq[string]] = [@[], @["h2", "http/1.1"]]
+    ## Every ALPN shape navi's engines offer, and the complete key set of a
+    ## `TlsContextStore`: `@["h2", "http/1.1"]` for an https target when h2 is
+    ## enabled, and none at all otherwise (plain http, h2 disabled, or a WebSocket
+    ## over an h1 Upgrade). Every `connect` call in navi passes one of these two.
+
+  proc prebuildContexts*(store: RootRef, cfg: TlsConfig) =
+    ## Build and cache the shared context for BOTH `naviAlpnShapes`, so no later
+    ## connect has to build one. That is what lets the credential be wiped out of
+    ## a live client (`clearTlsSecrets`, issue #438): contexts are normally built
+    ## lazily, on the first connect of each shape, and a context built after the
+    ## wipe would have no key material to install.
+    ##
+    ## A no-op without a store: a bare `TlsConfig` builds a context the caller
+    ## owns per connect, so there is nothing to build ahead of time. Raises
+    ## whatever the credential loader raises (`ValueError`, or an `IOError` for an
+    ## unreadable file), here rather than at the first connect.
+    if store.isNil: return
+    for alpn in naviAlpnShapes:
+      discard obtainContext(store, cfg, alpn)
 
   # --- per-connection handshake ------------------------------------------
 

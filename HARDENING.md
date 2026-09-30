@@ -211,6 +211,46 @@ Off by default. Precedence is `pkcs12File`, then in-memory (`certPem`/`keyPem`),
 then the `certFile`/`keyFile` pair. Supported on the native OpenSSL backends
 (sync, asyncdispatch, chronos); js does not present client certificates.
 
+### Key material in memory (`clearTlsSecrets`)
+
+```nim
+let api = newNavi(config)
+api.clearTlsSecrets()          # zero navi's copy of password/keyPem/certPem
+config.tls.clearTlsSecrets()   # and your own: newNavi copied the config by value
+```
+
+`certPem`, `keyPem` and `password` are plain Nim strings, and a client holds its
+copy for its whole lifetime because the TLS contexts are built lazily, one per
+ALPN shape on first connect. Left alone, a core file, a heap dump or a
+memory-disclosure bug in a long-running process yields the passphrase and the PEM
+private key in cleartext at several addresses, long after OpenSSL has the
+decrypted key and navi has no further use for them.
+
+`clearTlsSecrets` builds the remaining contexts eagerly and then zeroes navi's
+copy, so the client keeps working, mTLS included. Worth calling in a service that
+presents a client certificate and expects to run for days; pointless for a
+short-lived process, and a no-op for a client with no in-memory credential.
+
+What it does not do: it cannot reach the config *you* built (`newNavi` takes it by
+value), so wipe that yourself; the same `cleanse` is exported for any other secret
+string you hold. And it is refused with a `ValueError` while HTTP/3 is enabled on
+a `-d:naviHttp3` build, because the h3 driver rebuilds its TLS context from these
+fields per connection: drop `H3` from `config.http` if you want the wipe, or keep
+the material in memory. Whichever you choose, the plaintext navi reads out of
+`certFile`/`keyFile`/`pkcs12File` is now zeroed before its buffer is freed.
+
+One thing no wipe can do is reach a secret that was compiled in. A string built
+from a literal, a `const` or `staticRead` is backed by the binary's read-only
+data, and under `--mm:arc`/`--mm:orc` every copy shares that payload, so
+`cleanse` writes over a private copy while the original stays readable for the
+life of the process (and sits in the binary on disk regardless). Read the
+passphrase and the key at run time, from a file, an environment variable or a
+secrets API.
+
+This is a defence in depth against a *process*-level disclosure, not against an
+attacker who can already run code in the process: OpenSSL still holds the
+decrypted key, and nothing here protects it.
+
 ### Session resumption
 
 ```nim

@@ -31,7 +31,7 @@ checkmate --nimflags:"--mm:orc -d:useMalloc --passC:-fsanitize=address --passC:-
 
 # Interop (each stands up a real server and exits non-zero on failure):
 nimble interop            # HTTP/2 vs nghttpd (needs nghttpd + openssl)
-nimble mtls               # mutual-TLS client cert (needs openssl)
+nimble mtls               # mutual-TLS client cert + clearTlsSecrets (needs openssl)
 nimble tlsFallback        # handshake-aware address fallback (needs openssl + python3)
 nimble tlsVersion         # TLS min/max version pinning (needs openssl w/ TLS 1.3)
 nimble happyEyeballs      # RFC 8305 address racing (needs openssl)
@@ -179,6 +179,11 @@ end-to-end suites drive).
 | `test_cookies.nim` | Cookie jar expiry (Max-Age and Expires) and domain/path matching (RFC 6265) |
 | `test_digest.nim` | Digest auth: the pure computation (RFC 2617 vector) and the 401-challenge/retry flow end to end |
 | `test_stream_decompress.nim` | Streaming-response decompression: the incremental decoder fed across chunk boundaries, the `stream()` path decoding a body, and stacked `Content-Encoding` |
+| `test_tls_session.nim` | TLS session cache: which `CRYPTO_EX_INDEX` class the `ex_data` slot is allocated from across OpenSSL/LibreSSL versions (#439), and the insert policy driven with real `SSL_SESSION` objects -- a closed cache declining a late ticket and never reopening (#441), and a peer rejected after the handshake having its session evicted and later ones refused (#440) |
+| `test_tls_exdata.nim` | Allocating the session cache's `ex_data` index (#439) against the library the suite links: the index is valid, two allocations differ, and where `SSL_get_ex_new_index` is a real export (LibreSSL, OpenSSL 1.0.x) navi's index comes from the same SSL-class counter as a direct call's |
+| `test_tls_options.nim` | Which libraries may be handed an `SSL_OP_*` bit (#444): the `SSL_OP_NO_RENEGOTIATION` number is OpenSSL 1.1.0's, and OpenSSL 1.0.x and LibreSSL spend that bit on unrelated options, so the version gate must exclude them (LibreSSL's pinned 0x20000000 included) |
+| `test_tls_identity.nim` | The "verify on, no host" refusal happens before an SSL exists (#435): both client-SSL constructors raise it ahead of `SSL_new`, rather than from `bindExpectedIdentity` afterwards, which abandoned the SSL and its memory BIOs; plus the `insecureSkipVerify` and named-host paths that must still build one |
+| `test_tls_secrets.nim` | In-memory TLS key material (#438): `cleanse` overwriting the bytes rather than only shortening the string (with `setLen` alone as the counter-example), and `clearTlsSecrets` clearing exactly `password`/`keyPem`/`certPem` on a config and on a live client -- after building every ALPN shape's context, leaving the caller's own copy alone, and keeping the material when the build fails; also the documented limit that a literal/`const`-backed secret cannot be wiped under arc/orc |
 
 ### WebSocket client adapters
 
@@ -219,7 +224,7 @@ own **`streaming`** matrix job (four separate checks) — see the row below and 
 | Suite (script → driver) | CI | Verifies |
 |------|----|----------|
 | `run.sh` → `nghttpd_{sync,async}.nim` | **yes** (`interop`) | HTTP/2 against nghttpd (nghttp2 reference): navi's HPACK **encoder**, ALPN, real h2 wire framing, multiplexing, receive-side flow control, PADDED-flag handling (a second nghttpd runs with `-b` padding), and a streamed body upload (`body = producer`) over h2 (sync and the async mux) |
-| `mtls.sh` → `mtls.nim` | **yes** (`interop`) | Mutual TLS: an `openssl s_server -Verify 1` rejects clients without a CA-signed cert, exercising `TlsConfig.certFile`/`keyFile` in every accepted encoding (PEM, encrypted PEM, PKCS#12, DER, encrypted PKCS#8 DER, in-memory PEM) |
+| `mtls.sh` → `mtls.nim`, `tls_clear_secrets.nim` | **yes** (`interop`) | Mutual TLS: an `openssl s_server -Verify 1` rejects clients without a CA-signed cert, exercising `TlsConfig.certFile`/`keyFile` in every accepted encoding (PEM, encrypted PEM, PKCS#12, DER, encrypted PKCS#8 DER, in-memory PEM). The same server then drives `clearTlsSecrets` (#438) on all three native backends: the in-memory credential (plain and encrypted, plus a file-based one with a passphrase) is wiped out of a LIVE client and every request is made afterwards, so a server that mandates a client certificate proves the eagerly built contexts are what keeps mTLS working -- covering both ALPN shapes, the no-op with no credential (which must still be refused by the server), and a malformed credential raising while leaving the material intact |
 | `tls_fallback.sh` → `tls_fallback.nim` | **yes** (`interop`) | Handshake-aware address fallback (sync): a dead endpoint (accepts TCP then drops the handshake) plus a good TLS server on the same port; navi falls through to the good address |
 | `tls_version.sh` → `tls_version.nim` | **yes** (`interop`) | TLS version pinning: TLS-1.2-only and TLS-1.3-only servers; a `minVersion`/`maxVersion` pin excluding the server's version fails the handshake |
 | `happy_eyeballs.sh` → `happy_eyeballs.nim` | **yes** (`interop`) | Happy Eyeballs (RFC 8305): a blackholed first address (192.0.2.1, SYN dropped) plus a good server; navi races the addresses and reaches the good one in ~the attempt delay instead of stalling |

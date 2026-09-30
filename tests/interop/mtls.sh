@@ -137,6 +137,21 @@ else
   echo "note: chronos not installed; skipping the chronos mTLS leg"
 fi
 
+# clearTlsSecrets: the credential is wiped out of a LIVE client and every request
+# is made afterwards, so a server that mandates a client certificate proves the
+# eagerly built contexts are what keeps mTLS working (#438). Same three backends.
+echo "== clearTlsSecrets keeps mTLS working after the wipe =="
+nim c -r --hints:off -d:ssl -o:"$work/clearsec_sync" \
+  "$root/tests/interop/tls_clear_secrets.nim"
+nim c -r --hints:off -d:ssl -d:useAsync -o:"$work/clearsec_async" \
+  "$root/tests/interop/tls_clear_secrets.nim"
+if nimble path chronos >/dev/null 2>&1; then
+  nim c -r --hints:off -d:ssl -d:useChronos -o:"$work/clearsec_chronos" \
+    "$root/tests/interop/tls_clear_secrets.nim"
+else
+  echo "note: chronos not installed; skipping the chronos clearTlsSecrets leg"
+fi
+
 # An encrypted key with no configured passphrase must fail fast. OpenSSL's default
 # PEM callback prompts on /dev/tty and falls back to stdin, so re-run the sync
 # binary with stdin held open by a pipe nobody ever writes to: a prompt would block

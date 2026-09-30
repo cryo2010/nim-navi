@@ -167,11 +167,17 @@ suite "closed session cache (#441)":
 
 import navi/backend/api
 
+var sharedCtx: SslContext
+  ## One SSL_CTX for every `memSsl` below. A fresh context per call leaked one per
+  ## test: `SSL_free` releases the SSL, not the context behind it, and a context
+  ## with the system trust store loaded is a few hundred KB (#438).
+
 proc memSsl(slot: SessionSlot): SslPtr =
   ## An unhandshaken client SSL on memory BIOs, with `slot` linked into its
-  ## ex_data by `applySession` exactly as a real connect does.
-  let ctx = newTlsContext(defaultTls())
-  newClientSslMem(ctx, "example.com", verify = true, slot = slot).ssl
+  ## ex_data by `applySession` exactly as a real connect does. The caller frees
+  ## the SSL (which frees its two BIOs); the context is shared and outlives it.
+  if sharedCtx.isNil: sharedCtx = newTlsContext(defaultTls())
+  newClientSslMem(sharedCtx, "example.com", verify = true, slot = slot).ssl
 
 suite "post-handshake rejection drops the session (#440)":
   test "rejectSession should evict the origin's entry and mark the slot":

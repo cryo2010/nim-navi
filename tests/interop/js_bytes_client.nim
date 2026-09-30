@@ -147,6 +147,26 @@ proc uploadNoImplicitContentType(): Future[void] {.async.} =
   doAssert ct == "", "raw body sent an implicit Content-Type: " & ct
   echo "OK: raw string body sends no implicit Content-Type"
 
+proc clearTlsSecretsOverload(): Future[void] {.async.} =
+  ## The js `clearTlsSecrets(client)` overload (#438) exists so cross-backend code
+  ## can call it unconditionally. It can only drop the strings here (fetch owns TLS
+  ## and a JS string has no buffer to overwrite), and the client must keep working.
+  var cfg = initNaviConfig()
+  cfg.tls.password = "s3cret"
+  cfg.tls.keyPem = "-----BEGIN PRIVATE KEY-----\nnope\n-----END PRIVATE KEY-----\n"
+  cfg.tls.certPem = "-----BEGIN CERTIFICATE-----\nnope\n-----END CERTIFICATE-----\n"
+  let api = newNavi(cfg)
+  api.clearTlsSecrets()
+  doAssert api.config.tls.password.len == 0, "password survived the wipe"
+  doAssert api.config.tls.keyPem.len == 0, "keyPem survived the wipe"
+  doAssert api.config.tls.certPem.len == 0, "certPem survived the wipe"
+  doAssert cfg.tls.keyPem.len > 0, "the caller's own config must be untouched"
+  cfg.tls.clearTlsSecrets()                 # the config-level wipe is js-safe too
+  doAssert cfg.tls.keyPem.len == 0, "the config-level wipe did nothing"
+  let res = await api.get(base & "/echo")
+  doAssert res.status == 200, "status " & $res.status
+  echo "OK: clearTlsSecrets on a js client empties the TLS fields"
+
 proc main() {.async.} =
   bufferedFallbackConversion()
   await sinkRoundTrip()
@@ -156,6 +176,7 @@ proc main() {.async.} =
   await uploadGzipBody()
   await uploadUtf8Body()
   await uploadNoImplicitContentType()
+  await clearTlsSecretsOverload()
   echo "ALL OK: navi/js binary body round trip"
 
 discard main()
