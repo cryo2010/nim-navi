@@ -52,6 +52,18 @@ echo ">>> building and running the h3 SPKI pin test (chronos client)"
 nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/pin_chronos_test "$DIR/pin_chronos_test.nim"
 /tmp/pin_chronos_test
 
+echo ">>> building and running the h3 IP-literal origin test (sync client)"
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/iphost_test "$DIR/iphost_test.nim"
+/tmp/iphost_test
+
+echo ">>> building and running the h3 IP-literal origin test (asyncdispatch client)"
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/iphost_async_test "$DIR/iphost_async_test.nim"
+/tmp/iphost_async_test
+
+echo ">>> building and running the h3 IP-literal origin test (chronos client)"
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/iphost_chronos_test "$DIR/iphost_chronos_test.nim"
+/tmp/iphost_chronos_test
+
 echo ">>> building and running the transparent h3 dispatch test (sync client)"
 nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/dispatch_test "$DIR/dispatch_test.nim"
 /tmp/dispatch_test

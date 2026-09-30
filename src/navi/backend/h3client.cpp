@@ -29,6 +29,7 @@
 
 #include "h3client.h"   // NaviH3Tls: navi's TlsConfig across the FFI (#419)
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
@@ -1094,6 +1095,30 @@ SSL_CTX *obtain_ssl_ctx(const NaviH3Tls *t) {
   return ctx;
 }
 
+// An origin written as an IP literal is not a DNS name: RFC 6066 3 forbids sending
+// it as SNI, and it must be matched against the certificate's iPAddress SAN rather
+// than its dNSName SANs. SSL_set1_host gets the second half right only by accident
+// (it tries X509_VERIFY_PARAM_set1_ip_asc and falls back to the DNS-name matcher),
+// and that fallback misses a bracketed literal -- [::1], the form a URL authority
+// uses for IPv6 -- which is then matched as a DNS name no certificate answers
+// (#451). Recognise IPv4 and IPv6 literals here, bracketed or not, and hand back
+// the bare address so the caller can bind it explicitly. The h3 twin of the
+// isIpAddress split openssl_ctx.nim makes on the TCP backends.
+bool ip_literal(const char *s, std::string &out) {
+  if (!is_set(s)) return false;
+  std::string_view v(s);
+  if (v.size() >= 2 && v.front() == '[' && v.back() == ']')
+    v = v.substr(1, v.size() - 2);
+  if (v.empty()) return false;
+  std::string bare(v);
+  unsigned char addr[16];
+  if (inet_pton(AF_INET, bare.c_str(), addr) != 1 &&
+      inet_pton(AF_INET6, bare.c_str(), addr) != 1)
+    return false;
+  out = std::move(bare);
+  return true;
+}
+
 nghttp3_nv method_nv(const char *method) {  // :method value is a C string param
   return nghttp3_nv{reinterpret_cast<std::uint8_t *>(const_cast<char *>(":method")),
                     reinterpret_cast<std::uint8_t *>(const_cast<char *>(method)), 7,
@@ -1354,11 +1379,24 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
       std::fprintf(stderr, "SSL_new failed\n");
       return nullptr;
     }
+    // Bind the identity the peer must prove before the handshake, the way the TCP
+    // backends' bindExpectedIdentity does: an IP-literal origin against the
+    // certificate's iPAddress SAN, every other host against its dNSName SANs (#451).
+    std::string ip_host;
+    const bool sni_is_ip = ip_literal(sni, ip_host);
     if (verify) {
-      SSL_set_hostflags(c->ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-      if (SSL_set1_host(c->ssl, sni) != 1) {
-        std::fprintf(stderr, "SSL_set1_host failed\n");
-        return nullptr;
+      if (sni_is_ip) {
+        if (X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(c->ssl),
+                                          ip_host.c_str()) != 1) {
+          std::fprintf(stderr, "X509_VERIFY_PARAM_set1_ip_asc failed\n");
+          return nullptr;
+        }
+      } else {
+        SSL_set_hostflags(c->ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+        if (SSL_set1_host(c->ssl, sni) != 1) {
+          std::fprintf(stderr, "SSL_set1_host failed\n");
+          return nullptr;
+        }
       }
     }
     if (ngtcp2_crypto_ossl_ctx_new(&c->ossl, c->ssl) != 0) {
@@ -1374,7 +1412,9 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
       return nullptr;
     }
     SSL_set_alpn_protos(c->ssl, reinterpret_cast<const unsigned char *>("\x02h3"), 3);
-    SSL_set_tlsext_host_name(c->ssl, sni);
+    // RFC 6066 3: an IP literal must not be sent as a server_name, so only a real
+    // DNS host gets SNI -- same rule as openssl_ctx.newClientSsl (#451).
+    if (!sni_is_ip) SSL_set_tlsext_host_name(c->ssl, sni);
 
     ngtcp2_callbacks cb{};
     cb.client_initial = ngtcp2_crypto_client_initial_cb;

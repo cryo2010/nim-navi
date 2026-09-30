@@ -251,6 +251,24 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **An IP-literal origin over HTTP/3 is matched against the certificate's
+  `iPAddress` SAN and is no longer offered as SNI (#451).** `navi_h3_new` handed
+  every origin -- DNS name or numeric address alike -- to `SSL_set1_host`, the
+  DNS-name entry point, and then sent it verbatim as `server_name`. Sending an IP
+  literal as SNI is what RFC 6066 3 forbids, and origins that select a certificate
+  or a virtual host from SNI answer such a handshake with the wrong certificate or
+  reject it outright. The identity binding was equally accidental: `SSL_set1_host`
+  matches an address only through an internal `X509_VERIFY_PARAM_set1_ip_asc`
+  fallback that a bracketed literal (`[::1]`, the form a URL authority uses for
+  IPv6) slips past, leaving the address to be matched as a DNS name, which no
+  certificate answers. The QUIC leg now makes the same split the TCP backends make
+  in `openssl_ctx.bindExpectedIdentity`: an origin that parses as an IPv4 or IPv6
+  literal -- brackets stripped -- is bound with `X509_VERIFY_PARAM_set1_ip_asc` and
+  carries no `server_name`, while every other host keeps `SSL_set_hostflags` +
+  `SSL_set1_host` and its SNI. A mismatched address is still rejected before any h3
+  stream is opened. Covered by a new `tests/interop/http3` probe on all three
+  openers (sync, asyncdispatch, chronos) against a Caddy origin whose certificate
+  carries `IP:127.0.0.1` and which echoes back the `server_name` it received.
 - **The sync backend's proxy handshakes are bounded by the connect budget again
   (#452).** `timeouts.connect` is a wall-clock bound on establishment, and the
   asyncdispatch and chronos backends enforce it that way: one `withTimeout` around
