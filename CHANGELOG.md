@@ -84,6 +84,19 @@ onward (pre-1.0, minor versions may include breaking changes).
   `BodySink`), since the `Future` type differs per backend (#367).
 
 ### Changed
+- **The docs now state that `tls.caFile` replaces the system trust store rather than
+  adding to it (#437).** Setting `caFile` has curl's `--cacert` semantics on every
+  backend, HTTP/3 included: std/net's `newContext` scans the system store only when
+  `caFile` is empty (`if caDir != "" or caFile != ""` ... `else` scan, Nim 2.2.10
+  net.nim:713-730), and the QUIC leg calls either
+  `SSL_CTX_load_verify_locations(caFile)` or `SSL_CTX_set_default_verify_paths()`,
+  never both. The README said only that `""` uses the system store while describing
+  `caBundle` as added "alongside the system roots (and any `caFile`)", which read as
+  all three coexisting, so a corporate root in `caFile` silently broke every public
+  https request. The `TlsConfig` table, the TLS section, the in-memory-CA section,
+  api.nim's field comments and HARDENING.md's trust-anchor section now name `caFile`
+  as the replacing option and `caBundle` as the additive one, with the mechanism
+  quoted at the call site in `newTlsContext`. Behaviour is unchanged (#437).
 - **The HTTP/3 leg builds its OpenSSL context once per TLS policy instead of once
   per connection (#454).** `navi_h3_new` used to create an `SSL_CTX` and re-load the
   trust store, re-parse `caBundle`, re-decode the PKCS#12 or PEM client credential

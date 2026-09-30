@@ -54,8 +54,10 @@ config.tls.keyFile  = "/etc/navi/client.key"          # "" reuses certFile if it
 let api = newNavi(config)
 ```
 
-Why: `caFile` replaces the system trust store, so navi accepts only certificates
-that chain to your private root; verification stays on. The client certificate
+Why: `caFile` replaces the system trust store (it does not add to it), so navi
+accepts only certificates that chain to your private root; verification stays on.
+Public https endpoints stop verifying under that config, which is the point here
+and a surprise anywhere else -- see "Custom trust anchor" below. The client certificate
 lets the server authenticate navi in return. A PKCS#12 bundle
 (`config.tls.pkcs12File = "client.p12"; config.tls.password = "..."`) is an
 alternative to the cert/key pair, and the intermediates inside it are presented
@@ -105,7 +107,8 @@ partial wildcards such as `fo*.example.com` are rejected, and a certificate that
 carries dNSName SANs is judged on those alone -- its subject CN counts only when it
 has no SAN at all. `insecureSkipVerify = true` disables both and is intended only for tests
 against self-signed servers. If you need to trust a non-public CA, do **not** disable
-verification; set `caFile` instead.
+verification; set `caFile` instead (or `caBundle`, if the system roots must keep
+working alongside it).
 
 ### Custom trust anchor (`caFile`)
 
@@ -113,10 +116,19 @@ verification; set `caFile` instead.
 config.tls.caFile = "/etc/navi/internal-ca.pem"
 ```
 
-Default `""` uses the system trust store. Setting `caFile` restricts trust to the
-given CA bundle, which both enables a private CA and narrows the accepted chain
-for a public one. Verification stays on. `tls.caBundle` does the same from an
-in-memory PEM string (added alongside the system roots / `caFile`).
+Default `""` uses the system trust store. Setting `caFile` **replaces** those
+system roots with the given CA bundle -- curl's `--cacert` semantics -- on every
+backend, HTTP/3 included: std/net's `newContext` scans the system store only when
+`caFile` is empty, and the QUIC leg calls either
+`SSL_CTX_load_verify_locations(caFile)` or `SSL_CTX_set_default_verify_paths()`,
+never both. That both enables a private CA and narrows the accepted chain for a
+public one, and it means any public endpoint the process also talks to fails
+verification until its root is in the file. Verification itself stays on.
+
+`tls.caBundle` is the **additive** option: an in-memory PEM string whose
+certificates are added to whatever the store already holds (the system roots when
+`caFile` is empty, the `caFile` anchors when it is not). Use it to trust a private
+CA while public roots keep working; use `caFile` to trust nothing else.
 
 ### Public-key pinning (`pinnedKeys`)
 

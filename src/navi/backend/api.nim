@@ -58,10 +58,17 @@ type
                            ## Off by default (the zero value verifies), and meant
                            ## only for tests against a self-signed server. The
                            ## legacy `verify` accessor below is its inverse.
-    caFile*: string        ## custom CA bundle path; "" uses the system trust store
+    caFile*: string        ## custom CA bundle path. "" uses the system trust store;
+                           ## set, it REPLACES the system roots rather than adding to
+                           ## them (curl's `--cacert` semantics), on every backend
+                           ## including h3, so only chains anchored in this file
+                           ## verify and public sites stop verifying. Use `caBundle`
+                           ## to trust an extra CA *and* keep the system roots.
     caBundle*: string      ## additional trusted CA certificates as an in-memory PEM
                            ## string; added to the trust store alongside `caFile` /
-                           ## the system roots (supplements, does not replace)
+                           ## the system roots (supplements, does not replace). This
+                           ## is the additive option: with `caFile` empty, a
+                           ## `caBundle` extends the system roots.
     pinnedKeys*: seq[string] ## SPKI SHA-256 pins (base64, HPKP form). When non-empty,
                            ## the peer's public key must match one pin or the
                            ## connection is rejected -- checked after chain + hostname

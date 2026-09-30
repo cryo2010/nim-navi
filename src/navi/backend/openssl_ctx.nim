@@ -391,7 +391,9 @@ when defined(ssl):
   proc addCaBundle(ctx: SslCtx, pem: string) =
     ## Add every certificate in the in-memory PEM `pem` to the context's trust
     ## store, so a chain anchored at one of them verifies. Supplements the system
-    ## roots / `caFile` rather than replacing them.
+    ## roots / `caFile` rather than replacing them -- unlike `caFile`, which
+    ## replaces the system roots (see `newTlsContext`), this is the additive way to
+    ## trust an extra CA while public roots keep working.
     let store = SSL_CTX_get_cert_store(ctx)
     if store.isNil: fail("could not access the TLS trust store")
     let bio = memBio(pem)
@@ -471,6 +473,13 @@ when defined(ssl):
     if not custom and (cfg.keyFile.len > 0 or cfg.keyPem.len > 0):
       fail("TlsConfig has a client key but no certificate " &
            "(set certFile, certPem or pkcs12File)")
+    # A non-empty caFile REPLACES the system roots: std/net's newContext calls
+    # SSL_CTX_load_verify_locations(caFile) and takes the `else` branch that scans
+    # the system store (`scanSSLCertificates`) only when caFile and caDir are both
+    # empty. h3client.cpp mirrors that in `build_ssl_ctx`, whose ca_file branch
+    # calls load_verify_locations and whose else branch calls
+    # set_default_verify_paths, so the semantics are curl's --cacert on every
+    # backend. caBundle is the additive option; see addCaBundle.
     result = newContext(
       verifyMode = if cfg.wantsVerify: CVerifyPeer else: CVerifyNone,
       certFile = if custom: "" else: cfg.certFile,

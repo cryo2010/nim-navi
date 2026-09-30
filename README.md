@@ -272,8 +272,8 @@ let api = newNavi(config)
 | `timeouts.read` | `int` | `0` | Per-read idle deadline (ms); `0` disables. |
 | `timeouts.total` | `int` | `0` | Whole-request deadline including retries/redirects (ms); `0` disables. |
 | `timeouts.attempt` | `int` | `0` | Per-attempt deadline, `min(attempt, remaining total)` (ms); retryable on expiry. `0` disables. |
-| `tls.caBundle` | `string` | `""` | Extra trusted CA certificates as an in-memory PEM string (added alongside `caFile` / the system roots). |
-| `tls.caFile` | `string` | `""` | Custom CA bundle path; `""` uses the system trust store. |
+| `tls.caBundle` | `string` | `""` | Extra trusted CA certificates as an in-memory PEM string, **added** to the trust store (alongside `caFile` / the system roots). The additive option. |
+| `tls.caFile` | `string` | `""` | Custom CA bundle path; `""` uses the system trust store. When set it **replaces** the system roots (curl `--cacert` semantics), on every backend including h3. |
 | `tls.certFile` | `string` | `""` | Client certificate file (PEM or DER) for mTLS. |
 | `tls.certPem` | `string` | `""` | Client certificate as an in-memory PEM string. |
 | `tls.cipherSuites` | `string` | `""` | TLS 1.3 ciphersuites (colon-separated); `""` = library default. |
@@ -353,13 +353,17 @@ let api = newNavi(config)
 
 Verification is on for every `TlsConfig`, including a bare one: the opt-out is `tls.insecureSkipVerify = true`. `caFile` is honored by all three native clients, each through OpenSSL (chronos included; without a `caFile` they verify against the system trust store). All three negotiate modern TLS (up to the library's maximum, typically TLS 1.3) and support client certificates (mTLS).
 
-The whole `TlsConfig` applies to the HTTP/3 leg too (`-d:naviHttp3`): trust store, `caBundle`, client credential, pins, verify callback and cipher selection all reach the QUIC handshake. The one bound QUIC cannot honor is a `maxVersion` below TLS 1.3, since QUIC always uses TLS 1.3 (RFC 9001); with such a bound set navi simply skips the advertised h3 endpoint and stays on h2/h1.
+**`caFile` replaces the system trust store, it does not add to it** -- the same semantics as curl's `--cacert`. With a `caFile` set, only certificates that chain to an anchor in that file verify, on every backend including HTTP/3, so public https endpoints stop verifying until their roots are in the file too. That is usually what you want when navi only talks to an internal service; when you need a private CA *and* the public roots, put the private CA in `tls.caBundle` instead and leave `caFile` empty (`caBundle` is additive, see below). This is not a navi policy: std/net's `newContext` scans the system store only when `caFile` is empty, and the QUIC leg likewise calls `SSL_CTX_load_verify_locations(caFile)` or `SSL_CTX_set_default_verify_paths()`, never both.
+
+The whole `TlsConfig` applies to the HTTP/3 leg too (`-d:naviHttp3`): trust store (with the same replace-vs-add split between `caFile` and `caBundle`), client credential, pins, verify callback and cipher selection all reach the QUIC handshake. The one bound QUIC cannot honor is a `maxVersion` below TLS 1.3, since QUIC always uses TLS 1.3 (RFC 9001); with such a bound set navi simply skips the advertised h3 endpoint and stays on h2/h1.
 
 #### Trusting a CA in memory
 
-`caBundle` adds trusted CA certificates from an in-memory PEM string, alongside
-the system roots (and any `caFile`). Handy when the CA is embedded in the binary
-or fetched at runtime rather than on disk:
+`caBundle` adds trusted CA certificates from an in-memory PEM string. It is
+purely additive: the certificates join whatever the trust store already holds --
+the system roots when `caFile` is empty, the `caFile` anchors when it is not --
+so it is the way to trust a private CA while public roots keep verifying. Handy
+when the CA is embedded in the binary or fetched at runtime rather than on disk:
 
 ```nim
 config.tls.caBundle = readFile("corp-root.pem")   # or an embedded const
