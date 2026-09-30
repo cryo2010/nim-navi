@@ -175,3 +175,53 @@ suite "alt-svc broken-endpoint backoff":
     # 60 << 4 == 960, so the ceiling is reached at the fifth failure and holds.
     check min(brokenBackoffSecs shl 4, brokenBackoffMaxSecs) == brokenBackoffMaxSecs
     check min(brokenBackoffSecs shl 5, brokenBackoffMaxSecs) == brokenBackoffMaxSecs
+
+suite "openH3Tracked":
+  # The template binds `QuicError` at the expansion site on purpose (naming it in
+  # altsvc.nim would be an import cycle: navi/backend/quic imports altsvc), so the
+  # test declares its own stand-in and a fake open expression. That is exactly the
+  # contract the three real h3 openers rely on.
+  type QuicError = object of CatchableError
+
+  proc openOk(): string = "conn"
+  proc openFails(): string = raise newException(QuicError, "no route to UDP")
+
+  test "openH3Tracked should return the connection and clear the backoff":
+    let c = newAltSvcCache()
+    c.record("https", "example.com", 443, "h3=\":443\"; ma=3600")
+    c.markBroken("https", "example.com", 443)
+    check c.h3Endpoint("https", "example.com", 443).isNone
+    let conn = c.openH3Tracked("example.com", 443, openOk())
+    check conn == "conn"
+    check c.h3Endpoint("https", "example.com", 443).isSome
+
+  test "openH3Tracked should mark broken and re-raise on a QuicError":
+    let c = newAltSvcCache()
+    c.record("https", "example.com", 443, "h3=\":443\"; ma=3600")
+    check c.h3Endpoint("https", "example.com", 443).isSome
+    var raised = false
+    try:
+      discard c.openH3Tracked("example.com", 443, openFails())
+    except QuicError:
+      raised = true
+    check raised                         # the original error reaches the caller
+    check c.h3Endpoint("https", "example.com", 443).isNone
+
+  test "openH3Tracked should leave other errors alone":
+    # Only QuicError is a connect failure; anything else is not an Alt-Svc signal,
+    # so it propagates without touching the backoff (and without marking working).
+    let c = newAltSvcCache()
+    c.record("https", "example.com", 443, "h3=\":443\"; ma=3600")
+    c.markBroken("https", "example.com", 443)
+    var raised = false
+    try:
+      discard c.openH3Tracked("example.com", 443,
+                              (proc(): string = raise newException(ValueError, "x"))())
+    except ValueError:
+      raised = true
+    check raised
+    check c.h3Endpoint("https", "example.com", 443).isNone   # backoff untouched
+
+  test "openH3Tracked on a nil cache should still yield the connection":
+    var c: AltSvcCache = nil
+    check c.openH3Tracked("example.com", 443, openOk()) == "conn"

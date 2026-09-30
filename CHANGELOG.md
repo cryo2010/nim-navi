@@ -84,6 +84,35 @@ onward (pre-1.0, minor versions may include breaking changes).
   `BodySink`), since the `Future` type differs per backend (#367).
 
 ### Changed
+- **The HTTP/3 leg builds its OpenSSL context once per TLS policy instead of once
+  per connection (#454).** `navi_h3_new` used to create an `SSL_CTX` and re-load the
+  trust store, re-parse `caBundle`, re-decode the PKCS#12 or PEM client credential
+  and re-apply the cipher and version bounds on every QUIC connection, so every
+  idle-timeout eviction, cold start per origin and server-forced reconnect paid a
+  full credential parse (a PKCS#12 decode is deliberately slow). The driver now
+  caches the built context and hands out a reference, leaving only `SSL_new` per
+  connection, which is what the TCP backends have always done through
+  `TlsConfig.contextStore`. The cache is keyed by the owning client plus every input
+  that shapes the context (including the size and mtime of the file-based ones, so a
+  rewritten certificate is never served from cache), guarded by a mutex, bounded to
+  8 entries, and a client's entry is released when the client is closed; a
+  connection holds its own reference, so a released or evicted context stays alive
+  for as long as the connections built from it. `NAVI_H3_CTX_CACHE=0` restores the
+  old per-connection build.
+- **The HTTP/3 Alt-Svc mark-broken/mark-working bookkeeping moved into one shared
+  `openH3Tracked` template.** The RFC 7838 2.4 sequence added in #432 (catch a
+  `QuicError` out of the QUIC open, mark the origin's alternative broken and
+  re-raise; mark it working on success) was written out three times, once per h3
+  opener: the sync buffered transport in `navi.nim`, the sync streaming leg in
+  `private/stream_download.nim`, and the shared async `getH3Conn` behind both the
+  asyncdispatch and chronos clients. Each copy repeated the same scheme, host and
+  port, so a change to the policy had to be made three times and missing one would
+  silently reinstate the per-request handshake stall in that path. All three now
+  expand `altSvc.openH3Tracked(host, port, <open expression>)` from
+  `navi/core/altsvc`; the open expression is untyped, so one template serves a
+  blocking call and an `await`ed one on both async backends, and `QuicError` binds
+  at the expansion site (naming it in `altsvc.nim` would be an import cycle).
+  Behaviour is unchanged (#453).
 - **`TlsConfig.verify` became `TlsConfig.insecureSkipVerify` (#422).** The flag was
   inverted so the zero value is the secure one. Field assignment is unaffected
   (`cfg.tls.verify = false` still compiles, via a `verify`/`verify=` accessor pair),
@@ -222,6 +251,56 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **An IP-literal origin over HTTP/3 is matched against the certificate's
+  `iPAddress` SAN and is no longer offered as SNI (#451).** `navi_h3_new` handed
+  every origin -- DNS name or numeric address alike -- to `SSL_set1_host`, the
+  DNS-name entry point, and then sent it verbatim as `server_name`. Sending an IP
+  literal as SNI is what RFC 6066 3 forbids, and origins that select a certificate
+  or a virtual host from SNI answer such a handshake with the wrong certificate or
+  reject it outright. The identity binding was equally accidental: `SSL_set1_host`
+  matches an address only through an internal `X509_VERIFY_PARAM_set1_ip_asc`
+  fallback that a bracketed literal (`[::1]`, the form a URL authority uses for
+  IPv6) slips past, leaving the address to be matched as a DNS name, which no
+  certificate answers. The QUIC leg now makes the same split the TCP backends make
+  in `openssl_ctx.bindExpectedIdentity`: an origin that parses as an IPv4 or IPv6
+  literal -- brackets stripped -- is bound with `X509_VERIFY_PARAM_set1_ip_asc` and
+  carries no `server_name`, while every other host keeps `SSL_set_hostflags` +
+  `SSL_set1_host` and its SNI. A mismatched address is still rejected before any h3
+  stream is opened. Covered by a new `tests/interop/http3` probe on all three
+  openers (sync, asyncdispatch, chronos) against a Caddy origin whose certificate
+  carries `IP:127.0.0.1` and which echoes back the `server_name` it received.
+- **The sync backend's proxy handshakes are bounded by the connect budget again
+  (#452).** `timeouts.connect` is a wall-clock bound on establishment, and the
+  asyncdispatch and chronos backends enforce it that way: one `withTimeout` around
+  the whole `establish` (TCP connect, the proxy handshake, the TLS handshake). The
+  sync backend had no such wrapper. It armed `SO_RCVTIMEO` with the full budget and
+  relied on that, but a socket receive timeout bounds each `recv`, not the exchange:
+  every byte that arrives restarts it. A proxy trickling one byte just inside each
+  window therefore kept the CONNECT reply loop (which since #428 reads to the
+  `CRLFCRLF` terminator) alive for up to 16384 reads, i.e. 16384 x the budget of
+  wall clock, before the 16 KiB head cap raised; the SOCKS5 handshake and the
+  blocking TLS handshake had the same shape, and each phase was additionally armed
+  with a *fresh* full budget. `connect` now opens one budget at the top and every
+  step spends what is left of it: the tunnel drivers re-arm the socket timeouts per
+  read through a handle that carries the deadline, a spent budget raises navi's
+  connect `TimeoutError` (not a spurious "proxy closed the connection"), and a
+  bounded TLS handshake is driven non-blocking against that same deadline instead
+  of a per-`recv` timeout. `connectAcross` likewise bounds its whole re-race loop
+  once rather than per address. The socket is handed to the request phase with no
+  leftover receive timeout, as before: reads poll and re-arm their own budget.
+- **A `-d:naviHttp3` build compiles again with `--threads:off` (#450).** The sync
+  WebSocket-over-h3 pump declared its `Channel` and `Thread` state at module scope,
+  so `nim check -d:naviHttp3 --threads:off` failed with `undeclared identifier:
+  'Channel'` before reaching any of navi's code, even though the sync `websocket`
+  entry already refused the h3 transport on a threadless build with a clear error.
+  The pump types and procs now live behind `when compileOption("threads")`, matching
+  that gate, and the `wkH3` transport arm carries no state when it cannot be built.
+  Nim 2 defaults to `--threads:on`, so only a project that opts out was affected;
+  everything else in a threadless h3 build (all h3 requests and streaming, h1/h2
+  WebSockets, and h3 WebSockets on the async clients, which use no pump thread) was
+  already fine and stays so. The CI compile matrix now runs `nim check` over the
+  three native entries with `-d:naviHttp3` in both thread modes, so the gap cannot
+  reopen.
 - **A TLS connection that ends without `close_notify` can no longer truncate a
   read-until-close body (#426).** All three native TLS read paths reported a
   transport close that arrives without a TLS `close_notify` -- an injected RST, a

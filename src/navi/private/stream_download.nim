@@ -84,20 +84,14 @@ proc openStream(client: Navi, req0: Request): StreamResponse =
       let ep = client.altSvc.h3Endpoint("https", rq.url.host, rq.url.port)
       if ep.isSome:
         try:
-          let conn = block:
-            var c: QuicConn
-            try:
-              c = h3Open(ep.get.host, ep.get.port, sni = rq.url.host,
-                         tls = client.config.tls,
-                         maxBody = uint64(max(0, client.config.maxResponseBytes)),
-                         connectMs = client.config.connectMs,
-                         totalMs = client.config.totalMs)
-            except QuicError:
-              # RFC 7838 2.4: stop dialling an alternative that will not connect (#432).
-              client.altSvc.markBroken("https", rq.url.host, rq.url.port)
-              raise
-            client.altSvc.markWorking("https", rq.url.host, rq.url.port)
-            c
+          # RFC 7838 2.4: stop dialling an alternative that will not connect (#432);
+          # the mark-broken/mark-working pair is shared with the other h3 openers (#453).
+          let conn = client.altSvc.openH3Tracked(rq.url.host, rq.url.port,
+            h3Open(ep.get.host, ep.get.port, sni = rq.url.host,
+                   tls = client.config.tls,
+                   maxBody = uint64(max(0, client.config.maxResponseBytes)),
+                   connectMs = client.config.connectMs,
+                   totalMs = client.config.totalMs))
           var fwd: seq[(string, string)]
           for k, v in rq.headers:
             let lk = k.toLowerAscii

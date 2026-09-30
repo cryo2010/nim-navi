@@ -52,6 +52,18 @@ echo ">>> building and running the h3 SPKI pin test (chronos client)"
 nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/pin_chronos_test "$DIR/pin_chronos_test.nim"
 /tmp/pin_chronos_test
 
+echo ">>> building and running the h3 IP-literal origin test (sync client)"
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/iphost_test "$DIR/iphost_test.nim"
+/tmp/iphost_test
+
+echo ">>> building and running the h3 IP-literal origin test (asyncdispatch client)"
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/iphost_async_test "$DIR/iphost_async_test.nim"
+/tmp/iphost_async_test
+
+echo ">>> building and running the h3 IP-literal origin test (chronos client)"
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/iphost_chronos_test "$DIR/iphost_chronos_test.nim"
+/tmp/iphost_chronos_test
+
 echo ">>> building and running the transparent h3 dispatch test (sync client)"
 nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/dispatch_test "$DIR/dispatch_test.nim"
 /tmp/dispatch_test
@@ -83,6 +95,20 @@ nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/stream_async_te
 echo ">>> building and running the h3 streaming test (chronos backend)"
 nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/stream_chronos_test "$DIR/stream_chronos_test.nim"
 /tmp/stream_chronos_test
+
+echo ">>> building and running the h3 SSL_CTX cache test (sharing, release, bound)"
+# A PKCS#12 client credential for the benchmark below: decoding one is the slowest
+# part of building the context, which is what #454 stopped doing per connection.
+if OPENSSL_CONF=/dev/null "$OSSL/bin/openssl" pkcs12 -export -out "$WORK/client.p12" \
+     -inkey "$WORK/key.pem" -in "$WORK/cert.pem" -passout pass:navi >/dev/null 2>&1; then
+  export NAVI_H3_P12="$WORK/client.p12" NAVI_H3_P12_PASS=navi
+else
+  echo "note: could not build a PKCS#12 bundle; benchmarking without a credential"
+fi
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/ctxcache_test "$DIR/ctxcache_test.nim"
+/tmp/ctxcache_test
+echo ">>> ... and again with the cache off (NAVI_H3_CTX_CACHE=0), the before picture"
+NAVI_H3_CTX_CACHE=0 /tmp/ctxcache_test
 
 echo ">>> building and running the h3 leak check (fd + heap growth)"
 nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/leak_test "$DIR/leak_test.nim"

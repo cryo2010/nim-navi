@@ -16,7 +16,7 @@
 when not defined(naviHttp3):
   {.error: "navi/backend/quic is a -d:naviHttp3-only module.".}
 
-import std/[strutils, atomics, os, times]
+import std/[strutils, os, times]
 import ../core/altsvc
 import ../core/response   # ResponseTooLargeError, raised when a body exceeds maxResponseBytes
 import ./api              # TlsConfig: the full TLS policy the QUIC leg honours (#419)
@@ -107,6 +107,10 @@ type NaviH3Tls* {.importc: "NaviH3Tls", header: "h3client.h", bycopy.} = object
   maxVersion* {.importc: "max_version".}: cint
   handshakeTimeoutMs* {.importc: "handshake_timeout_ms".}: culonglong
     ## 0 = unset (ngtcp2's unbounded default)
+  ctxOwner* {.importc: "ctx_owner".}: culonglong
+    ## Identity of the owning client, for the driver's SSL_CTX cache (#454): the
+    ## address of its `TlsConfig.contextStore`, or 0 for a bare config with no
+    ## store. Never dereferenced on the C side.
 
 proc navi_h3_open(host, port, sni: cstring, tls: ptr NaviH3Tls,
                   maxBody: culonglong): pointer {.importc, cdecl.}
@@ -237,7 +241,9 @@ proc h3VersionCode(v: TlsVersion): cint =
 proc toH3Tls*(cfg: TlsConfig, handshakeMs = 0): NaviH3Tls =
   ## Flatten navi's `TlsConfig` for the h3 driver. The result BORROWS `cfg`'s
   ## strings, so `cfg` must outlive every navi_h3_new / navi_h3_open call made with
-  ## it (the driver copies what it needs during the call and nothing after).
+  ## it (the driver copies what it needs during the call and nothing after). The
+  ## client's context store doubles as the identity of the built SSL_CTX the driver
+  ## caches for this policy (`ctxOwner`, released by `h3ReleaseTlsContexts`).
   NaviH3Tls(
     caFile: cfg.caFile.cstring, caBundle: cfg.caBundle.cstring,
     pkcs12File: cfg.pkcs12File.cstring, certPem: cfg.certPem.cstring,
@@ -247,7 +253,33 @@ proc toH3Tls*(cfg: TlsConfig, handshakeMs = 0): NaviH3Tls =
     verify: cint(cfg.wantsVerify),
     minVersion: h3VersionCode(cfg.minVersion),
     maxVersion: h3VersionCode(cfg.maxVersion),
-    handshakeTimeoutMs: culonglong(max(0, handshakeMs)))
+    handshakeTimeoutMs: culonglong(max(0, handshakeMs)),
+    ctxOwner: culonglong(cast[uint](cast[pointer](cfg.contextStore))))
+
+# --- the driver's shared SSL_CTX cache (#454) --------------------------------
+# The QUIC context is built once per TLS policy and shared by every connection made
+# with it, the h3 twin of the TCP backends' `obtainContext`; see the cache notes in
+# h3client.cpp. These are the two entry points the Nim side drives: releasing a
+# closed client's contexts, and the counters the interop probe asserts on.
+
+proc navi_h3_ctx_release(owner: culonglong) {.importc, cdecl.}
+proc navi_h3_ctx_cache_stats(builds, reuses, entries: ptr culonglong)
+  {.importc, cdecl.}
+
+proc h3ReleaseTlsContexts*(store: RootRef) =
+  ## Free the QUIC SSL_CTXs the driver cached for the client owning `store`. Call
+  ## it where the TCP side calls `closeTlsCtxStore`, i.e. in the client's `close`
+  ## after its h3 connections have been closed; a connection that somehow outlives
+  ## the call holds its own reference and keeps working. A no-op for a nil store
+  ## (a bare `TlsConfig`, whose contexts the cache bounds instead).
+  navi_h3_ctx_release(culonglong(cast[uint](cast[pointer](store))))
+
+proc h3CtxCacheStats*(): tuple[builds, reuses, entries: int] =
+  ## Contexts actually built, cache hits, and entries currently held, since process
+  ## start. For tests and introspection (tests/interop/http3/ctxcache_test.nim).
+  var b, r, e: culonglong
+  navi_h3_ctx_cache_stats(addr b, addr r, addr e)
+  (int(b), int(r), int(e))
 
 proc h3TlsFail(msg: string) {.noreturn, raises: [ValueError].} =
   ## Same exception and wording as the TCP backends' `fail` (backend/openssl_ctx),
@@ -575,172 +607,179 @@ proc h3Get*(host: string, port: int, sni = "", path = "/", caFile = "",
 # it through two channels + the wake pipe (navi_h3_wake only touches the pipe). The
 # sync blocking API is unchanged -- this is purely behind the scenes.
 
-type
-  WsH3PumpObj = object
-    conn: pointer                  ## H3Conn*; the pump thread drives it, wsClose frees it
-    sid: int64
-    readMs: int                    ## per-read stall bound for wsRecv; 0 = block indefinitely
-    toApp: Channel[string]         ## inbound frame bytes; "" signals peer-close / error
-    toNet: Channel[string]         ## outbound frame bytes queued by the app thread
-    stop: Atomic[bool]             ## wsClose asks the pump to wind down
-    thr: Thread[ptr WsH3PumpObj]
-  WsH3Pump* = ptr WsH3PumpObj      ## shared (allocShared), not a GC ref: two threads touch it
+# The pump needs Channel/Thread, so it exists only in a --threads:on build (Nim 2's
+# default). private/websocket.nim gates the sync h3 WebSocket on the same condition
+# and raises a clear error otherwise, so a --threads:off -d:naviHttp3 build still
+# compiles and keeps h1/h2 WebSockets plus every h3 request path (#450).
+when compileOption("threads"):
+  import std/atomics   # only the pump needs it
 
-const wsInboundHighWater = 256
-  ## Cap on frames queued to the app: past it the pump stops draining inbound and
-  ## leaves bytes in the C buffer, so QUIC flow control back-pressures the peer
-  ## instead of `toApp` growing without bound when the app is slow to receive.
+  type
+    WsH3PumpObj = object
+      conn: pointer                  ## H3Conn*; the pump thread drives it, wsClose frees it
+      sid: int64
+      readMs: int                    ## per-read stall bound for wsRecv; 0 = block indefinitely
+      toApp: Channel[string]         ## inbound frame bytes; "" signals peer-close / error
+      toNet: Channel[string]         ## outbound frame bytes queued by the app thread
+      stop: Atomic[bool]             ## wsClose asks the pump to wind down
+      thr: Thread[ptr WsH3PumpObj]
+    WsH3Pump* = ptr WsH3PumpObj      ## shared (allocShared), not a GC ref: two threads touch it
 
-proc drainOutbound(p: ptr WsH3PumpObj): bool =
-  ## Hand every queued outbound frame to the driver (which copies each). Returns
-  ## false if a send fails (stream gone / OOM), so the pump can wind down instead of
-  ## silently dropping frames.
-  while true:
-    let (has, data) = p.toNet.tryRecv()
-    if not has: return true
-    var d = data
-    let bp = if d.len > 0: cast[pointer](addr d[0]) else: nil
-    if navi_h3_tunnel_send(p.conn, p.sid, bp, csize_t(d.len)) != 0: return false
+  const wsInboundHighWater = 256
+    ## Cap on frames queued to the app: past it the pump stops draining inbound and
+    ## leaves bytes in the C buffer, so QUIC flow control back-pressures the peer
+    ## instead of `toApp` growing without bound when the app is slow to receive.
 
-proc wsPumpLoop(p: ptr WsH3PumpObj) {.thread.} =
-  var buf = newString(64 * 1024)
-  var eof: cint
-  while not p.stop.load():
-    if not p.drainOutbound(): break              # send-side error: stop pumping
-    if navi_h3_pump(p.conn) != 0: break          # one cycle; blocks on timer or a wake
-    if navi_h3_draining(p.conn) != 0: break      # peer closed the connection (#278)
-    while p.toApp.peek() < wsInboundHighWater:    # drain only while the app keeps up
-      let n = navi_h3_read_body(p.conn, p.sid, cast[ptr char](addr buf[0]),
-                                csize_t(buf.len), addr eof)
-      if n > 0: p.toApp.send(buf[0 ..< n.int])
-      if eof != 0: p.stop.store(true); break      # peer half-closed
-      if n <= 0: break
-  # Flush any still-queued outbound (e.g. the WS Close frame the app just sent) BEFORE
-  # the stream FIN, so a normal close delivers the close code/reason, not a bare FIN.
-  # The app thread frees the conn (in wsClose, after join), so navi_h3_wake can never
-  # race a freed connection.
-  discard p.drainOutbound()
-  discard navi_h3_tunnel_close(p.conn, p.sid)
-  discard navi_h3_flush(p.conn)
-  p.toApp.send("")                               # unblock a parked wsRecv with eof
+  proc drainOutbound(p: ptr WsH3PumpObj): bool =
+    ## Hand every queued outbound frame to the driver (which copies each). Returns
+    ## false if a send fails (stream gone / OOM), so the pump can wind down instead of
+    ## silently dropping frames.
+    while true:
+      let (has, data) = p.toNet.tryRecv()
+      if not has: return true
+      var d = data
+      let bp = if d.len > 0: cast[pointer](addr d[0]) else: nil
+      if navi_h3_tunnel_send(p.conn, p.sid, bp, csize_t(d.len)) != 0: return false
 
-proc openWsH3*(host: string, port: int, sni: string, tls: TlsConfig,
-               path: string, headers: seq[(string, string)],
-               connectMs = 0, readMs = 0, totalMs = 0):
-               tuple[pump: WsH3Pump, status: int] =
-  ## Open a dedicated h3 connection, do the Extended CONNECT handshake on this
-  ## (single) thread, then hand the connection to a pump thread. Returns the pump
-  ## and the response :status (the caller checks 200). `tls` is navi's full TLS
-  ## policy, honoured exactly as in `h3Open` (trust store, client credential,
-  ## cipher bounds, SPKI pins and verify callback). Every stage is bounded by
-  ## `connectMs` (or, falling back like the sync `connect`, `totalMs`; 0 = a 30s
-  ## default): the QUIC handshake itself, the wait for the peer's SETTINGS, and the
-  ## wait for the CONNECT response, so neither a black-holed UDP path nor a server
-  ## that stalls after QUIC completes can hang the caller past that budget.
-  ## `readMs` (0 = block indefinitely) is carried to the pump as the per-read stall
-  ## bound `wsRecv` enforces, mirroring h1/h2 where each read is bounded by the
-  ## configured readMs.
-  let name = if sni.len > 0: sni else: host
-  # connectMs wins, then totalMs, else a 30s handshake default (mirroring how the
-  # sync `connect` resolves establishMs, but with an explicit backend floor).
-  let handshakeMs = establishMs(connectMs, totalMs, h3HandshakeDefaultMs)
-  var t = toH3Tls(tls, handshakeMs)
-  let h = navi_h3_open(host.cstring, ($port).cstring, name.cstring,
-                       addr t,
-                       culonglong(0))   # WebSocket frames stream via read_body: no buffered cap
-  if h == nil: raise newException(QuicError, "navi: HTTP/3 connect failed")
-  try:
-    h3PostHandshakeVerify(h, name, tls)
-  except CatchableError:
-    navi_h3_close(h)                    # fail closed before the CONNECT is sent
-    raise
-  let deadline = epochTime() + float(handshakeMs) / 1000.0
-  # RFC 9220 / RFC 8441 3: an Extended CONNECT may only be sent once the peer's
-  # SETTINGS has arrived AND enabled SETTINGS_ENABLE_CONNECT_PROTOCOL. Drive the
-  # connection until that SETTINGS lands (a deterministic signal, not an idle guess),
-  # then require the capability -- so a server without it fails fast with a clear
-  # diagnostic instead of late via a stream reset (#393). Same gate, same wording as
-  # the h2 path in private/websocket.nim.
-  while navi_h3_peer_settings_seen(h) == 0:
-    if epochTime() > deadline:
+  proc wsPumpLoop(p: ptr WsH3PumpObj) {.thread.} =
+    var buf = newString(64 * 1024)
+    var eof: cint
+    while not p.stop.load():
+      if not p.drainOutbound(): break              # send-side error: stop pumping
+      if navi_h3_pump(p.conn) != 0: break          # one cycle; blocks on timer or a wake
+      if navi_h3_draining(p.conn) != 0: break      # peer closed the connection (#278)
+      while p.toApp.peek() < wsInboundHighWater:    # drain only while the app keeps up
+        let n = navi_h3_read_body(p.conn, p.sid, cast[ptr char](addr buf[0]),
+                                  csize_t(buf.len), addr eof)
+        if n > 0: p.toApp.send(buf[0 ..< n.int])
+        if eof != 0: p.stop.store(true); break      # peer half-closed
+        if n <= 0: break
+    # Flush any still-queued outbound (e.g. the WS Close frame the app just sent) BEFORE
+    # the stream FIN, so a normal close delivers the close code/reason, not a bare FIN.
+    # The app thread frees the conn (in wsClose, after join), so navi_h3_wake can never
+    # race a freed connection.
+    discard p.drainOutbound()
+    discard navi_h3_tunnel_close(p.conn, p.sid)
+    discard navi_h3_flush(p.conn)
+    p.toApp.send("")                               # unblock a parked wsRecv with eof
+
+  proc openWsH3*(host: string, port: int, sni: string, tls: TlsConfig,
+                 path: string, headers: seq[(string, string)],
+                 connectMs = 0, readMs = 0, totalMs = 0):
+                 tuple[pump: WsH3Pump, status: int] =
+    ## Open a dedicated h3 connection, do the Extended CONNECT handshake on this
+    ## (single) thread, then hand the connection to a pump thread. Returns the pump
+    ## and the response :status (the caller checks 200). `tls` is navi's full TLS
+    ## policy, honoured exactly as in `h3Open` (trust store, client credential,
+    ## cipher bounds, SPKI pins and verify callback). Every stage is bounded by
+    ## `connectMs` (or, falling back like the sync `connect`, `totalMs`; 0 = a 30s
+    ## default): the QUIC handshake itself, the wait for the peer's SETTINGS, and the
+    ## wait for the CONNECT response, so neither a black-holed UDP path nor a server
+    ## that stalls after QUIC completes can hang the caller past that budget.
+    ## `readMs` (0 = block indefinitely) is carried to the pump as the per-read stall
+    ## bound `wsRecv` enforces, mirroring h1/h2 where each read is bounded by the
+    ## configured readMs.
+    let name = if sni.len > 0: sni else: host
+    # connectMs wins, then totalMs, else a 30s handshake default (mirroring how the
+    # sync `connect` resolves establishMs, but with an explicit backend floor).
+    let handshakeMs = establishMs(connectMs, totalMs, h3HandshakeDefaultMs)
+    var t = toH3Tls(tls, handshakeMs)
+    let h = navi_h3_open(host.cstring, ($port).cstring, name.cstring,
+                         addr t,
+                         culonglong(0))   # WebSocket frames stream via read_body: no buffered cap
+    if h == nil: raise newException(QuicError, "navi: HTTP/3 connect failed")
+    try:
+      h3PostHandshakeVerify(h, name, tls)
+    except CatchableError:
+      navi_h3_close(h)                    # fail closed before the CONNECT is sent
+      raise
+    let deadline = epochTime() + float(handshakeMs) / 1000.0
+    # RFC 9220 / RFC 8441 3: an Extended CONNECT may only be sent once the peer's
+    # SETTINGS has arrived AND enabled SETTINGS_ENABLE_CONNECT_PROTOCOL. Drive the
+    # connection until that SETTINGS lands (a deterministic signal, not an idle guess),
+    # then require the capability -- so a server without it fails fast with a clear
+    # diagnostic instead of late via a stream reset (#393). Same gate, same wording as
+    # the h2 path in private/websocket.nim.
+    while navi_h3_peer_settings_seen(h) == 0:
+      if epochTime() > deadline:
+        navi_h3_close(h)
+        raise newException(QuicError, "navi: h3 WebSocket handshake timed out")
+      if navi_h3_pump(h) != 0 or navi_h3_draining(h) != 0:
+        navi_h3_close(h)
+        raise newException(QuicError,
+          "navi: HTTP/3 connection closed before the server's SETTINGS")
+    if navi_h3_peer_allows_connect(h) == 0:
       navi_h3_close(h)
-      raise newException(QuicError, "navi: h3 WebSocket handshake timed out")
-    if navi_h3_pump(h) != 0 or navi_h3_draining(h) != 0:
+      raise newException(response.ProtocolError, h3NoConnectProtocolErr)
+    let reqHdr = encodeH3Fields(headers)
+    let sid = navi_h3_open_connect(h, path.cstring, reqHdr.cstring, "websocket".cstring)
+    if sid < 0:
+      navi_h3_close(h); raise newException(QuicError, "navi: h3 Extended CONNECT failed")
+    var status: clong
+    var hbuf = newString(16 * 1024)
+    var ready: cint
+    var hlen: csize_t
+    while true:                                    # pump until the response headers land
+      if navi_h3_response_headers(h, sid, addr status, cast[ptr char](addr hbuf[0]),
+                                  csize_t(hbuf.len), addr hlen, addr ready) != 0:
+        navi_h3_close(h); raise newException(QuicError, "navi: h3 stream gone")
+      if ready != 0: break
+      if epochTime() > deadline:                   # server withheld the CONNECT response
+        navi_h3_close(h)
+        raise newException(QuicError, "navi: h3 WebSocket handshake timed out")
+      if navi_h3_pump(h) != 0:
+        navi_h3_close(h); raise newException(QuicError, "navi: HTTP/3 connection closed")
+    let p = cast[WsH3Pump](allocShared0(sizeof(WsH3PumpObj)))
+    p.conn = h
+    p.sid = sid
+    p.readMs = readMs
+    p.toApp.open()
+    p.toNet.open()
+    p.stop.store(false)
+    try:
+      createThread(p.thr, wsPumpLoop, p)           # the pump now owns the connection
+    except CatchableError:                         # thread exhaustion: do not leak
+      p.toApp.close(); p.toNet.close()
       navi_h3_close(h)
-      raise newException(QuicError,
-        "navi: HTTP/3 connection closed before the server's SETTINGS")
-  if navi_h3_peer_allows_connect(h) == 0:
-    navi_h3_close(h)
-    raise newException(response.ProtocolError, h3NoConnectProtocolErr)
-  let reqHdr = encodeH3Fields(headers)
-  let sid = navi_h3_open_connect(h, path.cstring, reqHdr.cstring, "websocket".cstring)
-  if sid < 0:
-    navi_h3_close(h); raise newException(QuicError, "navi: h3 Extended CONNECT failed")
-  var status: clong
-  var hbuf = newString(16 * 1024)
-  var ready: cint
-  var hlen: csize_t
-  while true:                                    # pump until the response headers land
-    if navi_h3_response_headers(h, sid, addr status, cast[ptr char](addr hbuf[0]),
-                                csize_t(hbuf.len), addr hlen, addr ready) != 0:
-      navi_h3_close(h); raise newException(QuicError, "navi: h3 stream gone")
-    if ready != 0: break
-    if epochTime() > deadline:                   # server withheld the CONNECT response
-      navi_h3_close(h)
-      raise newException(QuicError, "navi: h3 WebSocket handshake timed out")
-    if navi_h3_pump(h) != 0:
-      navi_h3_close(h); raise newException(QuicError, "navi: HTTP/3 connection closed")
-  let p = cast[WsH3Pump](allocShared0(sizeof(WsH3PumpObj)))
-  p.conn = h
-  p.sid = sid
-  p.readMs = readMs
-  p.toApp.open()
-  p.toNet.open()
-  p.stop.store(false)
-  try:
-    createThread(p.thr, wsPumpLoop, p)           # the pump now owns the connection
-  except CatchableError:                         # thread exhaustion: do not leak
-    p.toApp.close(); p.toNet.close()
-    navi_h3_close(h)
+      deallocShared(p)
+      raise
+    (p, int(status))
+
+  proc wsSend*(p: WsH3Pump, data: string) =
+    ## Queue an outbound frame and wake the pump to flush it.
+    p.toNet.send(data)
+    navi_h3_wake(p.conn)
+
+  proc wsDataWaiting*(p: WsH3Pump, ms: int): bool =
+    ## True if an inbound chunk is queued within ~`ms` (coarse poll; for ws keepalive).
+    var left = ms
+    while true:
+      if p.toApp.peek() > 0: return true
+      if left <= 0: return false
+      let step = min(left, 5)
+      sleep(step)
+      left -= step
+
+  proc wsRecv*(p: WsH3Pump): string =
+    ## Block for the next inbound chunk; "" once the connection has closed. With
+    ## `readMs` set, the block is bounded by that per-read stall limit: the pump thread
+    ## owns the QUIC state, so (unlike h1/h2's socket recv) we poll the inbound channel
+    ## to a deadline instead of parking on a blocking `recv()`, and raise navi's
+    ## TimeoutError once it lapses with nothing delivered -- matching h1/h2, where each
+    ## read is bounded by readMs. With `readMs` 0 this is the original blocking recv.
+    if p.readMs <= 0: return p.toApp.recv()
+    if not p.wsDataWaiting(p.readMs):
+      raise newException(response.TimeoutError, readTimeoutMsg(p.readMs))
+    p.toApp.recv()
+
+  proc wsClose*(p: WsH3Pump) =
+    ## Stop the pump, join it, then free the connection and shared state. Idempotent
+    ## per WebSocket (the sync ws guards on `open`).
+    if p == nil: return
+    p.stop.store(true)
+    navi_h3_wake(p.conn)
+    joinThread(p.thr)
+    navi_h3_close(p.conn)             # freed here, after the pump has exited
+    p.toApp.close()
+    p.toNet.close()
     deallocShared(p)
-    raise
-  (p, int(status))
-
-proc wsSend*(p: WsH3Pump, data: string) =
-  ## Queue an outbound frame and wake the pump to flush it.
-  p.toNet.send(data)
-  navi_h3_wake(p.conn)
-
-proc wsDataWaiting*(p: WsH3Pump, ms: int): bool =
-  ## True if an inbound chunk is queued within ~`ms` (coarse poll; for ws keepalive).
-  var left = ms
-  while true:
-    if p.toApp.peek() > 0: return true
-    if left <= 0: return false
-    let step = min(left, 5)
-    sleep(step)
-    left -= step
-
-proc wsRecv*(p: WsH3Pump): string =
-  ## Block for the next inbound chunk; "" once the connection has closed. With
-  ## `readMs` set, the block is bounded by that per-read stall limit: the pump thread
-  ## owns the QUIC state, so (unlike h1/h2's socket recv) we poll the inbound channel
-  ## to a deadline instead of parking on a blocking `recv()`, and raise navi's
-  ## TimeoutError once it lapses with nothing delivered -- matching h1/h2, where each
-  ## read is bounded by readMs. With `readMs` 0 this is the original blocking recv.
-  if p.readMs <= 0: return p.toApp.recv()
-  if not p.wsDataWaiting(p.readMs):
-    raise newException(response.TimeoutError, readTimeoutMsg(p.readMs))
-  p.toApp.recv()
-
-proc wsClose*(p: WsH3Pump) =
-  ## Stop the pump, join it, then free the connection and shared state. Idempotent
-  ## per WebSocket (the sync ws guards on `open`).
-  if p == nil: return
-  p.stop.store(true)
-  navi_h3_wake(p.conn)
-  joinThread(p.thr)
-  navi_h3_close(p.conn)             # freed here, after the pump has exited
-  p.toApp.close()
-  p.toNet.close()
-  deallocShared(p)

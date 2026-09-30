@@ -1,12 +1,16 @@
-## Proxy resolution, cached once at construction (issue #361).
+## Proxy resolution, cached once at construction (issue #361), plus the sync
+## backend's establishment budget through an HTTP proxy (issue #452).
 ##
 ## Exercises `buildResolvedProxy` + `resolveProxy` directly: opts.proxy
 ## precedence, the http/https env-var fallback, NO_PROXY exclusions, the
 ## unixSocket bypass, socks scheme handling, and that a distinct proxy string
 ## resolves to a distinct cache (the .extend contract).
-import unittest, std/os
+import unittest, std/[os, monotimes, times]
+import navi
 import navi/core/[proxy, request, url]
+import navi/core/response  # for the `response.TimeoutError` qualifier
 import navi/backend/api
+import ./support
 
 const proxyEnvVars = ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY",
                       "all_proxy", "ALL_PROXY", "no_proxy", "NO_PROXY"]
@@ -117,3 +121,30 @@ suite "proxy resolution (cached at construction)":
   test "an invalid proxy port raises at construction, not per request":
     expect ValueError:
       discard resolved(proxy = "http://127.0.0.1:notaport")
+
+suite "sync establishment through a proxy is bounded by one wall clock (#452)":
+  test "a trickling CONNECT reply trips the connect timeout, not the head cap":
+    # The proxy answers the CONNECT one byte every 100 ms. SO_RCVTIMEO is a
+    # PER-SYSCALL timeout, so each byte used to restart the 300 ms window and the
+    # loop could only end at the 16 KiB head cap -- 16384 x 300 ms of wall clock.
+    # These 39 bytes alone would take ~3.9 s; the budget is 300 ms.
+    var port = 0
+    var th: Thread[TrickleCtx]
+    startTrickleProxy(th, port, "HTTP/1.1 200 Connection established\r\n\r\n", 100)
+    var cfg = initNaviConfig()
+    cfg.proxy = "http://127.0.0.1:" & $port
+    cfg.timeouts.connect = 300
+    cfg.retry.limit = 0                      # one attempt: measure one budget
+    let api = newNavi(cfg)
+    let t0 = getMonoTime()
+    var raised = "none"
+    try:
+      discard api.get("https://tunnel.test/")   # https: the proxy gets a CONNECT
+    except response.TimeoutError:
+      raised = "timeout"
+    except CatchableError as e:
+      raised = "other:" & $e.name
+    let elapsed = (getMonoTime() - t0).inMilliseconds.int
+    check raised == "timeout"
+    check elapsed < 1500
+    joinThread(th)

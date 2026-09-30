@@ -51,6 +51,13 @@ when defined(windows):
   proc setNoDelay(fd: SocketHandle) =
     setSockOptInt(fd, nativesockets.IPPROTO_TCP.int, winlean.TCP_NODELAY.int, 1)
   proc connectInProgress(): bool = osLastError().int32 == WSAEWOULDBLOCK
+  const wsaETimedOut = 10060'i32   # WSAETIMEDOUT; winlean carries no binding
+  proc lastIoTimedOut(): bool =
+    ## Whether the last socket call failed because an armed SO_RCVTIMEO/SO_SNDTIMEO
+    ## lapsed. Winsock reports that as WSAETIMEDOUT on a blocking socket (POSIX uses
+    ## EAGAIN/EWOULDBLOCK), and a non-blocking one still says WSAEWOULDBLOCK.
+    let e = osLastError().int32
+    e == WSAEWOULDBLOCK or e == wsaETimedOut
   proc setIoTimeout(fd: SocketHandle, ms: int) =
     setSockOptInt(fd, SOL_SOCKET.int, SO_RCVTIMEO.int, ms)  # win: DWORD ms
     setSockOptInt(fd, SOL_SOCKET.int, SO_SNDTIMEO.int, ms)
@@ -65,6 +72,10 @@ else:
   proc setNoDelay(fd: SocketHandle) =
     setSockOptInt(fd, posix.IPPROTO_TCP.int, posix.TCP_NODELAY.int, 1)
   proc connectInProgress(): bool = errno == EINPROGRESS
+  proc lastIoTimedOut(): bool =
+    ## Whether the last socket call failed because an armed SO_RCVTIMEO/SO_SNDTIMEO
+    ## lapsed: a receive/send timeout surfaces as would-block on POSIX.
+    errno == EAGAIN or errno == EWOULDBLOCK
   proc setIoTimeout(fd: SocketHandle, ms: int) =
     var tv = Timeval(tv_sec: posix.Time(ms div 1000),
                      tv_usec: Suseconds((ms mod 1000) * 1000))
@@ -135,6 +146,13 @@ proc pollWait(fds: ptr PollFd, n, ms: int): int =
       if left > 0:
         left = remainingMs(deadline)      # retry with the remaining time
         if left <= 0: return 0
+
+proc waitReadable(fd: SocketHandle, ms: int): bool =
+  ## True once the socket has data within `ms` ms. A hangup or error counts as
+  ## ready, so the read that follows surfaces the real failure rather than a stray
+  ## timeout. `ms` < 0 waits indefinitely (see `pollWait`).
+  var pfd = initPollFd(fd, pollRead)
+  pollWait(addr pfd, 1, ms) > 0
 
 proc waitWritable(fd: SocketHandle, ms: int): bool =
   ## True once the (non-blocking) socket becomes writable within `ms` ms -- i.e.
@@ -230,32 +248,104 @@ proc sendRaw(fd: SocketHandle, data: string) =
     if n <= 0: raise newException(IOError, "navi: socket write failed")
     off += n
 
+# --- the establishment budget -------------------------------------------
+# The async backends bound establishment -- TCP connect, the proxy handshake AND
+# the TLS handshake -- with a single `withTimeout` around their `establish()`, so
+# `timeouts.connect` is a wall-clock bound on the whole phase. The sync backend
+# has no such wrapper: its blocking I/O is bounded by SO_RCVTIMEO, which is a
+# PER-SYSCALL timeout that restarts on every byte that arrives. Each step used to
+# be armed with the FULL budget, so a proxy trickling one byte just inside every
+# window could hold `connect` open for (reads x budget) of wall clock -- up to
+# 16384 reads before the CONNECT head cap fires (issue #452). Every step below
+# therefore takes what is LEFT of one budget started at the top of `connect`.
+
+type
+  EstablishBudget = object
+    ms: int             ## the budget as configured; 0 = unbounded
+    deadline: MonoTime  ## absolute expiry; meaningful only when `ms` > 0
+
+  TunnelSock = object
+    ## The connection handle the shared tunnel drivers (backend/tunnel) see on this
+    ## backend: the raw socket plus the budget, so every frame they read is armed
+    ## with the time that is actually left rather than a fresh full window.
+    fd: SocketHandle
+    budget: EstablishBudget
+
+proc startBudget(ms: int): EstablishBudget =
+  ## Open an establishment budget of `ms` ms (<= 0 means unbounded).
+  result.ms = ms
+  if ms > 0: result.deadline = getMonoTime() + initDuration(milliseconds = ms)
+
+proc leftMs(b: EstablishBudget): int =
+  ## What is left of the budget. 0 means "unbounded" (no budget was set); a budget
+  ## that has run out raises navi's connect `TimeoutError` rather than returning 0,
+  ## so no caller can mistake exhaustion for "block forever".
+  if b.ms <= 0: return 0
+  result = remainingMs(b.deadline)
+  if result <= 0:
+    raise newException(response.TimeoutError, connectTimeoutMsg(b.ms))
+
+proc budgetExpired(s: TunnelSock) {.noreturn.} =
+  ## An armed SO_RCVTIMEO/SO_SNDTIMEO lapsed: that is the connect budget, spent.
+  raise newException(response.TimeoutError, connectTimeoutMsg(s.budget.ms))
+
+proc arm(s: TunnelSock): int {.discardable.} =
+  ## Re-arm the socket timeouts with the REMAINING budget, just before one blocking
+  ## syscall; raises the connect timeout once nothing is left.
+  result = s.budget.leftMs()
+  if result > 0: setIoTimeout(s.fd, result)
+
 # Byte-I/O primitives the shared tunnel drivers (backend/tunnel) mix in. `await`
 # is the identity template above, so the drivers' `await sockWrite(...)` etc run
 # these synchronously.
-proc sockWrite(fd: SocketHandle, s: string) = sendRaw(fd, s)
+proc sockWrite(s: TunnelSock, data: string) =
+  var off = 0
+  while off < data.len:
+    s.arm()
+    let n = sysSend(s.fd, unsafeAddr data[off], data.len - off)
+    if n <= 0:
+      if n < 0 and lastIoTimedOut(): s.budgetExpired()
+      raise newException(IOError, "navi: socket write failed")
+    off += n
 
-proc sockReadExactly(fd: SocketHandle, n: int): string =
+proc sockReadExactly(s: TunnelSock, n: int): string =
   ## Read exactly `n` bytes or raise; SOCKS5 replies are fixed-size frames.
   result = newString(n)
   var off = 0
   while off < n:
-    let r = sysRecv(fd, addr result[off], n - off)
-    if r <= 0: raise newException(IOError, "navi: SOCKS5 proxy closed the connection")
+    s.arm()
+    let r = sysRecv(s.fd, addr result[off], n - off)
+    if r <= 0:
+      if r < 0 and lastIoTimedOut(): s.budgetExpired()
+      raise newException(IOError, "navi: SOCKS5 proxy closed the connection")
     off += r
 
-proc sockReadSome(fd: SocketHandle, max: int): string =
+proc sockReadSome(s: TunnelSock, max: int): string =
   ## One read of up to `max` bytes; returns "" at EOF. The CONNECT driver loops
-  ## on this until the reply head is terminated, so a short read is expected.
+  ## on this until the reply head is terminated, so a short read is expected -- and
+  ## why the budget has to be re-armed here rather than once around the loop.
   result = newString(max)
-  let n = sysRecv(fd, addr result[0], max)
+  s.arm()
+  let n = sysRecv(s.fd, addr result[0], max)
+  if n < 0 and lastIoTimedOut(): s.budgetExpired()
   result.setLen(system.max(n, 0))
 
-proc proxyConnect(fd: SocketHandle, host: string, port: int, user, pass: string) =
-  proxyConnectDriver(fd, host, port, user, pass)
+proc proxyConnect(s: TunnelSock, host: string, port: int, user, pass: string) =
+  proxyConnectDriver(s, host, port, user, pass)
 
-proc socksConnect(fd: SocketHandle, host: string, port: int, user, pass: string) =
-  socksConnectDriver(fd, host, port, user, pass)
+proc socksConnect(s: TunnelSock, host: string, port: int, user, pass: string) =
+  socksConnectDriver(s, host, port, user, pass)
+
+when defined(ssl):
+  proc handshakeWait(budget: EstablishBudget): TlsWait =
+    ## The readiness wait `startClientTls` drives a bounded handshake with: it spends
+    ## what is left of the establishment budget on one poll, and `leftMs` raises the
+    ## connect timeout once that is nothing. `nil` for an unbounded budget, which
+    ## keeps the plain blocking handshake (and its blocking socket) untouched.
+    if budget.ms <= 0: return nil
+    result = proc(fd: SocketHandle, forWrite: bool): bool =
+      let ms = budget.leftMs()
+      if forWrite: waitWritable(fd, ms) else: waitReadable(fd, ms)
 
 # --- Happy Eyeballs (RFC 8305) -----------------------------------------
 # `heAttemptDelayMs`, `interleaveFamilies`, and `resolveAddrs` are shared with the
@@ -382,20 +472,24 @@ when defined(ssl):
     ## handshake on the winner; the connection uses each IP while SNI and
     ## verification use `sni`. On a *handshake* failure the winning address is
     ## dropped and the remaining addresses are re-raced, so a partially-broken CDN
-    ## pool still connects. `connectMs` > 0 bounds each race and handshake.
+    ## pool still connects. `connectMs` > 0 is ONE wall-clock budget over the whole
+    ## thing -- every race and handshake takes what is left of it, so re-racing a
+    ## broken pool cannot multiply the bound (issue #452).
     ## `ctx`/`slot` are set on the returned Conn by the caller. Exported for the
     ## interop tests; navi reaches it through `connect`.
     result.fd = osInvalidSocket
     if ips.len == 0:
       raise newException(IOError, "navi: could not resolve " & sni)
+    let budget = startBudget(connectMs)
     var pool = @ips
     var lastErr: ref CatchableError
     while pool.len > 0:
-      let (fd, idx) = happyConnect(pool, port, connectMs)   # raise = nothing connected
+      # raise = nothing connected (or the budget is spent)
+      let (fd, idx) = happyConnect(pool, port, budget.leftMs())
       try:
-        if connectMs > 0: setIoTimeout(fd, connectMs)   # bound the blocking handshake
-        result.ssl = startClientTls(ctx, fd, sni, verify, slot)
-        if connectMs > 0: setIoTimeout(fd, 0)           # clear; reads poll instead
+        # A bounded handshake is driven non-blocking against the remaining budget,
+        # so it needs no socket timeout; an unbounded one keeps the blocking path.
+        result.ssl = startClientTls(ctx, fd, sni, verify, slot, handshakeWait(budget))
         result.fd = fd
         result.slot = slot
         result.protocol = negotiatedProtocol(result.ssl)
@@ -415,6 +509,10 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   ## the overall (per-attempt) deadline. TLS requires `-d:ssl`.
   # A total deadline also caps establishment when no explicit connect limit is set.
   let establishMs = establishMs(connectMs, totalMs)
+  # ONE wall-clock budget for the whole phase -- TCP connect, the proxy handshake
+  # and the TLS handshake all spend from it, matching the async backends' single
+  # `withTimeout` around `establish` (issue #452).
+  let budget = startBudget(establishMs)
   result.fd = osInvalidSocket
   result.readMs = readMs
   if totalMs > 0:
@@ -433,36 +531,39 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
       if result.fd != osInvalidSocket:
         close(result.fd)
   if proxy.kind == pkUnix:
-    result.fd = unixConnect(proxy.host, establishMs)
+    result.fd = unixConnect(proxy.host, budget.leftMs())
     if tls:
       when defined(ssl):
-        if establishMs > 0: setIoTimeout(result.fd, establishMs)
         (result.ctx, result.ownsCtx) = obtainContext(cfg.contextStore, cfg, alpn)
         result.slot = resumeSlot(cfg, host & ":" & $port)
         result.ssl = startClientTls(result.ctx, result.fd, host, cfg.wantsVerify,
-                                    result.slot)
-        if establishMs > 0: setIoTimeout(result.fd, 0)
+                                    result.slot, handshakeWait(budget))
         result.protocol = negotiatedProtocol(result.ssl)
       else:
         raise newException(ValueError, "navi: https requires compiling with -d:ssl")
   elif proxy.isSet:
-    result.fd = tcpConnect(proxy.host, proxy.port, establishMs)
-    if establishMs > 0: setIoTimeout(result.fd, establishMs)
+    result.fd = tcpConnect(proxy.host, proxy.port, budget.leftMs())
+    # The tunnel drivers arm the socket timeouts themselves, per read, with what is
+    # left of `budget`: a blanket SO_RCVTIMEO here would only bound each recv, which
+    # a trickling proxy defeats by answering just inside every window (issue #452).
+    let tunnel = TunnelSock(fd: result.fd, budget: budget)
     # SOCKS5 tunnels every target; an HTTP proxy tunnels only https (CONNECT) and
     # relays http via an absolute-URI request (no tunnel needed here).
     if proxy.kind == pkSocks5:
-      socksConnect(result.fd, host, port, proxy.user, proxy.pass)
+      socksConnect(tunnel, host, port, proxy.user, proxy.pass)
     elif tls:
-      proxyConnect(result.fd, host, port, proxy.user, proxy.pass)
+      proxyConnect(tunnel, host, port, proxy.user, proxy.pass)
     if tls:
       when defined(ssl):
         (result.ctx, result.ownsCtx) = obtainContext(cfg.contextStore, cfg, alpn)
         result.slot = resumeSlot(cfg, host & ":" & $port)
         result.ssl = startClientTls(result.ctx, result.fd, host, cfg.wantsVerify,
-                                    result.slot)
+                                    result.slot, handshakeWait(budget))
         result.protocol = negotiatedProtocol(result.ssl)
       else:
         raise newException(ValueError, "navi: https requires compiling with -d:ssl")
+    # Hand the socket to the request phase with no leftover receive timeout: reads
+    # poll and re-arm their own budget (`sslReadSome` / `recvSome`).
     if establishMs > 0: setIoTimeout(result.fd, 0)
   elif tls:
     when defined(ssl):
@@ -476,7 +577,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
       # assigned (the connect-cleanup defer cannot see it yet).
       try:
         result = connectAcross(ctx, resolveAddrs(host, port), host, port,
-                               cfg.wantsVerify, slot, establishMs)
+                               cfg.wantsVerify, slot, budget.leftMs())
       except CatchableError:
         if owned: ctx.destroyContext()
         raise
@@ -488,7 +589,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     else:
       raise newException(ValueError, "navi: https requires compiling with -d:ssl")
   else:
-    result.fd = happyConnect(resolveAddrs(host, port), port, establishMs)[0]
+    result.fd = happyConnect(resolveAddrs(host, port), port, budget.leftMs())[0]
   when defined(ssl):
     # SPKI pinning + the user's verify callback (no-op unless configured). Runs
     # before `established`, so a rejection cleans up the fd/SSL via the defer.

@@ -191,6 +191,9 @@ proc close*(client: Navi): Future[void] {.async.} =
     if not refilled or sweeps >= 64: break
   closeTlsStore(client.config.tls.sessionCache)
   closeTlsCtxStore(client.config.tls.contextStore)
+  # The h3 driver caches its own SSL_CTX per policy (#454); this is that cache's
+  # half of closing the context store, and follows the h3 connections being closed.
+  when defined(naviHttp3): h3ReleaseTlsContexts(client.config.tls.contextStore)
 
 when defined(naviHttp3):
   proc h3ConnCount*(client: Navi): int = client.h3conns.len
@@ -521,17 +524,14 @@ when defined(naviHttp3):
       let pending = newFuture[QuicConn]("navi.pendingH3")
       client.pendingH3[origin] = pending
       try:
-        let qc = try:
-            await openQuicConn(ep.host, ep.port, req.url.host, client.config.tls,
-                               uint64(max(0, client.config.maxResponseBytes)),
-                               client.config.connectMs, client.config.totalMs)
-          except QuicError:
-            # RFC 7838 2.4: an alternative that fails to connect is marked broken for
-            # a backoff window, so the next request goes straight to TCP instead of
-            # stalling on the same dead QUIC path again (#432).
-            client.altSvc.markBroken("https", req.url.host, req.url.port)
-            raise
-        client.altSvc.markWorking("https", req.url.host, req.url.port)
+        # RFC 7838 2.4: an alternative that fails to connect is marked broken for a
+        # backoff window, so the next request goes straight to TCP instead of stalling
+        # on the same dead QUIC path again (#432). The mark-broken/mark-working pair
+        # is shared with the sync openers (#453).
+        let qc = client.altSvc.openH3Tracked(req.url.host, req.url.port,
+          await openQuicConn(ep.host, ep.port, req.url.host, client.config.tls,
+                             uint64(max(0, client.config.maxResponseBytes)),
+                             client.config.connectMs, client.config.totalMs))
         # A dead-but-uncleaned prior conn can occupy this slot: the loop above only
         # returns a cached entry when it is `alive`, so a `not alive` one falls
         # through to here and would be silently overwritten. Its background reader may

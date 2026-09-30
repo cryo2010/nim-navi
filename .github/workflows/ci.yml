@@ -88,6 +88,21 @@ jobs:
             nim check --mm:${{ matrix.mm }} -d:ssl --path:src --hints:off "src/$entry.nim"
           done
 
+      # -d:naviHttp3 needs ngtcp2/nghttp3/OpenSSL 3.5 only to LINK, so `nim check`
+      # covers the h3 sources here for free (the full build + live origin stay in
+      # the http3 workflow). Both thread modes: Nim 2 defaults to --threads:on, so
+      # a --threads:off consumer used to hit undeclared Channel/Thread in the sync
+      # ws-over-h3 pump (#450).
+      - name: Compile the h3 entries with threads on and off
+        run: |
+          for threads in on off; do
+            for entry in navi navi/asyncdispatch navi/chronos; do
+              echo "== $entry (-d:naviHttp3 --threads:$threads) =="
+              nim check --mm:${{ matrix.mm }} -d:ssl -d:naviHttp3 \
+                        --threads:$threads --path:src --hints:off "src/$entry.nim"
+            done
+          done
+
   compile-js:
     runs-on: ubuntu-latest
     name: compile navi/js (nim js)

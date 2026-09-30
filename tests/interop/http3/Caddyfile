@@ -2,12 +2,18 @@
 	# No ACME: use the self-signed cert run.sh generates. h1/h2/h3 all served on
 	# the TLS listener; h3 is the one the client dials over UDP.
 	auto_https off
+	# The #451 IP-literal probe dials 127.0.0.1 with no SNI (RFC 6066 3 forbids an
+	# IP literal there), so name the certificate to serve a ClientHello with no
+	# server_name. The one loaded cert covers DNS:localhost and IP:127.0.0.1 alike.
+	default_sni localhost
 	servers {
 		protocols h1 h2 h3
 	}
 }
 
-https://localhost:4433 {
+# Both authorities are served by the one site: the DNS name and the IP literal. The
+# one certificate carries DNS:localhost and IP:127.0.0.1, so it matches either.
+https://localhost:4433, https://127.0.0.1:4433 {
 	tls /work/cert.pem /work/key.pem
 	header Alt-Svc `h3=":4433"; ma=86400`
 	encode gzip {
@@ -26,6 +32,12 @@ https://localhost:4433 {
 	# A large, compressible body (its plaintext is BIG) for the compression test.
 	handle /big {
 		respond "{$BIG}" 200
+	}
+
+	# Echoes the TLS server_name the client sent, so the #451 probe can assert that
+	# an IP-literal origin sends no SNI at all (RFC 6066 3) while a DNS origin does.
+	handle /sni {
+		respond "sni={http.request.tls.server_name}" 200
 	}
 
 	handle {

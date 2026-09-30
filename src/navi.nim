@@ -191,6 +191,9 @@ proc close*(client: Navi) =
   when defined(naviHttp3): closeH3Conns(client.h3conns)
   closeTlsStore(client.config.tls.sessionCache)
   closeTlsCtxStore(client.config.tls.contextStore)
+  # The h3 driver caches its own SSL_CTX per policy (#454); this is that cache's
+  # half of closing the context store, and follows the h3 connections being closed.
+  when defined(naviHttp3): h3ReleaseTlsContexts(client.config.tls.contextStore)
 
 when defined(naviHttp3):
   proc evictH3(client: Navi, origin: string, conn: QuicConn) =
@@ -253,19 +256,16 @@ when defined(naviHttp3):
       var conn = client.liveH3Conn(origin)
       if conn == nil:
         reused = false
-        try:
-          conn = h3Open(ep.host, ep.port, sni = req.url.host,
-                        tls = client.config.tls,
-                        maxBody = uint64(max(0, client.config.maxResponseBytes)),
-                        connectMs = client.config.connectMs,
-                        totalMs = client.config.totalMs)
-        except QuicError:
-          # RFC 7838 2.4: an alternative that fails to connect is marked broken, so
-          # the next request goes straight to TCP instead of paying the same stalled
-          # QUIC handshake again until the advertisement's `ma` expires (#432).
-          client.altSvc.markBroken("https", req.url.host, req.url.port)
-          raise
-        client.altSvc.markWorking("https", req.url.host, req.url.port)
+        # RFC 7838 2.4: an alternative that fails to connect is marked broken, so
+        # the next request goes straight to TCP instead of paying the same stalled
+        # QUIC handshake again until the advertisement's `ma` expires (#432). The
+        # mark-broken/mark-working pair is shared with the other h3 openers (#453).
+        conn = client.altSvc.openH3Tracked(req.url.host, req.url.port,
+          h3Open(ep.host, ep.port, sni = req.url.host,
+                 tls = client.config.tls,
+                 maxBody = uint64(max(0, client.config.maxResponseBytes)),
+                 connectMs = client.config.connectMs,
+                 totalMs = client.config.totalMs))
         client.h3conns[origin] = H3Cached(conn: conn, lastUse: epochTime())
       try:
         let r = conn.request($req.verb, req.url.requestTarget, fwd, req.body,
