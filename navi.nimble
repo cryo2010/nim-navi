@@ -178,6 +178,14 @@ task tlsTruncate, "Unclean TLS close vs a body delimited by the close, all nativ
   # (issue #426).
   exec "bash tests/interop/tls_truncate.sh"
 
+task tlsBudget, "Sync establishment + read budgets as single wall clocks (needs openssl + python3)":
+  # Three python TLS servers: one that never answers the ClientHello (a bounded
+  # handshake must end at the budget as navi's TimeoutError with the connect
+  # wording), one that writes a bare TLS record header late in the read budget (the
+  # read must not re-arm a second full window inside SSL_read), and a healthy one
+  # as the control for the bounded and the unbounded handshake paths (issue #442).
+  exec "bash tests/interop/tls_budget.sh"
+
 task socks, "SOCKS5 proxy tunnelling + user/pass auth, all native clients (needs python3)":
   # A local HTTP origin behind two SOCKS5 proxies (no-auth and user/pass): navi
   # must tunnel through, authenticate, and reject wrong credentials, on the sync,

@@ -21,6 +21,17 @@ proc remainingMs*(deadline: MonoTime): int =
   ## Milliseconds left until `deadline` (may be <= 0 once it has lapsed).
   (deadline - getMonoTime()).inMilliseconds.int
 
+proc recvTimeoutMs*(deadline: MonoTime): int =
+  ## The SO_RCVTIMEO/SO_SNDTIMEO to arm for ONE blocking syscall that has to be over
+  ## by `deadline`: whatever is actually left, floored at 1 ms.
+  ##
+  ## Callers arm this AFTER a readiness wait has already spent part of the budget, so
+  ## the syscall that follows cannot overshoot the deadline by a second full budget
+  ## (issue #442). The floor matters: a socket timeout of 0 means "block forever" on
+  ## both POSIX and Winsock, so a lapsed deadline must never be armed as 0.
+  result = remainingMs(deadline)
+  if result < 1: result = 1
+
 proc connectTimeoutMsg*(ms: int): string =
   ## The canonical connect-timeout message. Kept in one place so the wording is
   ## identical across backends (h1/h2 sync + async, and the h3 handshake).

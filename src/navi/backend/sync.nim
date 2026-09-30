@@ -204,8 +204,22 @@ template guardedAttempt*(client, startReq, resp, attemptMs, cancel,
 proc tcpConnect(host: string, port: int, connectMs = 0): SocketHandle =
   ## Resolve `host` and connect to the first address that accepts a TCP
   ## connection (IPv4 or IPv6, in the resolver's order). With `connectMs` > 0 the
-  ## connect is bounded (non-blocking connect + select); otherwise it blocks (the
+  ## connect is bounded (non-blocking connect + poll); otherwise it blocks (the
   ## OS default). Raises `TimeoutError` on a connect timeout, else `IOError`.
+  ##
+  ## `connectMs` bounds the WHOLE walk, not each address: every attempt takes what is
+  ## left of one deadline opened here, so a proxy hostname with N blackholed addresses
+  ## costs one budget rather than N (issue #442). The deadline opens BEFORE the
+  ## resolve, so the name lookup is charged to it too. `happyConnect` and the
+  ## establishment budget in `connect` bound their own phases the same way.
+  var deadline: MonoTime
+  if connectMs > 0:
+    # Ahead of getAddrInfo on purpose: the resolve is a blocking call that can take
+    # seconds against a slow or unreachable resolver, and it is part of the phase
+    # `connectMs` bounds. Started after it, the budget would pay for the lookup and
+    # then still hand the first address a full window. A resolve that eats the whole
+    # budget now reports the connect timeout at the top of the loop.
+    deadline = getMonoTime() + initDuration(milliseconds = connectMs)
   var ai = getAddrInfo(host, Port(port), AF_UNSPEC, SOCK_STREAM, IPPROTO_TCP)
   defer: freeAddrInfo(ai)   # freed on every exit, including a raise mid-loop
   var it = ai
@@ -213,6 +227,11 @@ proc tcpConnect(host: string, port: int, connectMs = 0): SocketHandle =
   var timedOut = false
   result = osInvalidSocket
   while it != nil:
+    var left = 0
+    if connectMs > 0:
+      left = remainingMs(deadline)
+      if left <= 0:
+        timedOut = true; break        # the budget is spent: no further address
     let fd = createNativeSocket(it.ai_family, it.ai_socktype, it.ai_protocol)
     if fd != osInvalidSocket:
       # Disable Nagle: HTTP is request/response, and with Nagle on, the TLS
@@ -229,7 +248,7 @@ proc tcpConnect(host: string, port: int, connectMs = 0): SocketHandle =
           fd.setBlocking(true); result = fd; break     # connected immediately
         elif not connectInProgress():
           lastErr = osErrorMsg(osLastError()); close(fd)
-        elif not waitWritable(fd, connectMs):
+        elif not waitWritable(fd, left):
           timedOut = true; close(fd)
         elif getSockOptInt(fd, SOL_SOCKET.int, SO_ERROR.int) != 0:
           lastErr = "connection refused"; close(fd)
@@ -342,10 +361,19 @@ when defined(ssl):
     ## what is left of the establishment budget on one poll, and `leftMs` raises the
     ## connect timeout once that is nothing. `nil` for an unbounded budget, which
     ## keeps the plain blocking handshake (and its blocking socket) untouched.
+    ##
+    ## An expiry of the poll itself raises the same `TimeoutError` rather than
+    ## returning false: a false verdict reaches the caller as `startClientTls`'s
+    ## generic `ValueError("TLS handshake timed out for ...")`, which the
+    ## `Timeouts.connect` contract ("TCP connect + TLS handshake") says must be a
+    ## TimeoutError, and which `connectAcross` would answer by dropping the address
+    ## and re-racing the rest of the pool (issue #442).
     if budget.ms <= 0: return nil
     result = proc(fd: SocketHandle, forWrite: bool): bool =
-      let ms = budget.leftMs()
-      if forWrite: waitWritable(fd, ms) else: waitReadable(fd, ms)
+      let ms = budget.leftMs()      # raises once the budget is spent
+      result = if forWrite: waitWritable(fd, ms) else: waitReadable(fd, ms)
+      if not result:
+        raise newException(response.TimeoutError, connectTimeoutMsg(budget.ms))
 
 # --- Happy Eyeballs (RFC 8305) -----------------------------------------
 # `heAttemptDelayMs`, `interleaveFamilies`, and `resolveAddrs` are shared with the
@@ -494,6 +522,12 @@ when defined(ssl):
         result.slot = slot
         result.protocol = negotiatedProtocol(result.ssl)
         return
+      except response.TimeoutError:
+        # The establishment budget is spent (or lapsed inside the handshake): another
+        # address cannot be tried within it, and re-racing here would have to wait for
+        # `leftMs` to raise on the next round anyway (issue #442).
+        close(fd)
+        raise
       except CatchableError as e:
         close(fd); lastErr = e
         pool.delete(idx)   # TLS failed on this address; re-race the rest
@@ -688,19 +722,31 @@ when defined(ssl):
     ## then consumes those non-application bytes and issues a fresh blocking `recv` on
     ## the fd for the rest; on a post-handshake-silent server that recv parks the whole
     ## thread forever (the sync stall-timeout gap, issue #386). We arm SO_RCVTIMEO to
-    ## the current budget around each SSL_read so that inner recv cannot block past the
-    ## deadline: an expired receive timeout on a blocking socket surfaces as
+    ## what is LEFT of the budget around each SSL_read so that inner recv cannot block
+    ## past the deadline: an expired receive timeout on a blocking socket surfaces as
     ## SSL_ERROR_WANT_READ or SSL_ERROR_SYSCALL+EAGAIN, which we treat as "the read
     ## timed out" once the budget is spent (NOT as a transient to spin on, and NOT as
     ## an EOF). While budget remains we re-select and retry, so a genuine trickle of
     ## non-application records does not falsely time out.
+    ##
+    ## The budget is ONE deadline for the whole read, not one per syscall: the readiness
+    ## wait and the recv inside SSL_read both spend from it. Arming SO_RCVTIMEO with the
+    ## pre-wait budget instead let a ticket or a partial record arriving at the very end
+    ## of the window buy a second full window inside SSL_read, so a single read could
+    ## stall for ~2x `timeouts.read` and overshoot `timeouts.total` (which is only
+    ## rechecked between reads) by as much (issue #442).
     while true:
       let waitMs = c.readBudgetMs()   # raises if the total deadline already lapsed
+      var deadline: MonoTime
+      if waitMs > 0:
+        deadline = getMonoTime() + initDuration(milliseconds = waitMs)
       if waitMs > 0 and not c.waitReadable(waitMs):
         c.readTimedOut()
       # Bound the blocking recv OpenSSL runs under SSL_read: without this a readable
       # fd carrying only ticket/partial-record bytes wedges the thread here forever.
-      if waitMs > 0: setIoTimeout(c.fd, waitMs)
+      # The wait above may have spent nearly all of the budget, so arm what is LEFT of
+      # it (never 0, which the kernel reads as "block indefinitely").
+      if waitMs > 0: setIoTimeout(c.fd, recvTimeoutMs(deadline))
       # OpenSSL's error queue is per THREAD, not per SSL, and `SSL_get_error` is
       # documented to be reliable only when that queue was empty before the I/O call:
       # a stale entry (another pooled connection's teardown, a failed handshake)
@@ -708,6 +754,10 @@ when defined(ssl):
       # healthy read. Clear it before every SSL_* call.
       ErrClearError()
       let n = SSL_read(c.ssl, addr buf[0], buf.len).int
+      # Read the syscall verdict BEFORE anything else touches errno/WSAGetLastError:
+      # `setIoTimeout` below is itself a setsockopt, and on Winsock a successful call
+      # does not clear the thread's last error, so asking afterwards is not reliable.
+      let ioTimedOut = n < 0 and lastIoTimedOut()
       if waitMs > 0: setIoTimeout(c.fd, 0)   # clear; the next read re-arms its own budget
       if n > 0: return n
       case SSL_get_error(c.ssl, n.cint)
@@ -715,9 +765,9 @@ when defined(ssl):
       of SSL_ERROR_WANT_READ, SSL_ERROR_WANT_WRITE:
         # Would block. With no budget armed (waitMs == 0) the recv OpenSSL ran blocked
         # indefinitely, so a would-block here can only be a mid-record boundary: loop
-        # to re-select and read the rest. With a budget armed the recv already waited
-        # the full budget (SO_RCVTIMEO) before returning would-block -- that is exactly
-        # the post-handshake-silent stall, so it is the read timeout, not a transient.
+        # to re-select and read the rest. With a budget armed the recv already spent
+        # what was left of it (SO_RCVTIMEO) before returning would-block -- the budget
+        # is gone, so this is the read timeout and not a transient to spin on.
         if waitMs > 0: c.readTimedOut()
         continue
       of SSL_ERROR_SYSCALL:
@@ -726,12 +776,11 @@ when defined(ssl):
         # errno EAGAIN/EWOULDBLOCK -- NOT a close. Distinguish it from a genuine
         # transport EOF/error: treat would-block as the read timeout (mirroring
         # WANT_READ), and only a real syscall failure/EOF as the end of the stream.
-        when defined(posix):
-          if n < 0 and (errno == EAGAIN or errno == EWOULDBLOCK):
-            c.readTimedOut()
-        else:
-          if n < 0 and osLastError().int32 == WSAEWOULDBLOCK:
-            c.readTimedOut()
+        # `lastIoTimedOut` is the platform-correct test: a lapsed SO_RCVTIMEO is
+        # EAGAIN/EWOULDBLOCK on POSIX but WSAETIMEDOUT on a blocking Winsock socket,
+        # and the WSAEWOULDBLOCK-only check this used to do classified an expired read
+        # budget on Windows as an unclean EOF instead of navi's TimeoutError (#442).
+        if ioTimedOut: c.readTimedOut()
         # n == 0 (unexpected EOF) or a real errno. Still reported as a close, so an
         # EOF before any response keeps being classified as a keep-alive race and
         # replayed, but it is NOT a close_notify: record that so the engine can
@@ -759,6 +808,10 @@ proc recvSome*(c: Conn): string =
   let waitMs = c.readBudgetMs()   # raises if the total deadline already lapsed
   if waitMs > 0 and not c.waitReadable(waitMs):
     c.readTimedOut()
+  # No SO_RCVTIMEO to arm on this path, so there is no stale budget to overshoot with
+  # (issue #442): a plain socket that polls readable has bytes (or a hangup) waiting,
+  # and this single recv takes whatever that is without blocking. Only the TLS path can
+  # wake on bytes that carry no application data and have to read again.
   n = sysRecv(c.fd, addr result[0], result.len)
   if n <= 0:
     result.setLen(0)
@@ -773,9 +826,10 @@ proc recvWithin*(c: Conn, ms: int): tuple[timedOut: bool, data: string] =
   ## connection, which a plain `recvSome` + read timeout cannot do (that is terminal).
   ##
   ## Nothing is abandoned here: `waitReadable` only polls readiness, so on expiry not
-  ## a byte has left the socket. The read that follows a ready poll is bounded the
-  ## same way, so a readable socket carrying only TLS bookkeeping (a session ticket,
-  ## a partial record) cannot park past the wait either.
+  ## a byte has left the socket. The read that follows a ready poll gets what is LEFT
+  ## of the same wait, so a readable socket carrying only TLS bookkeeping (a session
+  ## ticket, a partial record) cannot park past it: giving that read a fresh full `ms`
+  ## let the gate run to ~2x its own bound (issue #442).
   ##
   ## `ms` is the CALLER'S bound, and it never outranks the request's own: the wait is
   ## clamped to whatever is left of the total deadline, exactly as `readBudgetMs`
@@ -791,11 +845,15 @@ proc recvWithin*(c: Conn, ms: int): tuple[timedOut: bool, data: string] =
     let remaining = remainingMs(c.deadline)
     if remaining <= 0: c.readTimedOut()      # no budget left: never start the wait
     waitMs = min(waitMs, remaining)
+  let deadline = getMonoTime() + initDuration(milliseconds = waitMs)
   if not c.waitReadable(waitMs):
     if c.bounded and remainingMs(c.deadline) <= 0: c.readTimedOut()   # the clamp, not `ms`
     return (true, "")
   var bounded = c                   # a value copy: the caller's timeouts are untouched
-  bounded.readMs = if c.readMs <= 0: waitMs else: min(c.readMs, waitMs)
+  # The poll above already spent part of the wait; the read gets the remainder of it
+  # (at least 1 ms, since 0 would mean "no read timeout at all").
+  let left = recvTimeoutMs(deadline)
+  bounded.readMs = if c.readMs <= 0: left else: min(c.readMs, left)
   try:
     result = (false, bounded.recvSome())
   except response.TimeoutError:

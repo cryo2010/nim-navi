@@ -318,6 +318,13 @@ jobs:
       # window, so a 4 MiB write parks. The greeting must still reach the reader.
       - name: Run the TLS read-during-write test
         run: bash tests/interop/tls_read_during_write.sh
+      # Establishment and read budgets as single wall clocks (#442): a TLS server
+      # that never answers the ClientHello (the bounded handshake must end at the
+      # budget as navi's TimeoutError), one that writes a bare TLS record header
+      # late in the read budget (SSL_read must not re-arm a second full window),
+      # and a healthy one as the control for both handshake paths.
+      - name: Run the sync establishment/read budget test
+        run: bash tests/interop/tls_budget.sh
 
       # WebSocket over HTTP/2 Extended CONNECT (RFC 8441): a Node h2 TLS server
       # that advertises SETTINGS_ENABLE_CONNECT_PROTOCOL and echoes frames,

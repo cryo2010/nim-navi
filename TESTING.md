@@ -40,6 +40,7 @@ nimble tlsPinning         # in-memory CA + SPKI pinning + verify callback (needs
 nimble tlsWriteClose      # a TLS write racing a close, asyncdispatch client (needs openssl + python3)
 nimble tlsReadDuringWrite # the chronos TLS pump reads while its own write is in flight (needs openssl + python3 + chronos)
 nimble tlsTruncate        # unclean TLS close vs an until-close body (needs openssl + python3)
+nimble tlsBudget          # sync establishment + read budgets as single wall clocks (needs openssl + python3)
 nimble socks              # SOCKS5 proxy + user/pass auth, all native clients (needs python3)
 nimble httpConnect        # HTTP CONNECT proxy: split / oversized / 407 replies (needs openssl + python3)
 nimble unixSocket         # Unix socket transport + failed-TLS teardown (needs python3 + openssl)
@@ -115,6 +116,20 @@ and Valgrind/ASan/LSan. `tls_fallback.sh` needs python3 and *exits 127 silently*
 it is missing, so it is deliberately excluded rather than allowed to pass vacuously;
 `happy_eyeballs.sh` assumes a blackhole address hangs, which Windows may instead fail
 fast as "network unreachable".
+
+`tls_budget.sh` is excluded for a reason of its own, beyond needing python3. Its
+`partial` server has to put a bare TLS record header on the wire *under* the TLS
+layer, which it does with `os.write(sslsock.fileno(), ...)`; on Windows
+`socket.fileno()` returns a Winsock handle rather than a C-runtime descriptor, so
+that write cannot land there and the case would pass on the plain stall instead of
+on the late record it exists to measure. The thresholds are tight as well: a 1700 ms
+stall inside a 2000 ms budget, asserted under a 2900 ms ceiling, leaves under a
+second of slack for a loaded Windows runner. The one Windows-specific branch the
+test's fix touches, the WSAETIMEDOUT arm of `lastIoTimedOut`, is still reached on
+Windows by the unit suite: the #452 trickling-proxy case in `test_socks.nim` runs in
+the `test` job and spends an armed `SO_RCVTIMEO` on a blocking socket. What stays
+uncovered on Windows is only its `SSL_ERROR_SYSCALL` call site in `sslReadSome`,
+which needs a real handshake.
 
 ---
 
@@ -211,6 +226,7 @@ own **`streaming`** matrix job (four separate checks) — see the row below and 
 | `highfd.sh` → `highfd.nim` | **yes** (`interop`) | Readiness waits above `FD_SETSIZE` (sync, POSIX): the client burns ~1100 descriptors with `dup(2)` so its socket lands above 1024, then requests with a read timeout armed (the only case that reaches the readiness wait). Built fortified, so the pre-#429 `select()` wait aborts in glibc's `FD_SET` instead of corrupting memory quietly. Needs room above 1024 descriptors (`docker run --ulimit nofile=4096:4096` if the image's hard limit is lower) |
 | `tls_truncate.sh` → `tls_truncate.nim` | **yes** (`interop`) | Unclean TLS close (#426), all three native clients: a python TLS server answers with a body delimited only by the close and then cuts the connection with a RST or a bare FIN instead of a `close_notify`; navi must raise rather than return the short body, on the buffered drain and on the streamed reader. The same run checks the regression side: the same body ended with `unwrap()` is delivered, a short `Content-Length` body still reports the parser truncation, a keep-alive pair is unaffected, and an `openssl s_server -www` page (until-close, closed cleanly) still arrives |
 | `tls_read_during_write.sh` → `tls_read_during_write.nim` | **yes** (`interop`) | The chronos TLS pump keeps reading while one of its own writes is in flight (#444): a python TLS server greets the client and then stops reading, and its listening socket carries a tiny `SO_RCVBUF` so a 4 MiB `write` is guaranteed to park inside `transport.write` holding the pump's write lock. Drives `ChronosTls` directly (the defect is in the pump, not in an HTTP layer) and asserts the greeting reaches `readSome` while that write is still blocked |
+| `tls_budget.sh` → `tls_budget.nim` | **yes** (`interop`) | Establishment and read budgets as single wall clocks (#442, sync): three python TLS servers driven by `stall_tls_server.py`. A handshake-deaf one accepts the TCP connection and never answers the ClientHello, so a bounded handshake can only end at navi's own budget and must do so as `TimeoutError` with the connect wording (under `timeouts.connect` and under a bare `timeouts.total`). A second one goes silent after the request and then writes a bare TLS record header late in the read budget, so the readiness wait is woken by bytes carrying no application data and `SSL_read` has to recv again: the run asserts the read ends at the budget instead of buying a second full window (the pre-fix stall was ~2x `timeouts.read`, and overshot `timeouts.total` by as much). A healthy third server is the control for both handshake paths, bounded (poll-driven, non-blocking) and unbounded (plain blocking `SSL_connect`) |
 | `streaming.sh` → `streaming_client.nim` (+ `streaming_server.nim` for h1) | **yes** (`file streaming …`, 4 checks) | File streaming (sync) as a matrix of protocol × direction: for http/1.1 (a local Nim server) and http/2 (nghttpd), upload via a streamed body (`body = producer`) and download via `stream()`/`each`. Each check asserts the transfer used that protocol (`res.httpVersion`) and the bytes hash-match a 3 MiB original |
 | `servers.sh` → `servers_{sync,async}.nim` | **yes** (`multiserver`) | h2 client against three unrelated stacks (nginx, Caddy/Go, h2o) over TLS via docker compose, plus the chronos h1+TLS leg; ALPN negotiation and a 256 KiB body (receive flow control) |
 | `streaming_concurrent/` (`nimble streamConcurrent`) | local | Concurrent streaming (navi/asyncdispatch): fires N (default 50, `NAVI_CONCURRENT_N`) simultaneous streamed downloads, then uploads, then a mixed batch, over one h2 connection against the FastAPI server; verifies every transfer by SHA-1 and asserts they all multiplexed onto a single connection (`openedConnections == 1`). Docker compose, one command |
