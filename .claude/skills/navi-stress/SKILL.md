@@ -14,7 +14,7 @@ allowed-tools: Bash, Read, Edit, Write, Agent, Monitor
 
 # navi-stress
 
-Orchestrate the following task: $ARGUMENTS. Turn the task into a matrix of pinned `nimble stress<Workload>` soaks. Fan out to agents (up to eight in parallel) to run the soak, monitor it and report any failures back to you. Each agent should handle one combination of client/protocol/workload (e.g. chronos/h2/sse). Once an agent reports a failure, let the other agents finish, fix the issues serially, and then restart the fanned out stress run. Drive an autonomous **fail → fix → restart** loop until one complete round passes clean on every cell. Then print a report.
+Orchestrate the following task: $ARGUMENTS. Turn the task into a matrix of pinned `nimble stress<Workload>` soaks. Fan out to agents (up to 12 in parallel) to run the soak, monitor it and report any failures back to you. Each agent should handle one combination of client/protocol/workload (e.g. chronos/h2/sse). Once an agent reports a failure, let the other agents finish, fix the issues serially, and then restart the fanned out stress run. Drive an autonomous **fail → fix → restart** loop until one complete round passes clean on every cell. Then print a report.
 
 `$prompt` is the whole invocation text (also `$ARGUMENTS`). If it is empty, ask the user what to
 stress and stop.
