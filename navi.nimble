@@ -186,6 +186,14 @@ task tlsBudget, "Sync establishment + read budgets as single wall clocks (needs 
   # as the control for the bounded and the unbounded handshake paths (issue #442).
   exec "bash tests/interop/tls_budget.sh"
 
+task connectAbandon, "An abandoned connect must not re-race the address pool (needs python3)":
+  # A deaf TCP listener on each loopback family on one port, so `localhost` is a
+  # two-address Happy Eyeballs pool whose winner never answers the ClientHello.
+  # When `connectMs` fires, exactly one connection may ever have reached the
+  # listeners: the abandoned `establish` has to stop rather than drop that address
+  # and re-race the rest behind the caller's back (issue #443).
+  exec "bash tests/interop/connect_abandon.sh"
+
 task socks, "SOCKS5 proxy tunnelling + user/pass auth, all native clients (needs python3)":
   # A local HTTP origin behind two SOCKS5 proxies (no-auth and user/pass): navi
   # must tunnel through, authenticate, and reject wrong credentials, on the sync,

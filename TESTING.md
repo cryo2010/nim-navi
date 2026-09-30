@@ -41,6 +41,7 @@ nimble tlsWriteClose      # a TLS write racing a close, asyncdispatch client (ne
 nimble tlsReadDuringWrite # the chronos TLS pump reads while its own write is in flight (needs openssl + python3 + chronos)
 nimble tlsTruncate        # unclean TLS close vs an until-close body (needs openssl + python3)
 nimble tlsBudget          # sync establishment + read budgets as single wall clocks (needs openssl + python3)
+nimble connectAbandon     # an abandoned connect must not re-race the address pool (needs python3)
 nimble socks              # SOCKS5 proxy + user/pass auth, all native clients (needs python3)
 nimble httpConnect        # HTTP CONNECT proxy: split / oversized / 407 replies (needs openssl + python3)
 nimble unixSocket         # Unix socket transport + failed-TLS teardown (needs python3 + openssl)
@@ -115,7 +116,8 @@ Not runnable on a Windows runner, and staying on Linux CI: everything Docker-bas
 and Valgrind/ASan/LSan. `tls_fallback.sh` needs python3 and *exits 127 silently* when
 it is missing, so it is deliberately excluded rather than allowed to pass vacuously;
 `happy_eyeballs.sh` assumes a blackhole address hangs, which Windows may instead fail
-fast as "network unreachable".
+fast as "network unreachable"; `connect_abandon.sh` needs python3 and a dual-homed
+`localhost` (it binds one deaf listener per loopback family on the same port).
 
 `tls_budget.sh` is excluded for a reason of its own, beyond needing python3. Its
 `partial` server has to put a bare TLS record header on the wire *under* the TLS
@@ -221,6 +223,7 @@ own **`streaming`** matrix job (four separate checks) — see the row below and 
 | `tls_fallback.sh` → `tls_fallback.nim` | **yes** (`interop`) | Handshake-aware address fallback (sync): a dead endpoint (accepts TCP then drops the handshake) plus a good TLS server on the same port; navi falls through to the good address |
 | `tls_version.sh` → `tls_version.nim` | **yes** (`interop`) | TLS version pinning: TLS-1.2-only and TLS-1.3-only servers; a `minVersion`/`maxVersion` pin excluding the server's version fails the handshake |
 | `happy_eyeballs.sh` → `happy_eyeballs.nim` | **yes** (`interop`) | Happy Eyeballs (RFC 8305): a blackholed first address (192.0.2.1, SYN dropped) plus a good server; navi races the addresses and reaches the good one in ~the attempt delay instead of stalling |
+| `connect_abandon.sh` → `connect_abandon.nim` | **yes** (`interop`) | An abandoned connect (#443), asyncdispatch and chronos: `deaf_tcp_server.py` accepts and never speaks on both loopback families on one port, so `localhost` is a two-address Happy-Eyeballs pool whose winner stalls the TLS handshake. When `connectMs` fires, exactly one connection may ever have reached the origin: the abandoned `establish` must stop rather than drop that address and re-race the rest with a fresh TCP connect and SSL_CTX/handshake. The chronos leg is the control (structured cancellation). Needs a dual-homed localhost (127.0.0.1 + ::1) |
 | `cipher_suite.sh` → `cipher_suite.nim` | **yes** (`interop`) | Cipher selection: servers pinned to one TLS 1.2 cipher and one TLS 1.3 ciphersuite; `TlsConfig.ciphers`/`cipherSuites` honored (matching name connects, non-matching fails the handshake) |
 | `ca_verify.sh` → `ca_verify.nim` | **yes** (`interop`) | Private-CA verification (sync): a server cert signed by a throwaway CA; navi trusts it via `TlsConfig.caFile` and rejects the same server without the CA (system trust lacks that root) |
 | `highfd.sh` → `highfd.nim` | **yes** (`interop`) | Readiness waits above `FD_SETSIZE` (sync, POSIX): the client burns ~1100 descriptors with `dup(2)` so its socket lands above 1024, then requests with a read timeout armed (the only case that reaches the readiness wait). Built fortified, so the pre-#429 `select()` wait aborts in glibc's `FD_SET` instead of corrupting memory quietly. Needs room above 1024 descriptors (`docker run --ulimit nofile=4096:4096` if the image's hard limit is lower) |
