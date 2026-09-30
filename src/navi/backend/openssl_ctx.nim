@@ -4,8 +4,9 @@
 ##   * certificate verification and CA trust come from std/net's `newContext`,
 ##     which owns the security-critical chain and hostname checks;
 ##   * ALPN (h2 / http/1.1) is set here;
-##   * the client certificate -- encrypted PEM, DER, PKCS#12, or in-memory PEM --
-##     is installed here, covering everything `newContext` cannot.
+##   * the client certificate -- encrypted PEM, DER (plain or encrypted PKCS#8),
+##     PKCS#12, or in-memory PEM -- is installed here, covering everything
+##     `newContext` cannot.
 ##
 ## Backends call `newTlsContext` and, after the handshake, `negotiatedProtocol`;
 ## they no longer touch `newContext`, ALPN, or the credential loader directly.
@@ -66,6 +67,15 @@ when defined(ssl):
   proc SSL_CTX_use_PrivateKey(ctx: SslCtx, pkey: EVP_PKEY): cint
     {.cdecl, dynlib: DLLSSLName, importc.}
   proc PEM_read_bio_X509(bp: BIO, x: ptr PX509, cb: pointer, u: pointer): PX509
+    {.cdecl, dynlib: DLLUtilName, importc.}
+  # DER private keys. d2i_PrivateKey_bio is d2i_AutoPrivateKey over a BIO: it
+  # reads a traditional RSA/EC key or an unencrypted PKCS#8 PrivateKeyInfo.
+  # d2i_PKCS8PrivateKey_bio reads the encrypted PKCS#8 shape
+  # (EncryptedPrivateKeyInfo) and decrypts it with the passphrase callback.
+  proc d2i_PrivateKey_bio(bp: BIO, a: ptr EVP_PKEY): EVP_PKEY
+    {.cdecl, dynlib: DLLUtilName, importc.}
+  proc d2i_PKCS8PrivateKey_bio(bp: BIO, x: ptr EVP_PKEY, cb: pointer,
+                               u: pointer): EVP_PKEY
     {.cdecl, dynlib: DLLUtilName, importc.}
   proc d2i_PKCS12_bio(bp: BIO, p12: ptr pointer): pointer
     {.cdecl, dynlib: DLLUtilName, importc.}
@@ -287,9 +297,26 @@ when defined(ssl):
         fail("could not install the PKCS#12 certificate chain")
       caOwned = false
 
+  const pemBoundary = "-----BEGIN"
+
+  proc isPem(data: string): bool =
+    ## Whether `data` is armoured PEM: a `-----BEGIN` encapsulation boundary
+    ## starts one of its lines. RFC 7468 section 5.2 allows explanatory text
+    ## before that boundary and OpenSSL's PEM readers skip it, so the marker is
+    ## not necessarily at offset 0 -- which is why the sniff below looks for the
+    ## boundary instead of testing the first byte for the ASN.1 SEQUENCE tag
+    ## (0x30, the ASCII digit '0'): a PEM file whose first character is '0' is
+    ## still valid PEM and used to be misrouted to the DER loader (#436).
+    if data.startsWith(pemBoundary): return true
+    var nl = data.find('\n')
+    while nl >= 0:
+      if data.continuesWith(pemBoundary, nl + 1): return true
+      nl = data.find('\n', nl + 1)
+    false
+
   proc isDer(data: string): bool =
-    ## DER starts with the ASN.1 SEQUENCE tag (0x30); PEM starts with '-'.
-    data.len > 0 and data[0] == '\x30'
+    ## Binary ASN.1: non-empty and carrying no PEM encapsulation boundary.
+    data.len > 0 and not isPem(data)
 
   proc useCertFile(ctx: SslCtx, path: string) =
     let data = readFile(path)
@@ -299,11 +326,45 @@ when defined(ssl):
     else:
       useCertChainPem(ctx, data)              # PEM leaf + any following chain
 
+  proc useKeyDer(ctx: SslCtx, der, password, path: string) =
+    ## Install a DER private key. Three shapes reach here: a traditional RSA/EC
+    ## key, an unencrypted PKCS#8 PrivateKeyInfo, and an encrypted PKCS#8
+    ## EncryptedPrivateKeyInfo (`openssl pkcs8 -topk8 -outform DER -v2
+    ## aes-256-cbc`). SSL_CTX_use_PrivateKey_file with SSL_FILETYPE_ASN1, which
+    ## this replaces, decodes only the first two: it calls d2i_PrivateKey and
+    ## never consults the passphrase callback, so an encrypted DER key failed
+    ## with a generic error while `tls.password` was silently ignored (#436).
+    var pkey: EVP_PKEY
+    block:
+      let plain = memBio(der)
+      pkey = d2i_PrivateKey_bio(plain, nil)   # traditional or plain PKCS#8
+      discard BIO_free(plain)
+    if pkey.isNil:
+      # Not an unencrypted key. The failed attempt left entries on this thread's
+      # error queue, which later SSL_get_error reads rely on being empty.
+      ErrClearError()
+      let enc = memBio(der)
+      # Never a nil callback: see pemPassword. Without one OpenSSL substitutes
+      # PEM_def_callback, which prompts on /dev/tty and blocks the event loop.
+      let u = if password.len > 0: cast[pointer](password.cstring) else: nil
+      pkey = d2i_PKCS8PrivateKey_bio(enc, nil, cast[pointer](pemPassword), u)
+      discard BIO_free(enc)
+    if pkey.isNil:
+      ErrClearError()
+      if password.len > 0:
+        fail("could not load the DER private key (wrong password?): " & path)
+      fail("could not load the DER private key; set tls.password if it is an " &
+           "encrypted PKCS#8 key: " & path)
+    # SSL_CTX_use_PrivateKey bumps the object's refcount, so we free our
+    # reference on every exit path once the key exists.
+    defer: EVP_PKEY_free(pkey)
+    if SSL_CTX_use_PrivateKey(ctx, pkey) != 1:
+      fail("the DER private key does not match the certificate: " & path)
+
   proc useKeyFile(ctx: SslCtx, path, password: string) =
     let data = readFile(path)
     if isDer(data):
-      if SSL_CTX_use_PrivateKey_file(ctx, path.cstring, SSL_FILETYPE_ASN1) != 1:
-        fail("could not load the DER private key: " & path)
+      useKeyDer(ctx, data, password, path)    # DER, possibly encrypted PKCS#8
     else:
       useKeyPem(ctx, data, password)          # PEM, possibly encrypted
 

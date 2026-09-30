@@ -251,6 +251,23 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **An encrypted PKCS#8 DER private key is decrypted with `tls.password`, and PEM is
+  detected by its `-----BEGIN` boundary rather than by the first byte (#436).** A DER
+  key file went to `SSL_CTX_use_PrivateKey_file(..., SSL_FILETYPE_ASN1)`, which calls
+  `d2i_PrivateKey` and never consults the passphrase callback, so an
+  `EncryptedPrivateKeyInfo` key (`openssl pkcs8 -topk8 -outform DER -v2 aes-256-cbc`)
+  failed with a generic "could not load the DER private key" while the configured
+  passphrase was silently ignored, contradicting the documented `password` and
+  auto-detected DER encoding. Navi now decodes DER keys itself: `d2i_PrivateKey_bio`
+  for a traditional or unencrypted PKCS#8 key, then `d2i_PKCS8PrivateKey_bio` with
+  navi's own passphrase callback (never OpenSSL's, which would prompt on the
+  terminal), and the failure names the encrypted-PKCS#8 case and whether a password
+  was set. The HTTP/3 leg had the same defect in its `SSL_FILETYPE_ASN1` fallback and
+  now shares the two-step loader. The PEM/DER sniff no longer tests the first byte for
+  the ASN.1 SEQUENCE tag either: a file is PEM when a `-----BEGIN` boundary starts one
+  of its lines, so a PEM key beginning with the character `0`, or carrying the
+  explanatory text RFC 7468 5.2 allows, is no longer misrouted to the DER loader
+  (#436).
 - **An IP-literal origin over HTTP/3 is matched against the certificate's
   `iPAddress` SAN and is no longer offered as SNI (#451).** `navi_h3_new` handed
   every origin -- DNS name or numeric address alike -- to `SSL_set1_host`, the

@@ -201,7 +201,7 @@ own **`streaming`** matrix job (four separate checks) — see the row below and 
 | Suite (script → driver) | CI | Verifies |
 |------|----|----------|
 | `run.sh` → `nghttpd_{sync,async}.nim` | **yes** (`interop`) | HTTP/2 against nghttpd (nghttp2 reference): navi's HPACK **encoder**, ALPN, real h2 wire framing, multiplexing, receive-side flow control, PADDED-flag handling (a second nghttpd runs with `-b` padding), and a streamed body upload (`body = producer`) over h2 (sync and the async mux) |
-| `mtls.sh` → `mtls.nim` | **yes** (`interop`) | Mutual TLS: an `openssl s_server -Verify 1` rejects clients without a CA-signed cert, exercising `TlsConfig.certFile`/`keyFile` |
+| `mtls.sh` → `mtls.nim` | **yes** (`interop`) | Mutual TLS: an `openssl s_server -Verify 1` rejects clients without a CA-signed cert, exercising `TlsConfig.certFile`/`keyFile` in every accepted encoding (PEM, encrypted PEM, PKCS#12, DER, encrypted PKCS#8 DER, in-memory PEM) |
 | `tls_fallback.sh` → `tls_fallback.nim` | **yes** (`interop`) | Handshake-aware address fallback (sync): a dead endpoint (accepts TCP then drops the handshake) plus a good TLS server on the same port; navi falls through to the good address |
 | `tls_version.sh` → `tls_version.nim` | **yes** (`interop`) | TLS version pinning: TLS-1.2-only and TLS-1.3-only servers; a `minVersion`/`maxVersion` pin excluding the server's version fails the handshake |
 | `happy_eyeballs.sh` → `happy_eyeballs.nim` | **yes** (`interop`) | Happy Eyeballs (RFC 8305): a blackholed first address (192.0.2.1, SYN dropped) plus a good server; navi races the addresses and reaches the good one in ~the attempt delay instead of stalling |

@@ -283,7 +283,7 @@ let api = newNavi(config)
 | `tls.keyPem` | `string` | `""` | Private key as an in-memory PEM string; `""` reuses `certPem`. |
 | `tls.maxVersion` | `TlsVersion` | `tlsDefault` | Highest TLS version to negotiate (`tlsDefault` = unset). |
 | `tls.minVersion` | `TlsVersion` | `tlsDefault` | Lowest TLS version to negotiate (`tlsDefault` = unset). |
-| `tls.password` | `string` | `""` | Passphrase for an encrypted key, or the PKCS#12 password. |
+| `tls.password` | `string` | `""` | Passphrase for an encrypted key (PEM or PKCS#8 DER), or the PKCS#12 password. |
 | `tls.pinnedKeys` | `seq[string]` | `@[]` | SPKI SHA-256 pins (base64, HPKP form); the peer public key must match one or the connection is rejected. |
 | `tls.pkcs12File` | `string` | `""` | PKCS#12/PFX bundle (cert + key + chain); highest precedence. |
 | `tls.resumeSessions` | `bool` | `true` | Reuse TLS sessions across connections (abbreviated handshake). |
@@ -443,6 +443,11 @@ config.tls.password = "secret"
 # DER-encoded cert and key (encoding auto-detected from content)
 config.tls.certFile = "client.crt"; config.tls.keyFile = "client.key"
 
+# Encrypted PKCS#8 DER key (openssl pkcs8 -topk8 -outform DER -v2 aes-256-cbc)
+config.tls.certFile = "client.crt"
+config.tls.keyFile  = "client.der.key"
+config.tls.password = "secret"
+
 # PKCS#12 / PFX bundle (password is the bundle password)
 config.tls.pkcs12File = "client.p12"
 config.tls.password   = "secret"
@@ -453,8 +458,14 @@ config.tls.keyPem  = keyString
 ```
 
 An encrypted key needs `tls.password`; without one the load fails immediately rather
-than prompting for a passphrase on the terminal. A key configured without a
+than prompting for a passphrase on the terminal. This holds for both encodings: a
+PEM key and an encrypted PKCS#8 DER key are decrypted with the same passphrase, on
+the native backends and on HTTP/3 alike. A key configured without a
 certificate is rejected.
+
+PEM and DER are told apart by content, not by file extension: a file is read as PEM
+when a `-----BEGIN` boundary starts one of its lines (explanatory text before it is
+allowed, per RFC 7468) and as DER otherwise.
 
 Key algorithms (RSA, ECDSA, Ed25519) work in any of these as long as OpenSSL supports them. In-memory PEM may carry an intermediate chain, and a PKCS#12 bundle's intermediates are installed too, so a client certificate issued by an intermediate CA is presented with the chain a root-only server needs to validate it.
 

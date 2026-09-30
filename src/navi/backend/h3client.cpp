@@ -824,6 +824,35 @@ bool use_pkcs12(SSL_CTX *ctx, const std::string &der, const char *password) {
   return true;
 }
 
+// Install a DER private key from `path`: a traditional RSA/EC key, an unencrypted
+// PKCS#8 PrivateKeyInfo, or an encrypted PKCS#8 EncryptedPrivateKeyInfo (from
+// `openssl pkcs8 -topk8 -outform DER -v2 aes-256-cbc`). SSL_CTX_use_PrivateKey_file
+// with SSL_FILETYPE_ASN1, which this replaces, decodes only the first two: it calls
+// d2i_PrivateKey and never consults the passphrase callback, so an encrypted DER key
+// failed on h3 with `password` silently ignored, exactly as on the TCP backends
+// (#436). Mirrors openssl_ctx.useKeyDer, including the order of the two attempts.
+bool use_key_der_file(SSL_CTX *ctx, const char *path, const char *password) {
+  EvpPkeyPtr key;
+  {
+    BioPtr bio{BIO_new_file(path, "rb")};
+    if (!bio) return false;
+    key.reset(d2i_PrivateKey_bio(bio.get(), nullptr));
+  }
+  if (!key) {
+    // Not an unencrypted key; re-read the file as EncryptedPrivateKeyInfo. The
+    // failed attempt left entries on the thread's error queue.
+    ERR_clear_error();
+    BioPtr bio{BIO_new_file(path, "rb")};
+    if (!bio) return false;
+    // navi_pw_cb rather than a null callback: OpenSSL's default prompts on the
+    // controlling terminal, and ours fails when no password is configured.
+    key.reset(d2i_PKCS8PrivateKey_bio(bio.get(), nullptr, navi_pw_cb,
+                                      const_cast<char *>(password)));
+  }
+  if (!key) return false;
+  return SSL_CTX_use_PrivateKey(ctx, key.get()) == 1;
+}
+
 // Install the client credential described by `t`. Precedence matches the TCP path
 // (openssl_ctx.loadClientCert): PKCS#12, then in-memory PEM, then the file pair.
 // Files may be PEM or DER; PEM is tried first and DER is the fallback.
@@ -855,7 +884,7 @@ bool apply_client_cert(SSL_CTX *ctx, const NaviH3Tls *t) {
          SSL_CTX_use_certificate_file(ctx, t->cert_file, SSL_FILETYPE_ASN1) == 1;
     if (ok)
       ok = SSL_CTX_use_PrivateKey_file(ctx, keyPath, SSL_FILETYPE_PEM) == 1 ||
-           SSL_CTX_use_PrivateKey_file(ctx, keyPath, SSL_FILETYPE_ASN1) == 1;
+           use_key_der_file(ctx, keyPath, t->password);
   }
   if (!ok) {
     std::fprintf(stderr, "h3 tls: could not load the client certificate/key\n");

@@ -70,13 +70,17 @@ type
     # --- Client credential for mTLS ----------------------------------------
     # The credential can come from several sources; precedence is `pkcs12File`,
     # then in-memory (`certPem`/`keyPem`), then the `certFile`/`keyFile` pair.
-    # Files may be PEM or DER (detected by content).
+    # Files may be PEM or DER, detected by content rather than extension: PEM when
+    # a `-----BEGIN` boundary starts one of the file's lines (RFC 7468 allows
+    # explanatory text before it), DER otherwise. An encrypted key is decrypted
+    # with `password` in either encoding, PEM or PKCS#8 DER.
     pkcs12File*: string    ## a PKCS#12/PFX bundle (cert + key + chain); highest precedence
     certPem*: string       ## client certificate as an in-memory PEM string (may hold a chain)
     keyPem*: string        ## private key as an in-memory PEM string ("" reuses `certPem`)
     certFile*: string      ## client certificate file (PEM or DER) for mTLS
     keyFile*: string       ## private key file for `certFile`; "" reuses certFile
-    password*: string      ## passphrase for an encrypted key, or the PKCS#12 bundle password
+    password*: string      ## passphrase for an encrypted key (PEM or an encrypted
+                           ## PKCS#8 DER key), or the PKCS#12 bundle password
 
     # --- Session + context reuse (performance) -----------------------------
     resumeSessions*: bool  ## reuse TLS sessions across connections to the same origin
