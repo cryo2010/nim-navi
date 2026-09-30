@@ -1540,13 +1540,22 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
   static const NaviH3Tls defaultTls{};   // all-unset: no verification, no credential
   if (!tls) tls = &defaultTls;
   const int verify = tls->verify;
-  static bool crypto_inited = false;
-  if (!crypto_inited) {
-    if (ngtcp2_crypto_ossl_init() != 0) {
-      set_error(NAVI_H3_ERR_INTERNAL, "ngtcp2_crypto_ossl_init failed");
-      return nullptr;
-    }
-    crypto_inited = true;
+  // One-time init of ngtcp2's OpenSSL crypto binding. The guard used to be a plain
+  // `static bool crypto_inited` set after the call: check-then-set with no mutex,
+  // atomic or call_once, so in a --threads:on program (Nim 2.2's default) two threads
+  // opening their first h3 connection at once could both observe it false and both
+  // run ngtcp2_crypto_ossl_init, which re-fetches and overwrites its file-scope
+  // EVP_CIPHER/EVP_MD globals without freeing the old ones -- a one-time leak of the
+  // first call's EVP objects plus a data race on those globals and on the flag, which
+  // TSan reports (#447). A function-local static's initialisation is thread safe by
+  // construction (C++11 [stmt.dcl]/4: concurrent entrants block until the initialiser
+  // has run, exactly once), so the initialiser itself is the guard, and its result is
+  // kept so a failed init fails every navi_h3_new with a reason rather than being
+  // silently retried per connection.
+  static const int crypto_rc = ngtcp2_crypto_ossl_init();
+  if (crypto_rc != 0) {
+    set_error(NAVI_H3_ERR_INTERNAL, "ngtcp2_crypto_ossl_init failed (%d)", crypto_rc);
+    return nullptr;
   }
   try {
     // Owned locally so any early return / thrown exception frees it and the C
