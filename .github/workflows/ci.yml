@@ -313,6 +313,12 @@ jobs:
       - name: Run the unclean-TLS-close truncation test
         run: bash tests/interop/tls_truncate.sh
 
+      # The chronos TLS pump reading while its own write is in flight (#444): a
+      # server that greets the client and then stops reading, with a tiny receive
+      # window, so a 4 MiB write parks. The greeting must still reach the reader.
+      - name: Run the TLS read-during-write test
+        run: bash tests/interop/tls_read_during_write.sh
+
       # WebSocket over HTTP/2 Extended CONNECT (RFC 8441): a Node h2 TLS server
       # that advertises SETTINGS_ENABLE_CONNECT_PROTOCOL and echoes frames,
       # driven by the sync, asyncdispatch, and chronos clients (config.http={H2}).

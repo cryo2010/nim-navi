@@ -439,6 +439,94 @@ when defined(ssl):
                       osslTlsVersion(cfg.maxVersion), nil) != 1:
         fail("the loaded OpenSSL/LibreSSL does not support setting the maximum TLS version")
 
+  const SSL_OP_NO_RENEGOTIATION = 0x40000000'u64
+    ## Refuse renegotiation: OpenSSL then drops a server's TLS 1.2 HelloRequest
+    ## with a `no_renegotiation` warning alert instead of starting a new
+    ## handshake. TLS 1.3 has no renegotiation at all, and RFC 9113 9.2.1 forbids
+    ## it for HTTP/2 regardless of version. navi never asks for one either
+    ## (nothing calls SSL_renegotiate), so the only thing this removes is a
+    ## peer-driven mid-connection handshake, which no navi backend can serve: on
+    ## the chronos pump it makes SSL_write return WANT_READ, and that path cannot
+    ## read the transport (chronos permits one pending read per transport, and the
+    ## mux reader owns it), so it used to fail the whole connection (issue #444).
+    ##
+    ## This NUMBER is OpenSSL 1.1.0's and only OpenSSL 1.1.0's. The option-bit
+    ## space is not shared across the libraries navi loads: OpenSSL 1.0.x spends
+    ## 0x40000000 on SSL_OP_NETSCAPE_DEMO_CIPHER_CHANGE_BUG, and LibreSSL spends it
+    ## on SSL_OP_NO_DTLSv1 while numbering its own SSL_OP_NO_RENEGOTIATION
+    ## 0x00040000 (which is SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION on OpenSSL, so
+    ## the two cannot be ORed in together either). `addCtxOptions` below is what
+    ## keeps the bit off a library that would read it as something else.
+
+  proc osslVersionNumber(): uint {.raises: [].} =
+    ## `getOpenSSLVersion()` with its inferred `Exception` contained -- std/openssl
+    ## forward-declares it without a raises annotation, which the strict paths here
+    ## reject (the same reason `tlsLib` is wrapped). When the number cannot be read
+    ## at all we answer 0x10100000 (OpenSSL 1.1.0), the era whose entry points this
+    ## module hand-resolves; both callers then take their conservative branch on
+    ## the symbol lookup instead.
+    try: uint(getOpenSSLVersion())
+    except Exception: 0x10100000'u
+
+  proc isOpenSsl11OrNewer*(version: uint): bool =
+    ## Whether `version` (an OPENSSL_VERSION_NUMBER, i.e. `getOpenSSLVersion()`)
+    ## is a real OpenSSL 1.1.0-or-newer, the only library family whose option bits
+    ## match the SSL_OP_* constants above. LibreSSL pins the number at 0x20000000
+    ## whatever its real version -- which sorts ABOVE 1.1.0 and must not be taken
+    ## for it -- and anything below 0x10100000 is OpenSSL 1.0.x or older. Exported
+    ## logic kept separate from the FFI so it can be unit-tested for the libraries
+    ## this host cannot install.
+    version != 0x20000000'u and version >= 0x10100000'u
+
+  type
+    SetOptions64Proc =
+      proc(ctx: SslCtx, op: uint64): uint64 {.cdecl, gcsafe, raises: [].}
+        ## OpenSSL 3.x: `uint64_t SSL_CTX_set_options(SSL_CTX *, uint64_t)`.
+    SetOptionsLongProc =
+      proc(ctx: SslCtx, op: culong): culong {.cdecl, gcsafe, raises: [].}
+        ## OpenSSL 1.1.x: `unsigned long SSL_CTX_set_options(SSL_CTX *, unsigned
+        ## long)`. Identical to the above wherever `long` is 64 bits, and NOT
+        ## interchangeable where it is 32: on AAPCS (32-bit ARM) and MIPS o32 a
+        ## 64-bit argument is passed in an even-aligned register pair, so a callee
+        ## expecting one word reads the wrong register and ORs garbage into the
+        ## option mask -- which is where SSL_OP_LEGACY_SERVER_CONNECT,
+        ## SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION and SSL_OP_NO_TLSv1_3 live.
+  var ctxSetOptionsAddr {.threadvar.}: pointer
+  var ctxSetOptionsReady {.threadvar.}: bool
+  var ctxSetOptionsVersion {.threadvar.}: uint
+
+  proc addCtxOptions(ctx: SslCtx, op: uint64) =
+    ## OR `op` (an SSL_OP_* bit in OpenSSL 1.1.0+ numbering) into the context's
+    ## option mask, or do nothing at all when the loaded library is not one whose
+    ## mask uses that numbering.
+    ##
+    ## `SSL_CTX_set_options` is a real exported function only from OpenSSL 1.1.0
+    ## on: OpenSSL 1.0.x and every LibreSSL define it as a macro over
+    ## SSL_CTX_ctrl(SSL_CTRL_OPTIONS), so the symbol does not resolve there. That
+    ## is not a case to fall back for, it is the case to skip: those are exactly
+    ## the libraries that read our bits as different options (see
+    ## SSL_OP_NO_RENEGOTIATION above), so the old ctrl fallback could only ever
+    ## set the wrong flag. The runtime version is checked as well, in case a
+    ## library ships a compatibility export while keeping its own numbering.
+    ##
+    ## Resolved by hand rather than with a `dynlib` importc for the reason
+    ## `resolveIdentityApi` explains: an unresolved importc kills the process when
+    ## this module initialises.
+    if not ctxSetOptionsReady:
+      ctxSetOptionsReady = true
+      ctxSetOptionsVersion = osslVersionNumber()
+      if isOpenSsl11OrNewer(ctxSetOptionsVersion):
+        ctxSetOptionsAddr = tlsLib(DLLSSLName).tlsSym("SSL_CTX_set_options")
+    if ctxSetOptionsAddr.isNil: return
+    # OpenSSL 3.0 widened the parameter from `unsigned long` to `uint64_t`, so the
+    # declaration has to follow the loaded library rather than be one compromise
+    # for both (see SetOptionsLongProc). No SSL_OP_* navi sets lives above bit 31,
+    # so the narrowing on a 32-bit `long` drops nothing.
+    if ctxSetOptionsVersion >= 0x30000000'u:
+      discard cast[SetOptions64Proc](ctxSetOptionsAddr)(ctx, op)
+    else:
+      discard cast[SetOptionsLongProc](ctxSetOptionsAddr)(ctx, culong(op))
+
   proc setCiphers(ctx: SslCtx, cfg: TlsConfig) =
     ## Restrict the offered ciphers. TLS <=1.2 and TLS 1.3 use separate OpenSSL
     ## APIs, so `ciphers` and `cipherSuites` are set independently; a non-1 return
@@ -490,6 +578,7 @@ when defined(ssl):
     setAlpn(result.context, alpn)
     setVersionBounds(result.context, cfg)
     setCiphers(result.context, cfg)
+    addCtxOptions(result.context, SSL_OP_NO_RENEGOTIATION)
 
   # --- TLS session resumption --------------------------------------------
   #

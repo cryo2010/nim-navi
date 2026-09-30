@@ -164,6 +164,12 @@ task tlsWriteClose, "A TLS write racing a close on the asyncdispatch client (nee
   # write through the SSL that freeConn already freed (issue #421).
   exec "bash tests/interop/tls_write_close.sh"
 
+task tlsReadDuringWrite, "The chronos TLS pump reads while its own write is in flight (needs openssl + python3 + chronos)":
+  # A TLS server that greets the client and then stops reading, with a tiny
+  # SO_RCVBUF so a 4 MiB write cannot drain: the greeting must still reach
+  # `readSome` instead of parking behind the write lock (issue #444).
+  exec "bash tests/interop/tls_read_during_write.sh"
+
 task tlsTruncate, "Unclean TLS close vs a body delimited by the close, all native clients (needs openssl + python3)":
   # A TLS server that answers with an un-framed body and then cuts the connection
   # with a RST (and with a bare FIN) instead of a close_notify: navi must refuse

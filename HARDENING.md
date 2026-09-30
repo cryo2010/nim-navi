@@ -158,6 +158,33 @@ downgrade to a weak protocol; a negotiation outside the pinned range fails the
 handshake. Enforced on all three native OpenSSL backends (sync, asyncdispatch,
 chronos), so `tls13` is honored on chronos too.
 
+### Renegotiation (not configurable: off on OpenSSL 1.1.0 and newer)
+
+On **OpenSSL 1.1.0 and newer** every navi TLS context sets
+`SSL_OP_NO_RENEGOTIATION`, so a TLS 1.2 (or earlier) peer cannot start a
+mid-connection handshake: OpenSSL answers a `HelloRequest` with a
+`no_renegotiation` warning alert and the connection carries on. TLS 1.3 has no
+renegotiation at all, RFC 9113 9.2.1 forbids it for HTTP/2 regardless of version,
+and navi never requests one itself.
+
+This is not free on every backend. A TLS 1.2 server that defers its
+client-certificate request to a renegotiation -- the per-directory pattern some
+Apache and IIS deployments use -- used to be served transparently by the sync and
+asyncdispatch backends (a blocking `SSL_read` with `SSL_MODE_AUTO_RETRY` just
+completed the new handshake); such a server now gets a `no_renegotiation` alert
+and the request typically fails. Have the server ask for the certificate in the
+initial handshake instead (`config.tls.certFile` and friends below). There is no
+knob to re-enable renegotiation.
+
+The option is deliberately **not** set on OpenSSL 1.0.x or on LibreSSL: those
+libraries spend that option bit on something else entirely (OpenSSL 1.0.x on
+`SSL_OP_NETSCAPE_DEMO_CIPHER_CHANGE_BUG`, LibreSSL on `SSL_OP_NO_DTLSv1`, which
+numbers its own `SSL_OP_NO_RENEGOTIATION` elsewhere), so setting it there would
+change an unrelated flag rather than refuse renegotiation. Against such a library
+a peer-driven renegotiation is still refused, just later and less politely: the
+sync and asyncdispatch backends let OpenSSL complete it, and the chronos backend
+fails that connection with "TLS peer requested renegotiation during a write".
+
 ### Cipher restriction
 
 ```nim
