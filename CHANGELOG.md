@@ -97,6 +97,18 @@ onward (pre-1.0, minor versions may include breaking changes).
   api.nim's field comments and HARDENING.md's trust-anchor section now name `caFile`
   as the replacing option and `caBundle` as the additive one, with the mechanism
   quoted at the call site in `newTlsContext`. Behaviour is unchanged (#437).
+- **The docs now say that a `-d:naviHttp3` build negotiates HTTP/3 by default
+  (#448).** `defaultHttpVersions` is `{H1, H2, H3}` in such a build and is the set
+  every client starts from, so a client that never assigns `config.http` upgrades to
+  h3 as soon as an origin advertises `Alt-Svc: h3`. The README config table, the
+  `wantsH3` doc comment, the HARDENING.md HTTP/3 recipe and the THREAT_MODEL.md
+  opt-in table all described h3 as something that "must be listed explicitly in
+  `http`", which would have led an operator who set the build flag for one service
+  to assume the binary's other clients kept h1/h2 semantics (and with them their
+  timeouts, TCP egress and, before the h3 TLS-parity work, their TLS posture). The
+  opt-in is the build flag, not the field: they now say so, and say that dropping
+  `H3` from `http` (e.g. `{H1, H2}`) is how a single client opts out. No behaviour
+  changed; `tests/test_strict_http.nim` already pins the build-aware default.
 - **The HTTP/3 leg builds its OpenSSL context once per TLS policy instead of once
   per connection (#454).** `navi_h3_new` used to create an `SSL_CTX` and re-load the
   trust store, re-parse `caBundle`, re-decode the PKCS#12 or PEM client credential

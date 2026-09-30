@@ -298,12 +298,16 @@ hardening; they are described in [THREAT_MODEL.md](THREAT_MODEL.md#denial-of-ser
 ### HTTP/3
 
 ```nim
-config.http = {H1, H2, H3}   # requires a -d:naviHttp3 build
+config.http = {H1, H2}       # opt a client OUT of h3 in a -d:naviHttp3 build
+config.http = {H1, H2, H3}   # the default of such a build, spelled out
 ```
 
-Opt-in: HTTP/3 is honored only in a `-d:naviHttp3` build and must be listed
-explicitly in `http` (an empty set does not imply it). It is reached per origin
-after Alt-Svc discovery and honors the same `TlsConfig` as the other backends:
+The opt-in is the build flag, not the field: h3 exists only in a `-d:naviHttp3`
+build, but `H3` is in that build's default `http` set, so every client that leaves
+`config.http` alone negotiates h3. Assign an `http` set without `H3` to keep a
+given client on h1/h2 (an empty set names no protocol and does not imply h3
+either, unlike h2). h3 is reached per origin after Alt-Svc discovery and honors
+the same `TlsConfig` as the other backends:
 `caFile`/`caBundle`, the client credential (mTLS), `ciphers`/`cipherSuites`, the
 chain and hostname check, and `pinnedKeys`/`verifyCallback` on the peer leaf before
 the connection is used. QUIC is TLS 1.3 only, so a `maxVersion` below TLS 1.3 rules

@@ -250,9 +250,13 @@ proc wantsH2*(opts: NaviConfigBase): bool =
     (H3 in opts.http and H1 notin opts.http)
 
 proc wantsH3*(opts: NaviConfigBase): bool =
-  ## H3 is opt-in: it must be listed explicitly (an empty `http` set does not
-  ## imply it, unlike h2) and is only honored in a `-d:naviHttp3` build. The
-  ## native transport upgrades to h3 per origin after Alt-Svc discovery.
+  ## Whether this client may take an h3 leg: `H3` has to be in `http`, and h3 is
+  ## only compiled in at all in a `-d:naviHttp3` build. `H3` IS in the default set
+  ## of such a build (`defaultHttpVersions`), so a client that never touches
+  ## `config.http` negotiates h3 and upgrades to it per origin after Alt-Svc
+  ## discovery; assigning an `http` set without `H3` (e.g. `{H1, H2}`) opts that
+  ## client out. The opt-in is therefore the build flag, not the field. An empty
+  ## `http` set means "no protocol named" and does not imply h3, unlike h2.
   H3 in opts.http
 
 proc protocolAllowed*(http: set[HttpVersion], httpVersion: string): bool =

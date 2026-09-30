@@ -113,7 +113,7 @@ nimble add navi
 - `checksums` (MD5 and SHA-256 for Digest auth; the former `std/md5`, now maintained by nim-lang as a separate package). This is navi's only required Nim dependency.
 - `chronos` >= 4.0, only if you `import navi/chronos`. The chronos client runs OpenSSL for TLS (like sync/asyncdispatch), so `https` needs a `-d:ssl` build. Aside from `checksums`, the sync and asyncdispatch clients pull in no third-party Nim packages.
 - `libbrotlidec` and `libzstd` (system libraries) are optional: needed only to decode `br`/`zstd` responses. They load lazily, so navi runs fine without them until a server actually sends those encodings.
-- HTTP/3 is opt-in via `-d:naviHttp3`, which needs **ngtcp2**, **nghttp3**, and **OpenSSL >= 3.5** (system libraries, located at build time via `pkg-config`) plus a C++ compiler. Without the flag none of these are required and h3 is unavailable; it applies to the sync, asyncdispatch, and chronos clients.
+- HTTP/3 is opt-in via `-d:naviHttp3`, which needs **ngtcp2**, **nghttp3**, and **OpenSSL >= 3.5** (system libraries, located at build time via `pkg-config`) plus a C++ compiler. Without the flag none of these are required and h3 is unavailable; it applies to the sync, asyncdispatch, and chronos clients. The flag is the opt-in: once it is set, `H3` is in the default `http` set, so every client in the binary that leaves `config.http` alone upgrades to HTTP/3 on `Alt-Svc` (drop `H3` from `http` to opt one out).
 - **On Windows**, the DLL names decide which OpenSSL is loaded. Nim's default 64-bit
   list names only the (EOL) 1.1 pair, so navi targets 3.x via `-d:sslVersion=3-x64`
   -- already set for this repo in `nim.cfg`; set it in your own app too. Nim's
@@ -253,7 +253,7 @@ let api = newNavi(config)
 | `decompress` | `bool` | `true` | Decode `gzip`/`deflate`/`br`/`zstd` response bodies. |
 | `expectContinueMs` | `int` | `0` | Wait this many ms for an interim `100 Continue` before sending an HTTP/1.1 request body (`Expect: 100-continue`); `0` disables the gate. |
 | `headers` | `Headers` | empty | Headers sent on every request. |
-| `http` | `set[HttpVersion]` | `{H1, H2}` | HTTP versions to negotiate; add `H3` (needs `-d:naviHttp3`). |
+| `http` | `set[HttpVersion]` | `{H1, H2}`, or `{H1, H2, H3}` in a `-d:naviHttp3` build | HTTP versions to negotiate. A `-d:naviHttp3` build negotiates h3 by default, so a default client auto-upgrades to HTTP/3 once an origin advertises `Alt-Svc: h3`; set `http` without `H3` (e.g. `{H1, H2}`) to opt that client out. Without the build flag `H3` is unavailable. |
 | `idleConnTimeout` | `int` | `0` | Evict and close an idle pooled connection after this many ms; `0` = no timeout. |
 | `maxIdleConns` | `int` | `0` | Global cap on idle pooled connections; `0` = unlimited. |
 | `maxIdleConnsPerHost` | `int` | `0` | Idle pooled connections kept per origin; `0` = default (8). |
