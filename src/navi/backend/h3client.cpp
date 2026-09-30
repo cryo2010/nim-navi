@@ -125,6 +125,21 @@ const char *ossl_error(char *buf, std::size_t cap) noexcept {
   return buf;
 }
 
+// A peer-supplied byte string rendered safely into an error message: printable ASCII
+// kept, everything else shown as '?', truncated to the buffer. Used for the ALPN
+// protocol the peer selected (#445) -- peer-controlled bytes never reach a message raw.
+void printable(char *out, std::size_t cap, const unsigned char *p,
+               unsigned int len) noexcept {
+  // SSL_get0_alpn_selected leaves both of its outputs untouched when no protocol was
+  // selected, so a caller that only zeroed the pointer can hand us nullptr with a
+  // stale length -- which the loop below would dereference. Treat it as empty.
+  if (p == nullptr) len = 0;
+  std::size_t n = 0;
+  for (unsigned int i = 0; i < len && n + 1 < cap; ++i)
+    out[n++] = (p[i] >= 0x20 && p[i] < 0x7f) ? static_cast<char>(p[i]) : '?';
+  out[n] = '\0';
+}
+
 // RAII wrappers for the C resources this file manages by hand, so an acquire is freed
 // on every path (including early returns and future edits) without a manual free.
 struct X509Deleter { void operator()(X509 *p) const noexcept { X509_free(p); } };
@@ -250,6 +265,10 @@ struct H3Conn {
   bool has_abort = false;   // some stream's producer failed; reset it in send_step
   bool draining = false;    // peer closed the connection gracefully (CONNECTION_CLOSE /
                             // draining): a clean end, not a transport error
+  int close_tls_alert = -1; // TLS alert to report in the CONNECTION_CLOSE written at
+                            // teardown, as crypto_error(alert) instead of NO_ERROR:
+                            // set when navi itself fails the connection over TLS
+                            // (no_application_protocol, #445). -1 = none.
   unsigned long long max_body = 0;  // navi maxResponseBytes: cap on a single response
                                     // body the driver will buffer (0 = unlimited)
   unsigned long long handshake_timeout_ms = 0;  // navi connectMs; bounds the blocking
@@ -1284,6 +1303,13 @@ bool ip_literal(const char *s, std::string &out) {
   return true;
 }
 
+// Exactly the two bytes "h3", the only ALPN protocol an HTTP/3 connection may use
+// (RFC 9114 3.1) and the only one navi offers. A peer that selected nothing arrives
+// here as a null pointer with length 0, which is the case #445 is about.
+bool alpn_is_h3(const unsigned char *proto, unsigned int len) noexcept {
+  return len == 2 && proto != nullptr && std::memcmp(proto, "h3", 2) == 0;
+}
+
 nghttp3_nv method_nv(const char *method) {  // :method value is a C string param
   return nghttp3_nv{reinterpret_cast<std::uint8_t *>(const_cast<char *>(":method")),
                     reinterpret_cast<std::uint8_t *>(const_cast<char *>(method)), 7,
@@ -1475,6 +1501,43 @@ int navi_h3_bind(H3Conn *c) {
       return -1;
     }
   }
+  // The peer must have selected the "h3" ALPN protocol (RFC 9114 3.1 / RFC 7301).
+  // navi offers only "h3" and OpenSSL rejects a server that answers with something
+  // else (tls_parse_stoc_alpn), but nothing on this path enforces that a protocol was
+  // selected AT ALL: ngtcp2's crypto_ossl binding does not look, and OpenSSL's
+  // no_application_protocol check lives in ossl_quic_tls_tick, which only its own
+  // native QUIC stack runs -- not the third-party TLS interface (SSL_set_quic_tls_cbs)
+  // ngtcp2 uses. So a non-compliant QUIC listener that completed the handshake with no
+  // ALPN selection was treated as an h3 peer: navi opened the control/QPACK streams,
+  // submitted the request, and failed late as a stream reset (QuicSubmittedError),
+  // which mayFallBackFromH3 refuses to fall back for a non-idempotent method -- an
+  // error the application could do nothing with. Fail here instead, before the session
+  // exists and before anything is submitted, so the failure is a clean pre-submit
+  // QuicError that any method may fall back from; and tell the peer why, with
+  // crypto_error(no_application_protocol) (TLS alert 120, RFC 9001 4.8) in the
+  // CONNECTION_CLOSE navi_h3_close writes (#445).
+  {
+    const unsigned char *proto = nullptr;
+    unsigned int proto_len = 0;
+    SSL_get0_alpn_selected(c->ssl, &proto, &proto_len);
+    if (!alpn_is_h3(proto, proto_len)) {
+      // Two different peers reach this, and the message has to tell them apart: one
+      // selected no protocol at all (the non-compliant listener this gate is about),
+      // the other selected something that is not "h3". A bare `(selected "")` read
+      // as the second when it was really the first.
+      if (proto == nullptr || proto_len == 0) {
+        set_error(NAVI_H3_ERR_PROTOCOL,
+                  "peer did not select the h3 ALPN protocol (selected none)");
+      } else {
+        char shown[64];
+        printable(shown, sizeof shown, proto, proto_len);
+        set_error(NAVI_H3_ERR_PROTOCOL,
+                  "peer did not select the h3 ALPN protocol (selected \"%s\")", shown);
+      }
+      c->close_tls_alert = 120;   // no_application_protocol -> crypto_error 0x178
+      return -1;
+    }
+  }
   nghttp3_settings settings;
   nghttp3_settings_default(&settings);
   settings.enable_connect_protocol = 1;   // allow WebSocket Extended CONNECT (RFC 9220)
@@ -1540,6 +1603,20 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
   static const NaviH3Tls defaultTls{};   // all-unset: no verification, no credential
   if (!tls) tls = &defaultTls;
   const int verify = tls->verify;
+  // Parity with api.requireVerifiableHost on the TCP backends (#435): verifying
+  // against an empty name is not verifying. With verify on and no host, the
+  // SSL_set1_host below would be called with "" -- which CLEARS the expected-name
+  // list and returns 1, so the handshake completes and navi_h3_bind's
+  // SSL_get_verify_result accepts ANY certificate that chains to a trusted CA, for
+  // whatever answered on the UDP socket. Refused here instead, before anything is
+  // allocated, with the wording the TCP legs raise.
+  if (verify && (sni == nullptr || *sni == '\0')) {
+    set_error(NAVI_H3_ERR_TLS,
+              "no hostname to verify against (the URL has an empty host); give the "
+              "URL a host, or set tls.insecureSkipVerify to connect without an "
+              "identity check");
+    return nullptr;
+  }
   // One-time init of ngtcp2's OpenSSL crypto binding. The guard used to be a plain
   // `static bool crypto_inited` set after the call: check-then-set with no mutex,
   // atomic or call_once, so in a --threads:on program (Nim 2.2's default) two threads
@@ -1630,7 +1707,15 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
                 "ngtcp2_crypto_ossl_configure_client_session failed");
       return nullptr;
     }
-    SSL_set_alpn_protos(c->ssl, reinterpret_cast<const unsigned char *>("\x02h3"), 3);
+    // Checked, not discarded: it allocates, and on failure the ClientHello would go
+    // out with no ALPN extension at all. A permissive peer would then complete the
+    // handshake selecting nothing and the gate in navi_h3_bind would refuse the
+    // connection as the PEER's fault. Fail here, where the cause is known.
+    if (SSL_set_alpn_protos(c->ssl,
+                            reinterpret_cast<const unsigned char *>("\x02h3"), 3) != 0) {
+      set_error(NAVI_H3_ERR_INTERNAL, "SSL_set_alpn_protos failed");
+      return nullptr;
+    }
     // RFC 6066 3: an IP literal must not be sent as a server_name, so only a real
     // DNS host gets SNI -- same rule as openssl_ctx.newClientSsl (#451).
     if (!sni_is_ip) SSL_set_tlsext_host_name(c->ssl, sni);
@@ -1740,7 +1825,13 @@ void navi_h3_close(H3Conn *c) {
     std::array<std::uint8_t, 1500> buf{};
     ngtcp2_ccerr ccerr;
     ngtcp2_ccerr_default(&ccerr);     // transport NO_ERROR: valid at any stage
-    if (c->h3 && ngtcp2_conn_get_handshake_completed(c->conn))
+    if (c->close_tls_alert >= 0)
+      // navi failed the connection over TLS itself (no ALPN selected, #445): report
+      // crypto_error(alert) so the peer learns why instead of seeing a clean close.
+      // A transport CONNECTION_CLOSE is legal at any stage, unlike an application one.
+      ngtcp2_ccerr_set_tls_alert(
+        &ccerr, static_cast<std::uint8_t>(c->close_tls_alert), nullptr, 0);
+    else if (c->h3 && ngtcp2_conn_get_handshake_completed(c->conn))
       // An application CONNECTION_CLOSE is only legal once the handshake is done;
       // H3_NO_ERROR is the graceful HTTP/3 shutdown code (RFC 9114 8.1).
       ngtcp2_ccerr_set_application_error(&ccerr, NGHTTP3_H3_NO_ERROR, nullptr, 0);
