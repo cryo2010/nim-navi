@@ -143,6 +143,35 @@ proc markWorking*(c: AltSvcCache, scheme, host: string, port: int) =
       e.failures = 0
       e.brokenUntil = default(MonoTime)
 
+template openH3Tracked*(cache: AltSvcCache, host: string, port: int,
+                        openExpr: untyped): untyped =
+  ## Open an h3 connection through `openExpr`, keeping the origin's RFC 7838 2.4
+  ## bookkeeping in one place: a `QuicError` out of the open marks the alternative
+  ## broken (the next request then goes straight to TCP instead of paying the same
+  ## stalled QUIC handshake again) and is re-raised unchanged, while a successful
+  ## open clears any active backoff. Every h3 opener goes through here -- the sync
+  ## buffered transport, the sync streaming leg and the shared async `getH3Conn` --
+  ## so the policy can no longer be changed in two paths out of three, silently
+  ## leaving the per-request stall in the third (#453).
+  ##
+  ## `openExpr` is untyped, so the same template serves a plain blocking call and an
+  ## `await`ed one under both asyncdispatch and chronos. `QuicError` is deliberately
+  ## left to bind at the expansion site: it lives in `navi/backend/quic`, which
+  ## imports this module, so naming it here would be an import cycle.
+  ##
+  ## The scheme is always "https" (h3 is TLS-only) and `host`/`port` are the ORIGIN's,
+  ## not the alternative's authority: that is how the cache is keyed.
+  block:
+    let trackedHost = host
+    let trackedPort = port
+    let trackedConn = try:
+        openExpr
+      except QuicError:
+        cache.markBroken("https", trackedHost, trackedPort)
+        raise
+    cache.markWorking("https", trackedHost, trackedPort)
+    trackedConn
+
 proc h3Endpoint*(c: AltSvcCache, scheme, host: string, port: int): Option[AltSvcEndpoint] =
   ## The cached, unexpired h3 endpoint for an origin, or `none`. Expired entries
   ## are evicted on read.

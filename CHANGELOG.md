@@ -84,6 +84,20 @@ onward (pre-1.0, minor versions may include breaking changes).
   `BodySink`), since the `Future` type differs per backend (#367).
 
 ### Changed
+- **The HTTP/3 Alt-Svc mark-broken/mark-working bookkeeping moved into one shared
+  `openH3Tracked` template.** The RFC 7838 2.4 sequence added in #432 (catch a
+  `QuicError` out of the QUIC open, mark the origin's alternative broken and
+  re-raise; mark it working on success) was written out three times, once per h3
+  opener: the sync buffered transport in `navi.nim`, the sync streaming leg in
+  `private/stream_download.nim`, and the shared async `getH3Conn` behind both the
+  asyncdispatch and chronos clients. Each copy repeated the same scheme, host and
+  port, so a change to the policy had to be made three times and missing one would
+  silently reinstate the per-request handshake stall in that path. All three now
+  expand `altSvc.openH3Tracked(host, port, <open expression>)` from
+  `navi/core/altsvc`; the open expression is untyped, so one template serves a
+  blocking call and an `await`ed one on both async backends, and `QuicError` binds
+  at the expansion site (naming it in `altsvc.nim` would be an import cycle).
+  Behaviour is unchanged (#453).
 - **`TlsConfig.verify` became `TlsConfig.insecureSkipVerify` (#422).** The flag was
   inverted so the zero value is the secure one. Field assignment is unaffected
   (`cfg.tls.verify = false` still compiles, via a `verify`/`verify=` accessor pair),
