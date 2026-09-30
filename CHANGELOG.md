@@ -236,6 +236,25 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **The sync backend's proxy handshakes are bounded by the connect budget again
+  (#452).** `timeouts.connect` is a wall-clock bound on establishment, and the
+  asyncdispatch and chronos backends enforce it that way: one `withTimeout` around
+  the whole `establish` (TCP connect, the proxy handshake, the TLS handshake). The
+  sync backend had no such wrapper. It armed `SO_RCVTIMEO` with the full budget and
+  relied on that, but a socket receive timeout bounds each `recv`, not the exchange:
+  every byte that arrives restarts it. A proxy trickling one byte just inside each
+  window therefore kept the CONNECT reply loop (which since #428 reads to the
+  `CRLFCRLF` terminator) alive for up to 16384 reads, i.e. 16384 x the budget of
+  wall clock, before the 16 KiB head cap raised; the SOCKS5 handshake and the
+  blocking TLS handshake had the same shape, and each phase was additionally armed
+  with a *fresh* full budget. `connect` now opens one budget at the top and every
+  step spends what is left of it: the tunnel drivers re-arm the socket timeouts per
+  read through a handle that carries the deadline, a spent budget raises navi's
+  connect `TimeoutError` (not a spurious "proxy closed the connection"), and a
+  bounded TLS handshake is driven non-blocking against that same deadline instead
+  of a per-`recv` timeout. `connectAcross` likewise bounds its whole re-race loop
+  once rather than per address. The socket is handed to the request phase with no
+  leftover receive timeout, as before: reads poll and re-arm their own budget.
 - **A `-d:naviHttp3` build compiles again with `--threads:off` (#450).** The sync
   WebSocket-over-h3 pump declared its `Channel` and `Thread` state at module scope,
   so `nim check -d:naviHttp3 --threads:off` failed with `undeclared identifier:

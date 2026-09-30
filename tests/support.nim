@@ -1258,3 +1258,72 @@ proc startExpect*(th: var Thread[ExpectCtx], port: var int, mode: ExpectMode,
     ExpectCtx(portOut: addr port, ready: addr ready, mode: mode,
               sawExpect: sawExpect, bodyLen: bodyLen))
   while not ready: sleep(1)
+
+# --- a proxy that trickles its handshake reply (issue #452) ---------------
+
+type TrickleCtx* = object
+  portOut*: ptr int
+  ready*: ptr bool
+  socks*: bool      ## drive a SOCKS5 handshake instead of an HTTP CONNECT
+  reply*: string    ## the handshake reply, dribbled out one byte at a time
+  gapMs*: int       ## pause between those bytes
+
+proc trickleRecv(client: Socket, n: int): string =
+  ## Exactly `n` bytes, or raise. Every wait is bounded so a client that says
+  ## nothing cannot wedge this thread: a wedged server thread hangs `joinThread`,
+  ## and on Windows CI that hangs the whole run.
+  while result.len < n:
+    let c = client.recv(1, timeout = 5000)
+    if c.len == 0: raise newException(IOError, "trickle peer closed")
+    result.add c
+
+proc serveTrickle(ctx: TrickleCtx) {.thread.} =
+  ## Accept one connection, read the client's handshake opener, then answer with
+  ## `reply` at one byte every `gapMs` ms and never finish. Each dribbled byte
+  ## restarts a per-recv socket timeout, so only a real wall-clock budget on the
+  ## whole establishment can stop the client here.
+  var server = newSocket()
+  try:
+    server.setSockOpt(OptReuseAddr, true)
+    server.bindAddr(Port(0), "127.0.0.1")   # ephemeral: no cross-test collision
+    server.listen()
+    ctx.portOut[] = server.getLocalAddr()[1].int
+    ctx.ready[] = true
+    var client = acceptClient(server)
+    try:
+      if ctx.socks:
+        discard client.trickleRecv(3)                 # VER NMETHODS METHODS
+        client.send("\x05\x00", flags = {})           # no-auth, answered promptly
+        discard client.trickleRecv(4)                 # VER CMD RSV ATYP(domain)
+        let dlen = int(uint8(client.trickleRecv(1)[0]))
+        discard client.trickleRecv(dlen + 2)          # host + port
+      else:
+        var req = ""
+        while req.len < 8192:
+          let c = client.recv(1, timeout = 5000)
+          if c.len == 0: break
+          req.add c
+          if req.len >= 4 and req[^4 .. ^1] == "\r\n\r\n": break
+      # `flags = {}` (not SafeDisconn): a swallowed disconnect spins this loop on
+      # Windows and `joinThread` then never returns. The client is expected to give
+      # up on its own budget well before the last byte; its close fails the send and
+      # ends the loop, which is bounded by `reply.len` either way.
+      for i in 0 ..< ctx.reply.len:
+        client.send($ctx.reply[i], flags = {})
+        sleep(ctx.gapMs)
+    except CatchableError:
+      discard                     # the expected path: the client timed out and left
+    client.close()
+  except CatchableError:
+    discard
+  server.close()
+
+proc startTrickleProxy*(th: var Thread[TrickleCtx], port: var int, reply: string,
+                        gapMs: int, socks = false) =
+  ## Serve one connection on an ephemeral port (written to `port`) as a proxy whose
+  ## handshake reply arrives at one byte per `gapMs` ms.
+  var ready = false
+  createThread(th, serveTrickle,
+    TrickleCtx(portOut: addr port, ready: addr ready, socks: socks,
+               reply: reply, gapMs: gapMs))
+  waitFlag(addr ready)

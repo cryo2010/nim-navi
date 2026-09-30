@@ -713,21 +713,53 @@ when defined(ssl):
       if not cfg.verifyCallback(der):
         fail("the verify callback rejected the certificate for " & host)
 
+  type TlsWait* = proc(fd: SocketHandle, forWrite: bool): bool {.closure, gcsafe,
+                                                                raises: [CatchableError].}
+    ## Readiness wait that lets `startClientTls` bound a handshake by WALL CLOCK.
+    ## Returns true once `fd` is readable (or writable, when `forWrite`), false when
+    ## the caller's budget lapsed; it may also raise the caller's own timeout
+    ## instead. A blocking socket cannot express this on its own: SO_RCVTIMEO bounds
+    ## each recv, and a peer trickling one byte just inside every window restarts it
+    ## indefinitely, so the handshake outlives the connect budget (issue #452).
+
   proc startClientTls*(ctx: SslContext, fd: SocketHandle, host: string,
-                       verify: bool, slot: SessionSlot = nil): SslPtr =
+                       verify: bool, slot: SessionSlot = nil,
+                       wait: TlsWait = nil): SslPtr =
     ## Blocking client handshake (sync backend): bind + SNI + expected identity +
     ## resume, drive the
     ## handshake, verify. Replaces std/net's `wrapConnectedSocket` so SNI and the
     ## verified hostname stay under navi's control. Raises `ValueError` on failure;
     ## `negotiatedProtocol(result)` reads the ALPN. The async backend composes
     ## `newClientSsl` + an await-based handshake + `verifyPeer` itself.
+    ##
+    ## With `wait` supplied the socket is switched non-blocking for the handshake
+    ## and every would-block is spent in `wait`, so the whole exchange is bounded by
+    ## the caller's single deadline rather than by a per-recv socket timeout; the
+    ## socket is restored to blocking before returning either way.
     result = newClientSsl(ctx, fd, host, verify, slot)
     var ok = false
     defer:
       if not ok: SSL_free(result)
-    ErrClearError()   # SSL_get_error / the error text below are only reliable on an
-                      # empty per-thread queue (see the backends' read loops)
-    if SSL_connect(result) != 1:
-      fail("TLS handshake failed for " & host)
+    if wait.isNil:
+      ErrClearError()   # SSL_get_error / the error text below are only reliable on an
+                        # empty per-thread queue (see the backends' read loops)
+      if SSL_connect(result) != 1:
+        fail("TLS handshake failed for " & host)
+    else:
+      fd.setBlocking(false)
+      defer: fd.setBlocking(true)   # every other path here expects a blocking socket
+      while true:
+        ErrClearError()             # see the comment above: per-thread error queue
+        let r = SSL_connect(result)
+        if r == 1: break
+        let err = SSL_get_error(result, r)
+        if err == SSL_ERROR_WANT_READ or err == SSL_ERROR_WANT_WRITE:
+          # `wait` normally raises the caller's TimeoutError when the budget is
+          # spent; a plain `false` (a bare readiness wait that just expired) is the
+          # same verdict, so report it rather than spinning.
+          if not wait(fd, err == SSL_ERROR_WANT_WRITE):
+            fail("TLS handshake timed out for " & host)
+        else:
+          fail("TLS handshake failed for " & host)
     verifyPeer(result, host, verify)
     ok = true

@@ -1,7 +1,11 @@
-## Sans-io SOCKS5 handshake frame building and reply parsing.
+## Sans-io SOCKS5 handshake frame building and reply parsing, plus the sync
+## backend's wall-clock bound on the live handshake (issue #452).
 import unittest
-import std/strutils
+import std/[strutils, monotimes, times]
+import navi
 import navi/core/socks
+import navi/core/response  # for the `response.TimeoutError` qualifier
+import ./support
 
 suite "SOCKS5 greeting and method selection":
   test "the greeting should offer only no-auth without credentials":
@@ -56,3 +60,31 @@ suite "SOCKS5 connect request and reply":
 
   test "boundTailLen should reject an unknown address type":
     expect SocksError: discard boundTailLen(0x09)
+
+suite "the sync SOCKS5 handshake is bounded by the connect budget (#452)":
+  test "a trickling connect reply trips the connect timeout":
+    # The proxy selects no-auth promptly, then dribbles the connect reply one byte
+    # every 100 ms: a domain-type bound address of 4 + 1 + 60 + 2 bytes, ~6.7 s in
+    # all. `sockReadExactly` recv'd each byte under a fresh 300 ms SO_RCVTIMEO, so
+    # nothing ever expired; the budget has to be wall-clock to stop it.
+    var port = 0
+    var th: Thread[TrickleCtx]
+    let reply = "\x05\x00\x00\x03" & char(60) & repeat('x', 60) & "\x00\x50"
+    startTrickleProxy(th, port, reply, 100, socks = true)
+    var cfg = initNaviConfig()
+    cfg.proxy = "socks5://127.0.0.1:" & $port
+    cfg.timeouts.connect = 300
+    cfg.retry.limit = 0                      # one attempt: measure one budget
+    let api = newNavi(cfg)
+    let t0 = getMonoTime()
+    var raised = "none"
+    try:
+      discard api.get("http://tunnel.test/")  # SOCKS5 tunnels plain http too
+    except response.TimeoutError:
+      raised = "timeout"
+    except CatchableError as e:
+      raised = "other:" & $e.name
+    let elapsed = (getMonoTime() - t0).inMilliseconds.int
+    check raised == "timeout"
+    check elapsed < 1500
+    joinThread(th)
