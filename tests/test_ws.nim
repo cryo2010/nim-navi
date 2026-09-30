@@ -91,6 +91,50 @@ suite "websocket handshake response validation (RFC 6455 4.1)":
       "Connection: Upgrade\r\nSec-WebSocket-Accept: " & acceptFor(clientKey) &
       "\r\n\r\n", clientKey)
 
+suite "WebSocket target URL (parseWsUrl)":
+  # The openers map the ws schemes onto http/https, which is what decides TLS
+  # (`isTls` compares against "https"), the default port and the pool key.
+
+  test "ws:// should dial http and wss:// should dial https":
+    let plain = parseWsUrl("ws://x.test/chat")
+    check not plain.isTls
+    check plain.port == 80
+    check $plain == "http://x.test/chat"
+    let secure = parseWsUrl("wss://x.test/chat")
+    check secure.isTls
+    check secure.port == 443
+    check $secure == "https://x.test/chat"
+
+  test "the scheme should be matched case-insensitively, so WSS:// still dials TLS":
+    # RFC 3986 3.1: the scheme is case-insensitive. A case-sensitive prefix match
+    # left "WSS://" in place, and the handshake then ran in cleartext on port 80.
+    for target in ["WSS://x.test/chat", "Wss://x.test/chat", "wSS://x.test/chat"]:
+      let u = parseWsUrl(target)
+      check u.isTls
+      check u.port == 443
+      check u.host == "x.test"
+    for target in ["WS://x.test/chat", "Ws://x.test/chat"]:
+      let u = parseWsUrl(target)
+      check not u.isTls
+      check u.port == 80
+      check u.host == "x.test"
+
+  test "an explicit port, userinfo and query should survive the scheme swap":
+    let u = parseWsUrl("WSS://x.test:8443/chat?room=1")
+    check u.isTls
+    check u.port == 8443
+    check $u == "https://x.test:8443/chat?room=1"
+
+  test "an http/https target should pass through unchanged":
+    check parseWsUrl("https://x.test/chat").isTls
+    check not parseWsUrl("http://x.test/chat").isTls
+
+  test "a target with no host should be rejected whatever the scheme case (#435)":
+    for target in ["ws:///chat", "wss:///chat", "WSS:///chat", "Ws:///chat",
+                   "https:///chat"]:
+      expect ValueError:
+        discard parseWsUrl(target)
+
 suite "websocket upgrade request (h1)":
   const nonce = "dGhlIHNhbXBsZSBub25jZQ=="
   let u = parseUrl("http://example.test/chat")

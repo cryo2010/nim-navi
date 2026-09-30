@@ -154,6 +154,33 @@ proc `verify=`*(tls: var TlsConfig, v: bool) =
   ## the same as `tls.insecureSkipVerify = true`.
   tls.insecureSkipVerify = not v
 
+proc requireVerifiableHost*(host: string, verify: bool) =
+  ## Fail closed when peer verification is on but there is no identity to check
+  ## the certificate against. An empty `host` used to mean "chain-only": no SNI
+  ## was sent, `SSL_set1_host` was never called and the post-handshake
+  ## `X509_check_host` / `X509_check_ip_asc` step was skipped, so ANY certificate
+  ## chaining to a trusted CA was accepted for the connection (#435). "Verify on"
+  ## must never quietly become "verify the chain but not who is on the other end",
+  ## so the handshake is refused instead.
+  ##
+  ## Reachable only through a URL the application built with no authority
+  ## (`https:///path`) over a `unixSocket`, or on a platform whose
+  ## `getaddrinfo("")` resolves to loopback; `buildRequest` and the WebSocket
+  ## openers now reject such a URL up front, and this is the transport-level
+  ## backstop for anything that reaches TLS another way (a middleware that
+  ## rewrites `ctx.req.url`, a backend used directly). `insecureSkipVerify` is
+  ## still an explicit opt-out: with verification off there is nothing to check
+  ## and an empty host stays legal, which is what the Unix-socket and
+  ## raw-fd test paths use.
+  ##
+  ## Pure logic, deliberately placed here rather than in `openssl_ctx` so it is
+  ## unit-testable without loading libssl.
+  if verify and host.len == 0:
+    raise newException(ValueError,
+      "navi: no hostname to verify against (the URL has an empty host); " &
+      "give the URL a host, or set tls.insecureSkipVerify to connect without " &
+      "an identity check")
+
 proc h3TlsUsable*(tls: TlsConfig): bool =
   ## Whether an HTTP/3 leg can be taken at all under this TLS policy. QUIC always
   ## uses TLS 1.3 (RFC 9001 4.2), so a `maxVersion` below it can never be met on

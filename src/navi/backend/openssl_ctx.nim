@@ -757,8 +757,16 @@ when defined(ssl):
     ## any chain-valid impostor. `verifyPeer` still re-checks afterwards, so on a
     ## library too old to offer these entry points we simply keep that check (the
     ## identity is then enforced one flight later, as it was before). A no-op
-    ## (true) when verification is off or there is no host to match.
-    if not verify or host.len == 0: return true
+    ## (true) when verification is off.
+    ##
+    ## Verification ON with no host is a failure (#435): the request must fail
+    ## before the handshake rather than after the client has presented its
+    ## certificate to an unauthenticated peer. Both constructors below raise it
+    ## BEFORE `SSL_new`, so the check here can no longer fire -- it is kept as the
+    ## local invariant for anything that grows a third caller, and deliberately
+    ## sits ahead of every allocation this proc makes (none today).
+    requireVerifiableHost(host, verify)
+    if not verify: return true
     resolveIdentityApi()
     if isIpAddress(host):
       if paramSet1IpAsc.isNil or sslGet0Param.isNil: return true
@@ -776,6 +784,12 @@ when defined(ssl):
     ## present any cached session for resumption. The caller drives the handshake
     ## (blocking in the sync backend, await-based in the async one) and frees the
     ## SSL on failure.
+    ##
+    ## The "verify on, no host" refusal (#435) runs first, before anything is
+    ## allocated: `bindExpectedIdentity` raises it, and raising it from there would
+    ## abandon the SSL this proc had already created (the caller only frees what it
+    ## was returned, and it is returned nothing).
+    requireVerifiableHost(host, verify)
     result = SSL_new(ctx.context)
     if result.isNil: fail("SSL_new failed")
     discard SSL_set_fd(result, fd)
@@ -796,6 +810,11 @@ when defined(ssl):
     ## (ciphertext in) and draining `wbio` (ciphertext out), then runs
     ## `verifyPeer`. `SSL_set_bio` transfers BIO ownership to the SSL, so the
     ## returned `rbio`/`wbio` are for pumping only -- freeing the SSL frees them.
+    ##
+    ## As in `newClientSsl`, the "verify on, no host" refusal (#435) runs before
+    ## anything is allocated: raised from `bindExpectedIdentity` it would abandon
+    ## the SSL and both memory BIOs, since the caller is handed nothing to free.
+    requireVerifiableHost(host, verify)
     let ssl = SSL_new(ctx.context)
     if ssl.isNil: fail("SSL_new failed")
     let rbio = bioNew(bioSMem())
@@ -819,12 +838,18 @@ when defined(ssl):
     ## belt-and-suspenders repeat: the SAN/CN for a DNS host, or the iPAddress SAN
     ## for an IP literal. No-op when `verify` is off. Raises `ValueError` on
     ## mismatch.
+    ##
+    ## An empty `host` with verification on is a failure, not a licence to check
+    ## only the chain (#435): it would accept any certificate issued by a trusted
+    ## CA for whatever answered on the socket. `bindExpectedIdentity` already
+    ## refuses it before the handshake; this keeps the invariant local, for a
+    ## caller that drives its own SSL and only reaches us here.
     if not verify: return
+    requireVerifiableHost(host, verify)
     if SSL_get_verify_result(ssl) != X509_V_OK:
       fail("certificate verification failed for " & host)
-    if host.len > 0:
-      if isIpAddress(host): checkCertIp(ssl, host)   # match the iPAddress SAN
-      else: checkCertName(ssl, host)
+    if isIpAddress(host): checkCertIp(ssl, host)   # match the iPAddress SAN
+    else: checkCertName(ssl, host)
 
   proc certDer(cert: PX509): string =
     ## DER encoding of `cert`, via the pointer-form i2d_X509 (std/openssl's string

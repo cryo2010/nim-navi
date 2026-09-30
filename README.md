@@ -489,6 +489,13 @@ let api = newNavi()
 api.config.throwHttpErrors = false
 ```
 
+A target that names a scheme navi dials (`http`, `https`, `ws`, `wss`) but carries no host
+raises `ValueError` when the request is built, on every backend: `https:///path` parses to
+an empty hostname, which is not dialable and, over TLS, would mean no SNI and no
+certificate identity to check. The same rejection applies to a redirect hop and to the
+WebSocket openers. A schemeless relative target (`/path`, resolved against `prefixUrl`) is
+unaffected.
+
 ### Retries
 
 Requests that hit a transient failure (network error or 408/413/429/500/502/503/504) are retried with capped exponential backoff, honoring `Retry-After` (both the seconds and HTTP-date forms).
@@ -1143,6 +1150,11 @@ sidecars). The URL still carries the host (used for the `Host` header and, over
 https, the TLS SNI/verification name) and the path; only where the bytes go
 changes. Proxies are bypassed. Supported on the native clients on POSIX
 (`navi/js` and Windows raise a clear error).
+
+The URL must name a host. A URL with no authority (`https:///path`, which
+`std/uri` parses to an empty hostname) is rejected with a `ValueError`, because
+the socket connect never resolves the host and an empty one would leave the TLS
+handshake with no identity to check the certificate against.
 
 ```nim
 var cfg = initNaviConfig()

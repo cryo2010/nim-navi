@@ -439,6 +439,10 @@ proc buildRequest*(opts: NaviConfigBase, verb: HttpVerb, target: string,
   result.url = join(opts.prefixUrl, target)
   if params.len > 0:
     result.url = result.url.withQuery(params)
+  # A dialable scheme with no authority (`https:///path`) is refused here, the one
+  # place every client builds a request, so it can never reach a transport that
+  # would treat the empty host as "no identity to verify" (#435).
+  result.url.requireHost()
   result.headers = merge(opts.headers, headers)
   result.trailers = trailers
   let resolved = resolveBody(body, form)

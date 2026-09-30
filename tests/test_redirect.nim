@@ -1,5 +1,6 @@
 ## Redirect request rewriting: method changes and credential stripping.
 import unittest
+import std/strutils            # `in` on the rejection message
 import navi/core/[headers, url, request, redirect, sinkgate]
 
 proc req(verb: HttpVerb, target: string): Request =
@@ -28,6 +29,46 @@ suite "redirect credential stripping":
     let r = redirectRequest(req(GET, "https://a.test/x"), 307, "https://a.test:8443/y")
     check not r.headers.contains("authorization")
     check not r.headers.contains("proxy-authorization")
+
+suite "a redirect hop must name a host (#435)":
+  # RFC 3986 resolution keeps an absolute Location verbatim when its scheme differs
+  # from the base's, so a Location with no authority survives as a dialable scheme
+  # with an empty host: not dialable, and over TLS no SNI and no certificate
+  # identity to check. `buildRequest` never sees a redirect target, so
+  # `redirectRequest` repeats its check.
+  test "a cross-scheme Location with no authority should be rejected":
+    for (base, location) in [("https://a.test/x", "http:///y"),
+                             ("http://a.test/x", "https:///y"),
+                             ("https://a.test/x", "wss:///y")]:
+      expect ValueError:
+        discard redirectRequest(req(GET, base), 302, location)
+
+  test "the rejection should apply to every redirect status":
+    for status in [301, 302, 303, 307, 308]:
+      expect ValueError:
+        discard redirectRequest(req(POST, "https://a.test/x"), status, "http:///y")
+
+  test "the rejection should name the offending URL":
+    var msg = ""
+    try: discard redirectRequest(req(GET, "https://a.test/x"), 302, "http:///y")
+    except ValueError as e: msg = e.msg
+    check "no host" in msg
+    check "http:///y" in msg
+
+  test "an authority-less Location under the same scheme is relative, so it keeps the host":
+    # std/uri resolves `https:///y` against an https base as a relative reference:
+    # the base host is inherited and there is nothing to reject.
+    check redirectRequest(req(GET, "https://a.test/x"), 302, "https:///y").url.host ==
+      "a.test"
+    check redirectRequest(req(GET, "http://a.test/x"), 302, "http:///y").url.host ==
+      "a.test"
+
+  test "an ordinary cross-scheme or relative Location should still resolve":
+    check redirectRequest(req(GET, "https://a.test/x"), 302, "http://b.test/y").url.host ==
+      "b.test"
+    check redirectRequest(req(GET, "https://a.test/x"), 302, "//b.test/y").url.host ==
+      "b.test"
+    check redirectRequest(req(GET, "https://a.test/x"), 302, "/y").url.host == "a.test"
 
 suite "redirect method rewriting":
   test "303 should switch any method to GET and drop the body":

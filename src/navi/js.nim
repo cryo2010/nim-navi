@@ -623,10 +623,14 @@ proc websocket*(client: Navi, url: string,
   ## already buffered it and enforces its own limit, so this is not a memory guard.
   ## `keepAlive` is accepted for API parity but ignored: the runtime manages its own
   ## WebSocket keepalive and does not expose ping/pong.
+  ##
+  ## A URL with no host (`wss:///path`) raises `ValueError`, matching the native
+  ## clients and `buildRequest` rather than leaving the runtime to reject it (#435).
   discard keepAlive
   var u = url
   if u.startsWith("http://"): u = "ws://" & u["http://".len .. ^1]
   elif u.startsWith("https://"): u = "wss://" & u["https://".len .. ^1]
+  parseUrl(u).requireHost()
   openWebSocket(u, maxMessageBytes)
 
 include navi/private/stream_verbs
