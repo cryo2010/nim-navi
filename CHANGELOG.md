@@ -222,6 +222,19 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **A `-d:naviHttp3` build compiles again with `--threads:off` (#450).** The sync
+  WebSocket-over-h3 pump declared its `Channel` and `Thread` state at module scope,
+  so `nim check -d:naviHttp3 --threads:off` failed with `undeclared identifier:
+  'Channel'` before reaching any of navi's code, even though the sync `websocket`
+  entry already refused the h3 transport on a threadless build with a clear error.
+  The pump types and procs now live behind `when compileOption("threads")`, matching
+  that gate, and the `wkH3` transport arm carries no state when it cannot be built.
+  Nim 2 defaults to `--threads:on`, so only a project that opts out was affected;
+  everything else in a threadless h3 build (all h3 requests and streaming, h1/h2
+  WebSockets, and h3 WebSockets on the async clients, which use no pump thread) was
+  already fine and stays so. The CI compile matrix now runs `nim check` over the
+  three native entries with `-d:naviHttp3` in both thread modes, so the gap cannot
+  reopen.
 - **A TLS connection that ends without `close_notify` can no longer truncate a
   read-until-close body (#426).** All three native TLS read paths reported a
   transport close that arrives without a TLS `close_notify` -- an injected RST, a

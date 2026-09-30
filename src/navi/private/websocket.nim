@@ -33,8 +33,12 @@ type
     of wkH1: conn: Conn
     of wkH2: h2c: WsH2
     of wkH3:
-      when defined(naviHttp3):
+      # The sync h3 pump is a thread + channels, so it exists only in a
+      # --threads:on build; without threads the h3 arm carries no state and
+      # `websocketH3` raises before one can be constructed (#450).
+      when defined(naviHttp3) and compileOption("threads"):
         pump: WsH3Pump
+      else: discard
   WebSocketObj = object
     tr: WsTransport
     dec: WsDecoder
@@ -107,21 +111,23 @@ proc h2Close(w: WsH2) =
   try: w.sock.close()
   except CatchableError: discard
 
-# The h3 arm of each transport dispatcher, with the -d:naviHttp3 guard defined
-# once per op instead of inline in every dispatcher below. Constructing a
-# WsTransport of kind wkH3 already requires the h3 build, so the else branches
-# are reached only on a misconfigured call.
+# The h3 arm of each transport dispatcher, with the -d:naviHttp3 (and pump
+# thread) guard defined once per op instead of inline in every dispatcher below.
+# Constructing a WsTransport of kind wkH3 already requires the h3 build and a
+# --threads:on one, so the else branches are reached only on a misconfigured call.
+const wsH3Available = defined(naviHttp3) and compileOption("threads")
+const wsH3Unavailable = "navi: h3 WebSocket without -d:naviHttp3 and --threads:on"
 proc h3Send(ws: WebSocket, data: string) =
-  when defined(naviHttp3): wsSend(ws.tr.pump, data)
-  else: raise newException(ValueError, "navi: h3 WebSocket without -d:naviHttp3")
+  when wsH3Available: wsSend(ws.tr.pump, data)
+  else: raise newException(ValueError, wsH3Unavailable)
 proc h3Recv(ws: WebSocket): string =
-  when defined(naviHttp3): wsRecv(ws.tr.pump)
-  else: raise newException(ValueError, "navi: h3 WebSocket without -d:naviHttp3")
+  when wsH3Available: wsRecv(ws.tr.pump)
+  else: raise newException(ValueError, wsH3Unavailable)
 proc h3DataWaiting(ws: WebSocket, ms: int): bool =
-  when defined(naviHttp3): wsDataWaiting(ws.tr.pump, ms)
+  when wsH3Available: wsDataWaiting(ws.tr.pump, ms)
   else: false
 proc h3Close(ws: WebSocket) =
-  when defined(naviHttp3): wsClose(ws.tr.pump)
+  when wsH3Available: wsClose(ws.tr.pump)
   else: discard
 
 proc sendRaw(ws: WebSocket, data: string) =
@@ -167,7 +173,7 @@ proc `=destroy`(o: var WebSocketObj) =
     o.closed = true
     try: h2Close(o.tr.h2c)
     except CatchableError: discard
-  when defined(naviHttp3):
+  when wsH3Available:
     if o.tr.kind == wkH3 and not o.closed:
       o.closed = true
       try: wsClose(o.tr.pump)
