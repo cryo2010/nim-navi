@@ -333,7 +333,9 @@ proc transport(client: Navi, req: Request, sink: BodySink,
   when defined(naviHttp3):
     let alt = result.headers.get("alt-svc")
     if alt.len > 0:
-      client.altSvc.record("https", req.url.host, req.url.port, alt)
+      # `recordFrom` drops the advertisement unless this response came over TLS
+      # (#434); the cache is keyed on the https origin either way.
+      client.altSvc.recordFrom(req.url, alt)
 
 proc runCore(client: Navi, req: Request, cancel: CancelToken,
              userSink: BodySink = nil, gate: SinkGate = nil): Response =

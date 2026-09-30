@@ -490,9 +490,11 @@ proc transportInner(client: Navi, req: Request, sink: BodySink,
 when defined(naviHttp3):
   proc recordAltSvc(client: Navi, req: Request, resp: Response) =
     ## Cache an h3 endpoint the origin advertised, so later requests can upgrade.
+    ## `recordFrom` applies the RFC 7838 2.1 gate: an advertisement carried by a
+    ## cleartext response is not learned for the https origin (#434).
     let alt = resp.headers.get("alt-svc")
     if alt.len > 0:
-      client.altSvc.record("https", req.url.host, req.url.port, alt)
+      client.altSvc.recordFrom(req.url, alt)
 
   proc closeOrphanQuic(qc: QuicConn) {.async.} =
     ## Fire-and-forget close of a QUIC connection displaced from `client.h3conns`
