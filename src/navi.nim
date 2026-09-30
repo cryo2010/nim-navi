@@ -187,6 +187,12 @@ proc close*(client: Navi) =
   ## sessions. Optional but recommended when done with a client: a later request
   ## just opens fresh connections. Without it, pooled connections are reclaimed
   ## only at process exit (and their OpenSSL contexts leak until then).
+  ##
+  ## The TLS session cache is closed for good, so requests made on the client
+  ## after this do full handshakes rather than resuming (issue #441: a connection
+  ## that was checked out rather than pooled outlives `close` and could otherwise
+  ## still insert a late TLS 1.3 ticket into a table nothing will free again).
+  ## Build a new client, or `extend` this one, to get resumption back.
   closeIdle(client.pool)
   when defined(naviHttp3): closeH3Conns(client.h3conns)
   closeTlsStore(client.config.tls.sessionCache)

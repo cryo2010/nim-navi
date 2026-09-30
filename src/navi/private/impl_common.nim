@@ -117,6 +117,12 @@ proc close*(client: Navi): Future[void] {.async.} =
   ## Close all pooled connections and shared h2 connections, freeing their TLS
   ## contexts. Any in-flight request on a shared connection fails with IOError.
   ## Optional but recommended when done with the client.
+  ##
+  ## The TLS session cache is closed for good, so a request made on the client
+  ## after this does a full handshake rather than resuming. That is deliberate: a
+  ## connection checked out rather than pooled (a live WebSocket or SSE stream)
+  ## stays up across `close` and could otherwise still hand a late TLS 1.3 ticket
+  ## to a table nothing will ever free again (issue #441).
   for pc in client.pool.drain():
     await close(pc.transport)
   # Teardown of the shared-connection tables runs as a STABILIZING loop, not a single

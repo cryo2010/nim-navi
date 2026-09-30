@@ -593,6 +593,13 @@ when defined(ssl):
       ## Per-client store of resumable TLS sessions, keyed by "host:port". Held by
       ## the client through `TlsConfig.sessionCache`; freed with `close`.
       sessions: Table[string, pointer]   # origin -> SSL_SESSION*
+      closed: bool
+        ## Set by `close` and never cleared: the client is gone, so the cache
+        ## takes no further session (see `offerSession`). It cannot simply be
+        ## dropped instead, because a connection that was checked out rather than
+        ## pooled (a live WebSocket or SSE stream, an in-flight h1 request) still
+        ## holds its `SessionSlot` and can still be handed a TLS 1.3
+        ## NewSessionTicket after the client was closed (issue #441).
     SessionSlot* = ref object
       ## Per-connection link from an SSL back to its cache and origin. Kept alive
       ## by the connection (its address lives in the SSL's ex_data), so the
@@ -695,24 +702,61 @@ when defined(ssl):
       slotExIdx = newSslExIndex()
       slotExIdxReady = true
 
+  proc offerSession*(slot: SessionSlot, session: pointer): bool =
+    ## Offer `session` (an SSL_SESSION OpenSSL is handing over) to `slot`'s cache,
+    ## under `slot`'s origin, freeing whatever was cached there before. Returns true
+    ## when the cache TOOK OWNERSHIP, which is what the new-session callback reports
+    ## to OpenSSL as 1; false leaves ownership with OpenSSL, which then frees the
+    ## session itself.
+    ##
+    ## Ownership is declined when the cache has been closed: the client is gone and
+    ## nothing will ever free the table again, so a session inserted now would leak
+    ## until a second `close` that never comes (issue #441). This is reachable
+    ## precisely because a connection that was checked out rather than pooled -- a
+    ## live WebSocket or SSE stream, an in-flight h1 request -- outlives
+    ## `client.close()` and can still receive a TLS 1.3 NewSessionTicket.
+    ##
+    ## Split out of the callback so the whole insert policy is ordinary Nim that can
+    ## be unit-tested; `onNewSession` is just the C shim over it.
+    if slot.isNil or slot.cache.isNil or session.isNil: return false
+    if slot.cache.closed: return false
+    let prev = slot.cache.sessions.getOrDefault(slot.origin, nil)
+    if not prev.isNil: SSL_SESSION_free(prev)
+    slot.cache.sessions[slot.origin] = session
+    true
+
   proc onNewSession(ssl: SslPtr, session: pointer): cint {.cdecl.} =
-    ## Called by OpenSSL when a resumable session becomes available; we take
-    ## ownership (return 1) and cache it under the connection's origin.
+    ## Called by OpenSSL when a resumable session becomes available. `offerSession`
+    ## decides whether we take ownership; 1 says we did, 0 leaves it with OpenSSL.
     {.cast(gcsafe).}:
       let p = SSL_get_ex_data(ssl, slotExIdx)
       if p.isNil: return 0
-      let slot = cast[SessionSlot](p)
-      let prev = slot.cache.sessions.getOrDefault(slot.origin, nil)
-      if not prev.isNil: SSL_SESSION_free(prev)
-      slot.cache.sessions[slot.origin] = session
-      return 1
+      if offerSession(cast[SessionSlot](p), session): 1.cint else: 0.cint
 
   proc newTlsSessionCache*(): TlsSessionCache =
     TlsSessionCache(sessions: initTable[string, pointer]())
 
+  proc isClosed*(cache: TlsSessionCache): bool =
+    ## Whether `close` has been called on `cache`. A closed cache is never reopened:
+    ## `newTlsStore` mints a fresh one per client instead.
+    not cache.isNil and cache.closed
+
+  proc sessionCount*(cache: TlsSessionCache): int =
+    ## Cached sessions (one per origin at most). For tests and introspection.
+    if cache.isNil: 0 else: cache.sessions.len
+
+  proc hasSession*(cache: TlsSessionCache, origin: string): bool =
+    ## Whether a resumable session is cached for `origin` ("host:port"). For tests
+    ## and introspection.
+    not cache.isNil and not cache.sessions.getOrDefault(origin, nil).isNil
+
   proc close*(cache: TlsSessionCache) =
-    ## Free every cached session. Call when the client is closed.
+    ## Free every cached session and mark the cache closed, so a late ticket on a
+    ## connection that outlived the client is declined rather than inserted into a
+    ## table nothing will free again (issue #441). Call when the client is closed.
+    ## Idempotent.
     if cache.isNil: return
+    cache.closed = true   # set FIRST: nothing may land in the table after this
     for s in cache.sessions.values: SSL_SESSION_free(s)
     cache.sessions.clear()
 
@@ -733,6 +777,7 @@ when defined(ssl):
     if slot.isNil: return
     ensureExIdx()
     discard SSL_set_ex_data(ssl, slotExIdx, cast[pointer](slot))
+    if slot.cache.isNil or slot.cache.closed: return
     let s = slot.cache.sessions.getOrDefault(slot.origin, nil)
     if not s.isNil: discard SSL_set_session(ssl, s)
 
