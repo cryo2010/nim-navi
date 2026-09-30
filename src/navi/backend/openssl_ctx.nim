@@ -615,10 +615,74 @@ when defined(ssl):
     {.cdecl, dynlib: DLLSSLName, importc.}
 
   const
-    CRYPTO_EX_INDEX_SSL = 0
     SSL_CTRL_SET_SESS_CACHE_MODE = 44
     SSL_SESS_CACHE_CLIENT = 0x0001
     SSL_SESS_CACHE_NO_INTERNAL_STORE = 0x0200
+
+  # --- allocating the ex_data index in the SSL class ----------------------
+  #
+  # `CRYPTO_get_ex_new_index` takes the *class* whose counter to draw from, and
+  # the class numbering changed with OpenSSL 1.1.0: it put SSL at 0 (BIO moved to
+  # 12), while OpenSSL 1.0.x -- and every LibreSSL, which inherited that header --
+  # numbers BIO 0 and SSL 1. Drawing from the wrong counter is not a harmless
+  # off-by-one: the returned number is then unregistered in the SSL class, so a
+  # co-resident library that legitimately allocates an SSL-class index can be
+  # handed the SAME number with its own dup/free callbacks attached, and
+  # SSL_free / SSL_dup would invoke those on navi's `SessionSlot` pointer (issue
+  # #439). Measured on the macOS LibreSSL (OPENSSL_VERSION_NUMBER 0x20000000):
+  # SSL_get_ex_new_index hands out 0 then 1, CRYPTO_get_ex_new_index(0, ...)
+  # returns 0 from the *BIO* counter, and CRYPTO_get_ex_new_index(1, ...) returns
+  # 2 -- i.e. the class-0 call collides with SSL-class index 0.
+  #
+  # So: prefer the library's own `SSL_get_ex_new_index`, which knows its class
+  # number. It is a real exported function exactly where the numbering differs
+  # (OpenSSL 1.0.x, LibreSSL) and a macro over CRYPTO_get_ex_new_index from
+  # OpenSSL 1.1.0 on, so when it does not resolve we pick the class from the
+  # runtime version instead. It is looked up by hand, not with a `dynlib` importc,
+  # for the reason `resolveIdentityApi` explains: an unresolved importc kills the
+  # process at module init.
+
+  const
+    CRYPTO_EX_INDEX_SSL_MODERN = 0.cint
+      ## CRYPTO_EX_INDEX_SSL from OpenSSL 1.1.0 on (that header numbers BIO 12).
+    CRYPTO_EX_INDEX_SSL_LEGACY = 1.cint
+      ## CRYPTO_EX_INDEX_SSL on OpenSSL 1.0.x and every LibreSSL, where
+      ## CRYPTO_EX_INDEX_BIO is 0 and the SSL class follows it.
+
+  proc sslExIndexClass*(version: uint): cint =
+    ## The `CRYPTO_EX_INDEX_SSL` class number for the library whose
+    ## OPENSSL_VERSION_NUMBER is `version` (i.e. `getOpenSSLVersion()`). LibreSSL
+    ## pins that number at 0x20000000 whatever its real version, which is how
+    ## std/net's `newContext` recognises it too; anything below OpenSSL 1.1.0
+    ## (0x10100000) predates the renumbering. Exported so the selection can be
+    ## unit-tested for libraries this host cannot run.
+    if version == 0x20000000'u: CRYPTO_EX_INDEX_SSL_LEGACY      # LibreSSL, any version
+    elif version < 0x10100000'u: CRYPTO_EX_INDEX_SSL_LEGACY     # OpenSSL 1.0.x and older
+    else: CRYPTO_EX_INDEX_SSL_MODERN                            # OpenSSL 1.1.0+
+
+  type SslGetExNewIndexProc = proc(argl: clong, argp: pointer,
+    newf, dupf, freef: pointer): cint {.cdecl, gcsafe, raises: [].}
+  var sslGetExNewIndex {.threadvar.}: SslGetExNewIndexProc
+  var sslGetExNewIndexReady {.threadvar.}: bool
+
+  proc newSslExIndex*(): cint {.raises: [].} =
+    ## Allocate an ex_data index in the SSL class, through the library's own
+    ## `SSL_get_ex_new_index` when it exports one and otherwise through
+    ## `CRYPTO_get_ex_new_index` with the version-selected class.
+    ##
+    ## Exported so the allocation itself can be unit-tested against whatever
+    ## library the suite links: `sslExIndexClass` covers the fallback's decision,
+    ## but on the libraries where the numbering actually differs the export
+    ## resolves and the fallback never runs, so the class constant is not what is
+    ## under test there. Each call consumes one index, as OpenSSL's own API does.
+    if not sslGetExNewIndexReady:
+      sslGetExNewIndexReady = true
+      sslGetExNewIndex = cast[SslGetExNewIndexProc](
+        tlsLib(DLLSSLName).tlsSym("SSL_get_ex_new_index"))
+    if not sslGetExNewIndex.isNil:
+      return sslGetExNewIndex(0, nil, nil, nil, nil)
+    CRYPTO_get_ex_new_index(sslExIndexClass(osslVersionNumber()),
+                            0, nil, nil, nil, nil)
 
   # Per-thread (threadvar): each thread registers its own ex-data index and uses it
   # for the SSL objects it owns, so the lazy init never races across threads (works
@@ -628,7 +692,7 @@ when defined(ssl):
   var slotExIdxReady {.threadvar.}: bool
   proc ensureExIdx() =
     if not slotExIdxReady:
-      slotExIdx = CRYPTO_get_ex_new_index(CRYPTO_EX_INDEX_SSL, 0, nil, nil, nil, nil)
+      slotExIdx = newSslExIndex()
       slotExIdxReady = true
 
   proc onNewSession(ssl: SslPtr, session: pointer): cint {.cdecl.} =
