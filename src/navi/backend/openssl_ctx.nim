@@ -606,6 +606,12 @@ when defined(ssl):
       ## new-session callback can reach the cache while the connection is open.
       cache: TlsSessionCache
       origin: string
+      rejected: bool
+        ## Set by `rejectSession` when this connection's peer failed a
+        ## post-handshake check (hostname/IP, SPKI pin, verify callback), cleared by
+        ## `applySession` when a fresh SSL is bound to the slot. While set, no
+        ## session from this connection is cached -- which is how a TLS 1.3 ticket
+        ## that arrives AFTER the rejection is kept out of the cache (issue #440).
 
   proc CRYPTO_get_ex_new_index(classIndex: cint, argl: clong, argp: pointer,
     newf, dupf, freef: pointer): cint {.cdecl, dynlib: DLLUtilName, importc.}
@@ -716,10 +722,15 @@ when defined(ssl):
     ## live WebSocket or SSE stream, an in-flight h1 request -- outlives
     ## `client.close()` and can still receive a TLS 1.3 NewSessionTicket.
     ##
+    ## Ownership is also declined once this connection's peer has been rejected by a
+    ## post-handshake check (issue #440): for TLS <= 1.2 the callback fires inside the
+    ## handshake, before those checks run, but under TLS 1.3 the ticket arrives during
+    ## the first reads and can therefore land after the rejection.
+    ##
     ## Split out of the callback so the whole insert policy is ordinary Nim that can
     ## be unit-tested; `onNewSession` is just the C shim over it.
     if slot.isNil or slot.cache.isNil or session.isNil: return false
-    if slot.cache.closed: return false
+    if slot.cache.closed or slot.rejected: return false
     let prev = slot.cache.sessions.getOrDefault(slot.origin, nil)
     if not prev.isNil: SSL_SESSION_free(prev)
     slot.cache.sessions[slot.origin] = session
@@ -732,6 +743,41 @@ when defined(ssl):
       let p = SSL_get_ex_data(ssl, slotExIdx)
       if p.isNil: return 0
       if offerSession(cast[SessionSlot](p), session): 1.cint else: 0.cint
+
+  proc rejectSession*(slot: SessionSlot) {.raises: [].} =
+    ## This connection's peer failed a post-handshake check, so nothing of its
+    ## session may stay cached for the origin (issue #440). Two things are needed,
+    ## because the callback fires at different times either side of TLS 1.3:
+    ##
+    ##   * remove and free the origin's cached entry. For TLS <= 1.2 the session was
+    ##     already stored during `SSL_connect`, before `verifyPeer` /
+    ##     `postHandshakeVerify` could run, so only an eviction can undo it.
+    ##   * mark the slot, so a TLS 1.3 NewSessionTicket that arrives on this
+    ##     connection AFTER the rejection is declined by `offerSession` instead of
+    ##     re-populating the entry we just dropped.
+    ##
+    ## Without this, the next connect to the origin would present a session bound to
+    ## a peer navi refused (an interception proxy with a chain-valid but unpinned
+    ## certificate, say) and keep that peer's session, with its certificate, in
+    ## memory. There is no verification bypass either way -- on resumption OpenSSL
+    ## restores verify_result and the peer certificate, so the same check fails again
+    ## -- but the client should not be advertising it, and a real server that does not
+    ## know the session pays a pointless round of resumption before falling back to a
+    ## full handshake.
+    ##
+    ## No-op for a nil slot (resumption off, or no session cache), so call sites need
+    ## no guard.
+    if slot.isNil or slot.cache.isNil: return
+    slot.rejected = true
+    let s = slot.cache.sessions.getOrDefault(slot.origin, nil)
+    if not s.isNil:
+      slot.cache.sessions.del(slot.origin)
+      SSL_SESSION_free(s)
+
+  proc isRejected*(slot: SessionSlot): bool =
+    ## Whether `rejectSession` has marked this connection's peer as refused. For
+    ## tests and introspection.
+    not slot.isNil and slot.rejected
 
   proc newTlsSessionCache*(): TlsSessionCache =
     TlsSessionCache(sessions: initTable[string, pointer]())
@@ -774,8 +820,15 @@ when defined(ssl):
   proc applySession*(ssl: SslPtr, slot: SessionSlot) =
     ## Link `ssl` to its cache/origin and, if a session is cached for that origin,
     ## present it so the handshake resumes. Call after SSL_new, before SSL_connect.
+    ##
+    ## Clears any `rejectSession` mark: the mark belongs to the SSL that was refused,
+    ## and one slot can be reused for a second SSL when `connectAcross` drops a
+    ## verification-failing address and re-races the remaining ones. Without the
+    ## reset, a pool whose first address is broken would stop caching sessions for
+    ## the address that actually worked.
     if slot.isNil: return
     ensureExIdx()
+    slot.rejected = false
     discard SSL_set_ex_data(ssl, slotExIdx, cast[pointer](slot))
     if slot.cache.isNil or slot.cache.closed: return
     let s = slot.cache.sessions.getOrDefault(slot.origin, nil)
@@ -940,7 +993,8 @@ when defined(ssl):
     sslSetConnectState(ssl)
     (ssl, rbio, wbio)
 
-  proc verifyPeer*(ssl: SslPtr, host: string, verify: bool) =
+  proc verifyPeer*(ssl: SslPtr, host: string, verify: bool,
+                   slot: SessionSlot = nil) =
     ## After a completed handshake, confirm the chain and the certificate
     ## identity. Both are already enforced during the handshake (SSL_VERIFY_PEER
     ## for the chain, `bindExpectedIdentity` for the name), so this is the
@@ -953,12 +1007,21 @@ when defined(ssl):
     ## CA for whatever answered on the socket. `bindExpectedIdentity` already
     ## refuses it before the handshake; this keeps the invariant local, for a
     ## caller that drives its own SSL and only reaches us here.
+    ##
+    ## Pass the connection's `slot` so a rejection also drops whatever session this
+    ## peer got cached for the origin, and keeps a late TLS 1.3 ticket out of it
+    ## (`rejectSession`, issue #440). Optional only so the interop tests can call it
+    ## without a cache.
     if not verify: return
     requireVerifiableHost(host, verify)
-    if SSL_get_verify_result(ssl) != X509_V_OK:
-      fail("certificate verification failed for " & host)
-    if isIpAddress(host): checkCertIp(ssl, host)   # match the iPAddress SAN
-    else: checkCertName(ssl, host)
+    try:
+      if SSL_get_verify_result(ssl) != X509_V_OK:
+        fail("certificate verification failed for " & host)
+      if isIpAddress(host): checkCertIp(ssl, host)   # match the iPAddress SAN
+      else: checkCertName(ssl, host)
+    except CatchableError:
+      rejectSession(slot)
+      raise
 
   proc certDer(cert: PX509): string =
     ## DER encoding of `cert`, via the pointer-form i2d_X509 (std/openssl's string
@@ -988,23 +1051,33 @@ when defined(ssl):
     h.update(der)
     base64.encode(h.digest())
 
-  proc postHandshakeVerify*(ssl: SslPtr, host: string, cfg: TlsConfig)
+  proc postHandshakeVerify*(ssl: SslPtr, host: string, cfg: TlsConfig,
+                            slot: SessionSlot = nil)
       {.raises: [CatchableError].} =
     ## Extra peer checks after `verifyPeer`'s chain + hostname verification: SPKI
     ## pinning and the user's verify callback. Both run even when `verify` is off,
     ## so an app that disables chain checking can still pin or inspect the leaf. A
     ## no-op when neither is configured. Raises `ValueError` on rejection.
-    if cfg.pinnedKeys.len > 0:
-      let pin = peerSpkiPin(ssl)
-      if pin.len == 0 or pin notin cfg.pinnedKeys:
-        fail("certificate public key does not match any pin for " & host)
-    if cfg.verifyCallback != nil:
-      let cert = SSL_get_peer_certificate(ssl)
-      if cert.isNil: fail("server presented no certificate")
-      let der = certDer(cert)
-      X509_free(cert)
-      if not cfg.verifyCallback(der):
-        fail("the verify callback rejected the certificate for " & host)
+    ##
+    ## Pass the connection's `slot` so a rejection also drops whatever session this
+    ## peer got cached for the origin, and keeps a late TLS 1.3 ticket out of it
+    ## (`rejectSession`, issue #440). Optional only so the interop tests can call it
+    ## without a cache.
+    try:
+      if cfg.pinnedKeys.len > 0:
+        let pin = peerSpkiPin(ssl)
+        if pin.len == 0 or pin notin cfg.pinnedKeys:
+          fail("certificate public key does not match any pin for " & host)
+      if cfg.verifyCallback != nil:
+        let cert = SSL_get_peer_certificate(ssl)
+        if cert.isNil: fail("server presented no certificate")
+        let der = certDer(cert)
+        X509_free(cert)
+        if not cfg.verifyCallback(der):
+          fail("the verify callback rejected the certificate for " & host)
+    except CatchableError:
+      rejectSession(slot)
+      raise
 
   type TlsWait* = proc(fd: SocketHandle, forWrite: bool): bool {.closure, gcsafe,
                                                                 raises: [CatchableError].}
@@ -1054,5 +1127,5 @@ when defined(ssl):
             fail("TLS handshake timed out for " & host)
         else:
           fail("TLS handshake failed for " & host)
-    verifyPeer(result, host, verify)
+    verifyPeer(result, host, verify, slot)   # a rejection also evicts the session
     ok = true

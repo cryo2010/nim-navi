@@ -300,6 +300,13 @@ jobs:
       - name: Run the private-CA verification test
         run: bash tests/interop/ca_verify.sh
 
+      # In-memory CA bundle, SPKI pinning and the verify callback -- and, on all
+      # three native backends over TLS 1.2 and 1.3, that a session cached during
+      # the handshake of a peer navi then REJECTED is evicted rather than
+      # re-offered to the origin on the next connect (#440).
+      - name: Run the TLS pinning and rejected-session test
+        run: bash tests/interop/tls_pin.sh
+
       # Readiness waits above FD_SETSIZE (#429): the client burns ~1100
       # descriptors so its socket lands above 1024, then requests with a read
       # timeout armed. Built fortified, so the old select() path aborts in

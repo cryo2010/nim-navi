@@ -241,8 +241,8 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
             let tlsc = newChronosTls(transport, ctx, host, cfg.wantsVerify, slot)
             conn.tls = tlsc
             await tlsc.handshake()
-            verifyPeer(tlsc.sslPtr, host, cfg.wantsVerify)
-            postHandshakeVerify(tlsc.sslPtr, host, cfg)
+            verifyPeer(tlsc.sslPtr, host, cfg.wantsVerify, slot)
+            postHandshakeVerify(tlsc.sslPtr, host, cfg, slot)
             conn.protocol = negotiatedProtocol(tlsc.sslPtr)
             conn.ctx = ctx
             conn.ownsCtx = owned
@@ -319,8 +319,9 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
               # Drive the handshake now so a verification failure raises here, not
               # mid-read; verifyPeer re-checks the chain + hostname/IP identity.
               await tlsc.handshake()
-              verifyPeer(tlsc.sslPtr, host, cfg.wantsVerify)
-              postHandshakeVerify(tlsc.sslPtr, host, cfg)   # SPKI pin + verify callback
+              # The slot makes a rejection evict this peer's cached session (#440).
+              verifyPeer(tlsc.sslPtr, host, cfg.wantsVerify, slot)
+              postHandshakeVerify(tlsc.sslPtr, host, cfg, slot)  # SPKI pin + callback
               conn.protocol = negotiatedProtocol(tlsc.sslPtr)
               conn.ctx = ctx
               conn.ownsCtx = owned

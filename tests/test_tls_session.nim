@@ -150,3 +150,169 @@ suite "closed session cache (#441)":
     check not SessionSlot(nil).offerSession(s)   # no slot on the SSL's ex_data
     SSL_SESSION_free(s)
     cache.close()
+
+# --- rejection evicts the origin's session -----------------------------------
+#
+# For TLS <= 1.2 the new-session callback fires INSIDE the handshake, before
+# navi's post-handshake hostname/IP, SPKI-pin and verify-callback checks can run,
+# so a session from a peer navi then refuses was already cached. Under TLS 1.3 the
+# ticket instead arrives on the first reads, i.e. it can land AFTER the rejection.
+# `rejectSession` covers both: it evicts the stored entry and marks the slot so
+# `offerSession` declines anything later (#440).
+#
+# The `verifyPeer` / `postHandshakeVerify` tests drive the real entry points
+# against a memory-BIO SSL that never handshook, so it has no peer certificate and
+# every check fails the way a rejected peer's would. That exercises the wiring
+# (the slot reaching `rejectSession` through the `except` path), not a stub.
+
+import navi/backend/api
+
+proc memSsl(slot: SessionSlot): SslPtr =
+  ## An unhandshaken client SSL on memory BIOs, with `slot` linked into its
+  ## ex_data by `applySession` exactly as a real connect does.
+  let ctx = newTlsContext(defaultTls())
+  newClientSslMem(ctx, "example.com", verify = true, slot = slot).ssl
+
+suite "post-handshake rejection drops the session (#440)":
+  test "rejectSession should evict the origin's entry and mark the slot":
+    let cache = newTlsSessionCache()
+    let slot = cache.newSlot("example.com:443")
+    check slot.offerSession(session())
+    check cache.sessionCount == 1
+    check not slot.isRejected
+    slot.rejectSession()
+    check slot.isRejected
+    check cache.sessionCount == 0
+    check not cache.hasSession("example.com:443")
+    cache.close()
+
+  test "a TLS 1.3 ticket arriving after the rejection should be declined":
+    # The ticket lands during the first reads, after the pin check already raised,
+    # so evicting alone would let it re-populate the entry we just dropped.
+    let cache = newTlsSessionCache()
+    let slot = cache.newSlot("example.com:443")
+    slot.rejectSession()
+    let s = session()
+    check not slot.offerSession(s)      # ownership stays with OpenSSL
+    check cache.sessionCount == 0
+    SSL_SESSION_free(s)                 # we still own it in this test
+    cache.close()
+
+  test "a rejection should drop only the rejected origin's session":
+    let cache = newTlsSessionCache()
+    let bad = cache.newSlot("bad.example:443")
+    let good = cache.newSlot("good.example:443")
+    check bad.offerSession(session())
+    check good.offerSession(session())
+    bad.rejectSession()
+    check not cache.hasSession("bad.example:443")
+    check cache.hasSession("good.example:443")
+    check cache.sessionCount == 1
+    check not good.isRejected
+    check good.offerSession(session())  # the healthy origin still caches
+    check cache.sessionCount == 1
+    cache.close()
+
+  test "rejectSession should be idempotent and fine with nothing cached":
+    let cache = newTlsSessionCache()
+    let slot = cache.newSlot("example.com:443")
+    slot.rejectSession()                # no entry to evict
+    slot.rejectSession()                # must not double-free anything
+    check slot.isRejected
+    check cache.sessionCount == 0
+    cache.close()
+
+  test "rejectSession on a closed cache or a nil slot should be a no-op":
+    # Call sites pass whatever slot the connection has, which is nil when
+    # resumption is off, and the cache may already be closed under them.
+    rejectSession(nil)
+    check not SessionSlot(nil).isRejected
+    let cache = newTlsSessionCache()
+    let slot = cache.newSlot("example.com:443")
+    check slot.offerSession(session())
+    cache.close()
+    slot.rejectSession()
+    check slot.isRejected
+    check cache.sessionCount == 0
+
+  test "applySession should clear the mark so a re-raced address caches again":
+    # sync's connectAcross reuses ONE slot across the addresses it re-races, so a
+    # first address that failed verification must not stop the address that works
+    # from caching its session.
+    let cache = newTlsSessionCache()
+    let slot = cache.newSlot("example.com:443")
+    slot.rejectSession()
+    check slot.isRejected
+    let ssl = memSsl(slot)              # applySession runs inside newClientSslMem
+    check not slot.isRejected
+    check slot.offerSession(session())
+    check cache.sessionCount == 1
+    SSL_free(ssl)
+    cache.close()
+
+  test "verifyPeer should evict the session when the identity check fails":
+    let cache = newTlsSessionCache()
+    let slot = cache.newSlot("example.com:443")
+    let ssl = memSsl(slot)
+    check slot.offerSession(session())  # what TLS <=1.2 cached mid-handshake
+    expect ValueError:
+      verifyPeer(ssl, "example.com", verify = true, slot = slot)
+    check slot.isRejected
+    check cache.sessionCount == 0
+    SSL_free(ssl)
+    cache.close()
+
+  test "verifyPeer with verification off should leave the cache alone":
+    let cache = newTlsSessionCache()
+    let slot = cache.newSlot("example.com:443")
+    let ssl = memSsl(slot)
+    check slot.offerSession(session())
+    verifyPeer(ssl, "example.com", verify = false, slot = slot)
+    check not slot.isRejected
+    check cache.sessionCount == 1
+    SSL_free(ssl)
+    cache.close()
+
+  test "postHandshakeVerify should evict the session when the pin check fails":
+    # The #440 failure scenario: an interception proxy with a chain-valid but
+    # unpinned certificate over TLS 1.2. Its session was cached during the
+    # handshake and would be re-offered to whoever answers next.
+    var cfg = defaultTls()
+    cfg.pinnedKeys = @["ZmFrZSBwaW4gdGhhdCBtYXRjaGVzIG5vdGhpbmc="]
+    let cache = newTlsSessionCache()
+    let slot = cache.newSlot("example.com:443")
+    let ssl = memSsl(slot)
+    check slot.offerSession(session())
+    expect ValueError:
+      postHandshakeVerify(ssl, "example.com", cfg, slot)
+    check slot.isRejected
+    check cache.sessionCount == 0
+    SSL_free(ssl)
+    cache.close()
+
+  test "postHandshakeVerify should evict the session when the callback rejects":
+    var cfg = defaultTls()
+    cfg.verifyCallback = proc(leafDer: string): bool {.gcsafe, raises: [CatchableError].} =
+      false
+    let cache = newTlsSessionCache()
+    let slot = cache.newSlot("example.com:443")
+    let ssl = memSsl(slot)
+    check slot.offerSession(session())
+    expect ValueError:
+      postHandshakeVerify(ssl, "example.com", cfg, slot)
+    check slot.isRejected
+    check cache.sessionCount == 0
+    SSL_free(ssl)
+    cache.close()
+
+  test "postHandshakeVerify with no pins and no callback should accept and cache":
+    # The overwhelmingly common config must not go anywhere near the eviction path.
+    let cache = newTlsSessionCache()
+    let slot = cache.newSlot("example.com:443")
+    let ssl = memSsl(slot)
+    postHandshakeVerify(ssl, "example.com", defaultTls(), slot)
+    check not slot.isRejected
+    check slot.offerSession(session())
+    check cache.sessionCount == 1
+    SSL_free(ssl)
+    cache.close()

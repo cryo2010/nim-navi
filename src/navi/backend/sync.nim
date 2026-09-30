@@ -628,7 +628,9 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     # SPKI pinning + the user's verify callback (no-op unless configured). Runs
     # before `established`, so a rejection cleans up the fd/SSL via the defer.
     if tls:
-      postHandshakeVerify(result.ssl, host, cfg)
+      # `result.slot` is set by every TLS branch above, so a rejection here also
+      # evicts this peer's cached session and blocks a late ticket (issue #440).
+      postHandshakeVerify(result.ssl, host, cfg, result.slot)
       # One cell per TLS connection, allocated here (never on a read path): the
       # close_notify verdict `closedCleanly` reports (issue #426).
       result.uncleanEof = new(bool)

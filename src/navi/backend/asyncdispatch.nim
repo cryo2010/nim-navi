@@ -473,8 +473,8 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
             conn.ssl = newClientSsl(conn.ctx, conn.fd.SocketHandle, host,
                                     cfg.wantsVerify, conn.slot)
             await driveHandshake(conn.ssl, conn.fd, host)
-            verifyPeer(conn.ssl, host, cfg.wantsVerify)
-            postHandshakeVerify(conn.ssl, host, cfg)
+            verifyPeer(conn.ssl, host, cfg.wantsVerify, conn.slot)
+            postHandshakeVerify(conn.ssl, host, cfg, conn.slot)
             conn.protocol = negotiatedProtocol(conn.ssl)
           else:
             raise newException(ValueError, "navi: https requires compiling with -d:ssl")
@@ -532,8 +532,9 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
             conn.ssl = newClientSsl(conn.ctx, fd.SocketHandle, host,
                                     cfg.wantsVerify, conn.slot)
             await driveHandshake(conn.ssl, fd, host)
-            verifyPeer(conn.ssl, host, cfg.wantsVerify)
-            postHandshakeVerify(conn.ssl, host, cfg)   # SPKI pin + verify callback
+            # The slot makes a rejection evict this peer's cached session (#440).
+            verifyPeer(conn.ssl, host, cfg.wantsVerify, conn.slot)
+            postHandshakeVerify(conn.ssl, host, cfg, conn.slot)  # SPKI pin + callback
             conn.protocol = negotiatedProtocol(conn.ssl)
           else:
             raise newException(ValueError, "navi: https requires compiling with -d:ssl")

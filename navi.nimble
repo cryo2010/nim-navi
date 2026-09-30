@@ -152,10 +152,13 @@ task highFd, "Readiness waits on descriptors above FD_SETSIZE, sync client (POSI
   # with a read timeout armed: the wait must poll, not select (issue #429).
   exec "bash tests/interop/highfd.sh"
 
-task tlsPinning, "In-memory CA bundle + SPKI pinning + verify callback, sync client (needs openssl)":
+task tlsPinning, "In-memory CA bundle + SPKI pinning + verify callback + rejected-session eviction, all native clients (needs openssl)":
   # A server signed by a throwaway CA: navi must trust it via an in-memory
   # caBundle, honor a matching SPKI pin (reject a wrong one), and run the verify
-  # callback (accept/reject, and even with chain verification disabled).
+  # callback (accept/reject, and even with chain verification disabled). Then
+  # tls_reject_resume.nim, on all three native backends over TLS 1.2 and 1.3: a
+  # session cached during the handshake of a peer navi then rejected must be
+  # evicted, so the next connect to that origin is a full handshake (issue #440).
   exec "bash tests/interop/tls_pin.sh"
 
 task tlsWriteClose, "A TLS write racing a close on the asyncdispatch client (needs openssl + python3)":
