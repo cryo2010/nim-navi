@@ -33,6 +33,7 @@
 #include <netdb.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -45,6 +46,7 @@
 #include <ctime>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -67,6 +69,8 @@ using X509Ptr = std::unique_ptr<X509, X509Deleter>;
 
 struct BioDeleter { void operator()(BIO *p) const noexcept { BIO_free(p); } };
 using BioPtr = std::unique_ptr<BIO, BioDeleter>;
+struct SslCtxDeleter { void operator()(SSL_CTX *p) const noexcept { SSL_CTX_free(p); } };
+using SslCtxPtr = std::unique_ptr<SSL_CTX, SslCtxDeleter>;
 struct Pkcs12Deleter { void operator()(PKCS12 *p) const noexcept { PKCS12_free(p); } };
 using Pkcs12Ptr = std::unique_ptr<PKCS12, Pkcs12Deleter>;
 struct EvpPkeyDeleter { void operator()(EVP_PKEY *p) const noexcept { EVP_PKEY_free(p); } };
@@ -174,7 +178,7 @@ struct H3Conn {
   int fd = -1;
   ngtcp2_path path{};
   sockaddr_storage local_ss{}, remote_ss{};
-  SSL_CTX *ssl_ctx = nullptr;
+  SSL_CTX *ssl_ctx = nullptr;   // a reference to the shared, cached context (#454)
   SSL *ssl = nullptr;
   ngtcp2_crypto_ossl_ctx *ossl = nullptr;
   std::string authority;
@@ -207,7 +211,9 @@ struct H3Conn {
   // destructor rather than per-member smart pointers whose order would follow
   // declaration order): each handle is released before the thing it depends on --
   // `conn` references `ossl` (ngtcp2_conn_set_tls_native_handle), `ossl` wraps `ssl`,
-  // and `ssl` belongs to `ssl_ctx`. It also relies on the library `_del` functions not
+  // and `ssl` belongs to `ssl_ctx` (whose SSL_CTX_free here drops this connection's
+  // reference: the shared context lives on while the cache or another connection
+  // still holds one). It also relies on the library `_del` functions not
   // re-entering our callbacks (e.g. ngtcp2_conn_del must not fire on_stream_close, or
   // it would touch the already-freed `h3`). A new handle added here must be slotted in
   // by this dependency order, and freed here.
@@ -825,6 +831,16 @@ bool apply_client_cert(SSL_CTX *ctx, const NaviH3Tls *t) {
     return true;   // no credential configured
   SSL_CTX_set_default_passwd_cb(ctx, navi_pw_cb);
   SSL_CTX_set_default_passwd_cb_userdata(ctx, const_cast<char *>(t->password));
+  // The userdata is a borrowed pointer into the caller's password string, which is
+  // only valid for this call, so it must not outlive it -- the context is cached and
+  // reused across connections now (#454). Nothing reads it after the key material is
+  // loaded below; dropping it here makes that structural rather than incidental. The
+  // callback itself stays installed, since the OpenSSL default it would fall back to
+  // prompts on the controlling terminal, while ours fails on an unset password.
+  struct PwGuard {
+    SSL_CTX *ctx;
+    ~PwGuard() { SSL_CTX_set_default_passwd_cb_userdata(ctx, nullptr); }
+  } pwGuard{ctx};
   bool ok = false;
   if (is_set(t->pkcs12_file)) {
     std::string der;
@@ -880,6 +896,204 @@ bool apply_ciphers(SSL_CTX *ctx, const NaviH3Tls *t) {
   return true;
 }
 
+// Build the QUIC SSL_CTX described by `t`. Everything here depends on the TLS
+// policy alone, never on the connection, which is what makes the result shareable;
+// the per-connection settings (SNI, the expected peer identity, ALPN) are applied to
+// the SSL in navi_h3_new. Returns nullptr with the reason on stderr.
+SSL_CTX *build_ssl_ctx(const NaviH3Tls *t) {
+  SslCtxPtr ctx{SSL_CTX_new(TLS_method())};
+  if (!ctx) {
+    std::fprintf(stderr, "SSL_CTX_new failed\n");
+    return nullptr;
+  }
+  // Verify the server certificate by default (matching navi's TlsConfig.verify),
+  // but do it AFTER the handshake (navi_h3_bind), not with SSL_VERIFY_PEER. On a
+  // rejected certificate, OpenSSL's in-handshake abort drives ngtcp2's experimental
+  // crypto_ossl binding to over-release its crypto buffers, tripping an assert
+  // (crypto_ossl_ctx_release_crypto_data). Setting SSL_VERIFY_NONE lets the
+  // handshake complete; we then check SSL_get_verify_result and reject before any
+  // request is sent -- the same post-handshake pattern navi's TCP backends use
+  // (backend/openssl_ctx postHandshakeVerify). The chain is still built and the
+  // hostname still matched (SSL_set1_host feeds the verify result); nothing is sent
+  // to an unverified peer, since h3Open verifies before returning.
+  SSL_CTX_set_verify(ctx.get(), SSL_VERIFY_NONE, nullptr);
+  if (t->verify) {
+    if (is_set(t->ca_file)) {
+      if (SSL_CTX_load_verify_locations(ctx.get(), t->ca_file, nullptr) != 1) {
+        std::fprintf(stderr, "failed to load CA file %s\n", t->ca_file);
+        return nullptr;
+      }
+    } else {
+      SSL_CTX_set_default_verify_paths(ctx.get());
+    }
+    // Extra in-memory roots supplement caFile / the system store, exactly as on
+    // the TCP backends; only meaningful when a chain is actually being built.
+    if (is_set(t->ca_bundle) && !apply_ca_bundle(ctx.get(), t->ca_bundle))
+      return nullptr;
+  }
+  // The client credential, the version bounds and the cipher selection apply
+  // whether or not the peer is verified: they describe what navi offers, not what
+  // it accepts. Each fails closed rather than connecting under a weaker policy.
+  if (!apply_client_cert(ctx.get(), t)) return nullptr;
+  if (!apply_versions(ctx.get(), t)) return nullptr;
+  if (!apply_ciphers(ctx.get(), t)) return nullptr;
+  return ctx.release();
+}
+
+// --- the shared SSL_CTX cache (#454) -----------------------------------------
+// Building that context is the dominant cost of navi_h3_new: it re-reads the trust
+// store, re-parses caBundle and (since #419) re-decodes the client credential --
+// and a PKCS#12 decode is deliberately slow. The context is immutable once built
+// and OpenSSL refcounts it, so connections share one and only SSL_new stays per
+// connection, exactly as the TCP backends share a context through
+// TlsConfig.contextStore (backend/openssl_ctx obtainContext). That matters on every
+// idle-timeout eviction, cold start per origin and server-forced reconnect.
+//
+// Key: the owning client (NaviH3Tls.ctx_owner, the address of its context store; 0
+// for a bare TlsConfig with no store) plus every field that shapes the context and,
+// for the file-based inputs, their size and mtime -- so a rewritten certificate on
+// disk is never served from cache. An entry lives until its owner is closed
+// (navi_h3_ctx_release) or the LRU bound evicts it; either way a connection built
+// from it holds its own reference, so the SSL_CTX outlives every SSL made from it.
+//
+// Thread safety: one mutex around the table (the sync ws-over-h3 pump runs on its
+// own thread and may share a process with the async clients). SSL_CTX itself is
+// refcounted and safe for concurrent SSL_new, and the build runs outside the lock.
+constexpr std::size_t kCtxCacheMax = 8;   // bound: churning configs cannot grow it
+
+struct CtxCacheEntry {
+  std::string key;
+  SSL_CTX *ctx = nullptr;             // the cache's own reference
+  unsigned long long owner = 0;
+  unsigned long long used = 0;        // LRU stamp
+};
+
+struct CtxCache {
+  std::mutex mu;
+  std::vector<CtxCacheEntry> entries;   // at most kCtxCacheMax, so a linear scan
+  unsigned long long tick = 0, builds = 0, reuses = 0;
+};
+
+// Deliberately never destroyed: freeing an SSL_CTX from a static destructor races
+// OpenSSL's own atexit cleanup. The bound keeps what that leaves at exit tiny, and
+// the function-local static is initialised thread safely.
+CtxCache &ctx_cache() {
+  static CtxCache *c = new CtxCache();
+  return *c;
+}
+
+// NAVI_H3_CTX_CACHE=0 builds a fresh context per connection (the pre-#454
+// behaviour), for measurement and as an escape hatch. Read once.
+bool ctx_cache_enabled() {
+  static const bool on = [] {
+    const char *v = std::getenv("NAVI_H3_CTX_CACHE");
+    return !(v && v[0] == '0' && v[1] == '\0');
+  }();
+  return on;
+}
+
+void key_add_num(std::string &k, unsigned long long v) {
+  k.append(reinterpret_cast<const char *>(&v), sizeof v);
+}
+
+// Length-prefixed, so no combination of values can spell another combination.
+void key_add(std::string &k, const char *s) {
+  const std::size_t n = is_set(s) ? std::strlen(s) : 0;
+  key_add_num(k, n);
+  if (n > 0) k.append(s, n);
+}
+
+// A path plus its identity on disk, so rewriting the file invalidates the entry.
+void key_add_file(std::string &k, const char *path) {
+  key_add(k, path);
+  struct ::stat st {};
+  if (is_set(path) && ::stat(path, &st) == 0) {
+    key_add_num(k, static_cast<unsigned long long>(st.st_size));
+    key_add_num(k, static_cast<unsigned long long>(st.st_mtime));
+#if defined(__APPLE__)
+    key_add_num(k, static_cast<unsigned long long>(st.st_mtimespec.tv_nsec));
+#else
+    key_add_num(k, static_cast<unsigned long long>(st.st_mtim.tv_nsec));
+#endif
+  }
+}
+
+// Every input build_ssl_ctx reads, and nothing else: handshake_timeout_ms is a
+// per-connection ngtcp2 setting, not part of the context.
+std::string ctx_key(const NaviH3Tls *t) {
+  std::string k;
+  k.reserve(256);
+  key_add_num(k, t->ctx_owner);
+  key_add_num(k, static_cast<unsigned long long>(t->verify));
+  key_add_num(k, static_cast<unsigned long long>(t->min_version));
+  key_add_num(k, static_cast<unsigned long long>(t->max_version));
+  key_add_file(k, t->ca_file);
+  key_add_file(k, t->pkcs12_file);
+  key_add_file(k, t->cert_file);
+  key_add_file(k, t->key_file);
+  key_add(k, t->ca_bundle);
+  key_add(k, t->cert_pem);
+  key_add(k, t->key_pem);
+  key_add(k, t->password);
+  key_add(k, t->ciphers);
+  key_add(k, t->cipher_suites);
+  return k;
+}
+
+// Drop the least recently used entry. Caller holds the lock.
+void ctx_cache_evict(CtxCache &cc) {
+  auto lru = cc.entries.begin();
+  for (auto it = cc.entries.begin(); it != cc.entries.end(); ++it)
+    if (it->used < lru->used) lru = it;
+  SSL_CTX_free(lru->ctx);   // only the cache's reference; live SSLs hold their own
+  cc.entries.erase(lru);
+}
+
+// The context for `t`, from the cache when one matches. The caller owns the
+// returned reference and frees it with SSL_CTX_free (the H3Conn destructor does).
+SSL_CTX *obtain_ssl_ctx(const NaviH3Tls *t) {
+  if (!ctx_cache_enabled()) {
+    SSL_CTX *ctx = build_ssl_ctx(t);
+    if (ctx) {
+      CtxCache &cc = ctx_cache();
+      std::lock_guard<std::mutex> lk(cc.mu);
+      ++cc.builds;
+    }
+    return ctx;
+  }
+  const std::string key = ctx_key(t);
+  CtxCache &cc = ctx_cache();
+  {
+    std::lock_guard<std::mutex> lk(cc.mu);
+    for (auto &e : cc.entries)
+      if (e.key == key) {
+        e.used = ++cc.tick;
+        ++cc.reuses;
+        SSL_CTX_up_ref(e.ctx);
+        return e.ctx;
+      }
+  }
+  // Built outside the lock: holding the mutex across a PKCS#12 decode would
+  // serialise every h3 connect in the process. Two threads racing the same new
+  // config both build, and the loser simply drops its context below.
+  SSL_CTX *ctx = build_ssl_ctx(t);
+  if (!ctx) return nullptr;
+  std::lock_guard<std::mutex> lk(cc.mu);
+  ++cc.builds;
+  for (auto &e : cc.entries)
+    if (e.key == key) {              // another thread won the race; keep its entry
+      e.used = ++cc.tick;
+      ++cc.reuses;
+      SSL_CTX_up_ref(e.ctx);
+      SSL_CTX_free(ctx);
+      return e.ctx;
+    }
+  if (cc.entries.size() >= kCtxCacheMax) ctx_cache_evict(cc);
+  SSL_CTX_up_ref(ctx);               // one reference for the cache, one returned
+  cc.entries.push_back(CtxCacheEntry{key, ctx, t->ctx_owner, ++cc.tick});
+  return ctx;
+}
+
 nghttp3_nv method_nv(const char *method) {  // :method value is a C string param
   return nghttp3_nv{reinterpret_cast<std::uint8_t *>(const_cast<char *>(":method")),
                     reinterpret_cast<std::uint8_t *>(const_cast<char *>(method)), 7,
@@ -889,6 +1103,39 @@ nghttp3_nv method_nv(const char *method) {  // :method value is a C string param
 }  // namespace
 
 extern "C" {
+
+// Drop every cached SSL_CTX built for `owner` (a client's TLS context store), the
+// h3 half of closing that store. A no-op for 0, which is every bare TlsConfig: those
+// entries share one owner and are bounded by the LRU instead. Connections still
+// using a released context hold their own reference and keep working.
+void navi_h3_ctx_release(unsigned long long owner) {
+  if (owner == 0) return;
+  try {
+    CtxCache &cc = ctx_cache();
+    std::lock_guard<std::mutex> lk(cc.mu);
+    for (auto it = cc.entries.begin(); it != cc.entries.end();) {
+      if (it->owner == owner) {
+        SSL_CTX_free(it->ctx);
+        it = cc.entries.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  } catch (...) {   // a C++ exception must never unwind into Nim
+  }
+}
+
+void navi_h3_ctx_cache_stats(unsigned long long *builds, unsigned long long *reuses,
+                             unsigned long long *entries) {
+  try {
+    CtxCache &cc = ctx_cache();
+    std::lock_guard<std::mutex> lk(cc.mu);
+    if (builds) *builds = cc.builds;
+    if (reuses) *reuses = cc.reuses;
+    if (entries) *entries = cc.entries.size();
+  } catch (...) {
+  }
+}
 
 int navi_h3_fd(H3Conn *c) { return c->fd; }
 
@@ -1063,7 +1310,6 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
                     const NaviH3Tls *tls, unsigned long long max_body) {
   static const NaviH3Tls defaultTls{};   // all-unset: no verification, no credential
   if (!tls) tls = &defaultTls;
-  const char *ca_file = tls->ca_file;
   const int verify = tls->verify;
   static bool crypto_inited = false;
   if (!crypto_inited) {
@@ -1096,43 +1342,13 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
       return nullptr;
     }
 
-    c->ssl_ctx = SSL_CTX_new(TLS_method());
-    if (!c->ssl_ctx) {
-      std::fprintf(stderr, "SSL_CTX_new failed\n");
-      return nullptr;
-    }
-    // Verify the server certificate by default (matching navi's TlsConfig.verify),
-    // but do it AFTER the handshake (navi_h3_bind), not with SSL_VERIFY_PEER. On a
-    // rejected certificate, OpenSSL's in-handshake abort drives ngtcp2's experimental
-    // crypto_ossl binding to over-release its crypto buffers, tripping an assert
-    // (crypto_ossl_ctx_release_crypto_data). Setting SSL_VERIFY_NONE lets the
-    // handshake complete; we then check SSL_get_verify_result and reject before any
-    // request is sent -- the same post-handshake pattern navi's TCP backends use
-    // (backend/openssl_ctx postHandshakeVerify). The chain is still built and the
-    // hostname still matched (SSL_set1_host feeds the verify result); nothing is sent
-    // to an unverified peer, since h3Open verifies before returning.
-    SSL_CTX_set_verify(c->ssl_ctx, SSL_VERIFY_NONE, nullptr);
+    // The whole TLS policy (trust store, client credential, cipher and version
+    // bounds) is built once per policy and shared: this hands back a reference to a
+    // cached SSL_CTX, building one only on the first connection for that policy
+    // (#454). The reference is the connection's own, released in ~H3Conn.
+    c->ssl_ctx = obtain_ssl_ctx(tls);
+    if (!c->ssl_ctx) return nullptr;   // the reason is already on stderr
     c->want_verify = verify != 0;
-    if (verify) {
-      if (is_set(ca_file)) {
-        if (SSL_CTX_load_verify_locations(c->ssl_ctx, ca_file, nullptr) != 1) {
-          std::fprintf(stderr, "failed to load CA file %s\n", ca_file);
-          return nullptr;
-        }
-      } else {
-        SSL_CTX_set_default_verify_paths(c->ssl_ctx);
-      }
-      // Extra in-memory roots supplement caFile / the system store, exactly as on
-      // the TCP backends; only meaningful when a chain is actually being built.
-      if (is_set(tls->ca_bundle) && !apply_ca_bundle(c->ssl_ctx, tls->ca_bundle))
-        return nullptr;
-    }
-    // The client credential, the version bounds and the cipher selection apply
-    // whether or not the peer is verified: they describe what navi offers, not what
-    // it accepts. Each fails closed rather than connecting under a weaker policy.
-    if (!apply_client_cert(c->ssl_ctx, tls)) return nullptr;
-    if (!apply_versions(c->ssl_ctx, tls)) return nullptr;
-    if (!apply_ciphers(c->ssl_ctx, tls)) return nullptr;
     c->ssl = SSL_new(c->ssl_ctx);
     if (!c->ssl) {
       std::fprintf(stderr, "SSL_new failed\n");

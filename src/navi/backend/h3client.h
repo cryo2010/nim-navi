@@ -31,7 +31,23 @@ typedef struct {
   int min_version;           // 0 unset, else 10/11/12/13 for TLS 1.0 .. 1.3
   int max_version;           // 0 unset, else 10/11/12/13 for TLS 1.0 .. 1.3
   unsigned long long handshake_timeout_ms;  // 0 = unset (ngtcp2's UINT64_MAX default)
+  // Identity of the client that owns this policy: the address of its
+  // TlsConfig.contextStore, or 0 for a bare TlsConfig with no store. Part of the
+  // SSL_CTX cache key, and what navi_h3_ctx_release names when the client is
+  // closed, so one client's contexts are never handed to another and are dropped
+  // with it (#454). Never dereferenced on this side.
+  unsigned long long ctx_owner;
 } NaviH3Tls;
+
+// Drop every cached SSL_CTX built for `owner` (see NaviH3Tls.ctx_owner); a no-op
+// for 0. Called when a navi client's TLS context store is freed. Connections still
+// using a released context hold their own reference and are unaffected.
+void navi_h3_ctx_release(unsigned long long owner);
+
+// SSL_CTX cache counters, for the interop probe: contexts actually built, cache
+// hits, and entries currently held. Any out-pointer may be null.
+void navi_h3_ctx_cache_stats(unsigned long long *builds, unsigned long long *reuses,
+                             unsigned long long *entries);
 
 #ifdef __cplusplus
 }

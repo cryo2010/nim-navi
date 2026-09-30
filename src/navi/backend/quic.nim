@@ -107,6 +107,10 @@ type NaviH3Tls* {.importc: "NaviH3Tls", header: "h3client.h", bycopy.} = object
   maxVersion* {.importc: "max_version".}: cint
   handshakeTimeoutMs* {.importc: "handshake_timeout_ms".}: culonglong
     ## 0 = unset (ngtcp2's unbounded default)
+  ctxOwner* {.importc: "ctx_owner".}: culonglong
+    ## Identity of the owning client, for the driver's SSL_CTX cache (#454): the
+    ## address of its `TlsConfig.contextStore`, or 0 for a bare config with no
+    ## store. Never dereferenced on the C side.
 
 proc navi_h3_open(host, port, sni: cstring, tls: ptr NaviH3Tls,
                   maxBody: culonglong): pointer {.importc, cdecl.}
@@ -237,7 +241,9 @@ proc h3VersionCode(v: TlsVersion): cint =
 proc toH3Tls*(cfg: TlsConfig, handshakeMs = 0): NaviH3Tls =
   ## Flatten navi's `TlsConfig` for the h3 driver. The result BORROWS `cfg`'s
   ## strings, so `cfg` must outlive every navi_h3_new / navi_h3_open call made with
-  ## it (the driver copies what it needs during the call and nothing after).
+  ## it (the driver copies what it needs during the call and nothing after). The
+  ## client's context store doubles as the identity of the built SSL_CTX the driver
+  ## caches for this policy (`ctxOwner`, released by `h3ReleaseTlsContexts`).
   NaviH3Tls(
     caFile: cfg.caFile.cstring, caBundle: cfg.caBundle.cstring,
     pkcs12File: cfg.pkcs12File.cstring, certPem: cfg.certPem.cstring,
@@ -247,7 +253,33 @@ proc toH3Tls*(cfg: TlsConfig, handshakeMs = 0): NaviH3Tls =
     verify: cint(cfg.wantsVerify),
     minVersion: h3VersionCode(cfg.minVersion),
     maxVersion: h3VersionCode(cfg.maxVersion),
-    handshakeTimeoutMs: culonglong(max(0, handshakeMs)))
+    handshakeTimeoutMs: culonglong(max(0, handshakeMs)),
+    ctxOwner: culonglong(cast[uint](cast[pointer](cfg.contextStore))))
+
+# --- the driver's shared SSL_CTX cache (#454) --------------------------------
+# The QUIC context is built once per TLS policy and shared by every connection made
+# with it, the h3 twin of the TCP backends' `obtainContext`; see the cache notes in
+# h3client.cpp. These are the two entry points the Nim side drives: releasing a
+# closed client's contexts, and the counters the interop probe asserts on.
+
+proc navi_h3_ctx_release(owner: culonglong) {.importc, cdecl.}
+proc navi_h3_ctx_cache_stats(builds, reuses, entries: ptr culonglong)
+  {.importc, cdecl.}
+
+proc h3ReleaseTlsContexts*(store: RootRef) =
+  ## Free the QUIC SSL_CTXs the driver cached for the client owning `store`. Call
+  ## it where the TCP side calls `closeTlsCtxStore`, i.e. in the client's `close`
+  ## after its h3 connections have been closed; a connection that somehow outlives
+  ## the call holds its own reference and keeps working. A no-op for a nil store
+  ## (a bare `TlsConfig`, whose contexts the cache bounds instead).
+  navi_h3_ctx_release(culonglong(cast[uint](cast[pointer](store))))
+
+proc h3CtxCacheStats*(): tuple[builds, reuses, entries: int] =
+  ## Contexts actually built, cache hits, and entries currently held, since process
+  ## start. For tests and introspection (tests/interop/http3/ctxcache_test.nim).
+  var b, r, e: culonglong
+  navi_h3_ctx_cache_stats(addr b, addr r, addr e)
+  (int(b), int(r), int(e))
 
 proc h3TlsFail(msg: string) {.noreturn, raises: [ValueError].} =
   ## Same exception and wording as the TCP backends' `fail` (backend/openssl_ctx),

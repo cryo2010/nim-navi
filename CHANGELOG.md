@@ -84,6 +84,21 @@ onward (pre-1.0, minor versions may include breaking changes).
   `BodySink`), since the `Future` type differs per backend (#367).
 
 ### Changed
+- **The HTTP/3 leg builds its OpenSSL context once per TLS policy instead of once
+  per connection (#454).** `navi_h3_new` used to create an `SSL_CTX` and re-load the
+  trust store, re-parse `caBundle`, re-decode the PKCS#12 or PEM client credential
+  and re-apply the cipher and version bounds on every QUIC connection, so every
+  idle-timeout eviction, cold start per origin and server-forced reconnect paid a
+  full credential parse (a PKCS#12 decode is deliberately slow). The driver now
+  caches the built context and hands out a reference, leaving only `SSL_new` per
+  connection, which is what the TCP backends have always done through
+  `TlsConfig.contextStore`. The cache is keyed by the owning client plus every input
+  that shapes the context (including the size and mtime of the file-based ones, so a
+  rewritten certificate is never served from cache), guarded by a mutex, bounded to
+  8 entries, and a client's entry is released when the client is closed; a
+  connection holds its own reference, so a released or evicted context stays alive
+  for as long as the connections built from it. `NAVI_H3_CTX_CACHE=0` restores the
+  old per-connection build.
 - **The HTTP/3 Alt-Svc mark-broken/mark-working bookkeeping moved into one shared
   `openH3Tracked` template.** The RFC 7838 2.4 sequence added in #432 (catch a
   `QuicError` out of the QUIC open, mark the origin's alternative broken and

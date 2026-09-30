@@ -191,6 +191,9 @@ proc close*(client: Navi): Future[void] {.async.} =
     if not refilled or sweeps >= 64: break
   closeTlsStore(client.config.tls.sessionCache)
   closeTlsCtxStore(client.config.tls.contextStore)
+  # The h3 driver caches its own SSL_CTX per policy (#454); this is that cache's
+  # half of closing the context store, and follows the h3 connections being closed.
+  when defined(naviHttp3): h3ReleaseTlsContexts(client.config.tls.contextStore)
 
 when defined(naviHttp3):
   proc h3ConnCount*(client: Navi): int = client.h3conns.len

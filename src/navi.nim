@@ -191,6 +191,9 @@ proc close*(client: Navi) =
   when defined(naviHttp3): closeH3Conns(client.h3conns)
   closeTlsStore(client.config.tls.sessionCache)
   closeTlsCtxStore(client.config.tls.contextStore)
+  # The h3 driver caches its own SSL_CTX per policy (#454); this is that cache's
+  # half of closing the context store, and follows the h3 connections being closed.
+  when defined(naviHttp3): h3ReleaseTlsContexts(client.config.tls.contextStore)
 
 when defined(naviHttp3):
   proc evictH3(client: Navi, origin: string, conn: QuicConn) =
