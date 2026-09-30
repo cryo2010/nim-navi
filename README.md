@@ -357,6 +357,16 @@ Verification is on for every `TlsConfig`, including a bare one: the opt-out is `
 
 The whole `TlsConfig` applies to the HTTP/3 leg too (`-d:naviHttp3`): trust store (with the same replace-vs-add split between `caFile` and `caBundle`), client credential, pins, verify callback and cipher selection all reach the QUIC handshake. The one bound QUIC cannot honor is a `maxVersion` below TLS 1.3, since QUIC always uses TLS 1.3 (RFC 9001); with such a bound set navi simply skips the advertised h3 endpoint and stays on h2/h1.
 
+When the h3 leg is refused by TLS, the reason travels with the error: the QUIC driver
+records why (including the X509 verify error text) and `navi/backend/quic` raises
+`QuicTlsError` -- a `QuicError` subtype, so the automatic fallback to h2/h1 is
+unchanged -- whose message names the cause. The driver never writes to stderr, so a
+daemon's log stays its own. Only the `-d:naviHttp3` h3 leg has this type; the TCP
+backends keep reporting TLS rejections as `ValueError`, as before. The type is
+defined in `navi/backend/quic`, which the `navi`, `navi/asyncdispatch` and
+`navi/chronos` entry modules do not re-export, so code that wants to catch it by
+name imports that module as well.
+
 #### Trusting a CA in memory
 
 `caBundle` adds trusted CA certificates from an in-memory PEM string. It is

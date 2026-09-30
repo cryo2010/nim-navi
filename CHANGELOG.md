@@ -288,7 +288,9 @@ onward (pre-1.0, minor versions may include breaking changes).
   navi's own passphrase callback (never OpenSSL's, which would prompt on the
   terminal), and the failure names the encrypted-PKCS#8 case and whether a password
   was set. The HTTP/3 leg had the same defect in its `SSL_FILETYPE_ASN1` fallback and
-  now shares the two-step loader. The PEM/DER sniff no longer tests the first byte for
+  now shares the two-step loader, its two messages, and the passphrase
+  callback's "no usable password" return, so a key that will not load reports
+  the same reason whichever leg was asked for it. The PEM/DER sniff no longer tests the first byte for
   the ASN.1 SEQUENCE tag either: a file is PEM when a `-----BEGIN` boundary starts one
   of its lines, so a PEM key beginning with the character `0`, or carrying the
   explanatory text RFC 7468 5.2 allows, is no longer misrouted to the DER loader
@@ -314,12 +316,21 @@ onward (pre-1.0, minor versions may include breaking changes).
   and raised "Read operation already pending!" immediately, which the pump swallowed
   as an EOF and turned into a torn-down connection with every in-flight stream
   failed. Only a TLS 1.2 peer-initiated renegotiation could reach it, so
-  `SSL_OP_NO_RENEGOTIATION` is now set on every navi TLS context (RFC 9113 9.2.1
-  forbids renegotiation for HTTP/2 regardless, TLS 1.3 has none, and navi never asks
-  for one): OpenSSL answers a `HelloRequest` with a warning alert instead, and a peer
-  that still drives `SSL_write` to want input gets a clear protocol error rather than
-  a phantom EOF. The dual-buffer `wrInBuf`/`FeedSide` machinery that described the
-  concurrent-read model chronos forbids is gone.
+  `SSL_OP_NO_RENEGOTIATION` is now set on every navi TLS context built against
+  OpenSSL 1.1.0 or newer (RFC 9113 9.2.1 forbids renegotiation for HTTP/2 regardless,
+  TLS 1.3 has none, and navi never asks for one): OpenSSL answers a `HelloRequest`
+  with a warning alert instead, and a peer that still drives `SSL_write` to want
+  input gets a clear protocol error rather than a phantom EOF. That option is set in
+  `newTlsContext`, so on OpenSSL 1.1.0 and newer it reaches the **sync and
+  asyncdispatch** clients too, where it is a deliberate behaviour change rather than
+  a fix: a TLS 1.2 server-initiated renegotiation used to complete transparently
+  under their blocking `SSL_read` (`SSL_MODE_AUTO_RETRY`) and `driveHandshake`, and
+  some Apache and IIS deployments use exactly that to defer a client-certificate
+  request until a protected resource is asked for, so those connections now take a
+  `no_renegotiation` alert and typically fail; such a server has to request the
+  certificate in the initial handshake instead (see HARDENING.md). The dual-buffer
+  `wrInBuf`/`FeedSide` machinery that described the concurrent-read model chronos
+  forbids is gone.
 - **An IP-literal origin over HTTP/3 is matched against the certificate's
   `iPAddress` SAN and is no longer offered as SNI (#451).** `navi_h3_new` handed
   every origin -- DNS name or numeric address alike -- to `SSL_set1_host`, the

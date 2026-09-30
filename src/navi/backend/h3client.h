@@ -49,6 +49,29 @@ void navi_h3_ctx_release(unsigned long long owner);
 void navi_h3_ctx_cache_stats(unsigned long long *builds, unsigned long long *reuses,
                              unsigned long long *entries);
 
+// --- last-error reporting (#446) ---------------------------------------------
+// What kind of failure the driver recorded, so the Nim side can raise the right
+// exception without parsing the text: a TLS code becomes a `QuicTlsError` (a
+// `QuicError` subtype, so existing h2/h1 fallback logic is unaffected), everything
+// else a plain `QuicError`. Keep in step with backend/quic.nim, which imports these
+// names from this header.
+typedef enum {
+  NAVI_H3_ERR_NONE = 0,        // nothing recorded
+  NAVI_H3_ERR_INTERNAL = 1,    // a driver/library setup call failed unexpectedly
+  NAVI_H3_ERR_NETWORK = 2,     // socket, datagram or QUIC transport failure
+  NAVI_H3_ERR_TLS = 3,         // the TLS policy could not be applied (trust store,
+                               // client credential, ciphers, expected identity)
+  NAVI_H3_ERR_TLS_VERIFY = 4,  // the peer's certificate or identity was rejected
+  NAVI_H3_ERR_PROTOCOL = 5     // the peer is not a usable HTTP/3 endpoint
+} NaviH3ErrCode;
+
+// The reason recorded for the most recent failure on the CALLING thread, or "" when
+// there is none, plus its NaviH3ErrCode. The driver never writes to stderr; this is
+// how a failure explains itself. The pointer stays valid until the next failure on
+// that thread, so a caller copies it before doing anything else.
+const char *navi_h3_last_error(void);
+int navi_h3_last_error_code(void);
+
 #ifdef __cplusplus
 }
 #endif

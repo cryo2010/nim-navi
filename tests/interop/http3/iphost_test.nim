@@ -7,7 +7,7 @@
 ##
 ## The run.sh origin cert carries DNS:localhost and IP:127.0.0.1, and the /sni route
 ## echoes the server_name the ClientHello carried. Sync opener. -d:ssl -d:naviHttp3.
-import std/os
+import std/[os, strutils]
 import navi/backend/quic
 
 let ca = getEnv("NAVI_H3_CA")
@@ -25,14 +25,21 @@ doAssert r2.body == "sni=", "the IP literal was sent as SNI: " & r2.body
 echo "ok: no SNI sent for an IP-literal origin (sync)"
 
 # 3. The identity check is real, not skipped: the same origin, required to prove a
-#    different address, must be rejected.
+#    different address, must be rejected -- and the rejection must say so. Since #446
+#    the driver records the reason instead of printing it to stderr, so this is a
+#    `QuicTlsError` (a `QuicError` subtype: the h2/h1 fallback is unchanged) whose
+#    message carries the X509 verify error text.
 var rejected = false
 try:
   discard h3Get("127.0.0.1", 4433, sni = "127.0.0.2", caFile = ca)
-except QuicError:
+except QuicTlsError as e:
   rejected = true
+  doAssert "IP address mismatch" in e.msg,
+    "the X509 verify reason was not surfaced: " & e.msg
+except QuicError as e:
+  doAssert false, "a verification rejection was not a QuicTlsError: " & e.msg
 doAssert rejected, "a certificate without IP:127.0.0.2 was accepted"
-echo "ok: mismatched IP literal rejected (sync)"
+echo "ok: mismatched IP literal rejected as QuicTlsError naming the X509 error (sync)"
 
 # 4. A bracketed literal, the form a URL authority uses for IPv6, is recognised as
 #    an address rather than left to be matched as a DNS name, which nothing answers.
