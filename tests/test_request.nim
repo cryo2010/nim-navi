@@ -1,7 +1,7 @@
 ## buildRequest identity-header defaults (User-Agent, Accept, Accept-Encoding)
 ## and the type-dispatched request body (`toBody` arm selection + precedence).
 import unittest, std/[strutils, json]
-import navi/core/[headers, request, version, multipart]
+import navi/core/[headers, request, version, multipart, url]
 
 proc built(headers: Headers = initHeaders(), decompress = false): Request =
   var cfg = NaviConfigBase(decompress: decompress)
@@ -174,3 +174,49 @@ suite "BodyIterator wrapping producer":
     check stream() == "c"
     check stream() == ""        # finished
     check stream() == ""        # stays "" after finish
+
+suite "empty-host URL rejection":
+  # `std/uri` parses `https:///path` to hostname "", which is not dialable and, on
+  # the TLS path, used to mean "no SNI and no certificate identity check" (#435).
+  # `buildRequest` is the single place every client builds a request, so the check
+  # lives there and covers the sync, asyncdispatch, chronos, js and h3 legs.
+  var cfg = NaviConfigBase()
+
+  test "buildRequest should reject an https URL with no host":
+    expect ValueError:
+      discard buildRequest(cfg, GET, "https:///path")
+
+  test "buildRequest should reject an http URL with no host":
+    expect ValueError:
+      discard buildRequest(cfg, GET, "http:///path")
+
+  test "buildRequest should reject ws and wss URLs with no host":
+    expect ValueError:
+      discard buildRequest(cfg, GET, "ws:///chat")
+    expect ValueError:
+      discard buildRequest(cfg, GET, "WSS:///chat")
+
+  test "the rejection should name the offending URL":
+    var msg = ""
+    try: discard buildRequest(cfg, GET, "https:///path")
+    except ValueError as e: msg = e.msg
+    check "no host" in msg
+    check "https:///path" in msg
+
+  test "buildRequest should accept a URL that has a host":
+    check buildRequest(cfg, GET, "https://x.test/path").url.host == "x.test"
+    check buildRequest(cfg, GET, "https://[::1]:8443/").url.host == "::1"
+
+  test "a prefixUrl should satisfy the host requirement for a relative target":
+    var pre = NaviConfigBase(prefixUrl: "https://x.test")
+    check buildRequest(pre, GET, "/path").url.host == "x.test"
+
+  test "a schemeless relative target should still be allowed":
+    # Only the schemes navi dials are judged; a bare path is left alone, so
+    # middleware that answers without a transport keeps working.
+    check buildRequest(cfg, GET, "/path").url.host == ""
+
+  test "requireHost should ignore a scheme navi does not dial":
+    requireHost(parseUrl("mailto:someone@x.test"))
+    requireHost(parseUrl("file:///etc/hosts"))
+    check true                            # neither call raised

@@ -54,6 +54,19 @@ type
     ## established, was found closed, or the stream could not be opened -- so nothing
     ## reached the server and any method may fall back to h2/h1 for the origin.
 
+  QuicTlsError* = object of QuicError
+    ## The h3 leg was refused by TLS rather than by the network: the peer's
+    ## certificate or identity was rejected, or navi's own TLS policy could not be
+    ## applied to the QUIC context (an unparseable `caFile`, a client credential that
+    ## will not load, an unusable cipher selection). Deliberately a `QuicError`
+    ## subtype, so every `except QuicError` fallback path keeps behaving exactly as
+    ## before: the engine still falls back to h2/h1 and `openH3Tracked`
+    ## (core/altsvc) still marks the Alt-Svc alternative broken, which is what stops
+    ## a rejected origin paying a fresh QUIC handshake on every request. What it adds
+    ## is that an application (or logging middleware) can tell a verification
+    ## rejection from a transport failure, and `msg` names the reason the driver
+    ## recorded, including the X509 verify error text (#446).
+
   QuicSubmittedError* = object of QuicError
     ## A QUIC/h3 failure raised AFTER the request was submitted on a stream: the
     ## server may already have processed it, and a streamed body producer may
@@ -281,6 +294,45 @@ proc h3CtxCacheStats*(): tuple[builds, reuses, entries: int] =
   navi_h3_ctx_cache_stats(addr b, addr r, addr e)
   (int(b), int(r), int(e))
 
+# --- what the driver recorded about its last failure (#446) -------------------
+# The driver writes no diagnostics of its own: every failing entry point records a
+# reason and a NAVI_H3_ERR_* code (backend/h3client.h) in a thread-local slot, and the
+# raise sites below put that reason into the exception message. The codes are imported
+# from the header rather than duplicated here, so the two sides cannot drift.
+# Declared with `header:` so the generated C uses h3client.h's prototypes rather
+# than emitting its own: navi_h3_last_error returns `const char *`, which a Nim
+# `cstring` prototype would redeclare as `char *` and gcc rejects as a conflict.
+proc navi_h3_last_error(): cstring {.importc, cdecl, header: "h3client.h".}
+proc navi_h3_last_error_code(): cint {.importc, cdecl, header: "h3client.h".}
+
+let
+  naviH3ErrTls {.importc: "NAVI_H3_ERR_TLS", header: "h3client.h".}: cint
+  naviH3ErrTlsVerify {.importc: "NAVI_H3_ERR_TLS_VERIFY", header: "h3client.h".}: cint
+
+proc h3LastError*(): string =
+  ## The reason the C driver recorded for the most recent failure on this thread, or
+  ## "" when it recorded none. Only meaningful immediately after a driver call that
+  ## failed (every such entry point clears the slot on the way in).
+  let s = navi_h3_last_error()
+  if s.isNil: "" else: $s
+
+proc h3Reason*(what: string): string =
+  ## `what` with the driver's recorded reason appended, when there is one. Used for
+  ## every h3 failure message so the cause is in the exception rather than nowhere.
+  let reason = h3LastError()
+  if reason.len > 0: what & ": " & reason else: what
+
+proc quicFail*(what: string) {.noreturn.} =
+  ## Raise the h3 failure the driver just reported: `what` names the operation and
+  ## the recorded reason is appended. A TLS code (policy or verification) raises
+  ## `QuicTlsError`, anything else a plain `QuicError` -- both pre-submit, so the
+  ## engine's fallback classification is unchanged.
+  let msg = h3Reason(what)
+  let code = navi_h3_last_error_code()
+  if code == naviH3ErrTls or code == naviH3ErrTlsVerify:
+    raise newException(QuicTlsError, msg)
+  raise newException(QuicError, msg)
+
 proc h3TlsFail(msg: string) {.noreturn, raises: [ValueError].} =
   ## Same exception and wording as the TCP backends' `fail` (backend/openssl_ctx),
   ## so a pin or callback rejection looks identical whichever leg hit it -- and, not
@@ -336,14 +388,14 @@ proc h3Open*(host: string, port: int, sni = "", tls = TlsConfig(),
   ## connection is usable. `maxBody` caps a buffered response body (0 = unlimited,
   ## navi maxResponseBytes). The handshake is bounded by `connectMs`, else
   ## `totalMs`, else `h3HandshakeDefaultMs`. Raises `QuicError` on a connect
-  ## failure and `ValueError` on a pin / callback rejection.
+  ## failure -- `QuicTlsError`, carrying the driver's reason, when TLS was what
+  ## refused it (#446) -- and `ValueError` on a pin / callback rejection.
   let name = if sni.len > 0: sni else: host
   var t = toH3Tls(tls, establishMs(connectMs, totalMs, h3HandshakeDefaultMs))
   let h = navi_h3_open(host.cstring, ($port).cstring, name.cstring,
                        addr t, culonglong(maxBody))
   if h == nil:
-    raise newException(QuicError,
-      "navi HTTP/3 connect to " & host & ":" & $port & " failed")
+    quicFail("navi HTTP/3 connect to " & host & ":" & $port & " failed")
   try:
     h3PostHandshakeVerify(h, name, tls)
   except CatchableError:
@@ -429,7 +481,7 @@ proc request*(c: QuicConn, verb: string, path = "/",
         "navi: HTTP/3 request timed out after " & $deadlineMs & " ms")
     if navi_h3_pump(c.handle) != 0:
       navi_h3_stream_free(c.handle, sid)
-      raise newException(QuicSubmittedError, "navi HTTP/3 pump failed")
+      raise newException(QuicSubmittedError, h3Reason("navi HTTP/3 pump failed"))
   if navi_h3_stream_done(c.handle, sid) == 0:      # connection drained before the response
     navi_h3_stream_free(c.handle, sid)
     raise newException(QuicSubmittedError, "navi HTTP/3 connection closed before response")
@@ -533,7 +585,7 @@ proc awaitHeaders*(c: QuicConn, sid: int64):
       raise newException(QuicSubmittedError,
                          "navi HTTP/3 connection closed before headers")
     if navi_h3_pump(c.handle) != 0:
-      raise newException(QuicSubmittedError, "navi HTTP/3 pump failed")
+      raise newException(QuicSubmittedError, h3Reason("navi HTTP/3 pump failed"))
 
 proc readStreamBody*(c: QuicConn, sid: int64): string =
   ## The next body chunk of `sid`, or "" at end of body (driving the connection until
@@ -553,7 +605,7 @@ proc readStreamBody*(c: QuicConn, sid: int64): string =
     if navi_h3_draining(c.handle) != 0:           # peer closed gracefully mid-stream (#278)
       raise newException(QuicSubmittedError, "navi HTTP/3 connection closed mid-stream")
     if navi_h3_pump(c.handle) != 0:
-      raise newException(QuicSubmittedError, "navi HTTP/3 pump failed")
+      raise newException(QuicSubmittedError, h3Reason("navi HTTP/3 pump failed"))
 
 proc streamTrailers*(c: QuicConn, sid: int64): seq[(string, string)] =
   ## The response trailer fields of `sid` (they land after the body EOF); "" if none.
@@ -687,7 +739,7 @@ when compileOption("threads"):
     let h = navi_h3_open(host.cstring, ($port).cstring, name.cstring,
                          addr t,
                          culonglong(0))   # WebSocket frames stream via read_body: no buffered cap
-    if h == nil: raise newException(QuicError, "navi: HTTP/3 connect failed")
+    if h == nil: quicFail("navi: HTTP/3 connect failed")
     try:
       h3PostHandshakeVerify(h, name, tls)
     except CatchableError:
@@ -704,7 +756,15 @@ when compileOption("threads"):
       if epochTime() > deadline:
         navi_h3_close(h)
         raise newException(QuicError, "navi: h3 WebSocket handshake timed out")
-      if navi_h3_pump(h) != 0 or navi_h3_draining(h) != 0:
+      # Two different endings, split so each says which one it was and, for the
+      # transport failure, why. The reason is read BEFORE navi_h3_close, which is
+      # free to record one of its own.
+      if navi_h3_pump(h) != 0:
+        let why = h3Reason("navi: the HTTP/3 connection failed before the " &
+                           "server's SETTINGS")
+        navi_h3_close(h)
+        raise newException(QuicError, why)
+      if navi_h3_draining(h) != 0:
         navi_h3_close(h)
         raise newException(QuicError,
           "navi: HTTP/3 connection closed before the server's SETTINGS")
@@ -714,7 +774,9 @@ when compileOption("threads"):
     let reqHdr = encodeH3Fields(headers)
     let sid = navi_h3_open_connect(h, path.cstring, reqHdr.cstring, "websocket".cstring)
     if sid < 0:
-      navi_h3_close(h); raise newException(QuicError, "navi: h3 Extended CONNECT failed")
+      let why = h3Reason("navi: h3 Extended CONNECT failed")
+      navi_h3_close(h)
+      raise newException(QuicError, why)
     var status: clong
     var hbuf = newString(16 * 1024)
     var ready: cint
@@ -728,7 +790,10 @@ when compileOption("threads"):
         navi_h3_close(h)
         raise newException(QuicError, "navi: h3 WebSocket handshake timed out")
       if navi_h3_pump(h) != 0:
-        navi_h3_close(h); raise newException(QuicError, "navi: HTTP/3 connection closed")
+        let why = h3Reason("navi: the HTTP/3 connection failed while waiting for " &
+                           "the CONNECT response")
+        navi_h3_close(h)
+        raise newException(QuicError, why)
     let p = cast[WsH3Pump](allocShared0(sizeof(WsH3PumpObj)))
     p.conn = h
     p.sid = sid

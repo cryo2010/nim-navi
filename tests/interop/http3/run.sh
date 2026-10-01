@@ -64,6 +64,42 @@ echo ">>> building and running the h3 IP-literal origin test (chronos client)"
 nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/iphost_chronos_test "$DIR/iphost_chronos_test.nim"
 /tmp/iphost_chronos_test
 
+echo ">>> building and running the h3 ALPN gate test (#445)"
+# The peer this probe needs is a QUIC listener that completes the handshake and then
+# selects no ALPN protocol at all. Caddy cannot play that part (it always selects h3)
+# and OpenSSL's own QUIC server is the compliant side of the exchange, so the listener
+# is aioquic with no `alpn_protocols` configured, on udp/4434 with the origin's cert.
+python3 "$DIR/noalpn_server.py" "$WORK/cert.pem" "$WORK/key.pem" 4434 \
+  >/tmp/noalpn.log 2>&1 &
+NOALPN_PID=$!
+trap 'kill "$NOALPN_PID" 2>/dev/null || true' EXIT
+for _ in $(seq 1 100); do
+  if grep -q listening /tmp/noalpn.log; then break; fi
+  sleep 0.1
+done
+if ! grep -q listening /tmp/noalpn.log; then
+  echo "the no-ALPN QUIC listener failed to start"; cat /tmp/noalpn.log; exit 1
+fi
+echo "aioquic: no-ALPN QUIC listener up on udp/4434"
+export NAVI_H3_NOALPN_LOG=/tmp/noalpn.log   # the probe reads the close code back off it
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/alpn_test "$DIR/alpn_test.nim"
+/tmp/alpn_test
+
+# The async and chronos openers drive the handshake with their own loops and tear the
+# connection down from their own except arms, so each needs its own leg: only the C
+# check is shared, and what makes the refusal useful is the pre-submit classification
+# every opener has to get right. They reuse the listener above (still running).
+echo ">>> ... and the same gate on the asyncdispatch opener"
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/alpn_async_test "$DIR/alpn_async_test.nim"
+/tmp/alpn_async_test
+
+echo ">>> ... and the same gate on the chronos opener"
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/alpn_chronos_test "$DIR/alpn_chronos_test.nim"
+/tmp/alpn_chronos_test
+
+kill "$NOALPN_PID" 2>/dev/null || true
+trap - EXIT
+
 echo ">>> building and running the transparent h3 dispatch test (sync client)"
 nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/dispatch_test "$DIR/dispatch_test.nim"
 /tmp/dispatch_test

@@ -187,7 +187,9 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
       if client.altSvc != nil:
         let alt = handle.resp.headers.get("alt-svc")
         if alt.len > 0:
-          client.altSvc.record("https", rreq.url.host, rreq.url.port, alt)
+          # Gated on `rreq.url.isTls` inside `recordFrom`: an Alt-Svc header from a
+          # cleartext stream must not name the https origin's h3 endpoint (#434).
+          client.altSvc.recordFrom(rreq.url, alt)
     # Arm the leak-guard: if the handle is dropped without drain/close, close its
     # connection. Captures only the connection essentials (not `handle`, which cycles).
     case handle.kind

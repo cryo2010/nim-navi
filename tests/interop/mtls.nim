@@ -2,7 +2,7 @@
 ## accepts, on the OpenSSL backends. Driven by mtls.sh, which stands up an
 ## `openssl s_server -Verify 1` that *requires* a client certificate and exports
 ## the same credential as PEM files, an encrypted PEM key, a PKCS#12 bundle, DER
-## files, and (read here) in-memory PEM. Built three ways:
+## files (plain and encrypted PKCS#8), and (read here) in-memory PEM. Built three ways:
 ##   nim c ...                -> navi (sync)
 ##   nim c -d:useAsync ...    -> navi/asyncdispatch
 ##   nim c -d:useChronos ...  -> navi/chronos (now OpenSSL, so it presents certs)
@@ -106,6 +106,47 @@ template runAll() =
     var cfg = mtlsCfg()
     cfg.tls.certFile = getEnv("NAVI_MTLS_DERCERT")
     cfg.tls.keyFile = getEnv("NAVI_MTLS_DERKEY")
+    (await newNavi(cfg).get(base & "/")).status == 200
+
+  check "DER cert with an encrypted PKCS#8 DER key and a passphrase":
+    # EncryptedPrivateKeyInfo, which SSL_CTX_use_PrivateKey_file(SSL_FILETYPE_ASN1)
+    # cannot decrypt (it never consults the passphrase callback), so navi decodes
+    # DER keys itself (#436).
+    var cfg = mtlsCfg()
+    cfg.tls.certFile = getEnv("NAVI_MTLS_DERCERT")
+    cfg.tls.keyFile = getEnv("NAVI_MTLS_DERENCKEY")
+    cfg.tls.password = getEnv("NAVI_MTLS_PASS")
+    (await newNavi(cfg).get(base & "/")).status == 200
+
+  check "wrong passphrase on an encrypted PKCS#8 DER key is rejected":
+    var cfg = mtlsCfg()
+    cfg.tls.certFile = getEnv("NAVI_MTLS_DERCERT")
+    cfg.tls.keyFile = getEnv("NAVI_MTLS_DERENCKEY")
+    cfg.tls.password = "not-the-password"
+    var raised = false
+    try: discard await newNavi(cfg).get(base & "/")
+    except CatchableError: raised = true
+    raised
+
+  check "encrypted PKCS#8 DER key with no passphrase fails instead of prompting":
+    # Same no-prompt contract as the PEM leg above: mtls.sh re-runs this binary with
+    # stdin held open by a pipe nobody writes to, under a timeout, so a fallback to
+    # OpenSSL's terminal prompt shows up as a hang rather than passing unnoticed.
+    var cfg = mtlsCfg()
+    cfg.tls.certFile = getEnv("NAVI_MTLS_DERCERT")
+    cfg.tls.keyFile = getEnv("NAVI_MTLS_DERENCKEY")
+    cfg.tls.password = ""
+    var raised = false
+    try: discard await newNavi(cfg).get(base & "/")
+    except CatchableError: raised = true
+    raised
+
+  check "a PEM key starting with '0' is not sniffed as DER":
+    # '0' is the ASCII spelling of the ASN.1 SEQUENCE tag (0x30) the old first-byte
+    # sniff tested for; RFC 7468 5.2 explanatory text keeps the file valid PEM (#436).
+    var cfg = mtlsCfg()
+    cfg.tls.certFile = getEnv("NAVI_MTLS_CERT")
+    cfg.tls.keyFile = getEnv("NAVI_MTLS_ZEROKEY")
     (await newNavi(cfg).get(base & "/")).status == 200
 
   check "in-memory PEM cert and key strings":

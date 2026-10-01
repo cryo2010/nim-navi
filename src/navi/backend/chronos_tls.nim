@@ -30,12 +30,12 @@ when defined(ssl):
                             ## reads) dereferences it -- so it must outlive the ssl
       writeLock: AsyncLock  ## serialize SSL_write + wbio drains so concurrent streams
                             ## (and post-handshake output) never interleave on the wire
-      inBuf: string         ## reusable ciphertext scratch for the READ path's feedIn,
-                            ## allocated once per connection instead of per read
-      wrInBuf: string       ## the same for the WRITE path's feedIn, which is not
-                            ## mutually exclusive with the read path (see FeedSide).
-                            ## Allocated lazily: only a renegotiation/key update
-                            ## during a write ever needs it
+      writers: int          ## tasks inside `write` (holding `writeLock` or queued for
+                            ## it). The read path reads this instead of ever waiting on
+                            ## the lock: see `tryFlushOut`
+      inBuf: string         ## reusable ciphertext scratch for `feedIn`, allocated once
+                            ## per connection instead of per read. One buffer is enough
+                            ## because only the read path ever reads the transport
       uncleanEof: bool      ## the transport ended before OpenSSL reported a
                             ## close_notify, so the end of the byte stream is not
                             ## authenticated (see `closedCleanly`)
@@ -44,21 +44,6 @@ when defined(ssl):
   const closeNotifyMs = 1000
     ## upper bound on pushing the close_notify alert out in `close`, so a peer that
     ## has stopped reading cannot stall a teardown
-
-  type FeedSide = enum
-    ## Which pump is reading ciphertext, and so which scratch buffer it owns.
-    ##
-    ## `feedIn` is reachable from two paths that are NOT mutually exclusive: the read
-    ## path (`handshake`, then `readSome`, which on an h2 connection is a background
-    ## mux reader parked for as long as the connection is idle) and the write path's
-    ## SSL_ERROR_WANT_READ branch, which holds `writeLock` but no read lock. A TLS 1.3
-    ## key update or a renegotiation can therefore start a second `readOnce` while the
-    ## first is still parked. The two must never target the same buffer: whichever
-    ## completed second would overwrite bytes the first had not yet handed to the
-    ## read-BIO, and the corrupted ciphertext would fail the connection. One buffer per
-    ## side is the invariant that keeps every in-flight `readOnce` on its own memory.
-    fsRead
-    fsWrite
 
   proc sslPtr*(t: ChronosTls): SslPtr = t.sslp
     ## The underlying SSL, for `negotiatedProtocol` / `verifyPeer` after handshake.
@@ -94,11 +79,62 @@ when defined(ssl):
       discard await t.transport.write(buf)
 
   proc flushOut(t: ChronosTls) {.async.} =
+    ## Drain the write-BIO under `writeLock`, waiting for the lock if a writer holds
+    ## it. Only for paths where that wait is harmless: the handshake (the only task
+    ## on the connection; no writer exists yet) and `close` (bounded by its own
+    ## timeout). The read path uses `tryFlushOut` instead.
+    ##
+    ## The pending check comes before the acquire. Taking the lock only to find
+    ## there is nothing to send is what used to park the h2 mux reader behind every
+    ## outbound write (issue #444).
+    if bioCtrlPending(t.wbio) <= 0: return
     await t.writeLock.acquire()
     try: await t.drainOut()
     finally: t.writeLock.release()
 
-  proc feedIn(t: ChronosTls, side: FeedSide): Future[bool] {.async.} =
+  proc tryFlushOut(t: ChronosTls) {.async.} =
+    ## `flushOut` for the READ path: drains only when no writer owns or wants
+    ## `writeLock`, and never WAITS for it. It can still do the send itself, so it
+    ## is not a promise that the reader never blocks; see the residual at the end.
+    ##
+    ## The reader must not park on that lock. `write` holds it across `drainOut`'s
+    ## `await transport.write`, so a reader that waited for it would stop pulling
+    ## inbound ciphertext for as long as an outbound write is in flight. On an h2
+    ## connection that delays every other stream's frames (HEADERS, DATA,
+    ## WINDOW_UPDATE, RST_STREAM, GOAWAY) for the duration of one large upload and
+    ## starves the keepalive's frame tick; against a peer that stops reading while
+    ## its own write is blocked it is a two-sided stall, since our write cannot
+    ## finish until the peer drains and the peer cannot drain until we read (#444).
+    ## The asyncdispatch TLS pump and the chronos plaintext path both keep reading
+    ## during a write; this is what brings the chronos TLS pump in line.
+    ##
+    ## Skipping the drain loses nothing. Post-handshake the read path queues output
+    ## only for a TLS 1.3 KeyUpdate answer or the no_renegotiation alert OpenSSL
+    ## sends for a HelloRequest, and neither has to be on the wire before our next
+    ## record: a writer's `drainOut` re-checks `bioCtrlPending` after every
+    ## `transport.write`, so it picks those bytes up (in order, still under the
+    ## lock, so records never interleave). If the last writer releases the lock
+    ## without noticing them, the next SSL_read returns WANT_READ again and this
+    ## retries -- and if nothing is ever written again, nothing needed them sent.
+    ##
+    ## One residual stays, much narrower than the stall above. When `writers` is 0
+    ## this proc sends the queued bytes itself, and `drainOut`'s `await
+    ## transport.write` can park the reader if the peer has stopped draining its
+    ## socket and our send buffer has filled. It takes the read path having output of
+    ## its own (the KeyUpdate answer or the no_renegotiation alert, tens of bytes) at
+    ## a moment when no writer is there to carry it, so ordinary traffic cannot
+    ## provoke it the way the old unconditional acquire could -- but it is a block on
+    ## the reader, not merely a skipped drain. Handing that output to the writer path
+    ## instead of sending it here would remove the residual outright.
+    if bioCtrlPending(t.wbio) <= 0: return
+    if t.writers > 0: return       # a writer owns or is queued for the lock
+    # `writers` is 0, so the only other acquirer can be `close`, whose flush is
+    # bounded by a timeout. No await between the check and the acquire.
+    await t.writeLock.acquire()
+    try: await t.drainOut()
+    finally: t.writeLock.release()
+
+  proc feedIn(t: ChronosTls): Future[bool] {.async.} =
     ## Read one chunk of ciphertext from the transport into the read-BIO. Returns
     ## false on EOF -- a clean peer close, or the transport being closed under us
     ## during teardown. Swallowing the closed/errored-transport exception (rather
@@ -115,16 +151,15 @@ when defined(ssl):
     ## cancellation flowing out through `handshake`/`readSome` so the guard returns
     ## promptly and reports the real error.
     ##
-    ## The ciphertext lands in one of the connection's own scratch buffers rather than
-    ## a fresh 64 KiB string per read: the bytes are copied straight into the read-BIO
+    ## The ciphertext lands in the connection's own scratch buffer rather than a
+    ## fresh 64 KiB string per read: the bytes are copied straight into the read-BIO
     ## and the buffer is never handed to a caller, so reuse cannot alias anything.
-    ## `side` picks the buffer, and the two sides must stay separate: see FeedSide.
-    if side == fsWrite and t.wrInBuf.len == 0:
-      t.wrInBuf = newStringUninit(tlsBufSize)     # first renegotiation on this conn
-    let buf = if side == fsWrite: addr t.wrInBuf else: addr t.inBuf
+    ## One buffer is sound because this is the only path that reads the transport --
+    ## chronos permits exactly one pending read per transport, so `write` must never
+    ## start its own (see the SSL_ERROR_WANT_READ branch there).
     var n = 0
     try:
-      n = await t.transport.readOnce(addr buf[][0], buf[].len)
+      n = await t.transport.readOnce(addr t.inBuf[0], t.inBuf.len)
     except CancelledError:
       raise               # never an EOF: see the note above
     except CatchableError:
@@ -138,7 +173,7 @@ when defined(ssl):
       # the engine reject a read-until-close body that ends here (issue #426).
       t.uncleanEof = true
       return false
-    discard bioWrite(t.rbio, cast[cstring](addr buf[][0]), n.cint)
+    discard bioWrite(t.rbio, cast[cstring](addr t.inBuf[0]), n.cint)
     return true
 
   proc handshake*(t: ChronosTls) {.async.} =
@@ -155,7 +190,7 @@ when defined(ssl):
       case err
       of SSL_ERROR_WANT_READ:
         await t.flushOut()          # send what we have (ClientHello) first
-        if not await t.feedIn(fsRead):
+        if not await t.feedIn():
           raise newException(IOError, "navi: TLS peer closed during handshake")
       of SSL_ERROR_WANT_WRITE:
         await t.flushOut()
@@ -166,29 +201,45 @@ when defined(ssl):
     ## Encrypt and send `data`. Serialized so concurrent h2 streams (and the mux
     ## reader's control frames) never interleave records.
     if data.len == 0: return
-    await t.writeLock.acquire()
+    # `writers` tells the read path a writer owns (or is queued for) `writeLock`,
+    # so it can skip its opportunistic flush instead of waiting for the lock. It
+    # must cover the acquire too, and a cancelled acquire must still clear it.
+    inc t.writers
     try:
-      var off = 0
-      while off < data.len:
-        ErrClearError()   # see `readSome`: SSL_get_error needs an empty error queue
-        let n = SSL_write(t.sslp, cast[cstring](addr data[off]), data.len - off)
-        if n > 0:
-          off += n
-          await t.drainOut()
-        else:
-          let err = SSL_get_error(t.sslp, n)
-          case err
-          of SSL_ERROR_WANT_WRITE:
+      await t.writeLock.acquire()
+      try:
+        var off = 0
+        while off < data.len:
+          ErrClearError()   # see `readSome`: SSL_get_error needs an empty error queue
+          let n = SSL_write(t.sslp, cast[cstring](addr data[off]), data.len - off)
+          if n > 0:
+            off += n
             await t.drainOut()
-          of SSL_ERROR_WANT_READ:            # renegotiation / key update wants input
-            await t.drainOut()
-            # fsWrite: a read-path readOnce may be parked right now (see FeedSide).
-            if not await t.feedIn(fsWrite):
-              raise newException(IOError, "navi: TLS closed during write")
           else:
-            raise newException(IOError, "navi: TLS write failed")
+            let err = SSL_get_error(t.sslp, n)
+            case err
+            of SSL_ERROR_WANT_WRITE:
+              await t.drainOut()
+            of SSL_ERROR_WANT_READ:
+              # SSL_write wants input: post-handshake that means the peer asked for a
+              # TLS 1.2 renegotiation. This path cannot read the transport itself --
+              # chronos allows one pending read per transport and the read path (the
+              # h2 mux reader, or a ws receive) normally owns it, so a second
+              # `readOnce` raises "Read operation already pending!" at once, which
+              # used to surface as a bogus EOF and tear the connection down (#444).
+              # Renegotiation is now off (SSL_OP_NO_RENEGOTIATION on the context, as
+              # RFC 9113 9.2.1 requires for h2), so a peer that still drives us here
+              # is misbehaving: drain whatever alert OpenSSL queued and report it.
+              await t.drainOut()
+              raise newException(IOError,
+                "navi: TLS peer requested renegotiation during a write, which navi " &
+                "does not allow")
+            else:
+              raise newException(IOError, "navi: TLS write failed")
+      finally:
+        t.writeLock.release()
     finally:
-      t.writeLock.release()
+      dec t.writers
 
   proc readSome*(t: ChronosTls): Future[string] {.async.} =
     ## Decrypt and return one chunk of application data, or "" on a clean close
@@ -211,9 +262,12 @@ when defined(ssl):
       let err = SSL_get_error(t.sslp, n)
       case err
       of SSL_ERROR_WANT_READ:
-        await t.flushOut()                   # rare post-handshake output first
-        if not await t.feedIn(fsRead): return ""  # peer closed: EOF for the parser
+        await t.tryFlushOut()                # rare post-handshake output, never waiting
+        if not await t.feedIn(): return ""   # peer closed: EOF for the parser
       of SSL_ERROR_WANT_WRITE:
+        # Unreachable with a memory write-BIO, which grows instead of filling up.
+        # `flushOut` (which may wait for the lock) rather than `tryFlushOut`: this
+        # branch has to make progress or SSL_read spins.
         await t.flushOut()
       of SSL_ERROR_ZERO_RETURN:
         return ""                            # peer sent close_notify

@@ -116,6 +116,19 @@ proc close*(client: Navi) =
   ## the native backends.
   discard
 
+proc clearTlsSecrets*(client: Navi) =
+  ## Empty the TLS key material in this client's config (`tls.password`,
+  ## `tls.keyPem`, `tls.certPem`), for parity with the native clients (#438) so
+  ## that cross-backend code can call it unconditionally.
+  ##
+  ## It drops the strings and nothing more. `fetch` owns TLS here, so navi never
+  ## reads those fields on this backend and there is no context to build before the
+  ## wipe; and a JS string is an engine-managed value with no buffer navi can
+  ## overwrite, so the engine's copies are beyond reach (see `cleanse`). Never
+  ## raises, where the native clients can raise from the context build they do
+  ## first.
+  clearTlsSecrets(client.config.tls)
+
 # --- request core (wrapped by middleware in request/stream) ---
 proc maybeThrow(client: Navi, req: Request, resp: Response) =
   if client.config.wantsThrow and not resp.ok:
@@ -623,10 +636,14 @@ proc websocket*(client: Navi, url: string,
   ## already buffered it and enforces its own limit, so this is not a memory guard.
   ## `keepAlive` is accepted for API parity but ignored: the runtime manages its own
   ## WebSocket keepalive and does not expose ping/pong.
+  ##
+  ## A URL with no host (`wss:///path`) raises `ValueError`, matching the native
+  ## clients and `buildRequest` rather than leaving the runtime to reject it (#435).
   discard keepAlive
   var u = url
   if u.startsWith("http://"): u = "ws://" & u["http://".len .. ^1]
   elif u.startsWith("https://"): u = "wss://" & u["https://".len .. ^1]
+  parseUrl(u).requireHost()
   openWebSocket(u, maxMessageBytes)
 
 include navi/private/stream_verbs

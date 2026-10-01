@@ -187,6 +187,12 @@ proc close*(client: Navi) =
   ## sessions. Optional but recommended when done with a client: a later request
   ## just opens fresh connections. Without it, pooled connections are reclaimed
   ## only at process exit (and their OpenSSL contexts leak until then).
+  ##
+  ## The TLS session cache is closed for good, so requests made on the client
+  ## after this do full handshakes rather than resuming (issue #441: a connection
+  ## that was checked out rather than pooled outlives `close` and could otherwise
+  ## still insert a late TLS 1.3 ticket into a table nothing will free again).
+  ## Build a new client, or `extend` this one, to get resumption back.
   closeIdle(client.pool)
   when defined(naviHttp3): closeH3Conns(client.h3conns)
   closeTlsStore(client.config.tls.sessionCache)
@@ -194,6 +200,52 @@ proc close*(client: Navi) =
   # The h3 driver caches its own SSL_CTX per policy (#454); this is that cache's
   # half of closing the context store, and follows the h3 connections being closed.
   when defined(naviHttp3): h3ReleaseTlsContexts(client.config.tls.contextStore)
+
+proc clearTlsSecrets*(client: Navi) =
+  ## Zero the TLS key material navi is holding for this client: `tls.password`,
+  ## `tls.keyPem` and `tls.certPem` on `client.config` are overwritten and emptied
+  ## (issue #438). Optional, and only worth calling in a long-running process that
+  ## presents a client certificate: without it those strings stay in the heap for
+  ## the client's whole lifetime, where a core file, a heap dump or a
+  ## memory-disclosure bug reads the passphrase and the PEM private key in
+  ## cleartext, long after OpenSSL has the decrypted key and navi has no further
+  ## use for them.
+  ##
+  ## Call it once the client is built; it does not need a request to have been
+  ## made. The remaining TLS contexts are built here, eagerly, before the wipe --
+  ## navi normally builds one lazily per ALPN shape on first connect, and a
+  ## context built after the wipe would have no credential to install. So this can
+  ## raise what a first connect would have raised: a `ValueError` for a malformed
+  ## or mismatched credential, an `IOError` for an unreadable file. The client
+  ## works normally afterwards, mTLS included, and calling it again is a no-op.
+  ##
+  ## It clears NAVI's copy only. `newNavi` copies the config by value, so the
+  ## `NaviConfig` you built and any `TlsConfig` you kept still hold the secret and
+  ## are beyond navi's reach; wipe those yourself with
+  ## `cfg.tls.clearTlsSecrets()`. `extend` likewise copies the merged config into
+  ## the derived client, which builds its own contexts: clear the derived client
+  ## too, and derive it BEFORE clearing the parent, or the derived client inherits
+  ## a config with no credential in it at all.
+  ##
+  ## Refused with a `ValueError` while HTTP/3 is enabled on an `-d:naviHttp3`
+  ## build and there is something to clear: the h3 driver builds its TLS context
+  ## per connection straight from these fields and keys its context cache on their
+  ## values (#454), so wiping them would break mTLS over h3 on the next
+  ## connection instead of at a point you could see. Drop `H3` from
+  ## `config.http` if you want the wipe, or keep the material.
+  if client.config.tls.password.len == 0 and
+     client.config.tls.keyPem.len == 0 and
+     client.config.tls.certPem.len == 0:
+    return                                   # nothing in memory to clear
+  when defined(naviHttp3):
+    if client.config.wantsH3:
+      raise newException(ValueError,
+        "navi: clearTlsSecrets cannot wipe the credential while HTTP/3 is " &
+        "enabled -- the h3 driver rebuilds its TLS context from " &
+        "tls.certPem/keyPem/password per connection. Remove H3 from " &
+        "config.http, or keep the material in memory.")
+  prebuildTlsContexts(client.config.tls)     # nothing may need it after the wipe
+  clearTlsSecrets(client.config.tls)
 
 when defined(naviHttp3):
   proc evictH3(client: Navi, origin: string, conn: QuicConn) =
@@ -333,7 +385,9 @@ proc transport(client: Navi, req: Request, sink: BodySink,
   when defined(naviHttp3):
     let alt = result.headers.get("alt-svc")
     if alt.len > 0:
-      client.altSvc.record("https", req.url.host, req.url.port, alt)
+      # `recordFrom` drops the advertisement unless this response came over TLS
+      # (#434); the cache is keyed on the https origin either way.
+      client.altSvc.recordFrom(req.url, alt)
 
 proc runCore(client: Navi, req: Request, cancel: CancelToken,
              userSink: BodySink = nil, gate: SinkGate = nil): Response =

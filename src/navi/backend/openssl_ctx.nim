@@ -4,8 +4,9 @@
 ##   * certificate verification and CA trust come from std/net's `newContext`,
 ##     which owns the security-critical chain and hostname checks;
 ##   * ALPN (h2 / http/1.1) is set here;
-##   * the client certificate -- encrypted PEM, DER, PKCS#12, or in-memory PEM --
-##     is installed here, covering everything `newContext` cannot.
+##   * the client certificate -- encrypted PEM, DER (plain or encrypted PKCS#8),
+##     PKCS#12, or in-memory PEM -- is installed here, covering everything
+##     `newContext` cannot.
 ##
 ## Backends call `newTlsContext` and, after the handshake, `negotiatedProtocol`;
 ## they no longer touch `newContext`, ALPN, or the credential loader directly.
@@ -66,6 +67,15 @@ when defined(ssl):
   proc SSL_CTX_use_PrivateKey(ctx: SslCtx, pkey: EVP_PKEY): cint
     {.cdecl, dynlib: DLLSSLName, importc.}
   proc PEM_read_bio_X509(bp: BIO, x: ptr PX509, cb: pointer, u: pointer): PX509
+    {.cdecl, dynlib: DLLUtilName, importc.}
+  # DER private keys. d2i_PrivateKey_bio is d2i_AutoPrivateKey over a BIO: it
+  # reads a traditional RSA/EC key or an unencrypted PKCS#8 PrivateKeyInfo.
+  # d2i_PKCS8PrivateKey_bio reads the encrypted PKCS#8 shape
+  # (EncryptedPrivateKeyInfo) and decrypts it with the passphrase callback.
+  proc d2i_PrivateKey_bio(bp: BIO, a: ptr EVP_PKEY): EVP_PKEY
+    {.cdecl, dynlib: DLLUtilName, importc.}
+  proc d2i_PKCS8PrivateKey_bio(bp: BIO, x: ptr EVP_PKEY, cb: pointer,
+                               u: pointer): EVP_PKEY
     {.cdecl, dynlib: DLLUtilName, importc.}
   proc d2i_PKCS12_bio(bp: BIO, p12: ptr pointer): pointer
     {.cdecl, dynlib: DLLUtilName, importc.}
@@ -287,23 +297,84 @@ when defined(ssl):
         fail("could not install the PKCS#12 certificate chain")
       caOwned = false
 
+  const pemBoundary = "-----BEGIN"
+
+  proc isPem(data: string): bool =
+    ## Whether `data` is armoured PEM: a `-----BEGIN` encapsulation boundary
+    ## starts one of its lines. RFC 7468 section 5.2 allows explanatory text
+    ## before that boundary and OpenSSL's PEM readers skip it, so the marker is
+    ## not necessarily at offset 0 -- which is why the sniff below looks for the
+    ## boundary instead of testing the first byte for the ASN.1 SEQUENCE tag
+    ## (0x30, the ASCII digit '0'): a PEM file whose first character is '0' is
+    ## still valid PEM and used to be misrouted to the DER loader (#436).
+    if data.startsWith(pemBoundary): return true
+    var nl = data.find('\n')
+    while nl >= 0:
+      if data.continuesWith(pemBoundary, nl + 1): return true
+      nl = data.find('\n', nl + 1)
+    false
+
   proc isDer(data: string): bool =
-    ## DER starts with the ASN.1 SEQUENCE tag (0x30); PEM starts with '-'.
-    data.len > 0 and data[0] == '\x30'
+    ## Binary ASN.1: non-empty and carrying no PEM encapsulation boundary.
+    data.len > 0 and not isPem(data)
 
   proc useCertFile(ctx: SslCtx, path: string) =
-    let data = readFile(path)
+    # Cleansed on the way out even though a certificate is public: a single PEM
+    # commonly holds the certificate AND its key (which is why `clientKeyFile`
+    # falls back to `certFile`), so this buffer can be secret (issue #438).
+    var data = readFile(path)
+    defer: cleanse(data)
     if isDer(data):                           # single DER cert (no chain)
       if SSL_CTX_use_certificate_file(ctx, path.cstring, SSL_FILETYPE_ASN1) != 1:
         fail("could not load the DER certificate: " & path)
     else:
       useCertChainPem(ctx, data)              # PEM leaf + any following chain
 
+  proc useKeyDer(ctx: SslCtx, der, password, path: string) =
+    ## Install a DER private key. Three shapes reach here: a traditional RSA/EC
+    ## key, an unencrypted PKCS#8 PrivateKeyInfo, and an encrypted PKCS#8
+    ## EncryptedPrivateKeyInfo (`openssl pkcs8 -topk8 -outform DER -v2
+    ## aes-256-cbc`). SSL_CTX_use_PrivateKey_file with SSL_FILETYPE_ASN1, which
+    ## this replaces, decodes only the first two: it calls d2i_PrivateKey and
+    ## never consults the passphrase callback, so an encrypted DER key failed
+    ## with a generic error while `tls.password` was silently ignored (#436).
+    var pkey: EVP_PKEY
+    block:
+      let plain = memBio(der)
+      pkey = d2i_PrivateKey_bio(plain, nil)   # traditional or plain PKCS#8
+      discard BIO_free(plain)
+    if pkey.isNil:
+      # Not an unencrypted key. The failed attempt left entries on this thread's
+      # error queue, which later SSL_get_error reads rely on being empty.
+      ErrClearError()
+      let enc = memBio(der)
+      # Never a nil callback: see pemPassword. Without one OpenSSL substitutes
+      # PEM_def_callback, which prompts on /dev/tty and blocks the event loop.
+      let u = if password.len > 0: cast[pointer](password.cstring) else: nil
+      pkey = d2i_PKCS8PrivateKey_bio(enc, nil, cast[pointer](pemPassword), u)
+      discard BIO_free(enc)
+    if pkey.isNil:
+      ErrClearError()
+      if password.len > 0:
+        fail("could not load the DER private key (wrong password?): " & path)
+      fail("could not load the DER private key; set tls.password if it is an " &
+           "encrypted PKCS#8 key: " & path)
+    # SSL_CTX_use_PrivateKey bumps the object's refcount, so we free our
+    # reference on every exit path once the key exists.
+    defer: EVP_PKEY_free(pkey)
+    if SSL_CTX_use_PrivateKey(ctx, pkey) != 1:
+      fail("the DER private key does not match the certificate: " & path)
+
   proc useKeyFile(ctx: SslCtx, path, password: string) =
-    let data = readFile(path)
+    # The key file's plaintext, zeroed before the buffer is freed: OpenSSL holds
+    # the decoded key by now and nothing should be able to read the PEM/DER back
+    # out of the heap (issue #438). The `defer` covers the failure paths too, and
+    # deliberately wraps the whole body rather than each branch, so it keeps
+    # covering a loader that decodes `data` itself instead of re-reading `path`.
+    var data = readFile(path)
+    defer: cleanse(data)
     if isDer(data):
-      if SSL_CTX_use_PrivateKey_file(ctx, path.cstring, SSL_FILETYPE_ASN1) != 1:
-        fail("could not load the DER private key: " & path)
+      useKeyDer(ctx, data, password, path)    # DER, possibly encrypted PKCS#8
     else:
       useKeyPem(ctx, data, password)          # PEM, possibly encrypted
 
@@ -316,11 +387,20 @@ when defined(ssl):
     ## detected from the content. Raises `ValueError` if the material is missing,
     ## malformed, or mismatched.
     if tls.pkcs12File.len > 0:
-      usePkcs12(ctx, readFile(tls.pkcs12File), tls.password)
+      # Named so it can be cleansed: a PKCS#12 bundle is the encrypted key, and
+      # `readFile(...)` inline leaves that plaintext in a temporary navi never
+      # gets to zero (issue #438).
+      var p12 = readFile(tls.pkcs12File)
+      defer: cleanse(p12)
+      usePkcs12(ctx, p12, tls.password)
     elif tls.certPem.len > 0:
       useCertChainPem(ctx, tls.certPem)
-      useKeyPem(ctx, (if tls.keyPem.len > 0: tls.keyPem else: tls.certPem),
-                tls.password)
+      # Two calls rather than `useKeyPem(ctx, (if ...: tls.keyPem else: ...))`:
+      # the `if` expression materialises a COPY of the key in a temporary, and a
+      # temporary is precisely what cannot be cleansed. Passing the field itself
+      # hands OpenSSL the one buffer the config already holds.
+      if tls.keyPem.len > 0: useKeyPem(ctx, tls.keyPem, tls.password)
+      else: useKeyPem(ctx, tls.certPem, tls.password)
     else:
       useCertFile(ctx, tls.certFile)
       useKeyFile(ctx, clientKeyFile(tls), tls.password)
@@ -330,7 +410,9 @@ when defined(ssl):
   proc addCaBundle(ctx: SslCtx, pem: string) =
     ## Add every certificate in the in-memory PEM `pem` to the context's trust
     ## store, so a chain anchored at one of them verifies. Supplements the system
-    ## roots / `caFile` rather than replacing them.
+    ## roots / `caFile` rather than replacing them -- unlike `caFile`, which
+    ## replaces the system roots (see `newTlsContext`), this is the additive way to
+    ## trust an extra CA while public roots keep working.
     let store = SSL_CTX_get_cert_store(ctx)
     if store.isNil: fail("could not access the TLS trust store")
     let bio = memBio(pem)
@@ -376,6 +458,94 @@ when defined(ssl):
                       osslTlsVersion(cfg.maxVersion), nil) != 1:
         fail("the loaded OpenSSL/LibreSSL does not support setting the maximum TLS version")
 
+  const SSL_OP_NO_RENEGOTIATION = 0x40000000'u64
+    ## Refuse renegotiation: OpenSSL then drops a server's TLS 1.2 HelloRequest
+    ## with a `no_renegotiation` warning alert instead of starting a new
+    ## handshake. TLS 1.3 has no renegotiation at all, and RFC 9113 9.2.1 forbids
+    ## it for HTTP/2 regardless of version. navi never asks for one either
+    ## (nothing calls SSL_renegotiate), so the only thing this removes is a
+    ## peer-driven mid-connection handshake, which no navi backend can serve: on
+    ## the chronos pump it makes SSL_write return WANT_READ, and that path cannot
+    ## read the transport (chronos permits one pending read per transport, and the
+    ## mux reader owns it), so it used to fail the whole connection (issue #444).
+    ##
+    ## This NUMBER is OpenSSL 1.1.0's and only OpenSSL 1.1.0's. The option-bit
+    ## space is not shared across the libraries navi loads: OpenSSL 1.0.x spends
+    ## 0x40000000 on SSL_OP_NETSCAPE_DEMO_CIPHER_CHANGE_BUG, and LibreSSL spends it
+    ## on SSL_OP_NO_DTLSv1 while numbering its own SSL_OP_NO_RENEGOTIATION
+    ## 0x00040000 (which is SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION on OpenSSL, so
+    ## the two cannot be ORed in together either). `addCtxOptions` below is what
+    ## keeps the bit off a library that would read it as something else.
+
+  proc osslVersionNumber(): uint {.raises: [].} =
+    ## `getOpenSSLVersion()` with its inferred `Exception` contained -- std/openssl
+    ## forward-declares it without a raises annotation, which the strict paths here
+    ## reject (the same reason `tlsLib` is wrapped). When the number cannot be read
+    ## at all we answer 0x10100000 (OpenSSL 1.1.0), the era whose entry points this
+    ## module hand-resolves; both callers then take their conservative branch on
+    ## the symbol lookup instead.
+    try: uint(getOpenSSLVersion())
+    except Exception: 0x10100000'u
+
+  proc isOpenSsl11OrNewer*(version: uint): bool =
+    ## Whether `version` (an OPENSSL_VERSION_NUMBER, i.e. `getOpenSSLVersion()`)
+    ## is a real OpenSSL 1.1.0-or-newer, the only library family whose option bits
+    ## match the SSL_OP_* constants above. LibreSSL pins the number at 0x20000000
+    ## whatever its real version -- which sorts ABOVE 1.1.0 and must not be taken
+    ## for it -- and anything below 0x10100000 is OpenSSL 1.0.x or older. Exported
+    ## logic kept separate from the FFI so it can be unit-tested for the libraries
+    ## this host cannot install.
+    version != 0x20000000'u and version >= 0x10100000'u
+
+  type
+    SetOptions64Proc =
+      proc(ctx: SslCtx, op: uint64): uint64 {.cdecl, gcsafe, raises: [].}
+        ## OpenSSL 3.x: `uint64_t SSL_CTX_set_options(SSL_CTX *, uint64_t)`.
+    SetOptionsLongProc =
+      proc(ctx: SslCtx, op: culong): culong {.cdecl, gcsafe, raises: [].}
+        ## OpenSSL 1.1.x: `unsigned long SSL_CTX_set_options(SSL_CTX *, unsigned
+        ## long)`. Identical to the above wherever `long` is 64 bits, and NOT
+        ## interchangeable where it is 32: on AAPCS (32-bit ARM) and MIPS o32 a
+        ## 64-bit argument is passed in an even-aligned register pair, so a callee
+        ## expecting one word reads the wrong register and ORs garbage into the
+        ## option mask -- which is where SSL_OP_LEGACY_SERVER_CONNECT,
+        ## SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION and SSL_OP_NO_TLSv1_3 live.
+  var ctxSetOptionsAddr {.threadvar.}: pointer
+  var ctxSetOptionsReady {.threadvar.}: bool
+  var ctxSetOptionsVersion {.threadvar.}: uint
+
+  proc addCtxOptions(ctx: SslCtx, op: uint64) =
+    ## OR `op` (an SSL_OP_* bit in OpenSSL 1.1.0+ numbering) into the context's
+    ## option mask, or do nothing at all when the loaded library is not one whose
+    ## mask uses that numbering.
+    ##
+    ## `SSL_CTX_set_options` is a real exported function only from OpenSSL 1.1.0
+    ## on: OpenSSL 1.0.x and every LibreSSL define it as a macro over
+    ## SSL_CTX_ctrl(SSL_CTRL_OPTIONS), so the symbol does not resolve there. That
+    ## is not a case to fall back for, it is the case to skip: those are exactly
+    ## the libraries that read our bits as different options (see
+    ## SSL_OP_NO_RENEGOTIATION above), so the old ctrl fallback could only ever
+    ## set the wrong flag. The runtime version is checked as well, in case a
+    ## library ships a compatibility export while keeping its own numbering.
+    ##
+    ## Resolved by hand rather than with a `dynlib` importc for the reason
+    ## `resolveIdentityApi` explains: an unresolved importc kills the process when
+    ## this module initialises.
+    if not ctxSetOptionsReady:
+      ctxSetOptionsReady = true
+      ctxSetOptionsVersion = osslVersionNumber()
+      if isOpenSsl11OrNewer(ctxSetOptionsVersion):
+        ctxSetOptionsAddr = tlsLib(DLLSSLName).tlsSym("SSL_CTX_set_options")
+    if ctxSetOptionsAddr.isNil: return
+    # OpenSSL 3.0 widened the parameter from `unsigned long` to `uint64_t`, so the
+    # declaration has to follow the loaded library rather than be one compromise
+    # for both (see SetOptionsLongProc). No SSL_OP_* navi sets lives above bit 31,
+    # so the narrowing on a 32-bit `long` drops nothing.
+    if ctxSetOptionsVersion >= 0x30000000'u:
+      discard cast[SetOptions64Proc](ctxSetOptionsAddr)(ctx, op)
+    else:
+      discard cast[SetOptionsLongProc](ctxSetOptionsAddr)(ctx, culong(op))
+
   proc setCiphers(ctx: SslCtx, cfg: TlsConfig) =
     ## Restrict the offered ciphers. TLS <=1.2 and TLS 1.3 use separate OpenSSL
     ## APIs, so `ciphers` and `cipherSuites` are set independently; a non-1 return
@@ -410,16 +580,36 @@ when defined(ssl):
     if not custom and (cfg.keyFile.len > 0 or cfg.keyPem.len > 0):
       fail("TlsConfig has a client key but no certificate " &
            "(set certFile, certPem or pkcs12File)")
+    # A non-empty caFile REPLACES the system roots: std/net's newContext calls
+    # SSL_CTX_load_verify_locations(caFile) and takes the `else` branch that scans
+    # the system store (`scanSSLCertificates`) only when caFile and caDir are both
+    # empty. h3client.cpp mirrors that in `build_ssl_ctx`, whose ca_file branch
+    # calls load_verify_locations and whose else branch calls
+    # set_default_verify_paths, so the semantics are curl's --cacert on every
+    # backend. caBundle is the additive option; see addCaBundle.
     result = newContext(
       verifyMode = if cfg.wantsVerify: CVerifyPeer else: CVerifyNone,
       certFile = if custom: "" else: cfg.certFile,
       keyFile = if custom: "" else: cfg.clientKeyFile,
       caFile = cfg.caFile)
+    # Every step below can raise: a malformed or mismatched credential, a CA
+    # bundle that will not parse, a version bound or a cipher name the loaded
+    # library refuses. The caller is then handed an exception instead of a
+    # context, so nothing else can ever free the SSL_CTX `newContext` just built
+    # -- and that is not a small object: it carries the whole trust store the
+    # verify locations loaded (measured at ~700 KB with the system roots). A
+    # caller that retries after fixing its config, or one that probes a
+    # credential per tenant, leaked one per attempt.
+    var ok = false
+    defer:
+      if not ok: destroyContext(result)
     if custom: loadClientCert(result.context, cfg)
     if cfg.caBundle.len > 0: addCaBundle(result.context, cfg.caBundle)
     setAlpn(result.context, alpn)
     setVersionBounds(result.context, cfg)
     setCiphers(result.context, cfg)
+    addCtxOptions(result.context, SSL_OP_NO_RENEGOTIATION)
+    ok = true
 
   # --- TLS session resumption --------------------------------------------
   #
@@ -434,12 +624,25 @@ when defined(ssl):
       ## Per-client store of resumable TLS sessions, keyed by "host:port". Held by
       ## the client through `TlsConfig.sessionCache`; freed with `close`.
       sessions: Table[string, pointer]   # origin -> SSL_SESSION*
+      closed: bool
+        ## Set by `close` and never cleared: the client is gone, so the cache
+        ## takes no further session (see `offerSession`). It cannot simply be
+        ## dropped instead, because a connection that was checked out rather than
+        ## pooled (a live WebSocket or SSE stream, an in-flight h1 request) still
+        ## holds its `SessionSlot` and can still be handed a TLS 1.3
+        ## NewSessionTicket after the client was closed (issue #441).
     SessionSlot* = ref object
       ## Per-connection link from an SSL back to its cache and origin. Kept alive
       ## by the connection (its address lives in the SSL's ex_data), so the
       ## new-session callback can reach the cache while the connection is open.
       cache: TlsSessionCache
       origin: string
+      rejected: bool
+        ## Set by `rejectSession` when this connection's peer failed a
+        ## post-handshake check (hostname/IP, SPKI pin, verify callback), cleared by
+        ## `applySession` when a fresh SSL is bound to the slot. While set, no
+        ## session from this connection is cached -- which is how a TLS 1.3 ticket
+        ## that arrives AFTER the rejection is kept out of the cache (issue #440).
 
   proc CRYPTO_get_ex_new_index(classIndex: cint, argl: clong, argp: pointer,
     newf, dupf, freef: pointer): cint {.cdecl, dynlib: DLLUtilName, importc.}
@@ -456,10 +659,74 @@ when defined(ssl):
     {.cdecl, dynlib: DLLSSLName, importc.}
 
   const
-    CRYPTO_EX_INDEX_SSL = 0
     SSL_CTRL_SET_SESS_CACHE_MODE = 44
     SSL_SESS_CACHE_CLIENT = 0x0001
     SSL_SESS_CACHE_NO_INTERNAL_STORE = 0x0200
+
+  # --- allocating the ex_data index in the SSL class ----------------------
+  #
+  # `CRYPTO_get_ex_new_index` takes the *class* whose counter to draw from, and
+  # the class numbering changed with OpenSSL 1.1.0: it put SSL at 0 (BIO moved to
+  # 12), while OpenSSL 1.0.x -- and every LibreSSL, which inherited that header --
+  # numbers BIO 0 and SSL 1. Drawing from the wrong counter is not a harmless
+  # off-by-one: the returned number is then unregistered in the SSL class, so a
+  # co-resident library that legitimately allocates an SSL-class index can be
+  # handed the SAME number with its own dup/free callbacks attached, and
+  # SSL_free / SSL_dup would invoke those on navi's `SessionSlot` pointer (issue
+  # #439). Measured on the macOS LibreSSL (OPENSSL_VERSION_NUMBER 0x20000000):
+  # SSL_get_ex_new_index hands out 0 then 1, CRYPTO_get_ex_new_index(0, ...)
+  # returns 0 from the *BIO* counter, and CRYPTO_get_ex_new_index(1, ...) returns
+  # 2 -- i.e. the class-0 call collides with SSL-class index 0.
+  #
+  # So: prefer the library's own `SSL_get_ex_new_index`, which knows its class
+  # number. It is a real exported function exactly where the numbering differs
+  # (OpenSSL 1.0.x, LibreSSL) and a macro over CRYPTO_get_ex_new_index from
+  # OpenSSL 1.1.0 on, so when it does not resolve we pick the class from the
+  # runtime version instead. It is looked up by hand, not with a `dynlib` importc,
+  # for the reason `resolveIdentityApi` explains: an unresolved importc kills the
+  # process at module init.
+
+  const
+    CRYPTO_EX_INDEX_SSL_MODERN = 0.cint
+      ## CRYPTO_EX_INDEX_SSL from OpenSSL 1.1.0 on (that header numbers BIO 12).
+    CRYPTO_EX_INDEX_SSL_LEGACY = 1.cint
+      ## CRYPTO_EX_INDEX_SSL on OpenSSL 1.0.x and every LibreSSL, where
+      ## CRYPTO_EX_INDEX_BIO is 0 and the SSL class follows it.
+
+  proc sslExIndexClass*(version: uint): cint =
+    ## The `CRYPTO_EX_INDEX_SSL` class number for the library whose
+    ## OPENSSL_VERSION_NUMBER is `version` (i.e. `getOpenSSLVersion()`). LibreSSL
+    ## pins that number at 0x20000000 whatever its real version, which is how
+    ## std/net's `newContext` recognises it too; anything below OpenSSL 1.1.0
+    ## (0x10100000) predates the renumbering. Exported so the selection can be
+    ## unit-tested for libraries this host cannot run.
+    if version == 0x20000000'u: CRYPTO_EX_INDEX_SSL_LEGACY      # LibreSSL, any version
+    elif version < 0x10100000'u: CRYPTO_EX_INDEX_SSL_LEGACY     # OpenSSL 1.0.x and older
+    else: CRYPTO_EX_INDEX_SSL_MODERN                            # OpenSSL 1.1.0+
+
+  type SslGetExNewIndexProc = proc(argl: clong, argp: pointer,
+    newf, dupf, freef: pointer): cint {.cdecl, gcsafe, raises: [].}
+  var sslGetExNewIndex {.threadvar.}: SslGetExNewIndexProc
+  var sslGetExNewIndexReady {.threadvar.}: bool
+
+  proc newSslExIndex*(): cint {.raises: [].} =
+    ## Allocate an ex_data index in the SSL class, through the library's own
+    ## `SSL_get_ex_new_index` when it exports one and otherwise through
+    ## `CRYPTO_get_ex_new_index` with the version-selected class.
+    ##
+    ## Exported so the allocation itself can be unit-tested against whatever
+    ## library the suite links: `sslExIndexClass` covers the fallback's decision,
+    ## but on the libraries where the numbering actually differs the export
+    ## resolves and the fallback never runs, so the class constant is not what is
+    ## under test there. Each call consumes one index, as OpenSSL's own API does.
+    if not sslGetExNewIndexReady:
+      sslGetExNewIndexReady = true
+      sslGetExNewIndex = cast[SslGetExNewIndexProc](
+        tlsLib(DLLSSLName).tlsSym("SSL_get_ex_new_index"))
+    if not sslGetExNewIndex.isNil:
+      return sslGetExNewIndex(0, nil, nil, nil, nil)
+    CRYPTO_get_ex_new_index(sslExIndexClass(osslVersionNumber()),
+                            0, nil, nil, nil, nil)
 
   # Per-thread (threadvar): each thread registers its own ex-data index and uses it
   # for the SSL objects it owns, so the lazy init never races across threads (works
@@ -469,27 +736,104 @@ when defined(ssl):
   var slotExIdxReady {.threadvar.}: bool
   proc ensureExIdx() =
     if not slotExIdxReady:
-      slotExIdx = CRYPTO_get_ex_new_index(CRYPTO_EX_INDEX_SSL, 0, nil, nil, nil, nil)
+      slotExIdx = newSslExIndex()
       slotExIdxReady = true
 
+  proc offerSession*(slot: SessionSlot, session: pointer): bool =
+    ## Offer `session` (an SSL_SESSION OpenSSL is handing over) to `slot`'s cache,
+    ## under `slot`'s origin, freeing whatever was cached there before. Returns true
+    ## when the cache TOOK OWNERSHIP, which is what the new-session callback reports
+    ## to OpenSSL as 1; false leaves ownership with OpenSSL, which then frees the
+    ## session itself.
+    ##
+    ## Ownership is declined when the cache has been closed: the client is gone and
+    ## nothing will ever free the table again, so a session inserted now would leak
+    ## until a second `close` that never comes (issue #441). This is reachable
+    ## precisely because a connection that was checked out rather than pooled -- a
+    ## live WebSocket or SSE stream, an in-flight h1 request -- outlives
+    ## `client.close()` and can still receive a TLS 1.3 NewSessionTicket.
+    ##
+    ## Ownership is also declined once this connection's peer has been rejected by a
+    ## post-handshake check (issue #440): for TLS <= 1.2 the callback fires inside the
+    ## handshake, before those checks run, but under TLS 1.3 the ticket arrives during
+    ## the first reads and can therefore land after the rejection.
+    ##
+    ## Split out of the callback so the whole insert policy is ordinary Nim that can
+    ## be unit-tested; `onNewSession` is just the C shim over it.
+    if slot.isNil or slot.cache.isNil or session.isNil: return false
+    if slot.cache.closed or slot.rejected: return false
+    let prev = slot.cache.sessions.getOrDefault(slot.origin, nil)
+    if not prev.isNil: SSL_SESSION_free(prev)
+    slot.cache.sessions[slot.origin] = session
+    true
+
   proc onNewSession(ssl: SslPtr, session: pointer): cint {.cdecl.} =
-    ## Called by OpenSSL when a resumable session becomes available; we take
-    ## ownership (return 1) and cache it under the connection's origin.
+    ## Called by OpenSSL when a resumable session becomes available. `offerSession`
+    ## decides whether we take ownership; 1 says we did, 0 leaves it with OpenSSL.
     {.cast(gcsafe).}:
       let p = SSL_get_ex_data(ssl, slotExIdx)
       if p.isNil: return 0
-      let slot = cast[SessionSlot](p)
-      let prev = slot.cache.sessions.getOrDefault(slot.origin, nil)
-      if not prev.isNil: SSL_SESSION_free(prev)
-      slot.cache.sessions[slot.origin] = session
-      return 1
+      if offerSession(cast[SessionSlot](p), session): 1.cint else: 0.cint
+
+  proc rejectSession*(slot: SessionSlot) {.raises: [].} =
+    ## This connection's peer failed a post-handshake check, so nothing of its
+    ## session may stay cached for the origin (issue #440). Two things are needed,
+    ## because the callback fires at different times either side of TLS 1.3:
+    ##
+    ##   * remove and free the origin's cached entry. For TLS <= 1.2 the session was
+    ##     already stored during `SSL_connect`, before `verifyPeer` /
+    ##     `postHandshakeVerify` could run, so only an eviction can undo it.
+    ##   * mark the slot, so a TLS 1.3 NewSessionTicket that arrives on this
+    ##     connection AFTER the rejection is declined by `offerSession` instead of
+    ##     re-populating the entry we just dropped.
+    ##
+    ## Without this, the next connect to the origin would present a session bound to
+    ## a peer navi refused (an interception proxy with a chain-valid but unpinned
+    ## certificate, say) and keep that peer's session, with its certificate, in
+    ## memory. There is no verification bypass either way -- on resumption OpenSSL
+    ## restores verify_result and the peer certificate, so the same check fails again
+    ## -- but the client should not be advertising it, and a real server that does not
+    ## know the session pays a pointless round of resumption before falling back to a
+    ## full handshake.
+    ##
+    ## No-op for a nil slot (resumption off, or no session cache), so call sites need
+    ## no guard.
+    if slot.isNil or slot.cache.isNil: return
+    slot.rejected = true
+    let s = slot.cache.sessions.getOrDefault(slot.origin, nil)
+    if not s.isNil:
+      slot.cache.sessions.del(slot.origin)
+      SSL_SESSION_free(s)
+
+  proc isRejected*(slot: SessionSlot): bool =
+    ## Whether `rejectSession` has marked this connection's peer as refused. For
+    ## tests and introspection.
+    not slot.isNil and slot.rejected
 
   proc newTlsSessionCache*(): TlsSessionCache =
     TlsSessionCache(sessions: initTable[string, pointer]())
 
+  proc isClosed*(cache: TlsSessionCache): bool =
+    ## Whether `close` has been called on `cache`. A closed cache is never reopened:
+    ## `newTlsStore` mints a fresh one per client instead.
+    not cache.isNil and cache.closed
+
+  proc sessionCount*(cache: TlsSessionCache): int =
+    ## Cached sessions (one per origin at most). For tests and introspection.
+    if cache.isNil: 0 else: cache.sessions.len
+
+  proc hasSession*(cache: TlsSessionCache, origin: string): bool =
+    ## Whether a resumable session is cached for `origin` ("host:port"). For tests
+    ## and introspection.
+    not cache.isNil and not cache.sessions.getOrDefault(origin, nil).isNil
+
   proc close*(cache: TlsSessionCache) =
-    ## Free every cached session. Call when the client is closed.
+    ## Free every cached session and mark the cache closed, so a late ticket on a
+    ## connection that outlived the client is declined rather than inserted into a
+    ## table nothing will free again (issue #441). Call when the client is closed.
+    ## Idempotent.
     if cache.isNil: return
+    cache.closed = true   # set FIRST: nothing may land in the table after this
     for s in cache.sessions.values: SSL_SESSION_free(s)
     cache.sessions.clear()
 
@@ -507,9 +851,17 @@ when defined(ssl):
   proc applySession*(ssl: SslPtr, slot: SessionSlot) =
     ## Link `ssl` to its cache/origin and, if a session is cached for that origin,
     ## present it so the handshake resumes. Call after SSL_new, before SSL_connect.
+    ##
+    ## Clears any `rejectSession` mark: the mark belongs to the SSL that was refused,
+    ## and one slot can be reused for a second SSL when `connectAcross` drops a
+    ## verification-failing address and re-races the remaining ones. Without the
+    ## reset, a pool whose first address is broken would stop caching sessions for
+    ## the address that actually worked.
     if slot.isNil: return
     ensureExIdx()
+    slot.rejected = false
     discard SSL_set_ex_data(ssl, slotExIdx, cast[pointer](slot))
+    if slot.cache.isNil or slot.cache.closed: return
     let s = slot.cache.sessions.getOrDefault(slot.origin, nil)
     if not s.isNil: discard SSL_set_session(ssl, s)
 
@@ -531,6 +883,12 @@ when defined(ssl):
 
   proc newTlsContextStore*(): TlsContextStore =
     TlsContextStore(contexts: initTable[string, SslContext]())
+
+  proc contextCount*(store: TlsContextStore): int =
+    ## Shared contexts built so far, i.e. how many ALPN shapes this client has
+    ## dialled. For tests and introspection, in the spirit of `sessionCount` and
+    ## `h3CtxCacheStats`; `prebuildContexts` brings it to `naviAlpnShapes.len`.
+    if store.isNil: 0 else: store.contexts.len
 
   proc close*(store: TlsContextStore) =
     ## Free every shared context. Call when the client is closed, after its pooled
@@ -561,6 +919,27 @@ when defined(ssl):
       ctx = buildContext(cfg, alpn)
       s.contexts[key] = ctx
     (ctx, false)
+
+  const naviAlpnShapes*: array[2, seq[string]] = [@[], @["h2", "http/1.1"]]
+    ## Every ALPN shape navi's engines offer, and the complete key set of a
+    ## `TlsContextStore`: `@["h2", "http/1.1"]` for an https target when h2 is
+    ## enabled, and none at all otherwise (plain http, h2 disabled, or a WebSocket
+    ## over an h1 Upgrade). Every `connect` call in navi passes one of these two.
+
+  proc prebuildContexts*(store: RootRef, cfg: TlsConfig) =
+    ## Build and cache the shared context for BOTH `naviAlpnShapes`, so no later
+    ## connect has to build one. That is what lets the credential be wiped out of
+    ## a live client (`clearTlsSecrets`, issue #438): contexts are normally built
+    ## lazily, on the first connect of each shape, and a context built after the
+    ## wipe would have no key material to install.
+    ##
+    ## A no-op without a store: a bare `TlsConfig` builds a context the caller
+    ## owns per connect, so there is nothing to build ahead of time. Raises
+    ## whatever the credential loader raises (`ValueError`, or an `IOError` for an
+    ## unreadable file), here rather than at the first connect.
+    if store.isNil: return
+    for alpn in naviAlpnShapes:
+      discard obtainContext(store, cfg, alpn)
 
   # --- per-connection handshake ------------------------------------------
 
@@ -598,8 +977,16 @@ when defined(ssl):
     ## any chain-valid impostor. `verifyPeer` still re-checks afterwards, so on a
     ## library too old to offer these entry points we simply keep that check (the
     ## identity is then enforced one flight later, as it was before). A no-op
-    ## (true) when verification is off or there is no host to match.
-    if not verify or host.len == 0: return true
+    ## (true) when verification is off.
+    ##
+    ## Verification ON with no host is a failure (#435): the request must fail
+    ## before the handshake rather than after the client has presented its
+    ## certificate to an unauthenticated peer. Both constructors below raise it
+    ## BEFORE `SSL_new`, so the check here can no longer fire -- it is kept as the
+    ## local invariant for anything that grows a third caller, and deliberately
+    ## sits ahead of every allocation this proc makes (none today).
+    requireVerifiableHost(host, verify)
+    if not verify: return true
     resolveIdentityApi()
     if isIpAddress(host):
       if paramSet1IpAsc.isNil or sslGet0Param.isNil: return true
@@ -617,6 +1004,12 @@ when defined(ssl):
     ## present any cached session for resumption. The caller drives the handshake
     ## (blocking in the sync backend, await-based in the async one) and frees the
     ## SSL on failure.
+    ##
+    ## The "verify on, no host" refusal (#435) runs first, before anything is
+    ## allocated: `bindExpectedIdentity` raises it, and raising it from there would
+    ## abandon the SSL this proc had already created (the caller only frees what it
+    ## was returned, and it is returned nothing).
+    requireVerifiableHost(host, verify)
     result = SSL_new(ctx.context)
     if result.isNil: fail("SSL_new failed")
     discard SSL_set_fd(result, fd)
@@ -637,6 +1030,11 @@ when defined(ssl):
     ## (ciphertext in) and draining `wbio` (ciphertext out), then runs
     ## `verifyPeer`. `SSL_set_bio` transfers BIO ownership to the SSL, so the
     ## returned `rbio`/`wbio` are for pumping only -- freeing the SSL frees them.
+    ##
+    ## As in `newClientSsl`, the "verify on, no host" refusal (#435) runs before
+    ## anything is allocated: raised from `bindExpectedIdentity` it would abandon
+    ## the SSL and both memory BIOs, since the caller is handed nothing to free.
+    requireVerifiableHost(host, verify)
     let ssl = SSL_new(ctx.context)
     if ssl.isNil: fail("SSL_new failed")
     let rbio = bioNew(bioSMem())
@@ -653,19 +1051,35 @@ when defined(ssl):
     sslSetConnectState(ssl)
     (ssl, rbio, wbio)
 
-  proc verifyPeer*(ssl: SslPtr, host: string, verify: bool) =
+  proc verifyPeer*(ssl: SslPtr, host: string, verify: bool,
+                   slot: SessionSlot = nil) =
     ## After a completed handshake, confirm the chain and the certificate
     ## identity. Both are already enforced during the handshake (SSL_VERIFY_PEER
     ## for the chain, `bindExpectedIdentity` for the name), so this is the
     ## belt-and-suspenders repeat: the SAN/CN for a DNS host, or the iPAddress SAN
     ## for an IP literal. No-op when `verify` is off. Raises `ValueError` on
     ## mismatch.
+    ##
+    ## An empty `host` with verification on is a failure, not a licence to check
+    ## only the chain (#435): it would accept any certificate issued by a trusted
+    ## CA for whatever answered on the socket. `bindExpectedIdentity` already
+    ## refuses it before the handshake; this keeps the invariant local, for a
+    ## caller that drives its own SSL and only reaches us here.
+    ##
+    ## Pass the connection's `slot` so a rejection also drops whatever session this
+    ## peer got cached for the origin, and keeps a late TLS 1.3 ticket out of it
+    ## (`rejectSession`, issue #440). Optional only so the interop tests can call it
+    ## without a cache.
     if not verify: return
-    if SSL_get_verify_result(ssl) != X509_V_OK:
-      fail("certificate verification failed for " & host)
-    if host.len > 0:
+    requireVerifiableHost(host, verify)
+    try:
+      if SSL_get_verify_result(ssl) != X509_V_OK:
+        fail("certificate verification failed for " & host)
       if isIpAddress(host): checkCertIp(ssl, host)   # match the iPAddress SAN
       else: checkCertName(ssl, host)
+    except CatchableError:
+      rejectSession(slot)
+      raise
 
   proc certDer(cert: PX509): string =
     ## DER encoding of `cert`, via the pointer-form i2d_X509 (std/openssl's string
@@ -695,23 +1109,33 @@ when defined(ssl):
     h.update(der)
     base64.encode(h.digest())
 
-  proc postHandshakeVerify*(ssl: SslPtr, host: string, cfg: TlsConfig)
+  proc postHandshakeVerify*(ssl: SslPtr, host: string, cfg: TlsConfig,
+                            slot: SessionSlot = nil)
       {.raises: [CatchableError].} =
     ## Extra peer checks after `verifyPeer`'s chain + hostname verification: SPKI
     ## pinning and the user's verify callback. Both run even when `verify` is off,
     ## so an app that disables chain checking can still pin or inspect the leaf. A
     ## no-op when neither is configured. Raises `ValueError` on rejection.
-    if cfg.pinnedKeys.len > 0:
-      let pin = peerSpkiPin(ssl)
-      if pin.len == 0 or pin notin cfg.pinnedKeys:
-        fail("certificate public key does not match any pin for " & host)
-    if cfg.verifyCallback != nil:
-      let cert = SSL_get_peer_certificate(ssl)
-      if cert.isNil: fail("server presented no certificate")
-      let der = certDer(cert)
-      X509_free(cert)
-      if not cfg.verifyCallback(der):
-        fail("the verify callback rejected the certificate for " & host)
+    ##
+    ## Pass the connection's `slot` so a rejection also drops whatever session this
+    ## peer got cached for the origin, and keeps a late TLS 1.3 ticket out of it
+    ## (`rejectSession`, issue #440). Optional only so the interop tests can call it
+    ## without a cache.
+    try:
+      if cfg.pinnedKeys.len > 0:
+        let pin = peerSpkiPin(ssl)
+        if pin.len == 0 or pin notin cfg.pinnedKeys:
+          fail("certificate public key does not match any pin for " & host)
+      if cfg.verifyCallback != nil:
+        let cert = SSL_get_peer_certificate(ssl)
+        if cert.isNil: fail("server presented no certificate")
+        let der = certDer(cert)
+        X509_free(cert)
+        if not cfg.verifyCallback(der):
+          fail("the verify callback rejected the certificate for " & host)
+    except CatchableError:
+      rejectSession(slot)
+      raise
 
   type TlsWait* = proc(fd: SocketHandle, forWrite: bool): bool {.closure, gcsafe,
                                                                 raises: [CatchableError].}
@@ -761,5 +1185,5 @@ when defined(ssl):
             fail("TLS handshake timed out for " & host)
         else:
           fail("TLS handshake failed for " & host)
-    verifyPeer(result, host, verify)
+    verifyPeer(result, host, verify, slot)   # a rejection also evicts the session
     ok = true

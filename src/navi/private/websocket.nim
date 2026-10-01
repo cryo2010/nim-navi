@@ -182,12 +182,6 @@ proc `=destroy`(o: var WebSocketObj) =
   `=destroy`(o.dec)
   `=destroy`(o.asmb)
 
-proc toWsUrl(url: string): Url =
-  var s = url
-  if s.startsWith("ws://"): s = "http://" & s["ws://".len .. ^1]
-  elif s.startsWith("wss://"): s = "https://" & s["wss://".len .. ^1]
-  parseUrl(s)
-
 proc websocketH1(client: Navi, u: Url, headers: Headers,
                  maxMessageBytes, keepAlive: int): WebSocket =
   ## WebSocket over an HTTP/1.1 Upgrade (RFC 6455): the universal transport.
@@ -337,7 +331,7 @@ proc websocket*(client: Navi, url: string, headers = initHeaders(),
   ## another interval passes with still nothing back -- so a dead peer is detected
   ## instead of blocking forever.
   let httpset = client.config.http
-  let u = toWsUrl(url)
+  let u = parseWsUrl(url)   # ws:// -> http://, wss:// -> https:// (#435)
   if httpset.card == 0 or H1 in httpset:             # h1 is the universal ws transport
     return client.websocketH1(u, headers, maxMessageBytes, keepAlive)
   elif H2 in httpset and u.isTls:                    # opt-in h2 (RFC 8441): config.http = {H2}

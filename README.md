@@ -113,7 +113,7 @@ nimble add navi
 - `checksums` (MD5 and SHA-256 for Digest auth; the former `std/md5`, now maintained by nim-lang as a separate package). This is navi's only required Nim dependency.
 - `chronos` >= 4.0, only if you `import navi/chronos`. The chronos client runs OpenSSL for TLS (like sync/asyncdispatch), so `https` needs a `-d:ssl` build. Aside from `checksums`, the sync and asyncdispatch clients pull in no third-party Nim packages.
 - `libbrotlidec` and `libzstd` (system libraries) are optional: needed only to decode `br`/`zstd` responses. They load lazily, so navi runs fine without them until a server actually sends those encodings.
-- HTTP/3 is opt-in via `-d:naviHttp3`, which needs **ngtcp2**, **nghttp3**, and **OpenSSL >= 3.5** (system libraries, located at build time via `pkg-config`) plus a C++ compiler. Without the flag none of these are required and h3 is unavailable; it applies to the sync, asyncdispatch, and chronos clients.
+- HTTP/3 is opt-in via `-d:naviHttp3`, which needs **ngtcp2**, **nghttp3**, and **OpenSSL >= 3.5** (system libraries, located at build time via `pkg-config`) plus a C++ compiler. Without the flag none of these are required and h3 is unavailable; it applies to the sync, asyncdispatch, and chronos clients. The flag is the opt-in: once it is set, `H3` is in the default `http` set, so every client in the binary that leaves `config.http` alone upgrades to HTTP/3 on `Alt-Svc` (drop `H3` from `http` to opt one out).
 - **On Windows**, the DLL names decide which OpenSSL is loaded. Nim's default 64-bit
   list names only the (EOL) 1.1 pair, so navi targets 3.x via `-d:sslVersion=3-x64`
   -- already set for this repo in `nim.cfg`; set it in your own app too. Nim's
@@ -253,7 +253,7 @@ let api = newNavi(config)
 | `decompress` | `bool` | `true` | Decode `gzip`/`deflate`/`br`/`zstd` response bodies. |
 | `expectContinueMs` | `int` | `0` | Wait this many ms for an interim `100 Continue` before sending an HTTP/1.1 request body (`Expect: 100-continue`); `0` disables the gate. |
 | `headers` | `Headers` | empty | Headers sent on every request. |
-| `http` | `set[HttpVersion]` | `{H1, H2}` | HTTP versions to negotiate; add `H3` (needs `-d:naviHttp3`). |
+| `http` | `set[HttpVersion]` | `{H1, H2}`, or `{H1, H2, H3}` in a `-d:naviHttp3` build | HTTP versions to negotiate. A `-d:naviHttp3` build negotiates h3 by default, so a default client auto-upgrades to HTTP/3 once an origin advertises `Alt-Svc: h3`; set `http` without `H3` (e.g. `{H1, H2}`) to opt that client out. Without the build flag `H3` is unavailable. |
 | `idleConnTimeout` | `int` | `0` | Evict and close an idle pooled connection after this many ms; `0` = no timeout. |
 | `maxIdleConns` | `int` | `0` | Global cap on idle pooled connections; `0` = unlimited. |
 | `maxIdleConnsPerHost` | `int` | `0` | Idle pooled connections kept per origin; `0` = default (8). |
@@ -272,18 +272,18 @@ let api = newNavi(config)
 | `timeouts.read` | `int` | `0` | Per-read idle deadline (ms); `0` disables. |
 | `timeouts.total` | `int` | `0` | Whole-request deadline including retries/redirects (ms); `0` disables. |
 | `timeouts.attempt` | `int` | `0` | Per-attempt deadline, `min(attempt, remaining total)` (ms); retryable on expiry. `0` disables. |
-| `tls.caBundle` | `string` | `""` | Extra trusted CA certificates as an in-memory PEM string (added alongside `caFile` / the system roots). |
-| `tls.caFile` | `string` | `""` | Custom CA bundle path; `""` uses the system trust store. |
+| `tls.caBundle` | `string` | `""` | Extra trusted CA certificates as an in-memory PEM string, **added** to the trust store (alongside `caFile` / the system roots). The additive option. |
+| `tls.caFile` | `string` | `""` | Custom CA bundle path; `""` uses the system trust store. When set it **replaces** the system roots (curl `--cacert` semantics), on every backend including h3. |
 | `tls.certFile` | `string` | `""` | Client certificate file (PEM or DER) for mTLS. |
 | `tls.certPem` | `string` | `""` | Client certificate as an in-memory PEM string. |
 | `tls.cipherSuites` | `string` | `""` | TLS 1.3 ciphersuites (colon-separated); `""` = library default. |
 | `tls.ciphers` | `string` | `""` | TLS <=1.2 cipher list (OpenSSL colon format); `""` = library default. |
 | `tls.insecureSkipVerify` | `bool` | `false` | Skip the certificate chain and hostname checks. Off by default, so every config verifies; for tests against self-signed servers only. The legacy `tls.verify` accessor is its inverse. |
 | `tls.keyFile` | `string` | `""` | Private key file for `certFile`; `""` reuses `certFile`. |
-| `tls.keyPem` | `string` | `""` | Private key as an in-memory PEM string; `""` reuses `certPem`. |
+| `tls.keyPem` | `string` | `""` | Private key as an in-memory PEM string; `""` reuses `certPem`. Secret; see [Clearing the key material from memory](#clearing-the-key-material-from-memory). |
 | `tls.maxVersion` | `TlsVersion` | `tlsDefault` | Highest TLS version to negotiate (`tlsDefault` = unset). |
 | `tls.minVersion` | `TlsVersion` | `tlsDefault` | Lowest TLS version to negotiate (`tlsDefault` = unset). |
-| `tls.password` | `string` | `""` | Passphrase for an encrypted key, or the PKCS#12 password. |
+| `tls.password` | `string` | `""` | Passphrase for an encrypted key (PEM or PKCS#8 DER), or the PKCS#12 password. Secret; see [Clearing the key material from memory](#clearing-the-key-material-from-memory). |
 | `tls.pinnedKeys` | `seq[string]` | `@[]` | SPKI SHA-256 pins (base64, HPKP form); the peer public key must match one or the connection is rejected. |
 | `tls.pkcs12File` | `string` | `""` | PKCS#12/PFX bundle (cert + key + chain); highest precedence. |
 | `tls.resumeSessions` | `bool` | `true` | Reuse TLS sessions across connections (abbreviated handshake). |
@@ -353,13 +353,27 @@ let api = newNavi(config)
 
 Verification is on for every `TlsConfig`, including a bare one: the opt-out is `tls.insecureSkipVerify = true`. `caFile` is honored by all three native clients, each through OpenSSL (chronos included; without a `caFile` they verify against the system trust store). All three negotiate modern TLS (up to the library's maximum, typically TLS 1.3) and support client certificates (mTLS).
 
-The whole `TlsConfig` applies to the HTTP/3 leg too (`-d:naviHttp3`): trust store, `caBundle`, client credential, pins, verify callback and cipher selection all reach the QUIC handshake. The one bound QUIC cannot honor is a `maxVersion` below TLS 1.3, since QUIC always uses TLS 1.3 (RFC 9001); with such a bound set navi simply skips the advertised h3 endpoint and stays on h2/h1.
+**`caFile` replaces the system trust store, it does not add to it** -- the same semantics as curl's `--cacert`. With a `caFile` set, only certificates that chain to an anchor in that file verify, on every backend including HTTP/3, so public https endpoints stop verifying until their roots are in the file too. That is usually what you want when navi only talks to an internal service; when you need a private CA *and* the public roots, put the private CA in `tls.caBundle` instead and leave `caFile` empty (`caBundle` is additive, see below). This is not a navi policy: std/net's `newContext` scans the system store only when `caFile` is empty, and the QUIC leg likewise calls `SSL_CTX_load_verify_locations(caFile)` or `SSL_CTX_set_default_verify_paths()`, never both.
+
+The whole `TlsConfig` applies to the HTTP/3 leg too (`-d:naviHttp3`): trust store (with the same replace-vs-add split between `caFile` and `caBundle`), client credential, pins, verify callback and cipher selection all reach the QUIC handshake. The one bound QUIC cannot honor is a `maxVersion` below TLS 1.3, since QUIC always uses TLS 1.3 (RFC 9001); with such a bound set navi simply skips the advertised h3 endpoint and stays on h2/h1.
+
+When the h3 leg is refused by TLS, the reason travels with the error: the QUIC driver
+records why (including the X509 verify error text) and `navi/backend/quic` raises
+`QuicTlsError` -- a `QuicError` subtype, so the automatic fallback to h2/h1 is
+unchanged -- whose message names the cause. The driver never writes to stderr, so a
+daemon's log stays its own. Only the `-d:naviHttp3` h3 leg has this type; the TCP
+backends keep reporting TLS rejections as `ValueError`, as before. The type is
+defined in `navi/backend/quic`, which the `navi`, `navi/asyncdispatch` and
+`navi/chronos` entry modules do not re-export, so code that wants to catch it by
+name imports that module as well.
 
 #### Trusting a CA in memory
 
-`caBundle` adds trusted CA certificates from an in-memory PEM string, alongside
-the system roots (and any `caFile`). Handy when the CA is embedded in the binary
-or fetched at runtime rather than on disk:
+`caBundle` adds trusted CA certificates from an in-memory PEM string. It is
+purely additive: the certificates join whatever the trust store already holds --
+the system roots when `caFile` is empty, the `caFile` anchors when it is not --
+so it is the way to trust a private CA while public roots keep verifying. Handy
+when the CA is embedded in the binary or fetched at runtime rather than on disk:
 
 ```nim
 config.tls.caBundle = readFile("corp-root.pem")   # or an embedded const
@@ -443,6 +457,11 @@ config.tls.password = "secret"
 # DER-encoded cert and key (encoding auto-detected from content)
 config.tls.certFile = "client.crt"; config.tls.keyFile = "client.key"
 
+# Encrypted PKCS#8 DER key (openssl pkcs8 -topk8 -outform DER -v2 aes-256-cbc)
+config.tls.certFile = "client.crt"
+config.tls.keyFile  = "client.der.key"
+config.tls.password = "secret"
+
 # PKCS#12 / PFX bundle (password is the bundle password)
 config.tls.pkcs12File = "client.p12"
 config.tls.password   = "secret"
@@ -453,10 +472,60 @@ config.tls.keyPem  = keyString
 ```
 
 An encrypted key needs `tls.password`; without one the load fails immediately rather
-than prompting for a passphrase on the terminal. A key configured without a
+than prompting for a passphrase on the terminal. This holds for both encodings: a
+PEM key and an encrypted PKCS#8 DER key are decrypted with the same passphrase, on
+the native backends and on HTTP/3 alike. A key configured without a
 certificate is rejected.
 
+PEM and DER are told apart by content, not by file extension: a file is read as PEM
+when a `-----BEGIN` boundary starts one of its lines (explanatory text before it is
+allowed, per RFC 7468) and as DER otherwise.
+
 Key algorithms (RSA, ECDSA, Ed25519) work in any of these as long as OpenSSL supports them. In-memory PEM may carry an intermediate chain, and a PKCS#12 bundle's intermediates are installed too, so a client certificate issued by an intermediate CA is presented with the chain a root-only server needs to validate it.
+
+##### Clearing the key material from memory
+
+`certPem`, `keyPem` and `password` are ordinary Nim strings, and a client keeps its copy of them
+for its whole lifetime: the TLS contexts are built lazily, one per ALPN shape on first connect, so
+navi cannot drop the material after the first one. In a long-running process that means a core
+file, a heap dump or a memory-disclosure bug reads the passphrase and the PEM private key in
+cleartext, at more than one address, long after OpenSSL holds the decrypted key.
+
+`clearTlsSecrets` closes that window once the client exists. It builds the remaining contexts
+eagerly and then zeroes navi's copy, so the client (mTLS included) keeps working:
+
+```nim
+let api = newNavi(config)
+api.clearTlsSecrets()      # navi's copy of password/keyPem/certPem is zeroed
+config.tls.clearTlsSecrets()   # and yours: newNavi copied the config by value
+```
+
+Notes:
+
+- It clears navi's copy only. `newNavi` takes the config **by value**, so the `NaviConfig` you
+  built is beyond navi's reach; `cfg.tls.clearTlsSecrets()` is the same wipe for your own copy
+  (and `cleanse(mySecret)` for any other secret string you hold).
+- `navi/js` has the same two calls, so cross-backend code can wipe unconditionally, but there
+  they only drop the strings: `fetch` owns TLS, and a JS string is an engine-managed value with
+  no buffer navi can overwrite.
+- **Read the secret at run time.** A string that came from a literal, a `const` or `staticRead`
+  is backed by the binary's read-only data, and under `--mm:arc`/`--mm:orc` every copy shares
+  that payload: the wipe then lands on a private copy and the original stays readable for the
+  life of the process (and it is in the binary on disk besides). Load the passphrase and the key
+  from a file, an environment variable or a secrets API instead, and nothing compiles them in.
+- Because the contexts are built there, it can raise what the first connect would have raised: a
+  `ValueError` for a malformed or mismatched credential, an `IOError` for an unreadable file. The
+  material is left intact when it does.
+- `extend` copies the merged config into the derived client, which builds its own contexts: clear
+  the derived client too, and derive it *before* clearing the parent, or the derived client has no
+  credential at all.
+- It is refused with a `ValueError` while HTTP/3 is enabled on a `-d:naviHttp3` build, because the
+  h3 driver rebuilds its TLS context from these fields per connection (and keys its context cache
+  on their values), so the wipe would break mTLS over h3 on the next connection rather than at a
+  point you could see. Drop `H3` from `config.http` if you want the wipe.
+- The file-based inputs (`certFile`, `keyFile`, `pkcs12File`) are paths, not secrets, and are left
+  alone -- but the plaintext navi reads out of those files is now zeroed before the buffer is
+  freed, whether the load succeeded or not.
 
 ### Errors
 
@@ -473,6 +542,13 @@ except HttpError as e:
 let api = newNavi()
 api.config.throwHttpErrors = false
 ```
+
+A target that names a scheme navi dials (`http`, `https`, `ws`, `wss`) but carries no host
+raises `ValueError` when the request is built, on every backend: `https:///path` parses to
+an empty hostname, which is not dialable and, over TLS, would mean no SNI and no
+certificate identity to check. The same rejection applies to a redirect hop and to the
+WebSocket openers. A schemeless relative target (`/path`, resolved against `prefixUrl`) is
+unaffected.
 
 ### Retries
 
@@ -1128,6 +1204,11 @@ sidecars). The URL still carries the host (used for the `Host` header and, over
 https, the TLS SNI/verification name) and the path; only where the bytes go
 changes. Proxies are bypassed. Supported on the native clients on POSIX
 (`navi/js` and Windows raise a clear error).
+
+The URL must name a host. A URL with no authority (`https:///path`, which
+`std/uri` parses to an empty hostname) is rejected with a `ValueError`, because
+the socket connect never resolves the host and an empty one would leave the TLS
+handshake with no identity to check the certificate against.
 
 ```nim
 var cfg = initNaviConfig()

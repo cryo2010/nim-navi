@@ -45,14 +45,26 @@ openssl x509 -req -in client.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 
   -out client.pem >/dev/null 2>&1
 
 # The same client credential re-encoded into every format navi accepts, so one
-# server can validate them all: an encrypted PEM key, a PKCS#12 bundle, and a
-# DER cert + key. (The PEM and in-memory paths reuse client.pem/client.key.)
+# server can validate them all: an encrypted PEM key, a PKCS#12 bundle, a DER cert +
+# key, an encrypted PKCS#8 DER key, and a PEM key with text before its boundary.
+# (The PEM and in-memory paths reuse client.pem/client.key.)
 pass="navi-secret"
 openssl rsa -in client.key -out client.enc.key -aes256 -passout "pass:$pass" >/dev/null 2>&1
 openssl pkcs12 -export -inkey client.key -in client.pem -certfile ca.pem \
   -passout "pass:$pass" -out client.p12 >/dev/null 2>&1
 openssl x509 -in client.pem -outform DER -out client.der.crt >/dev/null 2>&1
 openssl rsa -in client.key -outform DER -out client.der.key >/dev/null 2>&1
+# An encrypted PKCS#8 DER key (EncryptedPrivateKeyInfo). OpenSSL's
+# SSL_CTX_use_PrivateKey_file(SSL_FILETYPE_ASN1) cannot decrypt this shape and never
+# sees the passphrase, so navi decodes DER keys itself now (#436).
+openssl pkcs8 -topk8 -in client.key -outform DER -v2 aes-256-cbc \
+  -passout "pass:$pass" -out client.der.enc.key >/dev/null 2>&1
+# A PEM key whose first character is '0' -- the ASCII form of the ASN.1 SEQUENCE tag
+# the old sniff tested for. RFC 7468 5.2 allows explanatory text before the
+# "-----BEGIN" boundary and OpenSSL's PEM readers skip it, so this is still a valid
+# PEM file; navi must not route it to the DER loader (#436).
+{ printf '0 explanatory text before the PEM boundary\n'; cat client.key; } \
+  > client.zero.key
 
 # -Verify 1 makes a client certificate mandatory; -www answers a 200 HTML page.
 openssl s_server -accept "$port" -cert server.pem -key server.key \
@@ -110,6 +122,8 @@ export NAVI_MTLS_ENCKEY="$(navi_path "$work/client.enc.key")"
 export NAVI_MTLS_P12="$(navi_path "$work/client.p12")"
 export NAVI_MTLS_DERCERT="$(navi_path "$work/client.der.crt")"
 export NAVI_MTLS_DERKEY="$(navi_path "$work/client.der.key")"
+export NAVI_MTLS_DERENCKEY="$(navi_path "$work/client.der.enc.key")"
+export NAVI_MTLS_ZEROKEY="$(navi_path "$work/client.zero.key")"
 export NAVI_MTLS_PASS="$pass"
 
 # Same test on every native backend (js does not present client certs). chronos
@@ -121,6 +135,21 @@ if nimble path chronos >/dev/null 2>&1; then
     "$root/tests/interop/mtls.nim"
 else
   echo "note: chronos not installed; skipping the chronos mTLS leg"
+fi
+
+# clearTlsSecrets: the credential is wiped out of a LIVE client and every request
+# is made afterwards, so a server that mandates a client certificate proves the
+# eagerly built contexts are what keeps mTLS working (#438). Same three backends.
+echo "== clearTlsSecrets keeps mTLS working after the wipe =="
+nim c -r --hints:off -d:ssl -o:"$work/clearsec_sync" \
+  "$root/tests/interop/tls_clear_secrets.nim"
+nim c -r --hints:off -d:ssl -d:useAsync -o:"$work/clearsec_async" \
+  "$root/tests/interop/tls_clear_secrets.nim"
+if nimble path chronos >/dev/null 2>&1; then
+  nim c -r --hints:off -d:ssl -d:useChronos -o:"$work/clearsec_chronos" \
+    "$root/tests/interop/tls_clear_secrets.nim"
+else
+  echo "note: chronos not installed; skipping the chronos clearTlsSecrets leg"
 fi
 
 # An encrypted key with no configured passphrase must fail fast. OpenSSL's default

@@ -84,6 +84,31 @@ onward (pre-1.0, minor versions may include breaking changes).
   `BodySink`), since the `Future` type differs per backend (#367).
 
 ### Changed
+- **The docs now state that `tls.caFile` replaces the system trust store rather than
+  adding to it (#437).** Setting `caFile` has curl's `--cacert` semantics on every
+  backend, HTTP/3 included: std/net's `newContext` scans the system store only when
+  `caFile` is empty (`if caDir != "" or caFile != ""` ... `else` scan, Nim 2.2.10
+  net.nim:713-730), and the QUIC leg calls either
+  `SSL_CTX_load_verify_locations(caFile)` or `SSL_CTX_set_default_verify_paths()`,
+  never both. The README said only that `""` uses the system store while describing
+  `caBundle` as added "alongside the system roots (and any `caFile`)", which read as
+  all three coexisting, so a corporate root in `caFile` silently broke every public
+  https request. The `TlsConfig` table, the TLS section, the in-memory-CA section,
+  api.nim's field comments and HARDENING.md's trust-anchor section now name `caFile`
+  as the replacing option and `caBundle` as the additive one, with the mechanism
+  quoted at the call site in `newTlsContext`. Behaviour is unchanged (#437).
+- **The docs now say that a `-d:naviHttp3` build negotiates HTTP/3 by default
+  (#448).** `defaultHttpVersions` is `{H1, H2, H3}` in such a build and is the set
+  every client starts from, so a client that never assigns `config.http` upgrades to
+  h3 as soon as an origin advertises `Alt-Svc: h3`. The README config table, the
+  `wantsH3` doc comment, the HARDENING.md HTTP/3 recipe and the THREAT_MODEL.md
+  opt-in table all described h3 as something that "must be listed explicitly in
+  `http`", which would have led an operator who set the build flag for one service
+  to assume the binary's other clients kept h1/h2 semantics (and with them their
+  timeouts, TCP egress and, before the h3 TLS-parity work, their TLS posture). The
+  opt-in is the build flag, not the field: they now say so, and say that dropping
+  `H3` from `http` (e.g. `{H1, H2}`) is how a single client opts out. No behaviour
+  changed; `tests/test_strict_http.nim` already pins the build-aware default.
 - **The HTTP/3 leg builds its OpenSSL context once per TLS policy instead of once
   per connection (#454).** `navi_h3_new` used to create an `SSL_CTX` and re-load the
   trust store, re-parse `caBundle`, re-decode the PKCS#12 or PEM client credential
@@ -251,6 +276,289 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **An encrypted PKCS#8 DER private key is decrypted with `tls.password`, and PEM is
+  detected by its `-----BEGIN` boundary rather than by the first byte (#436).** A DER
+  key file went to `SSL_CTX_use_PrivateKey_file(..., SSL_FILETYPE_ASN1)`, which calls
+  `d2i_PrivateKey` and never consults the passphrase callback, so an
+  `EncryptedPrivateKeyInfo` key (`openssl pkcs8 -topk8 -outform DER -v2 aes-256-cbc`)
+  failed with a generic "could not load the DER private key" while the configured
+  passphrase was silently ignored, contradicting the documented `password` and
+  auto-detected DER encoding. Navi now decodes DER keys itself: `d2i_PrivateKey_bio`
+  for a traditional or unencrypted PKCS#8 key, then `d2i_PKCS8PrivateKey_bio` with
+  navi's own passphrase callback (never OpenSSL's, which would prompt on the
+  terminal), and the failure names the encrypted-PKCS#8 case and whether a password
+  was set. The HTTP/3 leg had the same defect in its `SSL_FILETYPE_ASN1` fallback and
+  now shares the two-step loader, its two messages, and the passphrase
+  callback's "no usable password" return, so a key that will not load reports
+  the same reason whichever leg was asked for it. The PEM/DER sniff no longer tests the first byte for
+  the ASN.1 SEQUENCE tag either: a file is PEM when a `-----BEGIN` boundary starts one
+  of its lines, so a PEM key beginning with the character `0`, or carrying the
+  explanatory text RFC 7468 5.2 allows, is no longer misrouted to the DER loader
+  (#436).
+- **The chronos TLS pump no longer stops reading while one of its own writes is in
+  flight, and it no longer starts a second, forbidden read from the write path
+  (#444).** `readSome` (and the handshake loop) called `flushOut` on every
+  `SSL_ERROR_WANT_READ`, and `flushOut` took the pump's write lock *before* looking
+  at whether the write-BIO had anything to send. `write` holds that same lock across
+  `drainOut`'s `await transport.write`, so the connection's only reader was parked
+  for the full duration of any outbound write with nothing of its own to flush: on an
+  HTTP/2 connection one large buffered upload delayed every inbound frame for every
+  other stream (HEADERS, DATA, WINDOW_UPDATE, RST_STREAM, GOAWAY) and starved the
+  keepalive's frame tick, and against a peer that stops reading while its own send is
+  blocked neither side could proceed, since our write needed the peer to drain and
+  the peer needed us to read. The read path now checks `bioCtrlPending` first and
+  drains only when no writer owns or is queued for the lock; a writer's `drainOut`
+  loop re-checks the write-BIO after every transport write, so the rare output the
+  read path itself queues (a TLS 1.3 KeyUpdate answer, a `no_renegotiation` alert)
+  still leaves in order under the lock. Separately, the write path's
+  `SSL_ERROR_WANT_READ` branch used to issue its own `transport.readOnce` while the
+  mux reader was parked in one; chronos permits a single pending read per transport
+  and raised "Read operation already pending!" immediately, which the pump swallowed
+  as an EOF and turned into a torn-down connection with every in-flight stream
+  failed. Only a TLS 1.2 peer-initiated renegotiation could reach it, so
+  `SSL_OP_NO_RENEGOTIATION` is now set on every navi TLS context built against
+  OpenSSL 1.1.0 or newer (RFC 9113 9.2.1 forbids renegotiation for HTTP/2 regardless,
+  TLS 1.3 has none, and navi never asks for one): OpenSSL answers a `HelloRequest`
+  with a warning alert instead, and a peer that still drives `SSL_write` to want
+  input gets a clear protocol error rather than a phantom EOF. That option is set in
+  `newTlsContext`, so on OpenSSL 1.1.0 and newer it reaches the **sync and
+  asyncdispatch** clients too, where it is a deliberate behaviour change rather than
+  a fix: a TLS 1.2 server-initiated renegotiation used to complete transparently
+  under their blocking `SSL_read` (`SSL_MODE_AUTO_RETRY`) and `driveHandshake`, and
+  some Apache and IIS deployments use exactly that to defer a client-certificate
+  request until a protected resource is asked for, so those connections now take a
+  `no_renegotiation` alert and typically fail; such a server has to request the
+  certificate in the initial handshake instead (see HARDENING.md). It is not set on
+  OpenSSL 1.0.x or on LibreSSL, which spend that option bit on an unrelated flag
+  (`SSL_OP_NETSCAPE_DEMO_CIPHER_CHANGE_BUG` and `SSL_OP_NO_DTLSv1` respectively) and
+  number their own `SSL_OP_NO_RENEGOTIATION` differently or not at all; the clear
+  protocol error covers the chronos pump there. The dual-buffer `wrInBuf`/`FeedSide`
+  machinery that described the concurrent-read model chronos forbids is gone.
+- **A URL with no host is rejected instead of turning into a TLS connection with
+  no identity check (#435).** `verifyPeer` skipped the whole identity step when
+  `host` was empty: no SNI was sent, `SSL_set1_host` was never called and the
+  post-handshake `X509_check_host` / `X509_check_ip_asc` was not run, so any
+  certificate chaining to a trusted CA was accepted for whatever answered on the
+  socket. Nothing upstream rejected such a URL: `std/uri` parses `https:///path`
+  to hostname `""`, and the empty host then reached the handshake over a configured
+  `unixSocket` (whose connect never resolves a host) or, on a platform whose
+  `getaddrinfo("")` resolves to loopback, over TCP to 127.0.0.1:443. Empty-host URLs
+  that name a scheme navi dials (`http`, `https`, `ws`, `wss`) are now refused with
+  a `ValueError` in `buildRequest`, on every redirect hop (`redirectRequest`) and in
+  the WebSocket openers, which covers the sync, asyncdispatch, chronos, js, streaming
+  and HTTP/3 legs. A redirect can reach the shape too: RFC 3986 resolution keeps an
+  absolute `Location` verbatim when its scheme differs from the base's, so
+  `http:///y` off `https://a.test/x` resolves to the scheme `http` with an empty
+  host (under the same scheme the Location is relative and inherits the base host).
+  The TLS layer fails closed as a backstop: with verification on, an empty host
+  raises before the handshake starts (`bindExpectedIdentity`) as well as after it
+  (`verifyPeer`), and `navi_h3_new` refuses it on the QUIC leg for the same reason,
+  where `SSL_set1_host(ssl, "")` would have cleared the expected-name list and
+  still reported success.
+  `insecureSkipVerify` remains an explicit opt-out, so the Unix-socket and raw-fd
+  paths that deliberately connect without an identity are unaffected, as is a
+  `unixSocket` proxy carrying a URL that does name a host. A schemeless relative
+  target still resolves as before. The WebSocket openers now also match the
+  `ws://` / `wss://` prefix case-insensitively (RFC 3986 3.1: the scheme is
+  case-insensitive), which fixes a longstanding silent TLS downgrade: a target
+  like `WSS://host/chat` kept its scheme, so `isTls` (a comparison against
+  `https`) read false and the default port became 80, and a caller that asked for
+  a secure WebSocket got a cleartext handshake. The sync and async openers now
+  share one `parseWsUrl` helper, so the scheme mapping and the host check exist in
+  one place.
+- **An `Alt-Svc` header is only learned from a response that arrived over TLS
+  (#434).** All four record sites (the sync buffered transport, the shared async
+  `recordAltSvc` used by the buffered and streaming legs, and the sync streaming
+  download) stored the advertisement under the hardcoded `https` origin key without
+  checking the scheme of the request that produced it, so an `Alt-Svc: h3="..."`
+  header received over cleartext `http://host:port` was cached as the h3 endpoint for
+  `https://host:port` and consumed by later https requests (whose lookups have always
+  been `isTls`-gated). An on-path attacker on the plain-http leg of a host that is
+  also reached over https could therefore pick the QUIC endpoint for the https origin,
+  or evict the origin's real advertisement with `clear`, for up to the advertised
+  max-age. RFC 7838 2.1 requires the alternative to be authenticated for the origin
+  and discourages honoring the header from an insecure origin. The gate now lives in
+  one place, `AltSvcCache.recordFrom`, which takes the request URL and drops the
+  header unless `url.isTls`; every transport goes through it, so a record site can
+  no longer skip a policy that none of the four applied before.
+- **A sync establishment or read budget is one wall clock, and running out of it
+  raises navi's `TimeoutError` (#442).** Two residues of the per-syscall budget.
+  `tcpConnect` (the proxy leg) gave every address in the resolver's list a fresh full
+  `connectMs`, so a proxy hostname with N blackholed addresses cost N budgets; it now
+  opens one deadline and hands each attempt what is left of it, stopping once that is
+  nothing. And a bounded handshake whose readiness wait simply expired reached the
+  caller as `ValueError("TLS handshake timed out for ...")`, which `Timeouts.connect`
+  ("TCP connect + TLS handshake") says must be a `TimeoutError` and which made
+  `connectAcross` treat the expiry as a broken address and re-race the rest of the
+  pool; the wait now raises the connect timeout itself, and `connectAcross` lets a
+  `TimeoutError` through instead of trying another address inside a spent budget.
+  Separately, `sslReadSome` computed its read budget once, spent most of it in the
+  readiness wait and then armed `SO_RCVTIMEO` with that same pre-wait figure, so a
+  TLS 1.3 session ticket or a partial record arriving late in the window bought the
+  `recv` inside `SSL_read` a second full window: one read could stall for ~2x
+  `timeouts.read` and overshoot `timeouts.total` (only rechecked between reads) by as
+  much. The budget is now a deadline that the wait and the read both spend from, and
+  the socket timeout is armed with the remainder (floored at 1 ms, since 0 means
+  "block forever"); `recvWithin` does the same with the caller's own bound. On
+  Windows a lapsed `SO_RCVTIMEO` under `SSL_read` reports `WSAETIMEDOUT` rather than
+  `WSAEWOULDBLOCK`, which the read loop had been classifying as an unclean EOF
+  instead of a read timeout; it now uses the platform-correct test, read before any
+  other syscall can overwrite the thread's last error.
+- **A timed-out asyncdispatch connect no longer keeps racing the remaining addresses
+  and handshaking in the background (#443).** asyncdispatch has no cancellation, so
+  the `establish` future a `connectMs` deadline gives up on keeps running. It used to
+  catch the very error the timeout path's own socket shutdown caused, treat it as an
+  address that failed, and carry on around its `while pool.len > 0` loop: another
+  Happy-Eyeballs TCP race and another full handshake (SSL_CTX, mTLS, SPKI pin) against
+  the origin, once per remaining address, after the caller had already received
+  `TimeoutError` and moved on. Worse, when the deadline landed while `happyConnect`
+  was still racing there was no fd yet, so the shutdown had nothing to wake and the
+  freshly won socket went through the whole handshake unowned; a follow-up handshake
+  that then stalled against the same slow peer was never woken and pinned its fd and
+  SSL session until the peer gave up. Under a retry loop against a multi-address host
+  this multiplied connection attempts against the origin by the address count. The
+  timeout path now flips a shared `abandoned` cell before shutting the socket down,
+  and `establish` checks it at every point where it would otherwise start new work:
+  the top of each pool iteration, immediately after `happyConnect` returns (closing
+  the socket it just won), after a SOCKS5/CONNECT tunnel completes, and after the Unix
+  connect. An abandoned connect therefore makes exactly the one attempt that was in
+  flight, and the `closeSync` backstop still reclaims a conn that was fully built
+  right at the deadline, exactly once. The chronos backend was already safe: its
+  `withTimeout` cancels `establish` structurally and its `except CancelledError`
+  branch deliberately declines to re-race, which the new interop test now pins down as
+  the control leg.
+- **An HTTP/3 session is only created once the peer has selected the `h3` ALPN
+  protocol (#445).** `h3client.cpp` offered ALPN `h3` but never read
+  `SSL_get0_alpn_selected`, and `navi_h3_bind` verified only the certificate before
+  creating the nghttp3 session. Nothing else on that path enforces a selection:
+  ngtcp2's `crypto_ossl` binding does not look, and OpenSSL's
+  `no_application_protocol` check lives in `ossl_quic_tls_tick`, which only its own
+  native QUIC stack runs -- not the third-party TLS interface ngtcp2 uses. So a
+  non-compliant QUIC listener that completed the handshake without selecting any
+  protocol was treated as an h3 peer: navi opened the control/QPACK streams,
+  submitted the request, and the failure surfaced late as a stream reset
+  (`QuicSubmittedError`), which the fallback rules refuse to replay for a
+  non-idempotent method -- an error the application could do nothing with.
+  `navi_h3_bind` now requires exactly `h3` before the session exists, so the failure
+  is a clean pre-submit `QuicError` any method may fall back from, and the
+  `CONNECTION_CLOSE` navi writes on the way out carries
+  `crypto_error(no_application_protocol)` (transport error `0x178`) so the peer
+  learns why. A server that selects a *different* protocol was already rejected by
+  OpenSSL itself (#445).
+- **The one-time init of ngtcp2's OpenSSL crypto binding is now thread safe
+  (#447).** `navi_h3_new` guarded `ngtcp2_crypto_ossl_init` with a plain
+  `static bool crypto_inited` set after the call: check-then-set, with no mutex,
+  atomic or `call_once`. In a `--threads:on` program (Nim 2.2's default) two threads
+  each owning a client and opening their first HTTP/3 connection could both observe
+  the flag false and both run the init, which unconditionally re-fetches and
+  overwrites its file-scope `EVP_CIPHER`/`EVP_MD` globals without freeing the old
+  ones: a one-time leak of the first call's EVP objects, plus a data race on the flag
+  and on ngtcp2's globals that TSan reports. The guard is now the initialiser of a
+  function-local `static const int`, whose initialisation C++ makes thread safe by
+  construction, and a non-zero result fails `navi_h3_new` with a recorded reason
+  instead of being retried silently per connection (#447).
+- **HTTP/3 TLS failures now explain themselves instead of printing to stderr
+  (#446).** Every TLS and transport failure in the h3 driver (`h3client.cpp`) was
+  reported with `fprintf(stderr, ...)` plus a null/-1 return: an unparseable
+  `caFile`, a client credential that would not load, a missing peer certificate, an
+  X509 verify error whose only trace was a bare number. Library code wrote
+  unconditionally to the host process's stderr, while the Nim wrappers turned the
+  same failures into a fixed-text `QuicError` that named no cause at all -- so an
+  application could not tell a certificate rejection (a UDP-only MITM while TCP is
+  clean) from a black-holed path, and the attempt, the stderr line and the fallback
+  repeated on every request. The driver now records a reason and a `NaviH3ErrCode` in a
+  thread-local slot (`navi_h3_last_error`, declared in `h3client.h`) for every
+  failure its connect, bind, pump, flush and TLS-configuration paths report,
+  including the `X509_verify_cert_error_string` text for a verification failure, and
+  writes to stderr nowhere; the result of `SSL_CTX_set_default_verify_paths` is
+  checked too, rather than silently leaving an empty trust store behind. Those entry
+  points also clear the slot on the way in, so a reason always belongs to the call
+  that just failed, and a reason a callback recorded while a packet was being handled
+  (an nghttp3 stream error, a peer flooding before the session is bound) is kept
+  rather than overwritten by the generic `read_pkt` failure that carried it out.
+  The three wrappers (`quic.nim`, `quic_async.nim`, `quic_chronos.nim`) put that
+  reason into the error they raise, and certificate/identity and TLS-policy failures
+  now raise the new **`QuicTlsError`** -- a `QuicError` subtype, so the engine's
+  fallback classification and `openH3Tracked`'s mark-broken bookkeeping are
+  unchanged, but a caller can finally distinguish a TLS rejection from a network
+  failure. The type lives in `navi/backend/quic` (and is re-exported by
+  `quic_async`/`quic_chronos`); the `navi`, `navi/asyncdispatch` and `navi/chronos`
+  entry modules re-export no QUIC error type, as before, so an application that
+  catches it by name imports `navi/backend/quic` too (#446).
+- **In-memory TLS key material can be zeroed out of a live client, and every transient
+  buffer navi allocates for it is cleansed (#438).** `tls.password`, `tls.keyPem` and
+  `tls.certPem` are ordinary Nim strings that `newNavi` copies into `client.config`
+  and keeps for the client's lifetime, because the SSL_CTXs are built lazily -- one
+  per ALPN shape on first connect -- so navi could not drop them after the first one;
+  nothing zeroed them once OpenSSL held the decrypted key, and the loaders freed the
+  key-file contents and the PKCS#12 bytes uncleansed. A core file, heap dump or
+  memory-disclosure bug in a long-running process therefore read the passphrase and
+  the PEM private key in cleartext at several addresses. The loaders now zero every
+  buffer they allocate for key material, on the failure paths too, and no longer
+  materialise a temporary copy of `keyPem`. The new `clearTlsSecrets` builds the
+  remaining contexts eagerly and then zeroes navi's copy of the three fields, so a
+  client (mTLS included) keeps working afterwards; `cfg.tls.clearTlsSecrets()` and
+  the exported `cleanse` do the same for a config or a secret string the caller still
+  holds, which navi cannot reach because `newNavi` takes the config by value. The
+  client-level wipe is refused while HTTP/3 is enabled on a `-d:naviHttp3` build, as
+  the h3 driver rebuilds its context from those fields per connection and keys its
+  context cache on their values. `cleanse` writes through a volatile pointer, so an
+  optimising build cannot drop the stores as dead; what it cannot do is reach a
+  secret that came from a literal, a `const` or `staticRead`, since that payload is
+  read-only and shared, so read key material at run time. Building a TLS context no
+  longer leaks the `SSL_CTX` (a few hundred KB with the trust store) when the
+  credential, CA bundle, version bounds or cipher list turn out to be unusable, which
+  the eager context build made easy to hit: the context is destroyed on the way out.
+  Documented in README and HARDENING.
+- **A TLS session from a peer that failed the hostname, pin or verify-callback check
+  is evicted instead of being re-offered to the origin (#440).** For TLS 1.2 and
+  below OpenSSL's new-session callback fires inside the handshake, before navi's
+  post-handshake checks (`verifyPeer`'s hostname/IP match, the SPKI pins and
+  `verifyCallback`, all run by `postHandshakeVerify`) can reject the peer, so the
+  session of a refused peer -- an interception proxy with a chain-valid but unpinned
+  certificate, say -- was stored under `host:port` and presented on the next connect
+  to that origin, keeping that peer's session and certificate in memory until
+  something replaced the entry. There was never a verification bypass (on resumption
+  OpenSSL restores `verify_result` and the peer certificate, so the same check fails
+  again). A rejection now removes and frees the origin's entry and marks the
+  connection's slot, so a TLS 1.3 NewSessionTicket arriving after the rejection is
+  declined too; `applySession` clears the mark when a new SSL is bound, so the sync
+  backend re-racing the remaining addresses still caches the one that works. Wired
+  through all three native backends. On the wire the stale offer was visible only on
+  chronos, which closes cleanly since #431: the sync and asyncdispatch reject paths
+  free the SSL without a shutdown, and OpenSSL then marks that session not_resumable
+  by accident.
+- **A TLS ticket arriving after `client.close()` no longer leaks its `SSL_SESSION`
+  into the emptied session cache (#441).** `close` freed and cleared the cache table
+  but left the cache object live, and a connection that was checked out rather than
+  pooled -- a live WebSocket or SSE stream, an in-flight h1 request -- keeps its
+  `SessionSlot` and stays up across the close, so a server sending a TLS 1.3
+  NewSessionTicket afterwards had that session inserted into the emptied table and
+  owned by navi, freed only by a second `close` that typically never comes. `close`
+  now marks the cache closed before freeing it, and the new-session callback declines
+  ownership (returns 0) for a closed cache so OpenSSL frees the ticket itself; the
+  flag is never cleared, so no later insert can reopen the cache. The whole insert
+  policy moved out of the C callback into `offerSession`, ordinary Nim that is
+  unit-tested. Consequence worth knowing: a request made on a client after `close`
+  does a full handshake instead of resuming, which the `close` docs now say.
+- **The TLS session cache allocates its `ex_data` index in the SSL class on LibreSSL
+  and OpenSSL 1.0.x too (#439).** `ensureExIdx` passed a hard-coded `0` as the
+  `CRYPTO_get_ex_new_index` class, which is `CRYPTO_EX_INDEX_SSL` only from OpenSSL
+  1.1.0 on; LibreSSL (every version) and OpenSSL 1.0.x number `CRYPTO_EX_INDEX_BIO`
+  0 and the SSL class 1, so on those libraries navi drew its index from the BIO
+  counter and then stored it on `SSL` objects. Measured on the macOS system LibreSSL
+  (`OPENSSL_VERSION_NUMBER` 0x20000000): `SSL_get_ex_new_index` hands out SSL-class
+  0 then 1, while `CRYPTO_get_ex_new_index(0, ...)` returns 0 from the BIO counter,
+  so navi's index collided with SSL-class index 0. It worked standalone but left the
+  index unregistered in the SSL class, so a co-resident library that legitimately
+  allocated the same SSL-class number with `dup`/`free` callbacks would have had them
+  invoked on navi's `SessionSlot` pointer at `SSL_free`/`SSL_dup`, and
+  `onNewSession` could have cast a foreign pointer to a `SessionSlot`. navi now
+  allocates through the library's own `SSL_get_ex_new_index` (a real export exactly
+  where the numbering differs, a macro from 1.1.0 on) and, when that symbol does not
+  resolve, picks the class from `getOpenSSLVersion()`. Session resumption is on by
+  default, so this ran on every TLS connection; the OpenSSL 3 CI target was
+  unaffected.
 - **An IP-literal origin over HTTP/3 is matched against the certificate's
   `iPAddress` SAN and is no longer offered as SNI (#451).** `navi_h3_new` handed
   every origin -- DNS name or numeric address alike -- to `SSL_set1_host`, the

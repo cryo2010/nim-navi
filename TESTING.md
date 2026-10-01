@@ -31,14 +31,17 @@ checkmate --nimflags:"--mm:orc -d:useMalloc --passC:-fsanitize=address --passC:-
 
 # Interop (each stands up a real server and exits non-zero on failure):
 nimble interop            # HTTP/2 vs nghttpd (needs nghttpd + openssl)
-nimble mtls               # mutual-TLS client cert (needs openssl)
+nimble mtls               # mutual-TLS client cert + clearTlsSecrets (needs openssl)
 nimble tlsFallback        # handshake-aware address fallback (needs openssl + python3)
 nimble tlsVersion         # TLS min/max version pinning (needs openssl w/ TLS 1.3)
 nimble happyEyeballs      # RFC 8305 address racing (needs openssl)
 nimble cipherSuite        # cipher / ciphersuite selection (needs openssl w/ TLS 1.3)
-nimble tlsPinning         # in-memory CA + SPKI pinning + verify callback (needs openssl)
+nimble tlsPinning         # in-memory CA + SPKI pinning + verify callback + rejected-session eviction (needs openssl)
 nimble tlsWriteClose      # a TLS write racing a close, asyncdispatch client (needs openssl + python3)
+nimble tlsReadDuringWrite # the chronos TLS pump reads while its own write is in flight (needs openssl + python3 + chronos)
 nimble tlsTruncate        # unclean TLS close vs an until-close body (needs openssl + python3)
+nimble tlsBudget          # sync establishment + read budgets as single wall clocks (needs openssl + python3)
+nimble connectAbandon     # an abandoned connect must not re-race the address pool (needs python3)
 nimble socks              # SOCKS5 proxy + user/pass auth, all native clients (needs python3)
 nimble httpConnect        # HTTP CONNECT proxy: split / oversized / 407 replies (needs openssl + python3)
 nimble unixSocket         # Unix socket transport + failed-TLS teardown (needs python3 + openssl)
@@ -113,7 +116,22 @@ Not runnable on a Windows runner, and staying on Linux CI: everything Docker-bas
 and Valgrind/ASan/LSan. `tls_fallback.sh` needs python3 and *exits 127 silently* when
 it is missing, so it is deliberately excluded rather than allowed to pass vacuously;
 `happy_eyeballs.sh` assumes a blackhole address hangs, which Windows may instead fail
-fast as "network unreachable".
+fast as "network unreachable"; `connect_abandon.sh` needs python3 and a dual-homed
+`localhost` (it binds one deaf listener per loopback family on the same port).
+
+`tls_budget.sh` is excluded for a reason of its own, beyond needing python3. Its
+`partial` server has to put a bare TLS record header on the wire *under* the TLS
+layer, which it does with `os.write(sslsock.fileno(), ...)`; on Windows
+`socket.fileno()` returns a Winsock handle rather than a C-runtime descriptor, so
+that write cannot land there and the case would pass on the plain stall instead of
+on the late record it exists to measure. The thresholds are tight as well: a 1700 ms
+stall inside a 2000 ms budget, asserted under a 2900 ms ceiling, leaves under a
+second of slack for a loaded Windows runner. The one Windows-specific branch the
+test's fix touches, the WSAETIMEDOUT arm of `lastIoTimedOut`, is still reached on
+Windows by the unit suite: the #452 trickling-proxy case in `test_socks.nim` runs in
+the `test` job and spends an armed `SO_RCVTIMEO` on a blocking socket. What stays
+uncovered on Windows is only its `SSL_ERROR_SYSCALL` call site in `sslReadSome`,
+which needs a real handshake.
 
 ---
 
@@ -161,6 +179,11 @@ end-to-end suites drive).
 | `test_cookies.nim` | Cookie jar expiry (Max-Age and Expires) and domain/path matching (RFC 6265) |
 | `test_digest.nim` | Digest auth: the pure computation (RFC 2617 vector) and the 401-challenge/retry flow end to end |
 | `test_stream_decompress.nim` | Streaming-response decompression: the incremental decoder fed across chunk boundaries, the `stream()` path decoding a body, and stacked `Content-Encoding` |
+| `test_tls_session.nim` | TLS session cache: which `CRYPTO_EX_INDEX` class the `ex_data` slot is allocated from across OpenSSL/LibreSSL versions (#439), and the insert policy driven with real `SSL_SESSION` objects -- a closed cache declining a late ticket and never reopening (#441), and a peer rejected after the handshake having its session evicted and later ones refused (#440) |
+| `test_tls_exdata.nim` | Allocating the session cache's `ex_data` index (#439) against the library the suite links: the index is valid, two allocations differ, and where `SSL_get_ex_new_index` is a real export (LibreSSL, OpenSSL 1.0.x) navi's index comes from the same SSL-class counter as a direct call's |
+| `test_tls_options.nim` | Which libraries may be handed an `SSL_OP_*` bit (#444): the `SSL_OP_NO_RENEGOTIATION` number is OpenSSL 1.1.0's, and OpenSSL 1.0.x and LibreSSL spend that bit on unrelated options, so the version gate must exclude them (LibreSSL's pinned 0x20000000 included) |
+| `test_tls_identity.nim` | The "verify on, no host" refusal happens before an SSL exists (#435): both client-SSL constructors raise it ahead of `SSL_new`, rather than from `bindExpectedIdentity` afterwards, which abandoned the SSL and its memory BIOs; plus the `insecureSkipVerify` and named-host paths that must still build one |
+| `test_tls_secrets.nim` | In-memory TLS key material (#438): `cleanse` overwriting the bytes rather than only shortening the string (with `setLen` alone as the counter-example), and `clearTlsSecrets` clearing exactly `password`/`keyPem`/`certPem` on a config and on a live client -- after building every ALPN shape's context, leaving the caller's own copy alone, and keeping the material when the build fails; also the documented limit that a literal/`const`-backed secret cannot be wiped under arc/orc |
 
 ### WebSocket client adapters
 
@@ -201,19 +224,24 @@ own **`streaming`** matrix job (four separate checks) — see the row below and 
 | Suite (script → driver) | CI | Verifies |
 |------|----|----------|
 | `run.sh` → `nghttpd_{sync,async}.nim` | **yes** (`interop`) | HTTP/2 against nghttpd (nghttp2 reference): navi's HPACK **encoder**, ALPN, real h2 wire framing, multiplexing, receive-side flow control, PADDED-flag handling (a second nghttpd runs with `-b` padding), and a streamed body upload (`body = producer`) over h2 (sync and the async mux) |
-| `mtls.sh` → `mtls.nim` | **yes** (`interop`) | Mutual TLS: an `openssl s_server -Verify 1` rejects clients without a CA-signed cert, exercising `TlsConfig.certFile`/`keyFile` |
+| `mtls.sh` → `mtls.nim`, `tls_clear_secrets.nim` | **yes** (`interop`) | Mutual TLS: an `openssl s_server -Verify 1` rejects clients without a CA-signed cert, exercising `TlsConfig.certFile`/`keyFile` in every accepted encoding (PEM, encrypted PEM, PKCS#12, DER, encrypted PKCS#8 DER, in-memory PEM). The same server then drives `clearTlsSecrets` (#438) on all three native backends: the in-memory credential (plain and encrypted, plus a file-based one with a passphrase) is wiped out of a LIVE client and every request is made afterwards, so a server that mandates a client certificate proves the eagerly built contexts are what keeps mTLS working -- covering both ALPN shapes, the no-op with no credential (which must still be refused by the server), and a malformed credential raising while leaving the material intact |
 | `tls_fallback.sh` → `tls_fallback.nim` | **yes** (`interop`) | Handshake-aware address fallback (sync): a dead endpoint (accepts TCP then drops the handshake) plus a good TLS server on the same port; navi falls through to the good address |
 | `tls_version.sh` → `tls_version.nim` | **yes** (`interop`) | TLS version pinning: TLS-1.2-only and TLS-1.3-only servers; a `minVersion`/`maxVersion` pin excluding the server's version fails the handshake |
 | `happy_eyeballs.sh` → `happy_eyeballs.nim` | **yes** (`interop`) | Happy Eyeballs (RFC 8305): a blackholed first address (192.0.2.1, SYN dropped) plus a good server; navi races the addresses and reaches the good one in ~the attempt delay instead of stalling |
+| `connect_abandon.sh` → `connect_abandon.nim` | **yes** (`interop`) | An abandoned connect (#443), asyncdispatch and chronos: `deaf_tcp_server.py` accepts and never speaks on both loopback families on one port, so `localhost` is a two-address Happy-Eyeballs pool whose winner stalls the TLS handshake. When `connectMs` fires, exactly one connection may ever have reached the origin: the abandoned `establish` must stop rather than drop that address and re-race the rest with a fresh TCP connect and SSL_CTX/handshake. The chronos leg is the control (structured cancellation). Needs a dual-homed localhost (127.0.0.1 + ::1) |
 | `cipher_suite.sh` → `cipher_suite.nim` | **yes** (`interop`) | Cipher selection: servers pinned to one TLS 1.2 cipher and one TLS 1.3 ciphersuite; `TlsConfig.ciphers`/`cipherSuites` honored (matching name connects, non-matching fails the handshake) |
 | `ca_verify.sh` → `ca_verify.nim` | **yes** (`interop`) | Private-CA verification (sync): a server cert signed by a throwaway CA; navi trusts it via `TlsConfig.caFile` and rejects the same server without the CA (system trust lacks that root) |
+| `tls_pin.sh` → `tls_pin.nim`, `tls_reject_resume.nim` | **yes** (`interop`) | SPKI pinning, an in-memory `caBundle` and the `verifyCallback` against a private-CA server, plus session hygiene after a rejection (#440): on all three native backends, pinned to TLS 1.2 and to TLS 1.3, two sequential requests through one client where the FIRST is refused post-handshake (wrong pin, or a callback that refuses once) must leave the second doing a FULL handshake -- `openssl s_server -www` names the session state in the page it serves, and a control scenario that rejects nothing must report `Reused` so a `New` really is the eviction |
 | `highfd.sh` → `highfd.nim` | **yes** (`interop`) | Readiness waits above `FD_SETSIZE` (sync, POSIX): the client burns ~1100 descriptors with `dup(2)` so its socket lands above 1024, then requests with a read timeout armed (the only case that reaches the readiness wait). Built fortified, so the pre-#429 `select()` wait aborts in glibc's `FD_SET` instead of corrupting memory quietly. Needs room above 1024 descriptors (`docker run --ulimit nofile=4096:4096` if the image's hard limit is lower) |
 | `tls_truncate.sh` → `tls_truncate.nim` | **yes** (`interop`) | Unclean TLS close (#426), all three native clients: a python TLS server answers with a body delimited only by the close and then cuts the connection with a RST or a bare FIN instead of a `close_notify`; navi must raise rather than return the short body, on the buffered drain and on the streamed reader. The same run checks the regression side: the same body ended with `unwrap()` is delivered, a short `Content-Length` body still reports the parser truncation, a keep-alive pair is unaffected, and an `openssl s_server -www` page (until-close, closed cleanly) still arrives |
+| `tls_read_during_write.sh` → `tls_read_during_write.nim` | **yes** (`interop`) | The chronos TLS pump keeps reading while one of its own writes is in flight (#444): a python TLS server greets the client and then stops reading, and its listening socket carries a tiny `SO_RCVBUF` so a 4 MiB `write` is guaranteed to park inside `transport.write` holding the pump's write lock. Drives `ChronosTls` directly (the defect is in the pump, not in an HTTP layer) and asserts the greeting reaches `readSome` while that write is still blocked |
+| `tls_budget.sh` → `tls_budget.nim` | **yes** (`interop`) | Establishment and read budgets as single wall clocks (#442, sync): three python TLS servers driven by `stall_tls_server.py`. A handshake-deaf one accepts the TCP connection and never answers the ClientHello, so a bounded handshake can only end at navi's own budget and must do so as `TimeoutError` with the connect wording (under `timeouts.connect` and under a bare `timeouts.total`). A second one goes silent after the request and then writes a bare TLS record header late in the read budget, so the readiness wait is woken by bytes carrying no application data and `SSL_read` has to recv again: the run asserts the read ends at the budget instead of buying a second full window (the pre-fix stall was ~2x `timeouts.read`, and overshot `timeouts.total` by as much). A healthy third server is the control for both handshake paths, bounded (poll-driven, non-blocking) and unbounded (plain blocking `SSL_connect`) |
 | `streaming.sh` → `streaming_client.nim` (+ `streaming_server.nim` for h1) | **yes** (`file streaming …`, 4 checks) | File streaming (sync) as a matrix of protocol × direction: for http/1.1 (a local Nim server) and http/2 (nghttpd), upload via a streamed body (`body = producer`) and download via `stream()`/`each`. Each check asserts the transfer used that protocol (`res.httpVersion`) and the bytes hash-match a 3 MiB original |
 | `servers.sh` → `servers_{sync,async}.nim` | **yes** (`multiserver`) | h2 client against three unrelated stacks (nginx, Caddy/Go, h2o) over TLS via docker compose, plus the chronos h1+TLS leg; ALPN negotiation and a 256 KiB body (receive flow control) |
 | `streaming_concurrent/` (`nimble streamConcurrent`) | local | Concurrent streaming (navi/asyncdispatch): fires N (default 50, `NAVI_CONCURRENT_N`) simultaneous streamed downloads, then uploads, then a mixed batch, over one h2 connection against the FastAPI server; verifies every transfer by SHA-1 and asserts they all multiplexed onto a single connection (`openedConnections == 1`). Docker compose, one command |
 | `sse/` (`nimble sse`) | **yes** (`SSE reconnect interop`) | SSE reconnection (navi/asyncdispatch): a FastAPI SSE server drops the connection after 3 events per request, so the client must reconnect and resume from Last-Event-ID to receive all 10 events in order over the h2 mux. Also exercises the SSE client shutdown (close joins the mux). Docker compose, one command |
 | `ws_h3/run.sh` → `client{,_chronos,_sync}.nim` + `client_noconnect{,_chronos,_sync}.nim` | local (h3 image) | WebSocket over HTTP/3 Extended CONNECT (RFC 9220) against an aioquic h3 origin, on all three native clients. Two halves: the normal path opens the CONNECT tunnel and echoes frames, and a second origin whose SETTINGS advertises `ENABLE_CONNECT_PROTOCOL=0` (it would still answer a CONNECT with 200) proves navi waits for the peer's SETTINGS and refuses to submit the CONNECT at all, failing fast with the same `ProtocolError` the h2 path raises (#393). Needs a `-d:naviHttp3` toolchain + aioquic, so run it inside the h3 image (`tests/stress/Dockerfile.h3`); see the header of `run.sh` for the one-liner |
+| `http3/run.sh` → `*_test.nim` | local (h3 image) | The whole HTTP/3 leg (`-d:naviHttp3`) against a Caddy h3 origin: verified GETs, SPKI pins and `verifyCallback`, IP-literal origins (iPAddress SAN, no SNI), transparent Alt-Svc dispatch, request trailers, multiplexing, streaming, the shared `SSL_CTX` cache, and an fd/heap leak check that also runs under ASan+UBSan. The ALPN gate probes (`alpn_test.nim`, `alpn_async_test.nim`, `alpn_chronos_test.nim`, #445) additionally need a peer Caddy cannot be -- an aioquic listener that completes the handshake and selects no ALPN protocol (`noalpn_server.py`) -- and assert, once per opener (each drives its own handshake loop and teardown), that navi refuses it pre-submit as a plain `QuicError` and closes with crypto_error(no_application_protocol). Build and run it as one image: `docker build -f tests/interop/http3/Dockerfile -t navi-h3 . && docker run --rm navi-h3` |
 | `httpbin.sh` → `httpbin_test.nim`, `httpbin_js.nim` | **yes** (`httpbin`) | Full httpbin breadth (every method, bodies, auth, redirects, decompression, cookies) behind Caddy (TLS+h2) across all four clients; also streaming download via `stream()`/`each` on all four and streamed body upload (`body = producer`) on the native clients (buffered on js); offline (never published to the host) |
 | `badssl.nim` (`badssl.yml`) | **yes** (`badssl TLS conformance`) | Certificate-verification conformance: navi rejects invalid server certs with verification on (the default) and accepts a valid one. Hits badssl.com (network) |
 | `chronos_cafile.sh` → `chronos_cafile.nim` | local | Custom-CA verification for chronos/BearSSL (`TlsConfig.caFile`): a server cert signed by a private CA is verified against that CA (uses a dNSName SAN, which BearSSL matches) |

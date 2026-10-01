@@ -1136,6 +1136,34 @@ suite "TLS peer verification defaults":
     cfg.tls.insecureSkipVerify = true
     check not cfg.tls.verify
 
+suite "empty-host identity guard (#435)":
+  # verifyPeer used to downgrade to chain-only verification when `host` was "":
+  # no SNI, no X509_check_host / X509_check_ip_asc, so any certificate chaining to
+  # a trusted CA was accepted for whatever answered on the socket. The guard is
+  # pure logic that runs before any OpenSSL call (in `bindExpectedIdentity` before
+  # the handshake, and again in `verifyPeer` after it), so it is unit-testable
+  # here without a live TLS peer.
+  test "verification on with no host should fail closed":
+    expect ValueError:
+      requireVerifiableHost("", true)
+
+  test "the failure should say there is no hostname to verify against":
+    var msg = ""
+    try: requireVerifiableHost("", true)
+    except ValueError as e: msg = e.msg
+    check "no hostname to verify against" in msg
+
+  test "a host with verification on should pass the guard":
+    requireVerifiableHost("x.test", true)
+    requireVerifiableHost("::1", true)
+    check true                            # neither call raised
+
+  test "insecureSkipVerify should stay an explicit opt-out":
+    # With verification off there is no identity to check, so an empty host (the
+    # Unix-socket and raw-fd test paths) stays legal.
+    requireVerifiableHost("", TlsConfig(insecureSkipVerify: true).wantsVerify)
+    check true
+
 suite "TLS version pinning config":
   test "tls minVersion and maxVersion should default to tlsDefault and be settable":
     var cfg = initNaviConfig()

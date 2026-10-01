@@ -54,8 +54,10 @@ config.tls.keyFile  = "/etc/navi/client.key"          # "" reuses certFile if it
 let api = newNavi(config)
 ```
 
-Why: `caFile` replaces the system trust store, so navi accepts only certificates
-that chain to your private root; verification stays on. The client certificate
+Why: `caFile` replaces the system trust store (it does not add to it), so navi
+accepts only certificates that chain to your private root; verification stays on.
+Public https endpoints stop verifying under that config, which is the point here
+and a surprise anywhere else -- see "Custom trust anchor" below. The client certificate
 lets the server authenticate navi in return. A PKCS#12 bundle
 (`config.tls.pkcs12File = "client.p12"; config.tls.password = "..."`) is an
 alternative to the cert/key pair, and the intermediates inside it are presented
@@ -105,7 +107,8 @@ partial wildcards such as `fo*.example.com` are rejected, and a certificate that
 carries dNSName SANs is judged on those alone -- its subject CN counts only when it
 has no SAN at all. `insecureSkipVerify = true` disables both and is intended only for tests
 against self-signed servers. If you need to trust a non-public CA, do **not** disable
-verification; set `caFile` instead.
+verification; set `caFile` instead (or `caBundle`, if the system roots must keep
+working alongside it).
 
 ### Custom trust anchor (`caFile`)
 
@@ -113,10 +116,19 @@ verification; set `caFile` instead.
 config.tls.caFile = "/etc/navi/internal-ca.pem"
 ```
 
-Default `""` uses the system trust store. Setting `caFile` restricts trust to the
-given CA bundle, which both enables a private CA and narrows the accepted chain
-for a public one. Verification stays on. `tls.caBundle` does the same from an
-in-memory PEM string (added alongside the system roots / `caFile`).
+Default `""` uses the system trust store. Setting `caFile` **replaces** those
+system roots with the given CA bundle -- curl's `--cacert` semantics -- on every
+backend, HTTP/3 included: std/net's `newContext` scans the system store only when
+`caFile` is empty, and the QUIC leg calls either
+`SSL_CTX_load_verify_locations(caFile)` or `SSL_CTX_set_default_verify_paths()`,
+never both. That both enables a private CA and narrows the accepted chain for a
+public one, and it means any public endpoint the process also talks to fails
+verification until its root is in the file. Verification itself stays on.
+
+`tls.caBundle` is the **additive** option: an in-memory PEM string whose
+certificates are added to whatever the store already holds (the system roots when
+`caFile` is empty, the `caFile` anchors when it is not). Use it to trust a private
+CA while public roots keep working; use `caFile` to trust nothing else.
 
 ### Public-key pinning (`pinnedKeys`)
 
@@ -146,6 +158,33 @@ downgrade to a weak protocol; a negotiation outside the pinned range fails the
 handshake. Enforced on all three native OpenSSL backends (sync, asyncdispatch,
 chronos), so `tls13` is honored on chronos too.
 
+### Renegotiation (not configurable: off on OpenSSL 1.1.0 and newer)
+
+On **OpenSSL 1.1.0 and newer** every navi TLS context sets
+`SSL_OP_NO_RENEGOTIATION`, so a TLS 1.2 (or earlier) peer cannot start a
+mid-connection handshake: OpenSSL answers a `HelloRequest` with a
+`no_renegotiation` warning alert and the connection carries on. TLS 1.3 has no
+renegotiation at all, RFC 9113 9.2.1 forbids it for HTTP/2 regardless of version,
+and navi never requests one itself.
+
+This is not free on every backend. A TLS 1.2 server that defers its
+client-certificate request to a renegotiation -- the per-directory pattern some
+Apache and IIS deployments use -- used to be served transparently by the sync and
+asyncdispatch backends (a blocking `SSL_read` with `SSL_MODE_AUTO_RETRY` just
+completed the new handshake); such a server now gets a `no_renegotiation` alert
+and the request typically fails. Have the server ask for the certificate in the
+initial handshake instead (`config.tls.certFile` and friends below). There is no
+knob to re-enable renegotiation.
+
+The option is deliberately **not** set on OpenSSL 1.0.x or on LibreSSL: those
+libraries spend that option bit on something else entirely (OpenSSL 1.0.x on
+`SSL_OP_NETSCAPE_DEMO_CIPHER_CHANGE_BUG`, LibreSSL on `SSL_OP_NO_DTLSv1`, which
+numbers its own `SSL_OP_NO_RENEGOTIATION` elsewhere), so setting it there would
+change an unrelated flag rather than refuse renegotiation. Against such a library
+a peer-driven renegotiation is still refused, just later and less politely: the
+sync and asyncdispatch backends let OpenSSL complete it, and the chronos backend
+fails that connection with "TLS peer requested renegotiation during a write".
+
 ### Cipher restriction
 
 ```nim
@@ -171,6 +210,46 @@ config.tls.password   = "secret"
 Off by default. Precedence is `pkcs12File`, then in-memory (`certPem`/`keyPem`),
 then the `certFile`/`keyFile` pair. Supported on the native OpenSSL backends
 (sync, asyncdispatch, chronos); js does not present client certificates.
+
+### Key material in memory (`clearTlsSecrets`)
+
+```nim
+let api = newNavi(config)
+api.clearTlsSecrets()          # zero navi's copy of password/keyPem/certPem
+config.tls.clearTlsSecrets()   # and your own: newNavi copied the config by value
+```
+
+`certPem`, `keyPem` and `password` are plain Nim strings, and a client holds its
+copy for its whole lifetime because the TLS contexts are built lazily, one per
+ALPN shape on first connect. Left alone, a core file, a heap dump or a
+memory-disclosure bug in a long-running process yields the passphrase and the PEM
+private key in cleartext at several addresses, long after OpenSSL has the
+decrypted key and navi has no further use for them.
+
+`clearTlsSecrets` builds the remaining contexts eagerly and then zeroes navi's
+copy, so the client keeps working, mTLS included. Worth calling in a service that
+presents a client certificate and expects to run for days; pointless for a
+short-lived process, and a no-op for a client with no in-memory credential.
+
+What it does not do: it cannot reach the config *you* built (`newNavi` takes it by
+value), so wipe that yourself; the same `cleanse` is exported for any other secret
+string you hold. And it is refused with a `ValueError` while HTTP/3 is enabled on
+a `-d:naviHttp3` build, because the h3 driver rebuilds its TLS context from these
+fields per connection: drop `H3` from `config.http` if you want the wipe, or keep
+the material in memory. Whichever you choose, the plaintext navi reads out of
+`certFile`/`keyFile`/`pkcs12File` is now zeroed before its buffer is freed.
+
+One thing no wipe can do is reach a secret that was compiled in. A string built
+from a literal, a `const` or `staticRead` is backed by the binary's read-only
+data, and under `--mm:arc`/`--mm:orc` every copy shares that payload, so
+`cleanse` writes over a private copy while the original stays readable for the
+life of the process (and sits in the binary on disk regardless). Read the
+passphrase and the key at run time, from a file, an environment variable or a
+secrets API.
+
+This is a defence in depth against a *process*-level disclosure, not against an
+attacker who can already run code in the process: OpenSSL still holds the
+decrypted key, and nothing here protects it.
 
 ### Session resumption
 
@@ -259,12 +338,16 @@ hardening; they are described in [THREAT_MODEL.md](THREAT_MODEL.md#denial-of-ser
 ### HTTP/3
 
 ```nim
-config.http = {H1, H2, H3}   # requires a -d:naviHttp3 build
+config.http = {H1, H2}       # opt a client OUT of h3 in a -d:naviHttp3 build
+config.http = {H1, H2, H3}   # the default of such a build, spelled out
 ```
 
-Opt-in: HTTP/3 is honored only in a `-d:naviHttp3` build and must be listed
-explicitly in `http` (an empty set does not imply it). It is reached per origin
-after Alt-Svc discovery and honors the same `TlsConfig` as the other backends:
+The opt-in is the build flag, not the field: h3 exists only in a `-d:naviHttp3`
+build, but `H3` is in that build's default `http` set, so every client that leaves
+`config.http` alone negotiates h3. Assign an `http` set without `H3` to keep a
+given client on h1/h2 (an empty set names no protocol and does not imply h3
+either, unlike h2). h3 is reached per origin after Alt-Svc discovery and honors
+the same `TlsConfig` as the other backends:
 `caFile`/`caBundle`, the client credential (mTLS), `ciphers`/`cipherSuites`, the
 chain and hostname check, and `pinnedKeys`/`verifyCallback` on the peer leaf before
 the connection is used. QUIC is TLS 1.3 only, so a `maxVersion` below TLS 1.3 rules

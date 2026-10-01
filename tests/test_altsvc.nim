@@ -2,7 +2,7 @@
 
 import unittest
 import std/options
-import navi/core/altsvc
+import navi/core/[altsvc, url]
 
 suite "parseAltSvc":
   test "parseAltSvc should read an h3 advertisement with default max-age":
@@ -225,3 +225,46 @@ suite "openH3Tracked":
   test "openH3Tracked on a nil cache should still yield the connection":
     var c: AltSvcCache = nil
     check c.openH3Tracked("example.com", 443, openOk()) == "conn"
+
+suite "recordFrom scheme gate":
+  # RFC 7838 2.1: an alternative service may only be learned from a response that
+  # arrived over a secure transport. `recordFrom` is the single gate every transport
+  # goes through, so a cleartext response can never name the https origin's h3
+  # endpoint (#434).
+  test "an Alt-Svc header on a plain-http response should not reach the cache":
+    let c = newAltSvcCache()
+    c.recordFrom(parseUrl("http://api.example:8443/health"),
+                 "h3=\"evil.example:443\"; ma=3600")
+    check c.h3Endpoint("https", "api.example", 8443).isNone   # the https origin
+    check c.h3Endpoint("http", "api.example", 8443).isNone    # and no http key either
+
+  test "an Alt-Svc header on an https response should be recorded":
+    let c = newAltSvcCache()
+    c.recordFrom(parseUrl("https://api.example:8443/"), "h3=\":8443\"; ma=3600")
+    let ep = c.h3Endpoint("https", "api.example", 8443)
+    check ep.isSome
+    check ep.get.host == "api.example"
+    check ep.get.port == 8443
+
+  test "recordFrom should use the scheme default port when the URL omits it":
+    let c = newAltSvcCache()
+    c.recordFrom(parseUrl("https://api.example/"), "h3=\":443\"; ma=3600")
+    check c.h3Endpoint("https", "api.example", 443).isSome
+
+  test "recordFrom should accept an uppercase https scheme":
+    let c = newAltSvcCache()
+    c.recordFrom(parseUrl("HTTPS://API.example/"), "h3=\":443\"; ma=3600")
+    check c.h3Endpoint("https", "api.example", 443).isSome
+
+  test "a cleartext clear directive should not drop the https entry":
+    # The mirror of the poisoning case: an on-path attacker on the http leg must not
+    # be able to evict the origin's real advertisement either.
+    let c = newAltSvcCache()
+    c.recordFrom(parseUrl("https://api.example:8443/"), "h3=\":8443\"; ma=3600")
+    c.recordFrom(parseUrl("http://api.example:8443/health"), "clear")
+    check c.h3Endpoint("https", "api.example", 8443).isSome
+
+  test "recordFrom on a nil cache should not raise":
+    var c: AltSvcCache = nil
+    c.recordFrom(parseUrl("https://api.example/"), "h3=\":443\"; ma=3600")
+    check c.h3Endpoint("https", "api.example", 443).isNone

@@ -42,6 +42,13 @@ RUN git clone --depth 1 --recursive https://github.com/ngtcp2/ngtcp2 /src/ngtcp2
 # A zero-config HTTP/3 origin for the probe to dial.
 COPY --from=caddy:2 /usr/bin/caddy /usr/bin/caddy
 
+# aioquic: a scriptable QUIC stack, used for the one peer Caddy cannot be -- a
+# listener that completes the handshake and selects no ALPN protocol at all, which is
+# what the #445 gate is about (tests/interop/http3/noalpn_server.py).
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip \
+ && pip3 install --no-cache-dir --break-system-packages aioquic \
+ && rm -rf /var/lib/apt/lists/*
+
 ENV PKG_CONFIG_PATH=$OSSL/lib/pkgconfig:$NGHTTP3/lib/pkgconfig:$NGTCP2/lib/pkgconfig
 ENV LD_LIBRARY_PATH=$OSSL/lib:$NGHTTP3/lib:$NGTCP2/lib
 

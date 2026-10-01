@@ -39,6 +39,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
+#include <cstdarg>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -62,6 +64,81 @@ typedef std::ptrdiff_t (*NaviBodyPull)(void *env, const char **out_ptr);
 }
 
 namespace {
+
+// --- last-error reporting (#446) ---------------------------------------------
+// Every TLS and transport failure in this file used to be reported with
+// fprintf(stderr, ...) plus a null/-1 return: library code writing unconditionally to
+// the host process's stderr, while the Nim side raised a fixed-text QuicError naming
+// no cause at all. An application could not tell a certificate rejection from a
+// black-holed UDP path, and an operator whose caFile failed to parse for h3 only ever
+// saw it on a stderr the process may own for something else.
+//
+// Each failure now records a NAVI_H3_ERR_* code and a reason here. The Nim wrappers
+// read both right after a failing call (backend/quic.h3LastError) and put the reason
+// into the QuicError they raise -- a QuicTlsError for the TLS codes, so a caller can
+// tell a verification rejection from a network failure.
+//
+// Thread-local rather than per-connection: every failure is recorded on the thread
+// that made the failing call and read by that same thread's raise site immediately
+// after, and the slot must also carry the failures that happen before a connection
+// exists (SSL_CTX_new, an unparseable caFile). A fixed buffer, so recording an error
+// never allocates -- some of these paths are ngtcp2/nghttp3 callbacks that must not
+// throw -- and the pointer navi_h3_last_error hands out stays valid until the next
+// failure on that thread.
+constexpr std::size_t kErrMax = 512;
+thread_local char g_err_msg[kErrMax] = {0};
+thread_local int g_err_code = NAVI_H3_ERR_NONE;
+
+#if defined(__GNUC__)
+__attribute__((format(printf, 2, 3)))
+#endif
+void set_error(int code, const char *fmt, ...) noexcept {
+  g_err_code = code;
+  std::va_list ap;
+  va_start(ap, fmt);
+  std::vsnprintf(g_err_msg, sizeof g_err_msg, fmt, ap);
+  va_end(ap);
+}
+
+void clear_error() noexcept {
+  g_err_msg[0] = '\0';
+  g_err_code = NAVI_H3_ERR_NONE;
+}
+
+// The MOST RECENT queued OpenSSL error as text in `buf`, with the whole queue
+// drained so a leftover entry cannot be misreported against a later failure.
+// ERR_peek_last_error, not ERR_get_error: the queue is a FIFO and ERR_get_error pops
+// the OLDEST entry, which on a multi-frame failure is the outermost and least
+// specific one. A DER certificate handed to SSL_CTX_use_certificate_chain_file, for
+// instance, queues PEM_R_NO_START_LINE first and the real reason behind it, so every
+// such failure was reported as "no start line" whatever had actually gone wrong. The
+// queue is cleared unconditionally, including in the empty case: an OpenSSL entry
+// point can fail without queueing anything, and either way the next SSL_get_error
+// read on this thread needs the queue empty.
+const char *ossl_error(char *buf, std::size_t cap) noexcept {
+  const unsigned long e = ERR_peek_last_error();
+  if (e == 0)
+    std::snprintf(buf, cap, "no OpenSSL error queued");
+  else
+    ERR_error_string_n(e, buf, cap);
+  ERR_clear_error();
+  return buf;
+}
+
+// A peer-supplied byte string rendered safely into an error message: printable ASCII
+// kept, everything else shown as '?', truncated to the buffer. Used for the ALPN
+// protocol the peer selected (#445) -- peer-controlled bytes never reach a message raw.
+void printable(char *out, std::size_t cap, const unsigned char *p,
+               unsigned int len) noexcept {
+  // SSL_get0_alpn_selected leaves both of its outputs untouched when no protocol was
+  // selected, so a caller that only zeroed the pointer can hand us nullptr with a
+  // stale length -- which the loop below would dereference. Treat it as empty.
+  if (p == nullptr) len = 0;
+  std::size_t n = 0;
+  for (unsigned int i = 0; i < len && n + 1 < cap; ++i)
+    out[n++] = (p[i] >= 0x20 && p[i] < 0x7f) ? static_cast<char>(p[i]) : '?';
+  out[n] = '\0';
+}
 
 // RAII wrappers for the C resources this file manages by hand, so an acquire is freed
 // on every path (including early returns and future edits) without a manual free.
@@ -188,6 +265,10 @@ struct H3Conn {
   bool has_abort = false;   // some stream's producer failed; reset it in send_step
   bool draining = false;    // peer closed the connection gracefully (CONNECTION_CLOSE /
                             // draining): a clean end, not a transport error
+  int close_tls_alert = -1; // TLS alert to report in the CONNECTION_CLOSE written at
+                            // teardown, as crypto_error(alert) instead of NO_ERROR:
+                            // set when navi itself fails the connection over TLS
+                            // (no_application_protocol, #445). -1 = none.
   unsigned long long max_body = 0;  // navi maxResponseBytes: cap on a single response
                                     // body the driver will buffer (0 = unlimited)
   unsigned long long handshake_timeout_ms = 0;  // navi connectMs; bounds the blocking
@@ -273,7 +354,9 @@ int on_recv_stream_data(ngtcp2_conn *conn, std::uint32_t flags,
   int fin = (flags & NGTCP2_STREAM_DATA_FLAG_FIN) != 0;
   if (!c->h3) {   // before navi_h3_bind: park it for replay instead of dropping it
     if (c->prebind_bytes + datalen > kPreBindMaxBytes) {
-      std::fprintf(stderr, "h3: peer sent too much before the session was bound\n");
+      set_error(NAVI_H3_ERR_PROTOCOL,
+                "peer sent more than %zu bytes before the HTTP/3 session was bound",
+                kPreBindMaxBytes);
       return NGTCP2_ERR_CALLBACK_FAILURE;
     }
     try {
@@ -288,7 +371,14 @@ int on_recv_stream_data(ngtcp2_conn *conn, std::uint32_t flags,
     return 0;   // the flow-control offsets are extended when it is replayed
   }
   nghttp3_ssize n = nghttp3_conn_read_stream(c->h3, stream_id, data, datalen, fin);
-  if (n < 0) return NGTCP2_ERR_CALLBACK_FAILURE;
+  if (n < 0) {
+    // Recorded here, where the reason exists: all ngtcp2 passes back out is
+    // NGTCP2_ERR_CALLBACK_FAILURE, and navi_h3_recv now keeps whatever this callback
+    // recorded instead of overwriting it with that.
+    set_error(NAVI_H3_ERR_PROTOCOL, "nghttp3 read_stream: %s",
+              nghttp3_strerror(static_cast<int>(n)));
+    return NGTCP2_ERR_CALLBACK_FAILURE;
+  }
   ngtcp2_conn_extend_max_stream_offset(conn, stream_id, static_cast<std::uint64_t>(n));
   ngtcp2_conn_extend_max_offset(conn, static_cast<std::uint64_t>(n));
   return 0;
@@ -673,7 +763,8 @@ ngtcp2_ssize send_step(H3Conn *c, std::span<std::uint8_t> buf) {
     if (c->h3) {
       sveccnt = nghttp3_conn_writev_stream(c->h3, &stream_id, &fin, vec.data(), vec.size());
       if (sveccnt < 0) {
-        std::fprintf(stderr, "nghttp3 writev: %s\n", nghttp3_strerror(static_cast<int>(sveccnt)));
+        set_error(NAVI_H3_ERR_PROTOCOL, "nghttp3 writev_stream: %s",
+                  nghttp3_strerror(static_cast<int>(sveccnt)));
         return -1;
       }
     }
@@ -703,7 +794,8 @@ ngtcp2_ssize send_step(H3Conn *c, std::span<std::uint8_t> buf) {
       continue;
     }
     if (wrote < 0) {
-      std::fprintf(stderr, "writev_stream: %s\n", ngtcp2_strerror(static_cast<int>(wrote)));
+      set_error(NAVI_H3_ERR_NETWORK, "ngtcp2 writev_stream: %s",
+                ngtcp2_strerror(static_cast<int>(wrote)));
       return -1;
     }
     if (ndatalen > 0)
@@ -721,7 +813,7 @@ int drive_until(H3Conn *c, const bool *flag, unsigned long long budget_ms = 0);
 // The QUIC leg used to receive only a CA file and a verify flag, so caBundle, the
 // client credential and the cipher/version bounds were silently dropped on h3 while
 // the TCP backends honoured them (#419). These helpers apply the same policy to the
-// QUIC SSL_CTX; each one reports the reason on stderr and returns false so
+// QUIC SSL_CTX; each one records the reason (set_error) and returns false so
 // navi_h3_new fails closed rather than connecting with a weaker configuration.
 
 bool is_set(const char *s) { return s != nullptr && s[0] != '\0'; }
@@ -731,16 +823,27 @@ bool is_set(const char *s) { return s != nullptr && s[0] != '\0'; }
 // instead when no password is configured.
 int navi_pw_cb(char *buf, int size, int /*rwflag*/, void *u) {
   const char *pw = static_cast<const char *>(u);
-  if (!is_set(pw)) return -1;
+  // 0, not -1, when there is no usable password: that is what
+  // openssl_ctx.pemPassword returns on the TCP backends, and the two values do not
+  // produce the same OpenSSL error. A 0 becomes PEM_R_BAD_PASSWORD_READ, which is
+  // what the "set tls.password" wording below is written against; a negative return
+  // surfaces as an unrelated generic decode failure, so the same missing passphrase
+  // was reported differently depending on which leg loaded the key.
+  if (!is_set(pw) || size <= 0) return 0;
   const int n = static_cast<int>(std::strlen(pw));
-  if (n > size) return -1;
+  if (n > size) return 0;
   std::memcpy(buf, pw, static_cast<std::size_t>(n));
   return n;
 }
 
 bool read_whole_file(const char *path, std::string &out) {
   BioPtr bio{BIO_new_file(path, "rb")};
-  if (!bio) return false;
+  if (!bio) {
+    char eb[256];
+    set_error(NAVI_H3_ERR_TLS, "could not read %s: %s", path,
+              ossl_error(eb, sizeof eb));
+    return false;
+  }
   char chunk[8192];
   int n;
   while ((n = BIO_read(bio.get(), chunk, sizeof(chunk))) > 0)
@@ -753,9 +856,17 @@ bool read_whole_file(const char *path, std::string &out) {
 // rather than replacing them (same contract as openssl_ctx.addCaBundle).
 bool apply_ca_bundle(SSL_CTX *ctx, const char *pem) {
   X509_STORE *store = SSL_CTX_get_cert_store(ctx);
-  if (!store) return false;
+  if (!store) {
+    set_error(NAVI_H3_ERR_INTERNAL, "the QUIC SSL_CTX has no certificate store");
+    return false;
+  }
   BioPtr bio{BIO_new_mem_buf(pem, -1)};
-  if (!bio) return false;
+  if (!bio) {
+    char eb[256];
+    set_error(NAVI_H3_ERR_TLS, "could not read TlsConfig.caBundle: %s",
+              ossl_error(eb, sizeof eb));
+    return false;
+  }
   int added = 0;
   while (true) {
     X509Ptr cert{PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr)};
@@ -766,7 +877,7 @@ bool apply_ca_bundle(SSL_CTX *ctx, const char *pem) {
   }
   ERR_clear_error();   // the loop always ends on a PEM "no start line" error
   if (added == 0) {
-    std::fprintf(stderr, "h3 tls: no certificate found in TlsConfig.caBundle\n");
+    set_error(NAVI_H3_ERR_TLS, "no certificate found in TlsConfig.caBundle");
     return false;
   }
   return true;
@@ -824,6 +935,54 @@ bool use_pkcs12(SSL_CTX *ctx, const std::string &der, const char *password) {
   return true;
 }
 
+// Install a DER private key from `path`: a traditional RSA/EC key, an unencrypted
+// PKCS#8 PrivateKeyInfo, or an encrypted PKCS#8 EncryptedPrivateKeyInfo (from
+// `openssl pkcs8 -topk8 -outform DER -v2 aes-256-cbc`). SSL_CTX_use_PrivateKey_file
+// with SSL_FILETYPE_ASN1, which this replaces, decodes only the first two: it calls
+// d2i_PrivateKey and never consults the passphrase callback, so an encrypted DER key
+// failed on h3 with `password` silently ignored, exactly as on the TCP backends
+// (#436). Mirrors openssl_ctx.useKeyDer, including the order of the two attempts.
+bool use_key_der_file(SSL_CTX *ctx, const char *path, const char *password) {
+  EvpPkeyPtr key;
+  {
+    BioPtr bio{BIO_new_file(path, "rb")};
+    if (!bio) return false;
+    key.reset(d2i_PrivateKey_bio(bio.get(), nullptr));
+  }
+  if (!key) {
+    // Not an unencrypted key; re-read the file as EncryptedPrivateKeyInfo. The
+    // failed attempt left entries on the thread's error queue.
+    ERR_clear_error();
+    BioPtr bio{BIO_new_file(path, "rb")};
+    if (!bio) return false;
+    // navi_pw_cb rather than a null callback: OpenSSL's default prompts on the
+    // controlling terminal, and ours fails when no password is configured.
+    key.reset(d2i_PKCS8PrivateKey_bio(bio.get(), nullptr, navi_pw_cb,
+                                      const_cast<char *>(password)));
+  }
+  if (!key) {
+    // The same two messages openssl_ctx.useKeyDer raises, so an encrypted DER key
+    // is reported identically whichever leg loaded it: "wrong password?" when one
+    // was configured, and the hint to set `tls.password` when none was. The generic
+    // "could not load the client certificate/key: <OpenSSL reason>" this used to
+    // fall through to named the mechanism (a bad decrypt) and not the fix.
+    //
+    // The queue is drained first: it holds the second attempt's decrypt failure,
+    // which adds nothing to either message and must not be misreported against a
+    // later call (the same reason openssl_ctx.useKeyDer clears it here).
+    ERR_clear_error();
+    if (is_set(password))
+      set_error(NAVI_H3_ERR_TLS,
+                "could not load the DER private key (wrong password?): %s", path);
+    else
+      set_error(NAVI_H3_ERR_TLS,
+                "could not load the DER private key; set tls.password if it is an "
+                "encrypted PKCS#8 key: %s", path);
+    return false;
+  }
+  return SSL_CTX_use_PrivateKey(ctx, key.get()) == 1;
+}
+
 // Install the client credential described by `t`. Precedence matches the TCP path
 // (openssl_ctx.loadClientCert): PKCS#12, then in-memory PEM, then the file pair.
 // Files may be PEM or DER; PEM is tried first and DER is the fallback.
@@ -855,14 +1014,24 @@ bool apply_client_cert(SSL_CTX *ctx, const NaviH3Tls *t) {
          SSL_CTX_use_certificate_file(ctx, t->cert_file, SSL_FILETYPE_ASN1) == 1;
     if (ok)
       ok = SSL_CTX_use_PrivateKey_file(ctx, keyPath, SSL_FILETYPE_PEM) == 1 ||
-           SSL_CTX_use_PrivateKey_file(ctx, keyPath, SSL_FILETYPE_ASN1) == 1;
+           use_key_der_file(ctx, keyPath, t->password);
   }
   if (!ok) {
-    std::fprintf(stderr, "h3 tls: could not load the client certificate/key\n");
+    // Only when no helper recorded something better: use_key_der_file names the
+    // file and what to do about it, and the OpenSSL reason behind it is the
+    // mechanism, not the cause, so overwriting it threw the useful message away.
+    if (g_err_code == NAVI_H3_ERR_NONE) {
+      char eb[256];
+      set_error(NAVI_H3_ERR_TLS, "could not load the client certificate/key: %s",
+                ossl_error(eb, sizeof eb));
+    } else {
+      ERR_clear_error();   // the recorded reason stands; do not leave the queue dirty
+    }
     return false;
   }
   if (SSL_CTX_check_private_key(ctx) != 1) {
-    std::fprintf(stderr, "h3 tls: the client certificate and private key do not match\n");
+    set_error(NAVI_H3_ERR_TLS,
+              "the client certificate and private key do not match");
     return false;
   }
   ERR_clear_error();
@@ -874,11 +1043,17 @@ bool apply_client_cert(SSL_CTX *ctx, const NaviH3Tls *t) {
 // the h3 endpoint in that case, and this is the backstop for a direct FFI caller.
 bool apply_versions(SSL_CTX *ctx, const NaviH3Tls *t) {
   if (t->max_version != 0 && t->max_version < 13) {
-    std::fprintf(stderr, "h3 tls: HTTP/3 requires TLS 1.3, but maxVersion is lower\n");
+    set_error(NAVI_H3_ERR_TLS,
+              "HTTP/3 requires TLS 1.3, but TlsConfig.maxVersion is lower");
     return false;
   }
-  if (SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION) != 1) return false;
-  if (SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION) != 1) return false;
+  if (SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION) != 1 ||
+      SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION) != 1) {
+    char eb[256];
+    set_error(NAVI_H3_ERR_TLS, "could not pin the QUIC context to TLS 1.3: %s",
+              ossl_error(eb, sizeof eb));
+    return false;
+  }
   return true;
 }
 
@@ -886,12 +1061,12 @@ bool apply_ciphers(SSL_CTX *ctx, const NaviH3Tls *t) {
   // `ciphers` selects TLS <= 1.2 suites, which QUIC never negotiates; it is still
   // validated and applied so a typo is reported rather than silently ignored.
   if (is_set(t->ciphers) && SSL_CTX_set_cipher_list(ctx, t->ciphers) != 1) {
-    std::fprintf(stderr, "h3 tls: no usable cipher in TlsConfig.ciphers\n");
+    set_error(NAVI_H3_ERR_TLS, "no usable cipher in TlsConfig.ciphers");
     return false;
   }
   if (is_set(t->cipher_suites) &&
       SSL_CTX_set_ciphersuites(ctx, t->cipher_suites) != 1) {
-    std::fprintf(stderr, "h3 tls: no usable ciphersuite in TlsConfig.cipherSuites\n");
+    set_error(NAVI_H3_ERR_TLS, "no usable ciphersuite in TlsConfig.cipherSuites");
     return false;
   }
   return true;
@@ -900,11 +1075,12 @@ bool apply_ciphers(SSL_CTX *ctx, const NaviH3Tls *t) {
 // Build the QUIC SSL_CTX described by `t`. Everything here depends on the TLS
 // policy alone, never on the connection, which is what makes the result shareable;
 // the per-connection settings (SNI, the expected peer identity, ALPN) are applied to
-// the SSL in navi_h3_new. Returns nullptr with the reason on stderr.
+// the SSL in navi_h3_new. Returns nullptr with the reason in the last-error slot.
 SSL_CTX *build_ssl_ctx(const NaviH3Tls *t) {
   SslCtxPtr ctx{SSL_CTX_new(TLS_method())};
   if (!ctx) {
-    std::fprintf(stderr, "SSL_CTX_new failed\n");
+    char eb[256];
+    set_error(NAVI_H3_ERR_TLS, "SSL_CTX_new failed: %s", ossl_error(eb, sizeof eb));
     return nullptr;
   }
   // Verify the server certificate by default (matching navi's TlsConfig.verify),
@@ -921,11 +1097,19 @@ SSL_CTX *build_ssl_ctx(const NaviH3Tls *t) {
   if (t->verify) {
     if (is_set(t->ca_file)) {
       if (SSL_CTX_load_verify_locations(ctx.get(), t->ca_file, nullptr) != 1) {
-        std::fprintf(stderr, "failed to load CA file %s\n", t->ca_file);
+        char eb[256];
+        set_error(NAVI_H3_ERR_TLS, "could not load the CA file %s: %s", t->ca_file,
+                  ossl_error(eb, sizeof eb));
         return nullptr;
       }
-    } else {
-      SSL_CTX_set_default_verify_paths(ctx.get());
+    } else if (SSL_CTX_set_default_verify_paths(ctx.get()) != 1) {
+      // Its result used to be ignored (#446), which would have left the context
+      // verifying against an empty trust store: every chain then fails in
+      // navi_h3_bind, per connection, with nothing saying why. Fail closed instead.
+      char eb[256];
+      set_error(NAVI_H3_ERR_TLS, "could not load the system trust store: %s",
+                ossl_error(eb, sizeof eb));
+      return nullptr;
     }
     // Extra in-memory roots supplement caFile / the system store, exactly as on
     // the TCP backends; only meaningful when a chain is actually being built.
@@ -1119,6 +1303,13 @@ bool ip_literal(const char *s, std::string &out) {
   return true;
 }
 
+// Exactly the two bytes "h3", the only ALPN protocol an HTTP/3 connection may use
+// (RFC 9114 3.1) and the only one navi offers. A peer that selected nothing arrives
+// here as a null pointer with length 0, which is the case #445 is about.
+bool alpn_is_h3(const unsigned char *proto, unsigned int len) noexcept {
+  return len == 2 && proto != nullptr && std::memcmp(proto, "h3", 2) == 0;
+}
+
 nghttp3_nv method_nv(const char *method) {  // :method value is a C string param
   return nghttp3_nv{reinterpret_cast<std::uint8_t *>(const_cast<char *>(":method")),
                     reinterpret_cast<std::uint8_t *>(const_cast<char *>(method)), 7,
@@ -1162,6 +1353,13 @@ void navi_h3_ctx_cache_stats(unsigned long long *builds, unsigned long long *reu
   }
 }
 
+// The reason the driver recorded for the most recent failure on THIS thread, and its
+// NAVI_H3_ERR_* code (#446). "" / NAVI_H3_ERR_NONE when nothing is recorded. The
+// pointer stays valid until the next failure on this thread; the Nim wrappers copy it
+// immediately, in the raise that reports the failing call.
+const char *navi_h3_last_error(void) { return g_err_msg; }
+int navi_h3_last_error_code(void) { return g_err_code; }
+
 int navi_h3_fd(H3Conn *c) { return c->fd; }
 
 int navi_h3_handshake_done(H3Conn *c) {
@@ -1177,6 +1375,7 @@ ngtcp2_ssize navi_h3_send(H3Conn *c, std::uint8_t *buf, std::size_t buflen) {
 // (#278) lets the reader deliver already-completed streams and fail only in-flight ones,
 // instead of treating a normal server shutdown as an abnormal transport failure.
 int navi_h3_recv(H3Conn *c, const std::uint8_t *pkt, std::size_t len) {
+  clear_error();   // see navi_h3_new: never report a stale reason as this one
   ngtcp2_pkt_info pi{};
   int rv = ngtcp2_conn_read_pkt(c->conn, &c->path, &pi, pkt, len, now_ns());
   if (rv == 0) return 0;
@@ -1188,7 +1387,14 @@ int navi_h3_recv(H3Conn *c, const std::uint8_t *pkt, std::size_t len) {
     c->draining = true;
     return 1;
   }
-  std::fprintf(stderr, "read_pkt: %s\n", ngtcp2_strerror(rv));
+  // Only if nothing more specific was recorded while the packet was being handled.
+  // read_pkt runs navi's ngtcp2 callbacks, and on_recv_stream_data records a PROTOCOL
+  // reason (a peer flooding before the HTTP/3 session is bound, an nghttp3 stream
+  // error) before returning NGTCP2_ERR_CALLBACK_FAILURE. Overwriting it with "ngtcp2
+  // read_pkt: callback failed" replaced the cause with the mechanism by which it was
+  // reported.
+  if (g_err_code == NAVI_H3_ERR_NONE)
+    set_error(NAVI_H3_ERR_NETWORK, "ngtcp2 read_pkt: %s", ngtcp2_strerror(rv));
   return -1;
 }
 
@@ -1204,7 +1410,7 @@ std::uint64_t navi_h3_timeout_ms(H3Conn *c) {
 
 int navi_h3_handle_timeout(H3Conn *c) {
   if (ngtcp2_conn_handle_expiry(c->conn, now_ns()) != 0) {
-    std::fprintf(stderr, "handle_expiry failed\n");
+    set_error(NAVI_H3_ERR_NETWORK, "ngtcp2 handle_expiry failed");
     return -1;
   }
   return 0;
@@ -1215,11 +1421,13 @@ int navi_h3_handle_timeout(H3Conn *c) {
 // block for the sync blocking loops (handshake, buffered request, and the sync
 // streaming reader). Returns 0 on success, -1 on a transport error.
 int navi_h3_pump(H3Conn *c) {
+  clear_error();   // see navi_h3_new
   std::array<std::uint8_t, 1500> buf{};
   ngtcp2_ssize n;
   while ((n = navi_h3_send(c, buf.data(), buf.size())) > 0)
     if (send(c->fd, buf.data(), static_cast<std::size_t>(n), 0) < 0) {
-      std::perror("send");
+      set_error(NAVI_H3_ERR_NETWORK, "datagram send failed: %s",
+                std::strerror(errno));
       return -1;
     }
   if (n < 0) return -1;
@@ -1249,10 +1457,18 @@ int navi_h3_pump(H3Conn *c) {
 // poll/recv. Used at teardown to push a stream FIN / CONNECTION_CLOSE promptly
 // instead of blocking on the QUIC timer.
 int navi_h3_flush(H3Conn *c) {
+  clear_error();   // see navi_h3_new
   std::array<std::uint8_t, 1500> buf{};
   ngtcp2_ssize n;
   while ((n = navi_h3_send(c, buf.data(), buf.size())) > 0)
-    if (send(c->fd, buf.data(), static_cast<std::size_t>(n), 0) < 0) return -1;
+    if (send(c->fd, buf.data(), static_cast<std::size_t>(n), 0) < 0) {
+      // Recorded, like navi_h3_pump's identical send: this was the one driver entry
+      // point that could fail leaving the last-error slot empty, so a caller's
+      // h3Reason had no reason to append.
+      set_error(NAVI_H3_ERR_NETWORK, "datagram send failed: %s",
+                std::strerror(errno));
+      return -1;
+    }
   return n < 0 ? -1 : 0;
 }
 
@@ -1271,15 +1487,54 @@ void navi_h3_wake(H3Conn *c) {
 // handshake certificate verification runs (see navi_h3_new): reject an untrusted or
 // mismatched peer here, before any h3 stream is opened.
 int navi_h3_bind(H3Conn *c) {
+  clear_error();   // see navi_h3_new (#446)
   if (c->want_verify) {
     X509Ptr cert{SSL_get1_peer_certificate(c->ssl)};   // freed on every path below
     if (!cert) {   // a TLS server always sends one; its absence is a failure
-      std::fprintf(stderr, "h3 verify: peer presented no certificate\n");
+      set_error(NAVI_H3_ERR_TLS_VERIFY, "peer presented no certificate");
       return -1;
     }
     long vr = SSL_get_verify_result(c->ssl);   // chain + hostname (SSL_set1_host)
     if (vr != X509_V_OK) {
-      std::fprintf(stderr, "h3 verify: certificate verification failed (%ld)\n", vr);
+      set_error(NAVI_H3_ERR_TLS_VERIFY, "certificate verification failed: %s (%ld)",
+                X509_verify_cert_error_string(vr), vr);
+      return -1;
+    }
+  }
+  // The peer must have selected the "h3" ALPN protocol (RFC 9114 3.1 / RFC 7301).
+  // navi offers only "h3" and OpenSSL rejects a server that answers with something
+  // else (tls_parse_stoc_alpn), but nothing on this path enforces that a protocol was
+  // selected AT ALL: ngtcp2's crypto_ossl binding does not look, and OpenSSL's
+  // no_application_protocol check lives in ossl_quic_tls_tick, which only its own
+  // native QUIC stack runs -- not the third-party TLS interface (SSL_set_quic_tls_cbs)
+  // ngtcp2 uses. So a non-compliant QUIC listener that completed the handshake with no
+  // ALPN selection was treated as an h3 peer: navi opened the control/QPACK streams,
+  // submitted the request, and failed late as a stream reset (QuicSubmittedError),
+  // which mayFallBackFromH3 refuses to fall back for a non-idempotent method -- an
+  // error the application could do nothing with. Fail here instead, before the session
+  // exists and before anything is submitted, so the failure is a clean pre-submit
+  // QuicError that any method may fall back from; and tell the peer why, with
+  // crypto_error(no_application_protocol) (TLS alert 120, RFC 9001 4.8) in the
+  // CONNECTION_CLOSE navi_h3_close writes (#445).
+  {
+    const unsigned char *proto = nullptr;
+    unsigned int proto_len = 0;
+    SSL_get0_alpn_selected(c->ssl, &proto, &proto_len);
+    if (!alpn_is_h3(proto, proto_len)) {
+      // Two different peers reach this, and the message has to tell them apart: one
+      // selected no protocol at all (the non-compliant listener this gate is about),
+      // the other selected something that is not "h3". A bare `(selected "")` read
+      // as the second when it was really the first.
+      if (proto == nullptr || proto_len == 0) {
+        set_error(NAVI_H3_ERR_PROTOCOL,
+                  "peer did not select the h3 ALPN protocol (selected none)");
+      } else {
+        char shown[64];
+        printable(shown, sizeof shown, proto, proto_len);
+        set_error(NAVI_H3_ERR_PROTOCOL,
+                  "peer did not select the h3 ALPN protocol (selected \"%s\")", shown);
+      }
+      c->close_tls_alert = 120;   // no_application_protocol -> crypto_error 0x178
       return -1;
     }
   }
@@ -1299,15 +1554,26 @@ int navi_h3_bind(H3Conn *c) {
 #else
   cb.recv_settings = on_recv_settings;
 #endif
-  if (nghttp3_conn_client_new(&c->h3, &cb, &settings, nullptr, c) != 0) return -1;
+  // Each of the three arms below records its reason: they are the rest of the "every
+  // failure explains itself" contract, and a bind that returned -1 with an empty slot
+  // left the wrappers raising "navi HTTP/3 bind failed" with nothing after it.
+  if (nghttp3_conn_client_new(&c->h3, &cb, &settings, nullptr, c) != 0) {
+    set_error(NAVI_H3_ERR_INTERNAL, "nghttp3_conn_client_new failed");
+    return -1;
+  }
   std::int64_t ctrl, qenc, qdec;
   if (ngtcp2_conn_open_uni_stream(c->conn, &ctrl, nullptr) != 0 ||
       ngtcp2_conn_open_uni_stream(c->conn, &qenc, nullptr) != 0 ||
-      ngtcp2_conn_open_uni_stream(c->conn, &qdec, nullptr) != 0)
+      ngtcp2_conn_open_uni_stream(c->conn, &qdec, nullptr) != 0) {
+    set_error(NAVI_H3_ERR_PROTOCOL,
+              "the peer did not allow the HTTP/3 control and QPACK streams");
     return -1;
+  }
   if (nghttp3_conn_bind_control_stream(c->h3, ctrl) != 0 ||
-      nghttp3_conn_bind_qpack_streams(c->h3, qenc, qdec) != 0)
+      nghttp3_conn_bind_qpack_streams(c->h3, qenc, qdec) != 0) {
+    set_error(NAVI_H3_ERR_INTERNAL, "could not bind the HTTP/3 control streams");
     return -1;
+  }
   // Feed nghttp3 whatever the peer sent before this session existed (see
   // PendingStreamData), in arrival order, and only now extend the flow-control
   // offsets for it.
@@ -1316,8 +1582,8 @@ int navi_h3_bind(H3Conn *c) {
       c->h3, p.id, reinterpret_cast<const std::uint8_t *>(p.data.data()),
       p.data.size(), p.fin ? 1 : 0);
     if (n < 0) {
-      std::fprintf(stderr, "h3 bind: read_stream: %s\n",
-                   nghttp3_strerror(static_cast<int>(n)));
+      set_error(NAVI_H3_ERR_PROTOCOL, "nghttp3 read_stream while binding: %s",
+                nghttp3_strerror(static_cast<int>(n)));
       return -1;
     }
     ngtcp2_conn_extend_max_stream_offset(c->conn, p.id,
@@ -1333,16 +1599,40 @@ int navi_h3_bind(H3Conn *c) {
 // handshake (no I/O, non-blocking).
 H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
                     const NaviH3Tls *tls, unsigned long long max_body) {
+  clear_error();   // so a failure here is never confused with an older one (#446)
   static const NaviH3Tls defaultTls{};   // all-unset: no verification, no credential
   if (!tls) tls = &defaultTls;
   const int verify = tls->verify;
-  static bool crypto_inited = false;
-  if (!crypto_inited) {
-    if (ngtcp2_crypto_ossl_init() != 0) {
-      std::fprintf(stderr, "ngtcp2_crypto_ossl_init failed\n");
-      return nullptr;
-    }
-    crypto_inited = true;
+  // Parity with api.requireVerifiableHost on the TCP backends (#435): verifying
+  // against an empty name is not verifying. With verify on and no host, the
+  // SSL_set1_host below would be called with "" -- which CLEARS the expected-name
+  // list and returns 1, so the handshake completes and navi_h3_bind's
+  // SSL_get_verify_result accepts ANY certificate that chains to a trusted CA, for
+  // whatever answered on the UDP socket. Refused here instead, before anything is
+  // allocated, with the wording the TCP legs raise.
+  if (verify && (sni == nullptr || *sni == '\0')) {
+    set_error(NAVI_H3_ERR_TLS,
+              "no hostname to verify against (the URL has an empty host); give the "
+              "URL a host, or set tls.insecureSkipVerify to connect without an "
+              "identity check");
+    return nullptr;
+  }
+  // One-time init of ngtcp2's OpenSSL crypto binding. The guard used to be a plain
+  // `static bool crypto_inited` set after the call: check-then-set with no mutex,
+  // atomic or call_once, so in a --threads:on program (Nim 2.2's default) two threads
+  // opening their first h3 connection at once could both observe it false and both
+  // run ngtcp2_crypto_ossl_init, which re-fetches and overwrites its file-scope
+  // EVP_CIPHER/EVP_MD globals without freeing the old ones -- a one-time leak of the
+  // first call's EVP objects plus a data race on those globals and on the flag, which
+  // TSan reports (#447). A function-local static's initialisation is thread safe by
+  // construction (C++11 [stmt.dcl]/4: concurrent entrants block until the initialiser
+  // has run, exactly once), so the initialiser itself is the guard, and its result is
+  // kept so a failed init fails every navi_h3_new with a reason rather than being
+  // silently retried per connection.
+  static const int crypto_rc = ngtcp2_crypto_ossl_init();
+  if (crypto_rc != 0) {
+    set_error(NAVI_H3_ERR_INTERNAL, "ngtcp2_crypto_ossl_init failed (%d)", crypto_rc);
+    return nullptr;
   }
   try {
     // Owned locally so any early return / thrown exception frees it and the C
@@ -1363,7 +1653,8 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
       c->wake_w.fd = wp[1];
     }
     if (c->fd < 0) {
-      std::fprintf(stderr, "udp connect failed\n");
+      set_error(NAVI_H3_ERR_NETWORK, "could not open a UDP socket to %s:%s: %s",
+                host, port, std::strerror(errno));
       return nullptr;
     }
 
@@ -1372,11 +1663,12 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
     // cached SSL_CTX, building one only on the first connection for that policy
     // (#454). The reference is the connection's own, released in ~H3Conn.
     c->ssl_ctx = obtain_ssl_ctx(tls);
-    if (!c->ssl_ctx) return nullptr;   // the reason is already on stderr
+    if (!c->ssl_ctx) return nullptr;   // the reason is already recorded
     c->want_verify = verify != 0;
     c->ssl = SSL_new(c->ssl_ctx);
     if (!c->ssl) {
-      std::fprintf(stderr, "SSL_new failed\n");
+      char eb[256];
+      set_error(NAVI_H3_ERR_TLS, "SSL_new failed: %s", ossl_error(eb, sizeof eb));
       return nullptr;
     }
     // Bind the identity the peer must prove before the handshake, the way the TCP
@@ -1388,19 +1680,22 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
       if (sni_is_ip) {
         if (X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(c->ssl),
                                           ip_host.c_str()) != 1) {
-          std::fprintf(stderr, "X509_VERIFY_PARAM_set1_ip_asc failed\n");
+          set_error(NAVI_H3_ERR_TLS,
+                    "could not require the certificate to match the IP %s",
+                    ip_host.c_str());
           return nullptr;
         }
       } else {
         SSL_set_hostflags(c->ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
         if (SSL_set1_host(c->ssl, sni) != 1) {
-          std::fprintf(stderr, "SSL_set1_host failed\n");
+          set_error(NAVI_H3_ERR_TLS,
+                    "could not require the certificate to match the host %s", sni);
           return nullptr;
         }
       }
     }
     if (ngtcp2_crypto_ossl_ctx_new(&c->ossl, c->ssl) != 0) {
-      std::fprintf(stderr, "ossl_ctx_new failed\n");
+      set_error(NAVI_H3_ERR_INTERNAL, "ngtcp2_crypto_ossl_ctx_new failed");
       return nullptr;
     }
     c->ref.get_conn = get_conn;
@@ -1408,10 +1703,19 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
     SSL_set_app_data(c->ssl, &c->ref);
     SSL_set_connect_state(c->ssl);
     if (ngtcp2_crypto_ossl_configure_client_session(c->ssl) != 0) {
-      std::fprintf(stderr, "configure_client_session failed\n");
+      set_error(NAVI_H3_ERR_INTERNAL,
+                "ngtcp2_crypto_ossl_configure_client_session failed");
       return nullptr;
     }
-    SSL_set_alpn_protos(c->ssl, reinterpret_cast<const unsigned char *>("\x02h3"), 3);
+    // Checked, not discarded: it allocates, and on failure the ClientHello would go
+    // out with no ALPN extension at all. A permissive peer would then complete the
+    // handshake selecting nothing and the gate in navi_h3_bind would refuse the
+    // connection as the PEER's fault. Fail here, where the cause is known.
+    if (SSL_set_alpn_protos(c->ssl,
+                            reinterpret_cast<const unsigned char *>("\x02h3"), 3) != 0) {
+      set_error(NAVI_H3_ERR_INTERNAL, "SSL_set_alpn_protos failed");
+      return nullptr;
+    }
     // RFC 6066 3: an IP literal must not be sent as a server_name, so only a real
     // DNS host gets SNI -- same rule as openssl_ctx.newClientSsl (#451).
     if (!sni_is_ip) SSL_set_tlsext_host_name(c->ssl, sni);
@@ -1479,7 +1783,7 @@ H3Conn *navi_h3_new(const char *host, const char *port, const char *sni,
 
     if (ngtcp2_conn_client_new(&c->conn, &dcid, &scid, &c->path, NGTCP2_PROTO_VER_V1,
                                &cb, &settings, &params, nullptr, c.get()) != 0) {
-      std::fprintf(stderr, "ngtcp2_conn_client_new failed\n");
+      set_error(NAVI_H3_ERR_INTERNAL, "ngtcp2_conn_client_new failed");
       return nullptr;
     }
     ngtcp2_conn_set_tls_native_handle(c->conn, c->ossl);
@@ -1521,7 +1825,13 @@ void navi_h3_close(H3Conn *c) {
     std::array<std::uint8_t, 1500> buf{};
     ngtcp2_ccerr ccerr;
     ngtcp2_ccerr_default(&ccerr);     // transport NO_ERROR: valid at any stage
-    if (c->h3 && ngtcp2_conn_get_handshake_completed(c->conn))
+    if (c->close_tls_alert >= 0)
+      // navi failed the connection over TLS itself (no ALPN selected, #445): report
+      // crypto_error(alert) so the peer learns why instead of seeing a clean close.
+      // A transport CONNECTION_CLOSE is legal at any stage, unlike an application one.
+      ngtcp2_ccerr_set_tls_alert(
+        &ccerr, static_cast<std::uint8_t>(c->close_tls_alert), nullptr, 0);
+    else if (c->h3 && ngtcp2_conn_get_handshake_completed(c->conn))
       // An application CONNECTION_CLOSE is only legal once the handshake is done;
       // H3_NO_ERROR is the graceful HTTP/3 shutdown code (RFC 9114 8.1).
       ngtcp2_ccerr_set_application_error(&ccerr, NGHTTP3_H3_NO_ERROR, nullptr, 0);
@@ -1679,9 +1989,16 @@ int navi_h3_peer_allows_connect(H3Conn *c) { return c->peer_connect_protocol ? 1
 // navi_h3_response_headers, then uses navi_h3_tunnel_send / navi_h3_read_body.
 std::int64_t navi_h3_open_connect(H3Conn *c, const char *path_, const char *req_headers,
                                   const char *protocol) {
+  clear_error();   // see navi_h3_new
   try {
     std::int64_t sid;
-    if (ngtcp2_conn_open_bidi_stream(c->conn, &sid, nullptr) != 0) return -1;
+    // Each arm records its reason: quic.nim reports this failure with h3Reason, and a
+    // bare -1 left it raising "h3 Extended CONNECT failed" and nothing else.
+    if (ngtcp2_conn_open_bidi_stream(c->conn, &sid, nullptr) != 0) {
+      set_error(NAVI_H3_ERR_PROTOCOL,
+                "the peer's stream limit left no bidirectional stream for CONNECT");
+      return -1;
+    }
     Stream &s = c->streams[sid];
     s.is_tunnel = true;
 
@@ -1696,12 +2013,17 @@ std::int64_t navi_h3_open_connect(H3Conn *c, const char *path_, const char *req_
 
     nghttp3_data_reader dr{};
     dr.read_data = read_tunnel;
-    if (nghttp3_conn_submit_request(c->h3, sid, nva.data(), nva.size(), &dr, nullptr) != 0) {
+    const int rv = nghttp3_conn_submit_request(c->h3, sid, nva.data(), nva.size(),
+                                              &dr, nullptr);
+    if (rv != 0) {
       c->streams.erase(sid);
+      set_error(NAVI_H3_ERR_PROTOCOL, "nghttp3 submit_request (CONNECT): %s",
+                nghttp3_strerror(rv));
       return -1;
     }
     return sid;
   } catch (...) {
+    set_error(NAVI_H3_ERR_INTERNAL, "out of memory opening the CONNECT stream");
     return -1;
   }
 }
@@ -1896,7 +2218,16 @@ int drive_until(H3Conn *c, const bool *flag, unsigned long long budget_ms) {
     ? budget_ms * NGTCP2_MILLISECONDS : 120ULL * NGTCP2_SECONDS;
   while (!*flag) {
     if (navi_h3_pump(c) != 0) return -1;
-    if (now_ns() - start > budget) return -1;
+    if (now_ns() - start > budget) {
+      // Recorded so the caller's message says what happened: the last pump cycle
+      // succeeded and therefore left the slot empty, so a black-holed UDP path used
+      // to surface as a bare "navi HTTP/3 connect failed" with no reason at all.
+      set_error(NAVI_H3_ERR_NETWORK,
+                "timed out after %llu ms waiting for the HTTP/3 connection to make "
+                "progress",
+                static_cast<unsigned long long>(budget / NGTCP2_MILLISECONDS));
+      return -1;
+    }
   }
   return 0;
 }

@@ -3,7 +3,7 @@
 ## certificate and /sni echo route as iphost_test.nim; `openConnChronos` shares
 ## navi_h3_new with the sync opener, so this pins the fix for the chronos path too.
 ## Built with -d:ssl -d:naviHttp3.
-import std/os
+import std/[os, strutils]
 import pkg/chronos
 import navi/backend/quic_chronos
 
@@ -18,14 +18,23 @@ proc main() {.async.} =
   await c.closeConn()
   echo "ok: IP-literal origin verified, no SNI sent (chronos)"
 
+  # The rejection must also say why: since #446 the driver records the reason instead
+  # of printing it to stderr, so this is a `QuicTlsError` (a `QuicError` subtype, so
+  # the h2/h1 fallback is unchanged) whose message carries the X509 verify error text.
   var rejected = false
+  var reason = ""
   try:
     let bad = await openConnChronos("127.0.0.1", 4433, "127.0.0.2", TlsConfig(caFile: ca))
     await bad.closeConn()
-  except QuicError:
+  except QuicTlsError as e:
     rejected = true
+    reason = e.msg
+  except QuicError as e:
+    doAssert false, "a verification rejection was not a QuicTlsError: " & e.msg
   doAssert rejected, "a certificate without IP:127.0.0.2 was accepted"
-  echo "ok: mismatched IP literal rejected (chronos)"
+  doAssert "IP address mismatch" in reason,
+    "the X509 verify reason was not surfaced: " & reason
+  echo "ok: mismatched IP literal rejected as QuicTlsError naming the X509 error (chronos)"
 
   let dns = await openConnChronos("localhost", 4433, "localhost", TlsConfig(caFile: ca))
   let rd = await dns.requestOnConn("GET", "/sni", @[], "")

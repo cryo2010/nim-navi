@@ -417,6 +417,30 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   conn.parked = new(ParkedRead)       # empty; filled only by an expired `recvWithin`
   when defined(ssl):
     if tls: conn.uncleanEof = new(bool)   # close_notify verdict (see closedCleanly)
+  # Set by the connectMs path below when it gives up on `establish` and raises
+  # TimeoutError. asyncdispatch cannot cancel, so this cell is the only way to tell
+  # the still-running `establish` that its result has no owner any more (issue #443).
+  # A `ref` rather than a plain local so the value is shared no matter how the async
+  # transform captures the two closures, and an explicit flag rather than
+  # `conn.fd`/`conn.state` because the deadline can fire while `happyConnect` is still
+  # racing, when there is no fd to shut down and nothing else records the giving up.
+  let abandoned = new(bool)
+
+  proc abandonedNow(): bool =
+    ## Whether the caller has already stopped waiting for this connect. The flag
+    ## covers the timeout, and `conn.state` covers a teardown that flipped the shared
+    ## state off csOpen (`shutdownConn` on the timeout path does both). `establish`
+    ## checks this wherever it would otherwise start NEW work -- another
+    ## Happy-Eyeballs race, another TLS handshake -- so an abandoned connect cannot
+    ## keep hitting the origin behind the caller's back.
+    abandoned[] or (not conn.state.isNil and conn.state[] != csOpen)
+
+  proc abandonedErr(): ref response.TimeoutError =
+    ## The error the abandoned `establish` fails with. Nobody awaits that future (the
+    ## caller is already unwinding on its own TimeoutError and the backstop callback
+    ## just observes the outcome), so this only ever shows up in a debugger; it is the
+    ## caller's error type so the message stays truthful if it ever does surface.
+    newException(response.TimeoutError, connectTimeoutMsg(connectMs))
 
   proc tearDownAttempt(fd: AsyncFD) =
     ## Release a half-built connection. Nothing here has a destructor and a
@@ -435,6 +459,12 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   proc establish() {.async.} =
     if proxy.kind == pkUnix:
       conn.fd = await unixConnect(proxy.host)
+      # The deadline can fire while the Unix connect is in flight, i.e. while there is
+      # no fd for `shutdownConn` to wake. Nothing owns this socket any more, so hand it
+      # back instead of running a TLS handshake (SSL_CTX, mTLS, pin checks) on it.
+      if abandonedNow():
+        tearDownAttempt(conn.fd)
+        raise abandonedErr()
       if tls:
         try:
           when defined(ssl):
@@ -443,8 +473,8 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
             conn.ssl = newClientSsl(conn.ctx, conn.fd.SocketHandle, host,
                                     cfg.wantsVerify, conn.slot)
             await driveHandshake(conn.ssl, conn.fd, host)
-            verifyPeer(conn.ssl, host, cfg.wantsVerify)
-            postHandshakeVerify(conn.ssl, host, cfg)
+            verifyPeer(conn.ssl, host, cfg.wantsVerify, conn.slot)
+            postHandshakeVerify(conn.ssl, host, cfg, conn.slot)
             conn.protocol = negotiatedProtocol(conn.ssl)
           else:
             raise newException(ValueError, "navi: https requires compiling with -d:ssl")
@@ -466,7 +496,21 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     # Happy-Eyeballs TCP race, then proxy/TLS on the winner; on a *handshake*
     # failure drop that address and re-race the rest (as sync's connectAcross does).
     while pool.len > 0:
+      # Never start another attempt for a caller that has already given up: a
+      # connectMs that fired mid-handshake would otherwise land here via the `except`
+      # below and run a whole new TCP race plus a new TLS handshake (SSL_CTX, mTLS,
+      # SPKI pin) against the origin, once per remaining address, after the caller
+      # raised TimeoutError and moved on (issue #443).
+      if abandonedNow(): raise abandonedErr()
       let (fd, idx) = await happyConnect(pool, dialPort)
+      # The race itself is unbounded from here, so the deadline may well have fired
+      # while it ran -- with `conn.fd` still invalidFd, so `shutdownConn` had no socket
+      # to shut down and this freshly won one would otherwise proceed through the full
+      # handshake unowned. Close it and stop.
+      if abandonedNow():
+        closeSocket(fd)
+        conn.fd = invalidFd
+        raise abandonedErr()
       conn.fd = fd
       try:
         # SOCKS5 tunnels every target; an HTTP proxy tunnels only https (CONNECT).
@@ -474,6 +518,9 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
           await socksConnect(fd, host, port, proxy.user, proxy.pass)
         elif proxy.isSet and tls:
           await proxyConnect(fd, host, port, proxy.user, proxy.pass)
+        # A tunnel that completed just as the deadline fired must not be followed by a
+        # fresh handshake either; `tearDownAttempt` in the `except` closes the fd.
+        if abandonedNow(): raise abandonedErr()
         if tls:
           when defined(ssl):
             # A CONNECT tunnel (HTTP proxy) and a SOCKS5 tunnel are both transparent
@@ -485,8 +532,9 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
             conn.ssl = newClientSsl(conn.ctx, fd.SocketHandle, host,
                                     cfg.wantsVerify, conn.slot)
             await driveHandshake(conn.ssl, fd, host)
-            verifyPeer(conn.ssl, host, cfg.wantsVerify)
-            postHandshakeVerify(conn.ssl, host, cfg)   # SPKI pin + verify callback
+            # The slot makes a rejection evict this peer's cached session (#440).
+            verifyPeer(conn.ssl, host, cfg.wantsVerify, conn.slot)
+            postHandshakeVerify(conn.ssl, host, cfg, conn.slot)  # SPKI pin + callback
             conn.protocol = negotiatedProtocol(conn.ssl)
           else:
             raise newException(ValueError, "navi: https requires compiling with -d:ssl")
@@ -519,9 +567,23 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
     # errors out and runs establish's own teardown (which closes the fd); the callback
     # is the backstop for the race where establish instead SUCCEEDS right at the
     # deadline, leaving a fully-built conn with no owner.
+    #
+    # The flag goes first and is what actually stops the orphan: `shutdownConn` only
+    # wakes an attempt we already hold an fd for, and does nothing at all when the
+    # deadline lands while `happyConnect` is racing. With the flag set, `establish`
+    # stops at its next checkpoint instead of walking the remaining addresses with a
+    # full TCP race and TLS handshake each (issue #443).
+    abandoned[] = true
     shutdownConn(conn)
     estFut.addCallback(proc() {.gcsafe.} =
-      {.cast(gcsafe).}: closeSync(conn))
+      {.cast(gcsafe).}:
+        # The orphan now fails by design, and an asyncdispatch future that fails with
+        # nobody reading its error orphans the injected stack trace at process exit (a
+        # valgrind-visible leak, the same reason `retireRead` exists), so observe it
+        # here. `closeSync` is idempotent on `state`, so this reclaims the conn exactly
+        # once however establish ended.
+        if estFut.failed: discard estFut.error
+        closeSync(conn))
     raise newException(response.TimeoutError, connectTimeoutMsg(connectMs))
   await estFut
   return conn

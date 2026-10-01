@@ -42,6 +42,8 @@ proc preservesBody*(status: int, verb: HttpVerb): bool =
 proc redirectRequest*(req: Request, status: int, location: string): Request =
   ## Build the follow-up request for a redirect response, applying the usual
   ## method rewrites and stripping Authorization when the origin changes.
+  ## Raises `ValueError` when the Location resolves to a dialable scheme with no
+  ## host, the same rejection `buildRequest` applies to a caller's target (#435).
   result = req
   let previousOrigin = req.url.originKey
   result.url = resolve(req.url, location)
@@ -66,3 +68,12 @@ proc redirectRequest*(req: Request, status: int, location: string): Request =
       result.dropBody()
   else:
     discard # 307/308 preserve method and body
+  # A hop must satisfy the same host requirement as a caller-built request. An
+  # absolute Location whose scheme differs from the base's is taken verbatim by
+  # RFC 3986 resolution, so `http:///y` off `https://a.test/x` resolves to the
+  # scheme `http` with an empty host: not dialable, and over TLS no SNI and no
+  # certificate identity to check. `buildRequest` never sees a redirect target,
+  # so the check is repeated here (#435). A Location that only omits the
+  # authority under the *same* scheme is relative and inherits the base host,
+  # which is why this only bites cross-scheme.
+  result.url.requireHost()

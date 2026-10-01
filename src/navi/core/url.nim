@@ -38,6 +38,55 @@ proc port*(u: Url): int =
     return p
   if u.isTls: 443 else: 80
 
+const dialableSchemes* = ["http", "https", "ws", "wss"]
+  ## The schemes navi dials. A target with any other scheme (or none, e.g. a
+  ## relative path resolved against an empty `prefixUrl`) is left to whatever
+  ## consumes it, so `requireHost` does not judge it.
+
+proc requireHost*(u: Url) =
+  ## Reject a URL that names one of the schemes navi dials but carries no
+  ## authority, e.g. `https:///path`, which `std/uri` happily parses to hostname
+  ## "". Such a URL is not dialable, yet it used to travel all the way to the
+  ## transport: over a configured `unixSocket` (which never resolves the host) or,
+  ## on a platform whose `getaddrinfo("")` resolves to loopback (macOS), over TCP
+  ## to 127.0.0.1. With TLS that was the dangerous case, because an empty host
+  ## meant no SNI and no certificate identity check, so any chain-valid
+  ## certificate was accepted (#435).
+  ##
+  ## Called by `buildRequest` and by the WebSocket openers, i.e. once per request
+  ## on every client including `navi/js` and the HTTP/3 leg (which is only ever
+  ## reached through a built request). Raises `ValueError`: a URL with no host is
+  ## a caller mistake, in the same class as the out-of-range port `port` rejects.
+  if u.host.len > 0: return
+  let s = u.raw.scheme.toLowerAscii
+  for known in dialableSchemes:
+    if s == known:
+      raise newException(ValueError,
+        "navi: URL has no host: '" & $u & "'")
+
+proc parseWsUrl*(url: string): Url =
+  ## Parse a WebSocket target into the URL its transport dials: `ws://` becomes
+  ## `http://` and `wss://` becomes `https://`, so one scheme pair drives the pool
+  ## key, `isTls`, the default port and the TLS identity. Anything else (already
+  ## `http`/`https`, or a scheme navi does not dial) is parsed as given.
+  ##
+  ## The scheme is case-insensitive (RFC 3986 3.1), so the prefix is matched on a
+  ## lowercased copy. Matching it case-sensitively was a silent TLS downgrade:
+  ## `WSS://host/chat` kept its scheme, `isTls` (which compares against `https`)
+  ## then read false and the default port became 80, so a caller that asked for a
+  ## secure WebSocket got a cleartext one.
+  ##
+  ## A target with no authority (`wss:///chat`) is rejected here for the reason
+  ## `requireHost` gives: it is not dialable and carries no identity (#435). Shared
+  ## by the sync and async WebSocket openers; `navi/js` hands the URL to the
+  ## runtime's own `WebSocket` and only applies `requireHost`.
+  let lowered = url.toLowerAscii
+  var s = url
+  if lowered.startsWith("ws://"): s = "http://" & s["ws://".len .. ^1]
+  elif lowered.startsWith("wss://"): s = "https://" & s["wss://".len .. ^1]
+  result = parseUrl(s)
+  result.requireHost()
+
 proc originKey*(scheme, host: string, port: int): string =
   ## Canonical origin key `scheme://host:port`. Scheme and host are lowercased
   ## (both are case-insensitive per RFC 3986 3.2.2), so differently-cased URLs for

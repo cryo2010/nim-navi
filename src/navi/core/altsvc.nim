@@ -119,6 +119,29 @@ proc record*(c: AltSvcCache, scheme, host: string, port: int, header: string) =
     brokenUntil: (if same: prior.brokenUntil else: default(MonoTime)),
     failures: (if same: prior.failures else: 0))
 
+proc recordFrom*(c: AltSvcCache, url: Url, header: string) =
+  ## Record one response's `Alt-Svc` header against the origin it came from. This
+  ## is the ONLY entry point the transports use, because it carries the RFC 7838
+  ## 2.1 gate: an alternative may only be learned from a response that arrived
+  ## over TLS. A cleartext `http://host:port` response is ignored outright.
+  ##
+  ## The cache is keyed on the "https" scheme (h3 is TLS-only) and `h3Endpoint`
+  ## is only consulted for `isTls` requests, so recording an advertisement seen on
+  ## the cleartext leg of a host that is ALSO reached over https would let an
+  ## on-path attacker on that cleartext leg pick the QUIC endpoint for the https
+  ## origin (or clear the entry) for the advertised max-age (#434).
+  ##
+  ## The gate is `isTls` and not "verified TLS": whether the peer was
+  ## authenticated is not recorded on the response, and the one bit that is
+  ## reachable here (`insecureSkipVerify`) does not answer the question. It is
+  ## also set by the pins-only posture (`insecureSkipVerify` plus `pinnedKeys` /
+  ## `verifyCallback`), where the response IS authenticated, while on its own it
+  ## already forfeits the whole channel, so an attacker who could inject the
+  ## header could equally serve the response. Gating on it would therefore break
+  ## a legitimate configuration for no gain.
+  if not url.isTls: return
+  c.record("https", url.host, url.port, header)
+
 proc markBroken*(c: AltSvcCache, scheme, host: string, port: int) =
   ## Note the origin's h3 alternative as broken (RFC 7838 2.4): the QUIC handshake
   ## failed before anything was submitted, so `h3Endpoint` suppresses it for a

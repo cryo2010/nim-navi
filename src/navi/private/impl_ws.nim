@@ -77,12 +77,6 @@ proc closeRaw(ws: WebSocket): Future[void] {.async.} =
       await ws.tr.qc.tunnelClose(ws.tr.h3sid)
       await ws.tr.qc.closeConn()
 
-proc toWsUrl(url: string): Url =
-  var s = url
-  if s.startsWith("ws://"): s = "http://" & s["ws://".len .. ^1]
-  elif s.startsWith("wss://"): s = "https://" & s["wss://".len .. ^1]
-  parseUrl(s)
-
 proc doWebsocketH1(client: Navi, u: Url, headers: Headers,
                    maxMessageBytes, keepAlive: int): Future[WebSocket] {.async.} =
   ## WebSocket over an HTTP/1.1 Upgrade (RFC 6455): the universal transport.
@@ -172,7 +166,7 @@ when defined(naviHttp3):
 proc doWebsocket(client: Navi, url: string,
                  headers = initHeaders(),
                  maxMessageBytes = 0, keepAlive = 0): Future[WebSocket] {.async.} =
-  let u = toWsUrl(url)
+  let u = parseWsUrl(url)   # ws:// -> http://, wss:// -> https:// (#435)
   let httpset = client.config.http
   if httpset.card == 0 or H1 in httpset:             # h1 is the universal ws transport
     return await client.doWebsocketH1(u, headers, maxMessageBytes, keepAlive)

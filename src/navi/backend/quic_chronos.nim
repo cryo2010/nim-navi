@@ -102,7 +102,7 @@ proc step(qc: QuicConn): Future[bool] {.async.} =
     discard sockSend(cint(qc.fd), addr buf[0], csize_t(n), 0)
     n = navi_h3_send(qc.c, addr buf[0], csize_t(buf.len))
   if n < 0:
-    raise newException(QuicError, "navi HTTP/3: send failed")
+    raise newException(QuicError, h3Reason("navi HTTP/3: send failed"))
 
   # Wait for readability, the QUIC timer or a poke: one future per cycle, against the
   # connection's single re-armed timer (no `one()`, whose loser leaks -- see armTimer).
@@ -118,13 +118,13 @@ proc step(qc: QuicConn): Future[bool] {.async.} =
     moved = true
     let rc = navi_h3_recv(qc.c, addr buf[0], csize_t(r))
     if rc < 0:
-      raise newException(QuicError, "navi HTTP/3: read_pkt failed")
+      raise newException(QuicError, h3Reason("navi HTTP/3: read_pkt failed"))
     if rc > 0:                    # peer closed gracefully: stop reading and let the reader
       qc.alive = false            # deliver completed streams, then tear down cleanly (#278)
       break
   if qc.alive and navi_h3_timeout_ms(qc.c) == 0:   # skip once a graceful close ended it (#278)
     if navi_h3_handle_timeout(qc.c) != 0:
-      raise newException(QuicError, "navi HTTP/3: handle_timeout failed")
+      raise newException(QuicError, h3Reason("navi HTTP/3: handle_timeout failed"))
   return moved or not qc.alive
 
 proc reader(qc: QuicConn) {.async.} =
@@ -184,16 +184,16 @@ proc openConnChronos*(host: string, port: int, sni: string, tls: TlsConfig,
   ## `h3Open` (trust store, client credential, cipher bounds, SPKI pins and verify
   ## callback). `maxBody` caps a buffered response body (0 = unlimited, navi
   ## maxResponseBytes). The handshake is bounded by `connectMs`, else `totalMs`,
-  ## else `h3HandshakeDefaultMs`. Raises `QuicError` on failure and `ValueError`
-  ## on a pin / callback rejection.
+  ## else `h3HandshakeDefaultMs`. Raises `QuicError` on failure -- `QuicTlsError`,
+  ## carrying the driver's reason, when TLS refused the connection (#446) -- and
+  ## `ValueError` on a pin / callback rejection.
   let name = if sni.len > 0: sni else: host
   let handshakeMs = establishMs(connectMs, totalMs, h3HandshakeDefaultMs)
   var t = toH3Tls(tls, handshakeMs)
   let c = navi_h3_new(host.cstring, ($port).cstring, name.cstring, addr t,
                       culonglong(maxBody))
   if c == nil:
-    raise newException(QuicError,
-      "navi HTTP/3 connect to " & host & ":" & $port & " failed")
+    quicFail("navi HTTP/3 connect to " & host & ":" & $port & " failed")
   let fd = AsyncFD(navi_h3_fd(c))
   let qc = QuicConnChronos(c: c, fd: fd, waiters: initTable[int64, Future[void]](),
                            recvReady: initTable[int64, Future[void]](), alive: true,
@@ -217,7 +217,7 @@ proc openConnChronos*(host: string, port: int, sni: string, tls: TlsConfig,
         raise newException(QuicError, connectTimeoutMsg(handshakeMs))
       discard await step(qc)
     if navi_h3_bind(c) != 0:
-      raise newException(QuicError, "navi HTTP/3 bind failed")
+      quicFail("navi HTTP/3 bind failed")
     # Pins / verify callback on the peer leaf, before the connection is returned
     # (and therefore before it can be cached or carry a request) -- #419.
     h3PostHandshakeVerify(c, name, tls)

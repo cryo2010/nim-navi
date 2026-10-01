@@ -152,10 +152,13 @@ task highFd, "Readiness waits on descriptors above FD_SETSIZE, sync client (POSI
   # with a read timeout armed: the wait must poll, not select (issue #429).
   exec "bash tests/interop/highfd.sh"
 
-task tlsPinning, "In-memory CA bundle + SPKI pinning + verify callback, sync client (needs openssl)":
+task tlsPinning, "In-memory CA bundle + SPKI pinning + verify callback + rejected-session eviction, all native clients (needs openssl)":
   # A server signed by a throwaway CA: navi must trust it via an in-memory
   # caBundle, honor a matching SPKI pin (reject a wrong one), and run the verify
-  # callback (accept/reject, and even with chain verification disabled).
+  # callback (accept/reject, and even with chain verification disabled). Then
+  # tls_reject_resume.nim, on all three native backends over TLS 1.2 and 1.3: a
+  # session cached during the handshake of a peer navi then rejected must be
+  # evicted, so the next connect to that origin is a full handshake (issue #440).
   exec "bash tests/interop/tls_pin.sh"
 
 task tlsWriteClose, "A TLS write racing a close on the asyncdispatch client (needs openssl + python3)":
@@ -164,6 +167,12 @@ task tlsWriteClose, "A TLS write racing a close on the asyncdispatch client (nee
   # write through the SSL that freeConn already freed (issue #421).
   exec "bash tests/interop/tls_write_close.sh"
 
+task tlsReadDuringWrite, "The chronos TLS pump reads while its own write is in flight (needs openssl + python3 + chronos)":
+  # A TLS server that greets the client and then stops reading, with a tiny
+  # SO_RCVBUF so a 4 MiB write cannot drain: the greeting must still reach
+  # `readSome` instead of parking behind the write lock (issue #444).
+  exec "bash tests/interop/tls_read_during_write.sh"
+
 task tlsTruncate, "Unclean TLS close vs a body delimited by the close, all native clients (needs openssl + python3)":
   # A TLS server that answers with an un-framed body and then cuts the connection
   # with a RST (and with a bare FIN) instead of a close_notify: navi must refuse
@@ -171,6 +180,22 @@ task tlsTruncate, "Unclean TLS close vs a body delimited by the close, all nativ
   # endings, a short Content-Length body and a keep-alive pair keep working
   # (issue #426).
   exec "bash tests/interop/tls_truncate.sh"
+
+task tlsBudget, "Sync establishment + read budgets as single wall clocks (needs openssl + python3)":
+  # Three python TLS servers: one that never answers the ClientHello (a bounded
+  # handshake must end at the budget as navi's TimeoutError with the connect
+  # wording), one that writes a bare TLS record header late in the read budget (the
+  # read must not re-arm a second full window inside SSL_read), and a healthy one
+  # as the control for the bounded and the unbounded handshake paths (issue #442).
+  exec "bash tests/interop/tls_budget.sh"
+
+task connectAbandon, "An abandoned connect must not re-race the address pool (needs python3)":
+  # A deaf TCP listener on each loopback family on one port, so `localhost` is a
+  # two-address Happy Eyeballs pool whose winner never answers the ClientHello.
+  # When `connectMs` fires, exactly one connection may ever have reached the
+  # listeners: the abandoned `establish` has to stop rather than drop that address
+  # and re-race the rest behind the caller's back (issue #443).
+  exec "bash tests/interop/connect_abandon.sh"
 
 task socks, "SOCKS5 proxy tunnelling + user/pass auth, all native clients (needs python3)":
   # A local HTTP origin behind two SOCKS5 proxies (no-auth and user/pass): navi
@@ -333,7 +358,10 @@ task demoWs, "Run the WebSocket demos for every client + browser page (Docker)":
 
 task mtls, "Run the mutual-TLS (client certificate) interop test (needs openssl)":
   # Starts an OpenSSL server that requires a client certificate and runs navi's
-  # mTLS test against it.
+  # mTLS test against it. Also tls_clear_secrets.nim, on all three native
+  # backends: every request is made AFTER `clearTlsSecrets` has wiped the
+  # credential, so a server that mandates a client certificate proves the
+  # eagerly built TLS contexts keep mTLS working (issue #438).
   exec "bash tests/interop/mtls.sh"
 
 task chronosCafile, "chronos custom-CA (caFile) interop test (needs openssl + chronos)":

@@ -26,6 +26,17 @@ proc closeTlsStore*(store: RootRef) =
   else:
     discard store
 
+proc prebuildTlsContexts*(cfg: TlsConfig) =
+  ## Build every shared TLS context this config can need, instead of leaving them
+  ## to the first connect of each ALPN shape. Only `clearTlsSecrets` calls it: the
+  ## credential has to be installed in every context before it can be wiped out of
+  ## the config (issue #438). A no-op without a context store, and on a
+  ## non-`-d:ssl` build.
+  when defined(ssl):
+    prebuildContexts(cfg.contextStore, cfg)
+  else:
+    discard cfg
+
 proc newTlsCtxStore*(cfg: TlsConfig): RootRef =
   ## The per-client shared TLS-context store (empty until the first TLS connect),
   ## or nil on a non-`-d:ssl` build. The entry puts it on `config.tls.contextStore`.

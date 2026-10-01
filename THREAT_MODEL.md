@@ -59,7 +59,7 @@ Security controls that are **opt-in** (off until you set them):
 | TLS cipher restriction | `tls.ciphers` / `tls.cipherSuites` |
 | Custom CA / private trust anchor | `tls.caFile` |
 | Client certificate (mTLS) | `tls.certFile` / `pkcs12File` / `certPem` |
-| HTTP/3 | build with `-d:naviHttp3`, list `H3` in `http` |
+| HTTP/3 | build with `-d:naviHttp3` (its default `http` set then includes `H3`; drop `H3` from `http` to opt a client out) |
 
 [HARDENING.md](HARDENING.md) shows how to set the opt-in controls.
 

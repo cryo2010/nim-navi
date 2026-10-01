@@ -55,3 +55,26 @@ export NAVI_TLS_PIN="$pin"
 
 echo "== TLS caBundle + SPKI pin + verify callback on 127.0.0.1:$port (pin=$pin) =="
 nim c -r --hints:off -d:ssl --path:"$root/src" -o:"$work/tls_pin" "$root/tests/interop/tls_pin.nim"
+
+# A session cached during the handshake of a peer navi then REJECTED (SPKI pin or
+# verify callback) must not be re-offered to the origin on the next connect
+# (#440). Same server, same CA and the same real pin; the test drives two
+# sequential requests through one client and reads the session state out of the
+# page `s_server -www` serves. Run on all three native backends and pinned to
+# both TLS 1.2 (new-session callback inside the handshake) and TLS 1.3 (ticket
+# after it).
+export NAVI_REJ_URL="$NAVI_TLS_URL"
+export NAVI_REJ_CA="$NAVI_TLS_CA"
+export NAVI_REJ_PIN="$pin"
+
+echo "== a rejected peer's TLS session is evicted, not re-offered (sync/asyncdispatch/chronos) =="
+nim c -r --hints:off -d:ssl --path:"$root/src" -o:"$work/reject_sync" \
+  "$root/tests/interop/tls_reject_resume.nim"
+nim c -r --hints:off -d:ssl -d:naviAsync --path:"$root/src" -o:"$work/reject_async" \
+  "$root/tests/interop/tls_reject_resume.nim"
+if nimble path chronos >/dev/null 2>&1; then
+  nim c -r --hints:off -d:ssl -d:naviChronos --path:"$root/src" -o:"$work/reject_chronos" \
+    "$root/tests/interop/tls_reject_resume.nim"
+else
+  echo "note: chronos not installed; skipping the chronos rejection leg"
+fi
