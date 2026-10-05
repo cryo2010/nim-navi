@@ -1,7 +1,7 @@
 ## Live interop against real public servers and CDNs.
 ##
 ## This hits the open internet, so it is a nightly / on-demand job (see
-## .github/workflows/live.yml), never a per-PR gate. It exists to catch h2/TLS
+## .github/workflows/nightly.yml), never a per-PR gate. It exists to catch h2/TLS
 ## bugs that only real, independent server stacks provoke: Google, Cloudflare,
 ## Fastly (api.github.com), Go's net/http2, nghttp2, Apache Traffic Server
 ## (Wikipedia), and a JSON request-echo (postman-echo).

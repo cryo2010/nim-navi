@@ -702,3 +702,87 @@ jobs:
       # fails the cell. navi-owned leaks are fixed, not suppressed.
       - name: ${{ matrix.name }}
         run: docker run --rm navi-leakcheck ${{ matrix.run }}
+
+  # --- TLS conformance against badssl.com -----------------------------------------
+  # Asserts navi rejects invalid server certificates (expired, self-signed,
+  # wrong-host, untrusted-root) with verification on, and accepts a valid one.
+  # badssl.com is external; if it turns flaky, move this job to nightly.yml. The
+  # Windows cell lives in windows.yml. Run directly (not via nimble) so a failing
+  # check fails the job.
+  badssl:
+    runs-on: ubuntu-latest
+    name: badssl TLS conformance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      # navi's only required Nim dep (MD5 for Digest auth); this job builds with
+      # raw `nim`, so it isn't resolved automatically.
+      - name: Install checksums
+        run: nimble install -y checksums
+      - name: Run badssl TLS checks
+        run: nim c -r --hints:off tests/interop/badssl.nim
+
+  # --- Fuzzing ----------------------------------------------------------------------
+  # Fast, portable, deterministic: replay the committed seed corpus under ASan.
+  # Catches regressions and keeps the harnesses building.
+  fuzz-replay:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [hpack, h1, frame, huffman, h2conn]
+    name: replay ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - run: bash tests/fuzz/run.sh ${{ matrix.target }} replay
+
+  # Coverage-guided libFuzzer, time-boxed to 120s per target.
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [hpack, h1, frame, huffman, h2conn]
+    name: fuzz ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install clang (libFuzzer runtime)
+        run: sudo apt-get update && sudo apt-get install -y clang
+      - name: Fuzz ${{ matrix.target }} for 120s
+        run: bash tests/fuzz/run.sh ${{ matrix.target }} 120
+      - name: Upload any crash
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}-crash
+          path: |
+            crash-*
+            timeout-*
+            oom-*
+          if-no-files-found: ignore
+
+  # --- HTTP/3 -----------------------------------------------------------------------
+  # Builds the ngtcp2 + nghttp3 + OpenSSL 3.5 toolchain image and runs the whole
+  # h3 leg (tests/interop/http3/run.sh) against a live Caddy h3 origin. It runs on
+  # every PR: the h3 code pulls in most of src/, so a path filter cannot name its
+  # real dependency set and silently skipped the probe on unrelated-looking changes.
+  http3:
+    runs-on: ubuntu-latest
+    name: HTTP/3 interop (Caddy h3 origin)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the HTTP/3 toolchain image and run the h3 suite
+        run: |
+          docker build -f tests/interop/http3/Dockerfile -t navi-h3 .
+          docker run --rm navi-h3
