@@ -1,12 +1,13 @@
-# Docs-only PRs (**.md, .claude/**) are excluded from ci.yml, fuzz.yml and
-# badssl.yml via paths-ignore, but the "Main ruleset" still requires their
-# checks, so such PRs could never merge. This workflow runs on the inverse
-# filter and reports every required context as a trivial success, which is
-# GitHub's documented pattern for skipped-but-required checks.
+# Docs-only PRs (**.md, .claude/**) are excluded from ci.yml via paths-ignore,
+# but the "Main ruleset" still requires its checks, so such PRs could never
+# merge. This workflow runs on the inverse filter and reports every required
+# context as a trivial success, which is GitHub's documented pattern for
+# skipped-but-required checks.
 #
-# Job names here must match the required contexts exactly. When a PR touches
-# both docs and code, both workflows report the same context and GitHub keeps
-# the most recently completed run, so the real (slower) result wins.
+# Job names here must match the required contexts (all ci.yml jobs) exactly.
+# When a PR touches both docs and code, both workflows report the same context
+# and GitHub keeps the most recently completed run, so the real (slower) result
+# wins.
 name: CI (docs-only skip)
 
 on:

@@ -182,3 +182,18 @@ jobs:
       - name: Opt-in cookie jar
         shell: bash
         run: bash tests/interop/js_cookiejar.sh
+
+  # Windows cell of the badssl conformance check (the Linux cell is in ci.yml).
+  # This is the only Windows job that exercises the verify path against real-world
+  # chains rather than a private CA. Needs MSYS2's OpenSSL 3 (Nim bundles only the
+  # EOL 1.1 pair) and a cacert.pem, which is the only way std/net finds CA
+  # certificates here; the setup action provides both.
+  badssl:
+    runs-on: windows-latest
+    name: "windows: badssl TLS conformance"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-navi-windows
+      - name: Run badssl TLS checks
+        shell: bash
+        run: nim c -r --hints:off tests/interop/badssl.nim

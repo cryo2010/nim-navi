@@ -1,5 +1,7 @@
-name: live
+name: nightly
 
+# Nightly jobs that must never gate a PR.
+#
 # Live interop against real public servers and CDNs (Google, Cloudflare, Fastly,
 # Go net/http2, nghttp2, Akamai, Apache Traffic Server). This touches the open
 # internet, so it runs nightly and on demand, never as a PR gate. The test

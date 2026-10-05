@@ -79,8 +79,8 @@ Interactively: a clean run ends with `Done <N> runs in <T> second(s)` (or
 
 ## CI
 
-`.github/workflows/fuzz.yml` replays the seed corpus on every PR (portable, fast)
-and runs each target under libFuzzer nightly, uploading any crash as an artifact.
+`.github/workflows/ci.yml` replays the seed corpus on every PR (portable, fast)
+and runs each target under libFuzzer for 120s, uploading any crash as an artifact.
 
 ## History
 
