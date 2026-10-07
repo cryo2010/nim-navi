@@ -21,35 +21,7 @@ else:
   const backend = "asyncdispatch"
 include ../common/httpset
 include ../common/chaos
-
-proc failHard(cfg: Config, msg: string) =
-  {.cast(gcsafe).}:
-    stderr.writeLine cfg.label & " FAIL: " & msg
-  quit(1)
-
-proc worker(cfg: Config, s: SseStream, counter: StatusCounter,
-            gate: ptr VersionGate, deadline: float) {.async.} =
-  var lastId = 0
-  try:
-    s.each(ev):
-      counter.tally(200)
-      gate[].sample(s.httpVersion)        # track the negotiated version (h3 after upgrade)
-      # Verify Last-Event-ID resume: the server numbers events monotonically and
-      # resumes at last+1 after each periodic drop, so a gap or duplicate id (across
-      # a reconnect) is a resume bug, not soak noise.
-      if ev.id.len > 0:
-        let id = try: parseInt(ev.id) except ValueError: -1
-        if id < 0:
-          cfg.failHard("non-numeric SSE id '" & ev.id & "'")
-        if lastId != 0 and id != lastId + 1:
-          cfg.failHard("SSE id discontinuity: expected " & $(lastId + 1) &
-            ", got " & $id & " (Last-Event-ID resume broken)")
-        lastId = id
-      if epochTime() >= deadline: break   # self-terminate: events flow continuously
-  except CatchableError:
-    counter.fail()
-  try: await s.close()                     # closed here, not mid-read: clean teardown
-  except CatchableError: discard
+include parts/sse_part   # the verified SSE consume loop (shared with mixed.nim)
 
 proc reporterLoop(cfg: Config, counter: StatusCounter,
                   start, deadline: float) {.async.} =
@@ -90,13 +62,15 @@ proc main() {.async.} =
   let chaos = chaosMaybeStart(cfg, deadline, cfg.reportSeconds)  # no-op when off
   var gate = initVersionGate(cfg)
   var futs: seq[Future[void]]
-  for s in streams: futs.add worker(cfg, s, counter, addr gate, deadline)
+  for s in streams: futs.add sseWorker(cfg, s, counter, addr gate, deadline)
   futs.add reporterLoop(cfg, counter, start, deadline)
   for f in futs: await f
   await chaosAwait(chaos)
   gate.finish()   # hard-fail if the pinned protocol (h2/h3) was never negotiated
 
-  if counter.ops == 0: cfg.failHard("no SSE event consumed")
+  # `ops - errors`, not `ops`: counter.fail() increments ops too, so a stream that
+  # only ever errored used to pass this check.
+  if counter.ops - counter.errors == 0: cfg.failHard("no SSE event consumed")
   let elapsed = epochTime() - start      # the measured phase: also the rate divisor
   report(cfg.label & " final", counter, elapsed, final = true)
   await chaosFinish(chaos, leakBase, cfg, @[api])

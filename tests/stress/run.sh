@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Per-workload stress harness. Stands up N TLS servers (FastAPI via hypercorn for
-# h1/h2; a Caddy front for h3), then builds and runs the workload client for each
-# client x protocol cell, distributing requests across the servers. Every cell
-# prints a status+RSS report each interval; the streaming cells verify a 1 GiB
-# checksum and fail hard on mismatch.
+# h1/h2; a Caddy front for h3; aioquic for an h3 WebSocket, which Caddy cannot
+# bridge), then builds and runs the workload client for each client x protocol
+# cell, distributing requests across the servers. Every cell prints a status+RSS
+# report each interval; the three checksum-verifying cells (streamUpload,
+# streamDownload and the two stream slices of mixed) verify the transfer and fail
+# hard on mismatch.
 #
 # Driven by `nimble stress<Workload>` (Dockerized). Config via NAVI_* env.
 set -uo pipefail
@@ -24,6 +26,32 @@ base_port="${NAVI_BASE_PORT:-9443}"
 # protocol's fault modes and the client attacks it alongside the verified soak.
 chaos="${NAVI_CHAOS:-none}"
 chaos_band="${NAVI_CHAOS_PORTBAND:-2000}"
+
+# WebSocket-over-h3 band. Only the mixed+h3 cell uses it: Caddy's reverse_proxy
+# does not bridge an h3 Extended CONNECT, so that cell needs aioquic ws origins
+# on their own ports alongside the Caddy front (see start_ws_h3_servers). The ws
+# workload's own h3 cell replaces Caddy outright and keeps the base ports.
+ws_band="${NAVI_WS_H3_PORTBAND:-3000}"
+
+# The band indexes real listening ports, so validate it once, loudly, here: a
+# non-integer silently becomes 0 (or a bash arithmetic error) and a value that
+# collides with another band points the ws slice at the wrong origin or makes two
+# servers fight for a port. Exit 2 is the same "bad invocation" code an unknown
+# NAVI_WORKLOAD uses.
+case "$ws_band" in
+  ''|*[!0-9]*) echo "NAVI_WS_H3_PORTBAND must be a positive integer (got '$ws_band')"; exit 2 ;;
+esac
+[ "$ws_band" -gt 0 ] || {
+  echo "NAVI_WS_H3_PORTBAND must be a positive integer (got '$ws_band')"; exit 2; }
+# The h3 backend hypercorns sit at base+1000 .. base+1000+servers (start_servers).
+if [ "$ws_band" -ge 1000 ] && [ "$ws_band" -le $((1000 + servers)) ]; then
+  echo "NAVI_WS_H3_PORTBAND=$ws_band overlaps the h3 backend band (1000..$((1000 + servers)))"
+  exit 2
+fi
+if [ "$chaos" != none ] && [ "$ws_band" -eq "$chaos_band" ]; then
+  echo "NAVI_WS_H3_PORTBAND=$ws_band collides with NAVI_CHAOS_PORTBAND=$chaos_band"
+  exit 2
+fi
 
 command -v openssl >/dev/null || { echo "openssl required"; exit 127; }
 command -v hypercorn >/dev/null || { echo "hypercorn required (pip install -r server/requirements.txt)"; exit 127; }
@@ -54,6 +82,33 @@ env -u LD_LIBRARY_PATH openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -keyout "$key" -out "$cert" -subj "/CN=localhost" \
   -addext "subjectAltName=DNS:localhost,DNS:127.0.0.1,IP:127.0.0.1" >/dev/null 2>&1 \
   || { echo "cert generation failed"; exit 1; }
+
+# --- aioquic WebSocket-over-h3 origins --------------------------------------
+# Launch N aioquic servers that terminate a WebSocket Extended CONNECT (RFC 9220)
+# natively, on $1 + i, and wait for each to print WS_H3_SERVER_READY. Caddy's
+# reverse_proxy does not bridge an h3 Extended CONNECT to a backend WebSocket, so
+# h3 ws has to be served here. Two callers:
+#   - workload=ws,    proto=h3: these REPLACE the Caddy front on the base ports.
+#   - workload=mixed, proto=h3: these run on the ws band BESIDE the Caddy front,
+#     so the other four slices keep their /echo, /events, /upload and /download.
+start_ws_h3_servers() {
+  local first="$1" i port
+  command -v python3 >/dev/null || { echo "python3 required for h3 ws"; return 1; }
+  for ((i=0; i<servers; i++)); do
+    port=$((first + i))
+    WS_HOST="$host" WS_PORT="$port" WS_CERT="$cert" WS_KEY="$key" \
+      setsid python3 "$root/tests/interop/ws_h3/server.py" >"$work/srv-ws-$i.log" 2>&1 &
+    pids+=($!)
+  done
+  for ((i=0; i<servers; i++)); do
+    local ok=""
+    for _ in $(seq 1 150); do
+      grep -q WS_H3_SERVER_READY "$work/srv-ws-$i.log" 2>/dev/null && { ok=1; break; }
+      sleep 0.2
+    done
+    [ -n "$ok" ] || { echo "aioquic ws-h3 server $i did not start"; cat "$work/srv-ws-$i.log"; return 1; }
+  done
+}
 
 # --- start N servers for a given protocol -----------------------------------
 start_servers() {
@@ -90,24 +145,9 @@ start_servers() {
     printf 'keep_alive_timeout = %s\n' "$ka_to"
   } >"$hcfg"
   if [ "$p" = "h3" ] && [ "$workload" = "ws" ]; then
-    # WebSocket over h3 (RFC 9220 Extended CONNECT) is terminated natively by an
-    # aioquic server -- Caddy's reverse_proxy does not bridge an h3 Extended CONNECT
-    # to a backend WebSocket. Each server echoes ws frames over its CONNECT stream.
-    command -v python3 >/dev/null || { echo "python3 required for h3 ws"; return 1; }
-    for ((i=0; i<servers; i++)); do
-      port=$((base_port + i))
-      WS_HOST="$host" WS_PORT="$port" WS_CERT="$cert" WS_KEY="$key" \
-        setsid python3 "$root/tests/interop/ws_h3/server.py" >"$work/srv-$i.log" 2>&1 &
-      pids+=($!)
-    done
-    for ((i=0; i<servers; i++)); do
-      local ok=""
-      for _ in $(seq 1 150); do
-        grep -q WS_H3_SERVER_READY "$work/srv-$i.log" 2>/dev/null && { ok=1; break; }
-        sleep 0.2
-      done
-      [ -n "$ok" ] || { echo "aioquic ws-h3 server $i did not start"; cat "$work/srv-$i.log"; return 1; }
-    done
+    # The ws workload's h3 cell is ws-only, so the aioquic origins take the base
+    # ports outright: no Caddy, no hypercorn, and no /echo to curl for readiness.
+    start_ws_h3_servers "$base_port" || return 1
     return 0
   fi
   if [ "$p" = "h3" ]; then
@@ -165,6 +205,13 @@ start_servers() {
       return 1
     }
   done
+  # The mixed h3 cell needs BOTH origins: Caddy on the base ports (above) for
+  # /echo, /events, /upload and /download, and the aioquic ws servers on the ws
+  # band for the ws slice. navi direct-dials QUIC for an h3 WebSocket, so the
+  # band needs no Alt-Svc discovery leg of its own.
+  if [ "$p" = "h3" ] && [ "$workload" = "mixed" ]; then
+    start_ws_h3_servers "$((base_port + ws_band))" || return 1
+  fi
 }
 
 # --- launch the chaos sidecar for a cell -------------------------------------
@@ -199,18 +246,39 @@ start_chaos() {
 # When chaos is on, also check the band's TCP ports (data/vanish/stall/control)
 # so the next cell does not race a lingering sidecar listener.
 ports_free() {
-  python3 - "$host" "$base_port" "$servers" "$chaos" "$chaos_band" <<'PY' 2>/dev/null
+  python3 - "$host" "$base_port" "$servers" "$chaos" "$chaos_band" \
+           "$workload" "$ws_band" <<'PY' 2>/dev/null
 import socket, sys
 host, base, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 chaos, band = sys.argv[4], int(sys.argv[5])
+workload, ws_band = sys.argv[6], int(sys.argv[7])
 ports = []
 for i in range(n):
     ports += [base + i, base + 1000 + i]
 if chaos != "none":
     ports += [base + band, base + band + 1, base + band + 2, base + band + 99]
+# The aioquic ws origins bind UDP only, so a TCP bind on their ports would always
+# succeed and prove nothing. Check them with a UDP bind, which does see a
+# lingering aioquic listener -- and without SO_REUSEADDR, since UDP has no
+# TIME_WAIT to forgive and the question here is simply whether anyone is still
+# bound. Which ports those are depends on the workload: the mixed cell puts them
+# on the ws band beside the Caddy front, while the ws workload's own h3 cell
+# replaces Caddy and takes the BASE ports (which the TCP loop above can only
+# prove free of a TCP listener, not of aioquic).
+if workload == "mixed":
+    udp_ports = [base + ws_band + i for i in range(n)]
+elif workload == "ws":
+    udp_ports = [base + i for i in range(n)]
+else:
+    udp_ports = []
 for p in ports:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try: s.bind((host, p))
+    except OSError: sys.exit(1)
+    finally: s.close()
+for p in udp_ports:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try: s.bind((host, p))
     except OSError: sys.exit(1)
     finally: s.close()
@@ -232,6 +300,7 @@ stop_servers() {
   pkill -9 -f hypercorn 2>/dev/null || true      # belt-and-suspenders for any stray
   pkill -9 -f 'caddy run' 2>/dev/null || true
   pkill -9 -f chaos_server.py 2>/dev/null || true   # reap any stray chaos sidecar
+  pkill -9 -f 'ws_h3/server.py' 2>/dev/null || true  # reap any stray aioquic ws origin
   for _ in $(seq 1 100); do ports_free && break; sleep 0.1; done
 }
 
@@ -242,11 +311,13 @@ case "$workload" in
   sse)             src="sse";             js_src="sse_js" ;;
   streamUpload)    src="stream_upload";   js_src="" ;;               # js can't stream uploads
   streamDownload)  src="stream_download"; js_src="stream_download_js" ;;
+  mixed)           src="mixed";           js_src="mixed_js" ;;         # all five at once (js: four)
   *) echo "unknown NAVI_WORKLOAD: $workload"; exit 2 ;;
 esac
 
 export NAVI_CERT="$cert" NAVI_HOST="$host" NAVI_BASE_PORT="$base_port"
 export NAVI_WORKLOAD="$workload" NAVI_SERVER_COUNT="$servers"
+export NAVI_WS_H3_PORTBAND="$ws_band"     # the mixed client's h3 ws origins
 export PYTHONPATH="$here/server"          # so hypercorn finds app.py as `app`
 cd "$here/server"
 
@@ -261,6 +332,7 @@ case "$client" in all) clients=(sync asyncdispatch chronos js) ;; *) clients=("$
 case "$proto"   in all) protos=(h1 h2 h3) ;; *) protos=("$proto") ;; esac
 
 fail=0
+ran=0        # cells actually executed; a run where every cell was skipped is not a pass
 for be in "${clients[@]}"; do
   # locate & build this client's binary
   bin=""
@@ -307,8 +379,17 @@ for be in "${clients[@]}"; do
     }
     if [[ "$bin" == *.js ]]; then NODE_EXTRA_CA_CERTS="$cert" run_cell node "$bin" || fail=1
     else run_cell "$bin" || fail=1; fi
+    ran=$((ran + 1))
     stop_servers
   done
 done
 
+# A matrix that skipped every cell (NAVI_CLIENT=sync with `mixed`, NAVI_CLIENT=js
+# with `streamUpload`) used to print "all cells passed" and exit 0: nothing ran,
+# nothing failed. Say so instead, and fail, so a typo in NAVI_CLIENT can never
+# read as green.
+if [ "$ran" -eq 0 ]; then
+  echo "== $workload: NO CELLS RAN =="
+  exit 1
+fi
 [ "$fail" -eq 0 ] && echo "== $workload: all cells passed ==" || { echo "== $workload: FAILURES =="; exit 1; }

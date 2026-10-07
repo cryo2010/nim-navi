@@ -95,6 +95,7 @@ proc runStress(workload: string) =
        " -e NAVI_STREAM_BYTES -e NAVI_REPORT_SECONDS -e NAVI_LOG_ERRORS" &
        " -e NAVI_RECYCLE -e NAVI_KEEPALIVE_MAX -e NAVI_KEEPALIVE_TIMEOUT" &
        " -e NAVI_H3_CTX_CACHE" &   # 0 rebuilds the h3 SSL_CTX per connection (#454)
+       " -e NAVI_WS_H3_PORTBAND" &   # the mixed+h3 ws band (aioquic origins)
        " -e NAVI_CHAOS -e NAVI_CHAOS_CONC -e NAVI_CHAOS_SEED -e NAVI_CHAOS_PORTBAND" &
        " -e NAVI_CHAOS_WATCHDOG -e NAVI_CHAOS_FD_SLACK -e NAVI_CHAOS_HEAP_SLACK_MB" &
        " -e NAVI_CHAOS_RSS_SLACK_MB -e NAVI_CHAOS_SELFTEST " & image
@@ -109,14 +110,22 @@ task stressStreamUpload, "Stress: stream 1 GiB up, server verifies checksum (har
   runStress("streamUpload")
 task stressStreamDownload, "Stress: stream 1 GiB down, client verifies checksum (hard-fail on mismatch)":
   runStress("streamDownload")
+task stressMixed, "Stress: all five workloads concurrently against one server set (shared clients + connections)":
+  # A smaller default transfer than the dedicated stream tasks use. The two
+  # stream slices share NAVI_CLIENT_COUNT instances (and their pooled
+  # connections) with 20 other workers, so a 1 GiB transfer can easily not
+  # complete inside a 60s cell; 256 MiB leaves the stream checks room to pass at
+  # the default NAVI_SECONDS. NAVI_STREAM_BYTES still overrides it for a soak.
+  if not existsEnv("NAVI_STREAM_BYTES"): putEnv("NAVI_STREAM_BYTES", "268435456")
+  runStress("mixed")
 
-task stress, "Stress smoke: all five workloads, short + small (a quick everything-works check)":
+task stress, "Stress smoke: all six workloads, short + small (a quick everything-works check)":
   # Discoverability + a fast smoke of the whole set. Defaults to 20s cells and a
   # 64 MiB stream unless overridden; set the NAVI_* knobs for a real soak,
   # or run a single stress<Workload> task.
   if not existsEnv("NAVI_SECONDS"): putEnv("NAVI_SECONDS", "20")
   if not existsEnv("NAVI_STREAM_BYTES"): putEnv("NAVI_STREAM_BYTES", "67108864")
-  for w in ["requests", "ws", "sse", "streamUpload", "streamDownload"]:
+  for w in ["requests", "ws", "sse", "streamUpload", "streamDownload", "mixed"]:
     runStress(w)
 
 task badssl, "TLS client conformance against badssl.com (network; nightly)":

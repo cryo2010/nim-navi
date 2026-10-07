@@ -62,7 +62,8 @@ proc main() =
     counter.fail()
   gate.finish()   # hard-fail if the pinned protocol (h2/h3) was never negotiated
 
-  if counter.ops == 0:
+  # `ops - errors`, not `ops`: counter.fail() increments ops too (see sse.nim).
+  if counter.ops - counter.errors == 0:
     stderr.writeLine cfg.label & " FAIL: no SSE event consumed"; quit(1)
   let elapsed = epochTime() - start      # the measured phase: also the rate divisor
   report(cfg.label & " final", counter, elapsed, final = true)

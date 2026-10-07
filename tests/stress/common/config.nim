@@ -12,7 +12,7 @@ import payloads
 
 type
   Config* = object
-    workload*: string        ## requests|ws|sse|streamUpload|streamDownload
+    workload*: string        ## requests|ws|sse|streamUpload|streamDownload|mixed
     proto*: string           ## h1|h2|h3 (concrete; "all" is expanded by run.sh)
     backend*: string         ## sync|asyncdispatch|chronos|js (label; the binary is the backend)
     host*: string
@@ -27,6 +27,9 @@ type
     reportSeconds*: int      ## per-report cadence
     streamBytes*: int        ## stream transfer size (bytes)
     cert*: string            ## CA/cert path for TLS verification
+    wsH3PortBand*: int       ## NAVI_WS_H3_PORTBAND: the mixed+h3 WebSocket band
+                             ## offset; the aioquic ws origin for worker i is
+                             ## basePort + wsH3PortBand + (i mod servers)
     chaos*: ChaosConfig      ## opt-in misbehaving-server attack config (NAVI_CHAOS*)
 
   ChaosConfig* = object
@@ -114,6 +117,7 @@ proc loadConfig*(backend: string): Config =
     reportSeconds: max(1, getInt("NAVI_REPORT_SECONDS", 60)),
     streamBytes: getInt("NAVI_STREAM_BYTES", 1073741824),
     cert: getEnv("NAVI_CERT", ""),
+    wsH3PortBand: getInt("NAVI_WS_H3_PORTBAND", 3000),
     chaos: loadChaos(getEnv("NAVI_WORKLOAD", "requests"),
                      getEnv("NAVI_PROTO", "h2"), backend))
   # js is excluded from chaos entirely: hostile-input handling there is undici's,
@@ -134,6 +138,15 @@ proc loadConfig*(backend: string): Config =
 proc label*(c: Config): string =
   ## The tag prefixed to every report line, e.g. "[requests h2 chronos]".
   "[" & c.workload & " " & c.proto & " " & c.backend & "]"
+
+proc failHard*(c: Config, msg: string) =
+  ## End the cell on a verification miss or an unrecoverable transport error:
+  ## one greppable line on stderr behind the cell's label, then exit 1. The
+  ## `{.cast(gcsafe).}` is what lets an async worker call it under chronos, whose
+  ## async transform gcsafe-checks the body and `stderr` is a global.
+  {.cast(gcsafe).}:
+    stderr.writeLine c.label & " FAIL: " & msg
+  quit(1)
 
 proc stressBodies*(): seq[string] =
   ## A rotation of request/response body shapes for the echo workload, so the

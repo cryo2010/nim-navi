@@ -81,7 +81,11 @@ type StreamRate* = ref object
   ## showed a cumulative total).
   total*: int        ## cumulative bytes moved across every transfer so far
   transfers*: int    ## completed transfers; the sync clients report from inside a
-                     ## callback and cannot reach a `var int` in their caller
+                     ## callback and cannot reach a `var int` in their caller.
+                     ## SYNC ONLY: the async and mixed clients count transfers on
+                     ## StreamProgress below (which shadows this name), so do not
+                     ## read this field from them -- clients/stream_{upload,
+                     ## download}_sync.nim are its only users
   lastTotal: int     ## `total` as of the previous report line
   lastAt: float      ## monotonic-ish timestamp of the previous report line
   startedAt: float   ## timestamp the run began, for the whole-run average
@@ -105,6 +109,16 @@ proc mark*(r: StreamRate, now: float): tuple[mb: int, rate: string] =
 
 proc elapsed*(r: StreamRate, now: float): float =
   now - r.startedAt
+
+type StreamProgress* = ref object
+  ## One streaming slice's live tallies: the shared `StreamRate` plus the
+  ## transfer and retry counts that the report line and the final banner carry.
+  ## Both stream parts (`clients/parts/stream_{upload,download}_part.nim`) use
+  ## this one type, so the upload and download halves of the mixed soak -- which
+  ## keep a separate instance each and are never summed -- report the same shape.
+  rate*: StreamRate    ## cumulative bytes moved + the previous report line's marker
+  transfers*: int      ## completed+verified transfers
+  errors*: int         ## retried transient transport failures
 
 proc summary*(bytes: float, seconds: float, dir: string,
               transfers, retried: int): string =

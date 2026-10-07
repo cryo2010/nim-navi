@@ -43,6 +43,6 @@ RUN nimble install -y checksums "chronos@>= 4.0.0"
 RUN pip3 install --no-cache-dir --break-system-packages \
       -r tests/stress/server/requirements.txt \
       -r tests/stress/chaos/requirements.txt \
-      aioquic   # h3 WebSocket (RFC 9220) origin for the ws+h3 stress cell
+      aioquic   # h3 WebSocket (RFC 9220) origin for BOTH the ws+h3 cell (where it replaces Caddy on the base ports) and the mixed+h3 cell (where it runs on the ws band beside Caddy)
 
 ENTRYPOINT ["bash", "tests/stress/run.sh"]

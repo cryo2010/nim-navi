@@ -19,34 +19,9 @@ else:
   const backend = "asyncdispatch"
 include ../common/httpset
 include ../common/chaos
+include parts/stream_download_part   # one verified download (shared with mixed.nim)
 
-type Progress = ref object
-  rate: StreamRate    ## cumulative bytes rx + the previous report line's marker
-  transfers: int      ## completed+verified transfers
-  errors: int         ## retried transient transport failures
-
-proc oneDownload(api: Navi, cfg: Config, prog: Progress, url: string) {.async.} =
-  var st = newSha1State()
-  var got = 0
-  let res = await api.stream.get(url)
-  if res.status != 200:
-    stderr.writeLine cfg.label & " FAIL: /download -> " & $res.status
-    quit(1)
-  cfg.checkVersion(res.httpVersion)   # hard-fail on a silent protocol downgrade
-  let expected = res.headers.get("x-sha1").toLowerAscii
-  res.each(chunk):
-    if chunk.len > 0:
-      st.update(chunk)                 # hash then discard: never buffered
-      got += chunk.len
-      prog.rate.add chunk.len
-  let clientSha = st.hex
-  if clientSha != expected:
-    stderr.writeLine cfg.label & " FAIL: checksum mismatch\n" &
-      "  got " & $got & " bytes, client sha1=" & clientSha & "\n" &
-      "  server x-sha1=" & expected
-    quit(1)
-
-proc reporterLoop(cfg: Config, prog: Progress, deadline: float) {.async.} =
+proc reporterLoop(cfg: Config, prog: StreamProgress, deadline: float) {.async.} =
   while epochTime() < deadline:
     await sleep(1000)                  # 1s granularity: stop within ~1s of the deadline
     let now = epochTime()
@@ -84,7 +59,7 @@ proc main() {.async.} =
   let start = epochTime()
   let deadline = start + cfg.seconds
   let chaos = chaosMaybeStart(cfg, deadline, cfg.reportSeconds)  # no-op when off
-  let prog = Progress(rate: newStreamRate(start))
+  let prog = StreamProgress(rate: newStreamRate(start))
   let rep = reporterLoop(cfg, prog, deadline)
   while epochTime() < deadline:
     try:

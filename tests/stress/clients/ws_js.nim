@@ -1,12 +1,13 @@
 ## stressWs, navi/js backend (Node). Opens `concurrency` WebSockets across the
 ## server pool and loops text+binary echo round-trips until the deadline. Reports
 ## via setInterval. The runner trusts the self-signed cert via NODE_EXTRA_CA_CERTS.
+##
+## The verified loop itself lives in parts/ws_js_part, shared with
+## clients/mixed_js.nim.
 
 import navi/js
 import ../common/harness_js
-
-proc wsUrl(base: string): string =
-  "wss://" & base["https://".len .. ^1] & "/ws"
+include parts/ws_js_part   # the verified ws echo loop (shared with mixed_js.nim)
 
 proc main() {.async.} =
   let cfg = loadJsCfg()
@@ -24,26 +25,14 @@ proc main() {.async.} =
   let timer = setIntervalJs(proc () = counter.report("[ws js]", start),
                             cfg.reportSeconds * 1000)
 
-  proc worker(ws: WebSocket) {.async.} =
-    try:
-      while nowMs() < deadline:
-        await ws.send("ping")
-        let t = await ws.receive()
-        if t.kind != wmText or t.data != "ping": counter.note(); break
-        await ws.send("bytes", binary = true)
-        let b = await ws.receive()
-        if b.kind != wmBinary or b.data != "bytes": counter.note(); break
-        counter.tally(200)
-      await ws.close()
-    except CatchableError:
-      counter.note()
-
   var futs: seq[Future[void]]
-  for ws in socks: futs.add worker(ws)
+  for ws in socks: futs.add wsWorker(ws, counter, deadline)
   for f in futs: await f
   clearIntervalJs(timer)
 
-  if counter.ops == 0: (echo "[ws js] FAIL: no WebSocket round-trip completed"; jsExit(1))
+  # `ops - errors`, not `ops`: note() increments ops too (see ws.nim).
+  if counter.ops - counter.errors == 0:
+    jsFail("[ws js]", "no WebSocket round-trip completed")
   let elapsed = (nowMs() - start) / 1000.0   # the measured phase: the rate divisor
   counter.report("[ws js]", start, final = true)
   echo "== ws js passed (", counter.ops, " round-trips, ",

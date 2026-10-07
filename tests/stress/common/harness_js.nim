@@ -14,6 +14,14 @@ proc setIntervalJs*(cb: proc (), ms: int): int {.importjs: "setInterval(#, #)".}
 proc clearIntervalJs*(id: int) {.importjs: "clearInterval(#)".}
 proc jsExit*(code: int) {.importjs: "process.exit(#)".}
 
+proc jsFail*(label, msg: string) =
+  ## The js hard fail: one greppable line behind the cell's label, then exit 1.
+  ## (The native cfg.failHard writes to stderr; node's stdout is what the harness
+  ## tees and the js clients echo, so this does too.) Shared so every js part --
+  ## requests, sse, streamDownload -- fails the same way.
+  echo label, " FAIL: ", msg
+  jsExit(1)
+
 type JsCfg* = object
   host*, proto*: string
   basePort*, servers*, clients*, concurrency*, reportSeconds*, streamBytes*: int
@@ -51,15 +59,20 @@ proc loadJsCfg*(): JsCfg =
     echo "[", result.proto, " js] chaos skip: js is excluded (hostile-input handling ",
       "is undici's, and js cells can't pin the protocol or measure navi's FD/heap)"
 
-type JsPool* = object
+type JsPool* = ref object
+  ## Round-robin over the server instances. A ref (the native ServerPool is an
+  ## object the clients pass as `ptr`) so a top-level worker proc can share one
+  ## pool with its siblings: `addr` on a local is not a tool the js backend
+  ## offers, and the shared parts under clients/parts/ are top-level procs.
   bases: seq[string]
   next: int
 
 proc initJsPool*(cfg: JsCfg): JsPool =
+  result = JsPool()
   for i in 0 ..< cfg.servers:
     result.bases.add "https://" & cfg.host & ":" & $(cfg.basePort + i)
 
-proc pick*(p: var JsPool): string =
+proc pick*(p: JsPool): string =
   result = p.bases[p.next]; p.next = (p.next + 1) mod p.bases.len
 
 type JsCounter* = ref object
@@ -101,3 +114,31 @@ proc report*(c: JsCounter, label: string, start: float, final = false) =
   echo label, " ", c.render, " | RSS ", rssMb(), "MB | heap ", heapUsedMb(),
        "MB | ", fmtRate(winOps, winSecs), " ops/s | t=",
        int((now - start) / 1000.0), "s"
+
+proc intervalRate*(c: JsCounter, start: float, final = false): string =
+  ## The counter's rate over the interval since the previous line, as a bare
+  ## number; the whole-run average when `final`. Advances the same bookkeeping
+  ## `report` uses, so a client drives one or the other -- never both on the
+  ## same counter. Mirrors reporter.intervalRate on the native side.
+  let now = nowMs()
+  let since = if final or c.lastMs <= 0.0: start else: c.lastMs
+  let winOps = if final: c.ops else: c.ops - c.lastOps
+  let winSecs = (now - since) / 1000.0
+  if not final:
+    c.lastOps = c.ops
+    c.lastMs = now
+  fmtRate(winOps, winSecs)
+
+proc segment*(c: JsCounter, name, unit: string, start: float,
+              statuses = false, final = false): string =
+  ## One slice's field group for a report line that composes several counters
+  ## (the mixed workload), as a string rather than a printed line: the slice
+  ## name, then either the full status render (`statuses`, what `report` prints)
+  ## or the bare op count plus `unit`, then the interval rate in `unit`/s, then
+  ## the error tally when there is one (the `statuses` render already carries
+  ## "errN"; the bare-count variant dropped it, which let an all-failing ws or
+  ## sse slice print like a healthy one). Mirrors reporter.segment.
+  let rate = c.intervalRate(start, final)
+  let body = if statuses: c.render else: $c.ops & " " & unit
+  let errs = if statuses or c.errors == 0: "" else: " err" & $c.errors
+  name & " " & body & " " & rate & " " & unit & "/s" & errs

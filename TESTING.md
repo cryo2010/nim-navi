@@ -71,7 +71,8 @@ nimble stressWs           # soak: persistent WebSocket, text+binary
 nimble stressSse          # soak: SSE subscribe with reconnect / Last-Event-ID resume
 nimble stressStreamUpload # soak: stream 1 GiB up, server verifies checksum (hard-fail)
 nimble stressStreamDownload # soak: stream 1 GiB down, client verifies checksum (hard-fail)
-nimble stress             # short smoke of all five stress workloads
+nimble stressMixed        # soak: all five workloads at once, one server set, shared clients
+nimble stress             # short smoke of all six stress workloads
 ```
 
 ---
@@ -381,8 +382,9 @@ the client does) rather than protocol. Each runs many navi clients against **N T
 servers** (FastAPI/hypercorn for h1/h2; a Caddy front for h3), distributes requests
 across them, and prints a status-code + RSS report every interval. Responses are
 tallied into a counter and **discarded** (never retained), so memory stays flat over
-a multi-hour soak; the two streaming workloads verify a 1 GiB checksum and **fail
-hard** on any mismatch. The async clients fan out many parallel requests.
+a multi-hour soak; three cells verify a streamed checksum and **fail hard** on any
+mismatch -- `streamUpload`, `streamDownload`, and the two stream slices of
+`mixed`. The async clients fan out many parallel requests.
 
 | Task | Workload |
 |------|----------|
@@ -391,7 +393,8 @@ hard** on any mismatch. The async clients fan out many parallel requests.
 | `nimble stressSse` | SSE subscribe under load; the server drops mid-stream, exercising navi's reconnect + Last-Event-ID resume |
 | `nimble stressStreamUpload` | Stream 1 GiB up (pull-based `body = producer`, constant memory); the **server** verifies the SHA-1 and the client hard-fails on mismatch |
 | `nimble stressStreamDownload` | Stream 1 GiB down (`stream()`/`each`, hashed and discarded); the **client** verifies against `x-sha1` and hard-fails on mismatch |
-| `nimble stress` | Short smoke of all five (20 s cells, 64 MiB streams) |
+| `nimble stressMixed` | All five of the above **concurrently**, against one set of servers and through the **same `Navi` instances**, so a bulk stream and many small `/echo` requests share a pooled connection (the #444 shape). On h3 the ws slice is the exception: it shares the instances and the loop but dials its own QUIC origin, so not a connection. Each slice keeps its own verification, its own counter and its own zero-work check; the counters are never summed. Defaults `NAVI_STREAM_BYTES` to 256 MiB, since a stream sharing connections with 20 other workers may not finish 1 GiB inside a 60 s cell |
+| `nimble stress` | Short smoke of all six (20 s cells, 64 MiB streams) |
 
 Each task builds one image and runs the **client × protocol** matrix inside the
 container. The four clients map to `sync` / `asyncdispatch` / `chronos` (one async
@@ -399,7 +402,9 @@ source, built twice) / `js` (Node); a cell whose client can't do the workload is
 **skipped with a printed reason** (see gaps below), not silently. `nimble` does not
 propagate a task's exit code (nim-lang/nimble#1802): read the final
 `== <workload>: all cells passed ==` banner, or run the `docker run` directly for an
-honest exit code.
+honest exit code. A matrix in which **every** cell was skipped (say `NAVI_CLIENT=sync`
+with `mixed`) prints `== <workload>: NO CELLS RAN ==` and exits 1, so a run that did
+no work never reads as a pass.
 
 **Configuration** — every knob is a `NAVI_*` env var:
 
@@ -410,14 +415,20 @@ honest exit code.
 | `NAVI_SERVER_COUNT` | `5` | Number of server instances; requests round-robin across them |
 | `NAVI_SECONDS` | `60` | Runtime per (client × protocol) cell |
 | `NAVI_CLIENT_COUNT` | `3` | Concurrent navi client instances per cell |
-| `NAVI_CONCURRENCY` | `32` | In-flight requests per client (async fan-out width) |
-| `NAVI_REQ_COMPRESSION` | `gzip` | Request body encoding: `none` \| `gzip` \| `deflate` (native only) |
+| `NAVI_CONCURRENCY` | `8` | In-flight requests per client (async fan-out width) |
+| `NAVI_REQ_COMPRESSION` | `gzip` | Request body encoding: `none` \| `gzip` \| `deflate` (native only; octet/text bodies only) |
 | `NAVI_RESP_COMPRESSION` | `gzip` | Response encoding requested via `x-want-encoding`: `none` \| `gzip` \| `deflate` \| `br` \| `zstd` |
+| `NAVI_CONTENT_TYPES` | `octet,text,json,form` | csv restricting the `/echo` body rotation; an unknown token hard-fails at startup |
 | `NAVI_REPORT_SECONDS` | `60` | Report cadence |
-| `NAVI_STREAM_BYTES` | `1073741824` | Streaming transfer size in bytes (1 GiB); lower for a local smoke |
+| `NAVI_STREAM_BYTES` | `1073741824` | Streaming transfer size in bytes (1 GiB); lower for a local smoke. `nimble stressMixed` defaults it to 256 MiB and `nimble stress` to 64 MiB |
+| `NAVI_RECYCLE` | `0` | `1` lowers the server's keep-alive limits so it GOAWAYs / idle-closes pooled connections mid-soak, exercising navi's recycle + retry path |
+| `NAVI_KEEPALIVE_MAX` | `1000000000` | hypercorn `keep_alive_max_requests` (`200` under `NAVI_RECYCLE=1`) |
+| `NAVI_KEEPALIVE_TIMEOUT` | `NAVI_SECONDS + 3600` | hypercorn `keep_alive_timeout` (`2` under `NAVI_RECYCLE=1`) |
+| `NAVI_WS_H3_PORTBAND` | `3000` | `mixed` + h3 only: the aioquic WebSocket origins sit at `NAVI_BASE_PORT + band + i`, beside the Caddy front |
+| `NAVI_CHAOS*` | off | The opt-in misbehaving-server sidecar and its leak bounds: `NAVI_CHAOS`, `_CONC`, `_SEED`, `_PORTBAND`, `_WATCHDOG`, `_FD_SLACK`, `_HEAP_SLACK_MB`, `_RSS_SLACK_MB`, `_SELFTEST`. Documented in [`tests/stress/README.md`](tests/stress/README.md) |
 
-(`NAVI_WORKLOAD` is set by each task; `NAVI_HOST` / `NAVI_BASE_PORT`
-/ `NAVI_CERT` / `NAVI_KEY` are set internally by `run.sh`.)
+(`NAVI_WORKLOAD` is set by each task; `NAVI_HOST` / `NAVI_BASE_PORT` /
+`NAVI_CERT` are set internally by `run.sh`.)
 
 Example — a 10-minute h1/h2/h3 requests soak on chronos, reporting each minute:
 
@@ -429,7 +440,13 @@ NAVI_SECONDS=600 NAVI_PROTO=all NAVI_CLIENT=chronos \
 **Client/protocol gaps** (skipped with a reason, not run):
 
 - `js` + `streamUpload` — `fetch` cannot stream a request body (navi/js buffers it,
-  which would defeat a 1 GiB soak), so there is no js upload client.
+  which would defeat a 1 GiB soak), so there is no js upload client. For the same
+  reason the js `mixed` cell mixes four of the five workloads and folds the upload
+  share into its download slice.
+- `sync` + `mixed` is skipped for want of a source. The sync client is blocking,
+  so a genuinely concurrent mix needs either `--threads:on` with a thread per
+  slice or an interleaved step loop like `syncChaosStep`; deliberately not built
+  yet.
 - `h3` on `js` — js/undici has no HTTP/3. (HTTP/3 runs on sync, asyncdispatch, and chronos.)
 - `h3` without a `-d:naviHttp3` build — use the h3 image (selected automatically when
   `NAVI_PROTO=h3`).

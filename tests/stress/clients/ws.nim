@@ -13,7 +13,6 @@ import std/[times, strutils]
 from std/os import getEnv
 import ../common/[config, reporter, servers, leakcheck]
 
-let logErrors = getEnv("NAVI_LOG_ERRORS").len > 0
 when defined(useChronos):
   import navi/chronos
   const backend = "chronos"
@@ -22,34 +21,7 @@ else:
   const backend = "asyncdispatch"
 include ../common/httpset
 include ../common/chaos
-
-proc wsUrl(base: string): string =
-  "wss://" & base["https://".len .. ^1] & "/ws"
-
-proc worker(ws: WebSocket, counter: StatusCounter, deadline: float) {.async.} =
-  try:
-    while epochTime() < deadline:
-      await ws.send("ping")
-      let t = await ws.receive()
-      if t.kind == wmClose: break          # peer closed (e.g. the close handshake as
-                                           # the soak winds down): a normal end, not a fail
-      if t.kind != wmText or t.data != "ping":
-        counter.fail()
-        if logErrors: stderr.writeLine("ws text mismatch: kind=" & $t.kind & " len=" & $t.data.len)
-        break
-      await ws.send("bytes", binary = true)
-      let b = await ws.receive()
-      if b.kind == wmClose: break
-      if b.kind != wmBinary or b.data != "bytes":
-        counter.fail()
-        if logErrors: stderr.writeLine("ws bin mismatch: kind=" & $b.kind & " len=" & $b.data.len)
-        break
-      counter.tally(200)
-  except CatchableError as e:
-    counter.fail()
-    if logErrors: stderr.writeLine("ws err: " & $e.name & ": " & e.msg)
-  try: await ws.close()                    # closing an already-closing socket is not a failure
-  except CatchableError: discard
+include parts/ws_part   # the verified ws echo loop (shared with mixed.nim)
 
 proc reporterLoop(cfg: Config, counter: StatusCounter,
                   start, deadline: float) {.async.} =
@@ -85,12 +57,15 @@ proc main() {.async.} =
   let deadline = start + cfg.seconds
   let chaos = chaosMaybeStart(cfg, deadline, cfg.reportSeconds)  # no-op when off
   var futs: seq[Future[void]]
-  for ws in socks: futs.add worker(ws, counter, deadline)
+  for ws in socks: futs.add wsWorker(ws, counter, deadline)
   futs.add reporterLoop(cfg, counter, start, deadline)
   for f in futs: await f
   await chaosAwait(chaos)
 
-  if counter.ops == 0:                 # a cell that did no round-trips is not a pass
+  # `ops - errors`, not `ops`: counter.fail() increments ops too, so a cell whose
+  # every round-trip failed used to pass this check. A cell that did no round-trips
+  # is not a pass.
+  if counter.ops - counter.errors == 0:
     stderr.writeLine cfg.label & " FAIL: no WebSocket round-trip completed"
     quit(1)
   let elapsed = epochTime() - start      # the measured phase: also the rate divisor

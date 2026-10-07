@@ -52,7 +52,8 @@ proc main() =
       syncChaosReport(sc)
   ws.close()
 
-  if counter.ops == 0:
+  # `ops - errors`, not `ops`: counter.fail() increments ops too (see ws.nim).
+  if counter.ops - counter.errors == 0:
     stderr.writeLine cfg.label & " FAIL: no WebSocket round-trip completed"
     quit(1)
   let elapsed = epochTime() - start      # the measured phase: also the rate divisor
