@@ -20,48 +20,9 @@ else:
   const backend = "asyncdispatch"
 include ../common/httpset
 include ../common/chaos
+include parts/stream_upload_part   # one verified upload (shared with mixed.nim)
 
-type Progress = ref object
-  rate: StreamRate    ## cumulative bytes tx + the previous report line's marker
-  transfers: int      ## completed+verified transfers
-  errors: int         ## retried transient transport failures
-
-proc oneUpload(api: Navi, cfg: Config, prog: Progress, url: string) {.async.} =
-  var st = newSha1State()
-  var remaining = cfg.streamBytes
-  var sent = 0
-  var idx = 0
-  var blk = fillBlock()   # local (gcsafe under chronos); re-stamped per block below
-  var h = initHeaders()
-  h["content-type"] = "application/octet-stream"
-
-  let res = await api.request(POST, url, headers = h,
-    body = BodyProducer(proc(): string =
-      if remaining <= 0: return ""
-      let n = min(blockSize, remaining)
-      remaining -= n
-      stampBlock(blk, idx); inc idx   # distinct per block: server catches a reorder/dup
-      let chunk = if n == blockSize: blk else: blk[0 ..< n]
-      st.update(chunk)
-      sent += n
-      prog.rate.add n
-      chunk))
-
-  if res.status != 200:
-    stderr.writeLine cfg.label & " FAIL: /upload -> " & $res.status
-    quit(1)
-  cfg.checkVersion(res.httpVersion)   # hard-fail if the streamed upload downgraded
-  let clientSha = st.hex
-  let j = parseJson(res.body)
-  let serverSha = j{"sha1"}.getStr
-  let serverSize = j{"size"}.getInt
-  if serverSha != clientSha or serverSize != sent:
-    stderr.writeLine cfg.label & " FAIL: checksum mismatch\n" &
-      "  sent " & $sent & " bytes, client sha1=" & clientSha & "\n" &
-      "  server got " & $serverSize & " bytes, sha1=" & serverSha
-    quit(1)
-
-proc reporterLoop(cfg: Config, prog: Progress, deadline: float) {.async.} =
+proc reporterLoop(cfg: Config, prog: StreamProgress, deadline: float) {.async.} =
   while epochTime() < deadline:
     await sleep(1000)                  # 1s granularity: stop within ~1s of the deadline
     let now = epochTime()
@@ -100,7 +61,7 @@ proc main() {.async.} =
   let start = epochTime()
   let deadline = start + cfg.seconds
   let chaos = chaosMaybeStart(cfg, deadline, cfg.reportSeconds)  # no-op when off
-  let prog = Progress(rate: newStreamRate(start))
+  let prog = StreamProgress(rate: newStreamRate(start))
   let rep = reporterLoop(cfg, prog, deadline)
   while epochTime() < deadline:
     try:

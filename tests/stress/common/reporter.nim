@@ -56,7 +56,7 @@ proc fmtRate*(ops: int, seconds: float): string =
   formatFloat(opsPerSec(ops, seconds), ffDecimal, 1)
 
 proc render*(c: StatusCounter): string =
-  ## "200x45123 503x12 err3" — sorted by status for stable output.
+  ## "200x45123 503x12 err3": sorted by status for stable output.
   var keys: seq[int]
   for k in c.counts.keys: keys.add k
   keys.sort()
@@ -83,6 +83,37 @@ proc report*(label: string, c: StatusCounter, elapsed: float, final = false) =
        " | heap ", fmtBytes(getOccupiedMem()),
        " | ", fmtRate(winOps, winSecs), " ops/s",
        " | t=", elapsed.int, "s"
+
+proc intervalRate*(c: StatusCounter, elapsed: float, final = false): string =
+  ## The counter's rate over the interval since the previous line, as a bare
+  ## number ("1203.4"); the whole-run average when `final`. Advances the same
+  ## interval bookkeeping `report` uses, so a client drives one or the other --
+  ## never both on the same counter.
+  let winOps = if final: c.ops else: c.ops - c.lastOps
+  let winSecs = if final: elapsed else: elapsed - c.lastElapsed
+  if not final:
+    c.lastOps = c.ops
+    c.lastElapsed = elapsed
+  fmtRate(winOps, winSecs)
+
+proc segment*(c: StatusCounter, name, unit: string, elapsed: float,
+              statuses = false, final = false): string =
+  ## One slice's field group for a report line that composes several counters
+  ## (the mixed workload), as a string rather than a printed line: the slice
+  ## name, then either the full status render (`statuses`, what `report` prints)
+  ## or the bare op count plus `unit`, then the interval rate in `unit`/s.
+  ##
+  ##   segment(req, "req", "ops", e, statuses = true) -> "req 200x12034 1203.4 ops/s"
+  ##   segment(ws,  "ws",  "rt",  e)                  -> "ws 8810 rt 881.0 rt/s err3"
+  ##
+  ## Either way the segment carries the error tally when there is one. The
+  ## `statuses` render already appends "errN"; the bare-count variant dropped it
+  ## entirely, which let an all-failing ws or sse slice print like a healthy one
+  ## (its zero-work check reads `ops - errors` for the same reason).
+  let rate = c.intervalRate(elapsed, final)
+  let body = if statuses: c.render else: $c.ops & " " & unit
+  let errs = if statuses or c.errors == 0: "" else: " err" & $c.errors
+  name & " " & body & " " & rate & " " & unit & "/s" & errs
 
 # --- chaos tallies ----------------------------------------------------------
 

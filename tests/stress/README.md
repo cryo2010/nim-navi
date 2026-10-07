@@ -32,6 +32,20 @@ carries the whole-run average.
   == streamDownload chronos passed (4096MB rx in 61s, 67.1 MB/s, 4 transfers, 0 retried) ==
   ```
 
+- `mixed`: one line carrying every slice's own numbers side by side, in the same
+  fields the single-workload cells print. The slices are **never summed**: a
+  headline that added small `/echo` ops to 1 MiB stream chunks would mean nothing,
+  and a dead slice would hide inside it.
+
+  ```
+  [mixed h3 chronos] req 200x7529 743.7 ops/s | ws 3990 rt 396.8 rt/s | sse 930005 ev 95708.6 ev/s | up 1981MB 193.9 MB/s 30 done 0 retried | down 844MB 86.7 MB/s 12 done 0 retried | RSS 78MB | heap 10MB | t=10s
+  == mixed chronos h3 passed (req 7529 ops 731.7 ops/s, ws 3990 round-trips, sse 930005 events, up 2048MB tx 32 transfers, down 896MB rx 14 transfers) ==
+  ```
+
+  The interval line's cumulative MB and the banner's differ because a transfer
+  in flight at the deadline runs to completion: the interval line was printed at
+  the deadline, the banner after the last transfer finished.
+
 ## Tasks
 
 | Task | Workload |
@@ -41,7 +55,8 @@ carries the whole-run average.
 | `nimble stressSse` | SSE subscribe under load, reconnect + Last-Event-ID resume |
 | `nimble stressStreamUpload` | stream 1 GiB up; server verifies checksum (hard-fail) |
 | `nimble stressStreamDownload` | stream 1 GiB down; client verifies checksum (hard-fail) |
-| `nimble stress` | short smoke of all five |
+| `nimble stressMixed` | all five of the above at once, through the same clients and connections |
+| `nimble stress` | short smoke of all six |
 
 ## Configuration (`NAVI_*` env)
 
@@ -58,6 +73,7 @@ carries the whole-run average.
 | `CONTENT_TYPES` | `octet,text,json,form` | csv restricting the `requests` /echo rotation; unknown tokens hard-fail at startup |
 | `REPORT_SECONDS` | `60` | report cadence |
 | `STREAM_BYTES` | `1073741824` | stream size (1 GiB); lower for a smoke |
+| `WS_H3_PORTBAND` | `3000` | `mixed` + h3 only: the aioquic ws origins are `NAVI_BASE_PORT + band + i`, beside the Caddy front |
 
 The `requests` workload rotates four body kinds through `/echo`:
 
@@ -72,6 +88,90 @@ Example:
 ```
 NAVI_SECONDS=600 NAVI_PROTO=all NAVI_CLIENT=chronos \
   nimble stressRequests
+```
+
+## `mixed`: all five workloads at once (`nimble stressMixed`)
+
+The five soaks above each drive one workload at one set of servers, so they can
+never see an interaction *between* workloads. `mixed` is the sixth cell: all five
+verified loops at once, against one set of servers, through the **same `Navi`
+instances**. `NAVI_CLIENT_COUNT` instances are built once (with the `requests`
+cell's `x-stress` middleware, harmless on the other routes) and shared
+round-robin across every slice, so a bulk `/upload` or `/download` body and
+dozens of small `/echo` streams really ride one pooled h2/h3 connection next to a
+parked SSE read and a WebSocket. Same server is easy; same connection is the
+point. #444 -- a buffered upload parking an h2 connection's only reader, delaying
+every inbound frame for every other stream on it -- is the shape this cell exists
+to catch.
+
+One caveat: on h3 the ws slice shares the instances and the event loop but *not* a
+connection, because it has to dial its own QUIC origin (see "h3 needs two origins"
+below). On h1 and h2 every slice shares connections with every other.
+
+**Worker split.** `NAVI_CLIENT_COUNT x NAVI_CONCURRENCY` workers are divided
+requests 40% / ws 20% / sse 20% / streamUpload 10% / streamDownload 10%, each
+share rounded to the nearest worker, every slice at least one, and the remainder
+to requests. At the defaults (3 x 8 = 24) that is `req=10 ws=5 sse=5 up=2 down=2`.
+The rule is one pure proc (`common/mixsplit.nim`), shared with the js client, and
+the resolved split is printed at cell start:
+
+```
+[mixed h2 chronos] split req=10 ws=5 sse=5 up=2 down=2
+```
+
+**Verification is per slice, unchanged.** Each slice runs the same `parts/*` work
+proc its single-workload client runs: per-response `checkVersion` for requests and
+both streams, the per-kind echo checks, the SSE `VersionGate` plus Last-Event-ID
+continuity, and the upload/download SHA-1 brackets. Each slice keeps its own
+counter, and each has its own **zero-work check** -- `no request completed`, `no
+WebSocket round-trip completed`, `no SSE event consumed`, `no upload bytes moved`,
+`no download bytes moved` -- so a stalled SSE feed or an upload that moved nothing
+cannot hide behind a healthy `/echo` rate. The ws and sse checks read
+`ops - errors`, not `ops`, because a tallied failure counts as an op too, so an
+all-failing slice would otherwise clear the check. All shared instances are passed to
+`chaosFinish`, so the process-wide FD/heap bracket stays honest under chaos.
+
+**h3 needs two origins.** Caddy's `reverse_proxy` does not bridge an h3 Extended
+CONNECT to a backend WebSocket, so for a mixed h3 cell `run.sh` keeps the Caddy
+front on `NAVI_BASE_PORT + i` (for `/echo`, `/events`, `/upload`, `/download`) and
+*also* starts aioquic ws servers on a band at `NAVI_BASE_PORT +
+NAVI_WS_H3_PORTBAND + i`; the ws slice dials those. navi direct-dials QUIC for an
+h3 WebSocket, so the band needs no Alt-Svc discovery leg. On h1 and h2 the ws
+slice shares the base origins with everything else.
+
+**Gaps.** `sync` has **no mixed client**: the sync client is blocking, so a real
+concurrent mix needs either `--threads:on` with a thread per slice or an
+interleaved step loop like `syncChaosStep`. That is deliberately not built yet;
+`run.sh` prints the usual "no source for this client/workload" skip. `js` mixes
+**four** of the five (requests, ws, sse, streamDownload): js cannot stream a
+request body, so the upload share folds into the download slice and the split line
+says so.
+
+**Reading the numbers.** A slice's rate in a mixed cell is not comparable to its
+own dedicated cell, and that is the whole point: the slices contend for one
+connection and one event loop, so a measured h2 cell can show the download slice
+at hundreds of MB/s while the upload slice crawls, or the request slice at a
+fraction of its solo ops/s. Compare a mixed cell to *itself* across runs, not to
+the single-workload cells. One practical consequence: a streaming transfer takes
+far longer here than in its own cell, so `nimble stressMixed` defaults
+`NAVI_STREAM_BYTES` to **256 MiB** rather than the 1 GiB the dedicated stream
+tasks use (and the `nimble stress` smoke drops it to 64 MiB); set
+`NAVI_STREAM_BYTES` to override either. The two stream zero-work checks are
+byte-based for the same reason -- `no upload bytes moved` / `no download bytes
+moved`, not "no transfer completed" -- since a healthy short cell can legitimately
+end with a transfer still in flight and none finished.
+
+**The deadline is soft for the stream slices.** A stream worker will not *start* a
+transfer it has no time left to finish (it compares the time remaining against its
+own last transfer's duration), but one already in flight at the deadline runs to
+completion, so a mixed cell can overrun `NAVI_SECONDS` by roughly one transfer.
+The interval lines keep printing through the overrun, and the final line divides
+the req/ws/sse rates by the time the deadline was reached while the two stream
+fields divide by the full elapsed, so the overrun is never charged to the other
+slices.
+
+```
+NAVI_SECONDS=600 NAVI_PROTO=h2 NAVI_CLIENT=chronos nimble stressMixed
 ```
 
 ## Chaos: the misbehaving-server sidecar (`NAVI_CHAOS`)
@@ -213,10 +313,13 @@ NAVI_CHAOS=all NAVI_PROTO=h1 NAVI_CLIENT=all nimble stressRequests
 
 ## Layout
 
-- `common/` — shared native harness: `config` (env + gap policy), `reporter`
-  (status counter + interval ops/s + RSS from `/proc/self/statm`), `servers`
-  (round-robin), `streamcontent` (fixed-block + incremental SHA-1 + the MB/MB/s
-  accounting shared with the js download client), `httpset` (proto → version set),
+- `common/`: shared native harness, `config` (env + gap policy + the shared
+  `failHard`), `reporter` (status counter + interval ops/s + RSS from
+  `/proc/self/statm`, plus the `segment` renderer the mixed line composes),
+  `servers` (round-robin), `streamcontent` (fixed-block + incremental SHA-1 + the
+  MB/MB/s accounting shared with the js download client + the `StreamProgress` both
+  stream slices report from), `mixsplit` (the mixed worker split, shared with js),
+  `httpset` (proto → version set),
   `chaos` (client-side chaos driver: seeded schedule, workers/watchdog, outcome
   classification; split into `chaos_async`/`chaos_sync` for the two client models),
   `leakcheck` (FD/heap/RSS sampling + assertions).
@@ -224,10 +327,16 @@ NAVI_CHAOS=all NAVI_PROTO=h1 NAVI_CLIENT=all nimble stressRequests
   (entrypoint + control port), `modes.py` (registry + wire helpers), `h1.py`,
   `h2.py` (hyper-h2 decoder + raw-frame writer), `h3.py` (aioquic modes + the
   TCP Alt-Svc discovery leg), `requirements.txt` (`h2`).
-- `clients/` — one client per workload. The async source (`*.nim`) is built for
-  both asyncdispatch and (`-d:useChronos`) chronos; `*_sync.nim` is the sync
-  client; `*_js.nim` runs under Node. run.sh skips any client whose source
-  is absent, so partial client coverage degrades gracefully.
+- `clients/`: the workload clients, plus `clients/parts/` holding the verified
+  work procs they are composed from. One client per workload, and `mixed` /
+  `mixed_js` compose all of them: `parts/*_part.nim` (native) and
+  `parts/*_js_part.nim` (js) are `include`d, not imported, because every proc in
+  them takes the backend's `Navi`/`Future` types -- the same reason `common/httpset`
+  and `common/chaos` are includes. So a single-workload cell and the mixed cell run
+  the same code, not two copies of it. The async source (`*.nim`) is built for both
+  asyncdispatch and (`-d:useChronos`) chronos; `*_sync.nim` is the sync client;
+  `*_js.nim` runs under Node. run.sh skips any client whose source is absent, so
+  partial client coverage degrades gracefully (there is no `mixed_sync.nim`).
 - `server/app.py` — one FastAPI app (echo, ws, events, upload, download) served by
   hypercorn (h1/h2); Caddy fronts it for h3.
 - `Dockerfile` (h1/h2) and `Dockerfile.h3` (adds the ngtcp2/nghttp3/OpenSSL-3.5
@@ -239,6 +348,9 @@ NAVI_CHAOS=all NAVI_PROTO=h1 NAVI_CLIENT=all nimble stressRequests
 - `nimble` does not propagate a task's exit code (nim-lang/nimble#1802): read the
   final `== <workload>: all cells passed ==` banner, or run the `docker run`
   directly for an honest exit code.
+- A matrix in which every cell was skipped prints `== <workload>: NO CELLS RAN ==`
+  and exits 1, rather than reading as a pass on no work: `NAVI_CLIENT=sync` with
+  `mixed`, or `NAVI_CLIENT=js` with `streamUpload`, has no client to run at all.
 - RSS is read on Linux (everything is Dockerized); the js client reports
   `process.memoryUsage().rss`.
 - CI runs a nightly chaos rotation (`.github/workflows/stress-chaos.yml`): the full

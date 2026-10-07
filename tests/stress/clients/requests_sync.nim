@@ -19,10 +19,6 @@ proc stampMw(): NaviMiddleware =
     ctx.req.headers["x-stress"] = "1"
     ctx.next()
 
-proc failHard(cfg: Config, msg: string) =
-  stderr.writeLine cfg.label & " FAIL: " & msg
-  quit(1)
-
 proc baseType(ct: string): string =
   ## The media type before any `;` parameter, lowercased/trimmed, for the mirror check.
   ct.split(';', 1)[0].strip().toLowerAscii()
