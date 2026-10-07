@@ -3,9 +3,34 @@
 Focused, Dockerized soak tests, split by **workload** (what the client does) with
 protocol, client, server count, compression, and runtime as configurable
 dimensions. Each runs many navi clients against N TLS servers, prints a status +
-memory report every interval (responses are tallied and discarded, so memory
-stays flat over a long soak), and — for the streaming workloads — verifies a 1 GiB
-checksum and fails hard on any mismatch.
+throughput + memory report every interval (responses are tallied and discarded, so
+memory stays flat over a long soak), and — for the streaming workloads — verifies a
+1 GiB checksum and fails hard on any mismatch.
+
+## Report lines
+
+Every cell prints one line per `REPORT_SECONDS` and a final `== ... passed (...) ==`
+banner. The throughput field on the interval line is the rate over the window since
+the previous line (so a mid-soak slowdown shows where it happened); the banner
+carries the whole-run average.
+
+- `requests`, `ws`, `sse`: status tallies, RSS, heap, then **ops/s** for the
+  interval. The banner names the unit: `ops/s`, `round-trips/s`, `events/s`.
+
+  ```
+  [requests h2 chronos] 200x45123 503x12 err3 | RSS 42MB | heap 3MB | 1234.5 ops/s | t=120s
+  == requests chronos h2 passed (45123 ops, 751.9 ops/s) ==
+  ```
+
+- `streamUpload`, `streamDownload`: measured in **megabytes** (MiB), not transfers.
+  A 1 GiB transfer is minutes long, so the transfer count is only a secondary
+  field. Cumulative MB first, then the interval's MB/s. A window at or below a
+  millisecond prints `n/a` instead of a bogus rate.
+
+  ```
+  [streamDownload h2 chronos] 3072MB rx | 51.2 MB/s | 3 done | 0 retried | RSS 42MB | heap 12MB
+  == streamDownload chronos passed (4096MB rx in 61s, 67.1 MB/s, 4 transfers, 0 retried) ==
+  ```
 
 ## Tasks
 
@@ -189,8 +214,9 @@ NAVI_CHAOS=all NAVI_PROTO=h1 NAVI_CLIENT=all nimble stressRequests
 ## Layout
 
 - `common/` — shared native harness: `config` (env + gap policy), `reporter`
-  (status counter + RSS from `/proc/self/statm`), `servers` (round-robin),
-  `streamcontent` (fixed-block + incremental SHA-1), `httpset` (proto → version set),
+  (status counter + interval ops/s + RSS from `/proc/self/statm`), `servers`
+  (round-robin), `streamcontent` (fixed-block + incremental SHA-1 + the MB/MB/s
+  accounting shared with the js download client), `httpset` (proto → version set),
   `chaos` (client-side chaos driver: seeded schedule, workers/watchdog, outcome
   classification; split into `chaos_async`/`chaos_sync` for the two client models),
   `leakcheck` (FD/heap/RSS sampling + assertions).

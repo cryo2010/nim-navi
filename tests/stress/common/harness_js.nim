@@ -65,10 +65,21 @@ proc pick*(p: var JsPool): string =
 type JsCounter* = ref object
   counts: Table[int, int]
   errors*, ops*: int
+  lastOps: int        ## ops as of the previous report line
+  lastMs: float       ## nowMs() of the previous report line (0 = none yet)
 
 proc newJsCounter*(): JsCounter = JsCounter(counts: initTable[int, int]())
 proc tally*(c: JsCounter, s: int) = c.counts.mgetOrPut(s, 0).inc; inc c.ops
 proc note*(c: JsCounter) = inc c.errors; inc c.ops
+
+proc opsPerSec*(ops: int, seconds: float): float =
+  ## Mirrors the native reporter: a zero, negative or sub-millisecond window (and
+  ## an empty window) yields 0.0, so the line never carries a division by zero.
+  if ops <= 0 or seconds <= 0.001: 0.0 else: ops.float / seconds
+
+proc fmtRate*(ops: int, seconds: float): string =
+  ## The throughput number with one decimal, e.g. "751.9".
+  formatFloat(opsPerSec(ops, seconds), ffDecimal, 1)
 
 proc render(c: JsCounter): string =
   var parts: seq[string]
@@ -76,6 +87,17 @@ proc render(c: JsCounter): string =
   if c.errors > 0: parts.add "err" & $c.errors
   if parts.len == 0: "(none)" else: parts.join(" ")
 
-proc report*(c: JsCounter, label: string, start: float) =
+proc report*(c: JsCounter, label: string, start: float, final = false) =
+  ## Mirrors the native report line, ops/s field included: the rate over the
+  ## interval since the previous line (the first window starts at `start`).
+  ## `final` prints the whole-run average and leaves the bookkeeping untouched.
+  let now = nowMs()
+  let since = if final or c.lastMs <= 0.0: start else: c.lastMs
+  let winOps = if final: c.ops else: c.ops - c.lastOps
+  let winSecs = (now - since) / 1000.0
+  if not final:
+    c.lastOps = c.ops
+    c.lastMs = now
   echo label, " ", c.render, " | RSS ", rssMb(), "MB | heap ", heapUsedMb(),
-       "MB | t=", int((nowMs() - start) / 1000.0), "s"
+       "MB | ", fmtRate(winOps, winSecs), " ops/s | t=",
+       int((now - start) / 1000.0), "s"

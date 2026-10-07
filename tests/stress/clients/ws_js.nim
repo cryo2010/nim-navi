@@ -44,7 +44,9 @@ proc main() {.async.} =
   clearIntervalJs(timer)
 
   if counter.ops == 0: (echo "[ws js] FAIL: no WebSocket round-trip completed"; jsExit(1))
-  counter.report("[ws js]", start)
-  echo "== ws js passed (", counter.ops, " round-trips) =="
+  let elapsed = (nowMs() - start) / 1000.0   # the measured phase: the rate divisor
+  counter.report("[ws js]", start, final = true)
+  echo "== ws js passed (", counter.ops, " round-trips, ",
+    fmtRate(counter.ops, elapsed), " round-trips/s) =="
 
 discard main()

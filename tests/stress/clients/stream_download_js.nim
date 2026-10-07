@@ -2,9 +2,10 @@
 ## /download, hashing each chunk with Node's native SHA-1 (crypto), then compares
 ## to the server's x-sha1. Mismatch FAILS HARD (process.exit(1)). Repeats while
 ## time remains. (js cannot stream uploads, so there is no streamUpload js client.)
+## Reports cumulative megabytes and the interval's MB/s, matching the native cells.
 
 import navi/js
-import ../common/harness_js
+import ../common/[harness_js, streamcontent]   # streamcontent: the shared MB/s math
 
 proc jsExit(code: int) {.importjs: "process.exit(#)".}
 
@@ -46,17 +47,28 @@ proc main() {.async.} =
   # Float, not int: the js backend overflow-checks int at 2^31, and cumulative
   # bytes crosses 2 GiB within seconds of a soak (~32 x 64 MiB). A JS number holds
   # the running total exactly well past any realistic soak (2^53 bytes = 8 PiB).
+  # No StreamRate here for the same reason: its total is an int.
   var bytes = 0.0                        # cumulative bytes rx, for the reporter
+  var lastBytes = 0.0                    # `bytes` as of the previous report line
+  var lastMs = start                     # timestamp of the previous report line
   proc reportMem() =
-    echo "[streamDownload js] ", int(bytes / 1048576.0), "MB rx | ", transfers,
-         " done | RSS ", rssMb(), "MB | heap ", heapUsedMb(), "MB | t=",
-         int((nowMs() - start) / 1000.0), "s"
+    # MB/s over the window since the previous line, not the whole run, so a mid-soak
+    # slowdown shows up instead of being averaged away. mbPerSec guards a zero or
+    # sub-millisecond window.
+    let now = nowMs()
+    let mbps = mbPerSec(bytes - lastBytes, (now - lastMs) / 1000.0)
+    lastBytes = bytes
+    lastMs = now
+    echo "[streamDownload js] ", megabytes(bytes), "MB rx | ", mbps, " MB/s | ",
+         transfers, " done | 0 retried | RSS ", rssMb(), "MB | heap ",
+         heapUsedMb(), "MB | t=", int((now - start) / 1000.0), "s"
   let timer = setIntervalJs(reportMem, cfg.reportSeconds * 1000)
   while true:
     bytes += float(await oneDownload(api, cfg, pool.pick() & "/download?size=" & $cfg.streamBytes))
     inc transfers
     if nowMs() >= deadline: break
   clearIntervalJs(timer)
-  echo "== streamDownload js passed (", transfers, " x ", cfg.streamBytes, " bytes) =="
+  echo "== streamDownload js passed (",
+       summary(bytes, (nowMs() - start) / 1000.0, "rx", transfers, 0), ") =="
 
 discard main()

@@ -6,7 +6,9 @@
 ## A checksum/size mismatch FAILS HARD (exit 1). A transient transport error (e.g.
 ## the server recycled/idle-closed a pooled connection mid-transfer) is retried, not
 ## fatal. Repeats while time remains; a background reporter prints cumulative
-## progress + RSS on the interval regardless of per-transfer duration.
+## megabytes, the interval's MB/s and RSS on the interval, regardless of per-transfer
+## duration (one 1 GiB transfer is minutes long, so a transfer count is far too
+## coarse to be the headline number).
 
 import std/[times, json]
 import ../common/[config, reporter, servers, streamcontent, leakcheck]
@@ -20,7 +22,7 @@ include ../common/httpset
 include ../common/chaos
 
 type Progress = ref object
-  bytes: int          ## cumulative bytes sent across all transfers
+  rate: StreamRate    ## cumulative bytes tx + the previous report line's marker
   transfers: int      ## completed+verified transfers
   errors: int         ## retried transient transport failures
 
@@ -42,7 +44,7 @@ proc oneUpload(api: Navi, cfg: Config, prog: Progress, url: string) {.async.} =
       let chunk = if n == blockSize: blk else: blk[0 ..< n]
       st.update(chunk)
       sent += n
-      prog.bytes += n
+      prog.rate.add n
       chunk))
 
   if res.status != 200:
@@ -59,13 +61,15 @@ proc oneUpload(api: Navi, cfg: Config, prog: Progress, url: string) {.async.} =
       "  server got " & $serverSize & " bytes, sha1=" & serverSha
     quit(1)
 
-proc reporterLoop(cfg: Config, prog: Progress, start, deadline: float) {.async.} =
-  var last = start
+proc reporterLoop(cfg: Config, prog: Progress, deadline: float) {.async.} =
   while epochTime() < deadline:
     await sleep(1000)                  # 1s granularity: stop within ~1s of the deadline
-    if epochTime() - last >= cfg.reportSeconds.float:
-      last = epochTime()
-      echo cfg.label, " ", prog.bytes div (1 shl 20), "MB tx | ",
+    let now = epochTime()
+    if prog.rate.due(now, cfg.reportSeconds):
+      # MB/s is over the window since the previous line, not the whole run, so a
+      # mid-soak slowdown shows up instead of being averaged away.
+      let (mb, mbps) = prog.rate.mark(now)
+      echo cfg.label, " ", mb, "MB tx | ", mbps, " MB/s | ",
            prog.transfers, " done | ", prog.errors, " retried | RSS ",
            fmtBytes(rssBytes()), " | heap ", fmtBytes(getOccupiedMem())
 
@@ -96,8 +100,8 @@ proc main() {.async.} =
   let start = epochTime()
   let deadline = start + cfg.seconds
   let chaos = chaosMaybeStart(cfg, deadline, cfg.reportSeconds)  # no-op when off
-  let prog = Progress()
-  let rep = reporterLoop(cfg, prog, start, deadline)
+  let prog = Progress(rate: newStreamRate(start))
+  let rep = reporterLoop(cfg, prog, deadline)
   while epochTime() < deadline:
     try:
       await oneUpload(api, cfg, prog, pool.pick() & "/upload")
@@ -106,13 +110,16 @@ proc main() {.async.} =
       inc prog.errors
       stderr.writeLine cfg.label & " transfer retried: " & e.msg
   await rep
+  # Measure the run before the chaos/leak settle phase, which moves no bytes and
+  # would otherwise drag the average rate down.
+  let ran = prog.rate.elapsed(epochTime())
   await chaosAwait(chaos)
 
   if prog.transfers == 0:
     stderr.writeLine cfg.label & " FAIL: no transfer completed (" & $prog.errors & " errors)"
     quit(1)
   await chaosFinish(chaos, leakBase, cfg, @[api])
-  echo "== streamUpload ", backend, " passed (", prog.transfers, " x ",
-       cfg.streamBytes, " bytes, ", prog.errors, " retried) =="
+  echo "== streamUpload ", backend, " passed (",
+       summary(prog.rate.total, ran, "tx", prog.transfers, prog.errors), ") =="
 
 waitFor main()

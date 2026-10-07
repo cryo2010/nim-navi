@@ -97,8 +97,10 @@ proc main() {.async.} =
   gate.finish()   # hard-fail if the pinned protocol (h2/h3) was never negotiated
 
   if counter.ops == 0: cfg.failHard("no SSE event consumed")
-  report(cfg.label & " final", counter, epochTime() - start)
+  let elapsed = epochTime() - start      # the measured phase: also the rate divisor
+  report(cfg.label & " final", counter, elapsed, final = true)
   await chaosFinish(chaos, leakBase, cfg, @[api])
-  echo "== sse ", backend, " ", cfg.proto, " passed (", counter.ops, " events) =="
+  echo "== sse ", backend, " ", cfg.proto, " passed (", counter.ops, " events, ",
+    fmtRate(counter.ops, elapsed), " events/s) =="
 
 waitFor main()

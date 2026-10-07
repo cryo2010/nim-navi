@@ -117,7 +117,9 @@ proc main() {.async.} =
   if counter.ops == 0:
     echo label, " FAIL: no request completed"
     jsExit(1)
-  counter.report(label, start)
-  echo "== requests js ", cfg.proto, " passed (", counter.ops, " ops) =="
+  let elapsed = (nowMs() - start) / 1000.0   # the measured phase: the ops/s divisor
+  counter.report(label, start, final = true)
+  echo "== requests js ", cfg.proto, " passed (", counter.ops, " ops, ",
+    fmtRate(counter.ops, elapsed), " ops/s) =="
 
 discard main()

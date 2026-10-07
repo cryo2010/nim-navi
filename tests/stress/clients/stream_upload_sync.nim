@@ -2,6 +2,11 @@
 ## /upload as a pull-based chunked body (constant memory), hashing as it flies, and
 ## compares to the server's SHA-1. Mismatch FAILS HARD (exit 1). Repeats while time
 ## remains.
+##
+## There is no concurrent reporter on the sync backend, so the report line is emitted
+## from inside the body producer on the report cadence. The `StreamRate` is created
+## once in main and passed in, so the cumulative total and the interval MB/s span
+## every transfer instead of restarting at zero on each one.
 
 import std/[times, json]
 import ../common/[config, reporter, servers, streamcontent, leakcheck]
@@ -11,13 +16,12 @@ include ../common/chaos
 
 let blkBase = fillBlock()
 
-proc oneUpload(api: Navi, cfg: Config, url: string) =
+proc oneUpload(api: Navi, cfg: Config, rate: StreamRate, url: string) =
   var st = newSha1State()
   var remaining = cfg.streamBytes
   var sent = 0
   var idx = 0
   var blk = blkBase   # local mutable copy so each block can be index-stamped
-  var lastReport = epochTime()
   var h = initHeaders()
   h["content-type"] = "application/octet-stream"
 
@@ -30,11 +34,14 @@ proc oneUpload(api: Navi, cfg: Config, url: string) =
       let chunk = if n == blockSize: blk else: blk[0 ..< n]
       st.update(chunk)
       sent += n
+      rate.add n
       let now = epochTime()
-      if now - lastReport >= cfg.reportSeconds.float:
-        lastReport = now
-        echo cfg.label, " up ", sent div (1 shl 20), "/",
-             cfg.streamBytes div (1 shl 20), "MB | RSS ", fmtBytes(rssBytes()),
+      if rate.due(now, cfg.reportSeconds):
+        # "0 retried" is a constant here: the sync client has no retry loop, an
+        # exception propagates. It stays in the line so sync and async parse alike.
+        let (mb, mbps) = rate.mark(now)
+        echo cfg.label, " ", mb, "MB tx | ", mbps, " MB/s | ",
+             rate.transfers, " done | 0 retried | RSS ", fmtBytes(rssBytes()),
              " | heap ", fmtBytes(getOccupiedMem())
       chunk))
 
@@ -72,17 +79,21 @@ proc main() =
           if api.request(GET, base & "/echo").httpVersion == expect: break
         except CatchableError: break
 
-  let deadline = epochTime() + cfg.seconds
+  let start = epochTime()
+  let deadline = start + cfg.seconds
   var sc = syncChaosStart(cfg, leakBase)     # no-op when chaos is off
-  var transfers = 0
+  let rate = newStreamRate(start)
   while true:
-    oneUpload(api, cfg, pool.pick() & "/upload")
-    inc transfers
+    oneUpload(api, cfg, rate, pool.pick() & "/upload")
+    inc rate.transfers
     # one interleaved chaos interaction per transfer: a 1 GiB stream is long, so
     # even at every transfer the chaos:verified ratio stays modest.
     if sc.active: syncChaosStep(sc)
     if epochTime() >= deadline: break
+  # Measure the run before the chaos/leak settle phase, which moves no bytes.
+  let ran = rate.elapsed(epochTime())
   syncChaosFinish(sc, @[api])
-  echo "== streamUpload sync passed (", transfers, " x ", cfg.streamBytes, " bytes) =="
+  echo "== streamUpload sync passed (",
+       summary(rate.total, ran, "tx", rate.transfers, 0), ") =="
 
 main()

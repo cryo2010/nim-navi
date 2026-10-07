@@ -47,7 +47,9 @@ proc main() {.async.} =
   clearIntervalJs(timer)
 
   if counter.ops == 0: (echo "[sse js] FAIL: no SSE event consumed"; jsExit(1))
-  counter.report("[sse js]", start)
-  echo "== sse js passed (", counter.ops, " events) =="
+  let elapsed = (nowMs() - start) / 1000.0   # the measured phase: the rate divisor
+  counter.report("[sse js]", start, final = true)
+  echo "== sse js passed (", counter.ops, " events, ",
+    fmtRate(counter.ops, elapsed), " events/s) =="
 
 discard main()
