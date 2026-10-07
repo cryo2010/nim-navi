@@ -64,8 +64,10 @@ proc main() =
 
   if counter.ops == 0:
     stderr.writeLine cfg.label & " FAIL: no SSE event consumed"; quit(1)
-  report(cfg.label & " final", counter, epochTime() - start)
+  let elapsed = epochTime() - start      # the measured phase: also the rate divisor
+  report(cfg.label & " final", counter, elapsed, final = true)
   syncChaosFinish(sc, @[api])
-  echo "== sse sync ", cfg.proto, " passed (", counter.ops, " events) =="
+  echo "== sse sync ", cfg.proto, " passed (", counter.ops, " events, ",
+    fmtRate(counter.ops, elapsed), " events/s) =="
 
 main()

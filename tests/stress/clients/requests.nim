@@ -222,8 +222,10 @@ proc main() {.async.} =
   await chaosAwait(chaos)                  # drain the chaos workers/watchdog
 
   if counter.ops == 0: cfg.failHard("no request completed")   # a cell must do work
-  report(cfg.label & " final", counter, epochTime() - start)
+  let elapsed = epochTime() - start      # the measured phase: also the ops/s divisor
+  report(cfg.label & " final", counter, elapsed, final = true)
   await chaosFinish(chaos, leakBase, cfg, apis)  # close all clients, drain, leak assert
-  echo "== requests ", backend, " ", cfg.proto, " passed (", counter.ops, " ops) =="
+  echo "== requests ", backend, " ", cfg.proto, " passed (", counter.ops, " ops, ",
+    fmtRate(counter.ops, elapsed), " ops/s) =="
 
 waitFor main()

@@ -55,8 +55,10 @@ proc main() =
   if counter.ops == 0:
     stderr.writeLine cfg.label & " FAIL: no WebSocket round-trip completed"
     quit(1)
-  report(cfg.label & " final", counter, epochTime() - start)
+  let elapsed = epochTime() - start      # the measured phase: also the rate divisor
+  report(cfg.label & " final", counter, elapsed, final = true)
   syncChaosFinish(sc, @[api])
-  echo "== ws sync ", cfg.proto, " passed (", counter.ops, " round-trips) =="
+  echo "== ws sync ", cfg.proto, " passed (", counter.ops, " round-trips, ",
+    fmtRate(counter.ops, elapsed), " round-trips/s) =="
 
 main()

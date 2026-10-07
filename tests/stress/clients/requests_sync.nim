@@ -178,8 +178,10 @@ proc main() =
       syncChaosReport(sc)
 
   if counter.ops == 0: cfg.failHard("no request completed")
-  report(cfg.label & " final", counter, epochTime() - start)
+  let elapsed = epochTime() - start      # the measured phase: also the ops/s divisor
+  report(cfg.label & " final", counter, elapsed, final = true)
   syncChaosFinish(sc, apis)
-  echo "== requests sync ", cfg.proto, " passed (", counter.ops, " ops) =="
+  echo "== requests sync ", cfg.proto, " passed (", counter.ops, " ops, ",
+    fmtRate(counter.ops, elapsed), " ops/s) =="
 
 main()

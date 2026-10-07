@@ -93,8 +93,10 @@ proc main() {.async.} =
   if counter.ops == 0:                 # a cell that did no round-trips is not a pass
     stderr.writeLine cfg.label & " FAIL: no WebSocket round-trip completed"
     quit(1)
-  report(cfg.label & " final", counter, epochTime() - start)
+  let elapsed = epochTime() - start      # the measured phase: also the rate divisor
+  report(cfg.label & " final", counter, elapsed, final = true)
   await chaosFinish(chaos, leakBase, cfg, @[api])
-  echo "== ws ", backend, " ", cfg.proto, " passed (", counter.ops, " round-trips) =="
+  echo "== ws ", backend, " ", cfg.proto, " passed (", counter.ops, " round-trips, ",
+    fmtRate(counter.ops, elapsed), " round-trips/s) =="
 
 waitFor main()

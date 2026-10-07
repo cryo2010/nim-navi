@@ -12,6 +12,8 @@ type StatusCounter* = ref object
   counts*: Table[int, int]   ## HTTP status -> count
   errors*: int               ## transport failures / exceptions (soak continues)
   ops*: int                  ## completed requests (any outcome)
+  lastOps: int               ## ops as of the previous report line
+  lastElapsed: float         ## elapsed (s) as of the previous report line
 
 proc newStatusCounter*(): StatusCounter =
   StatusCounter(counts: initTable[int, int]())
@@ -44,6 +46,15 @@ proc fmtBytes*(n: int): string =
   elif n >= 1 shl 10: $(n div (1 shl 10)) & "KB"
   else: $n & "B"
 
+proc opsPerSec*(ops: int, seconds: float): float =
+  ## Throughput over a window, guarded: a zero, negative or sub-millisecond window
+  ## (and an empty window) yields 0.0 instead of a division by zero or inf/nan.
+  if ops <= 0 or seconds <= 0.001: 0.0 else: ops.float / seconds
+
+proc fmtRate*(ops: int, seconds: float): string =
+  ## The throughput number with one decimal, e.g. "751.9". Never inf/nan.
+  formatFloat(opsPerSec(ops, seconds), ffDecimal, 1)
+
 proc render*(c: StatusCounter): string =
   ## "200x45123 503x12 err3" — sorted by status for stable output.
   var keys: seq[int]
@@ -54,12 +65,23 @@ proc render*(c: StatusCounter): string =
   if c.errors > 0: parts.add "err" & $c.errors
   if parts.len == 0: "(no requests yet)" else: parts.join(" ")
 
-proc report*(label: string, c: StatusCounter, elapsed: float) =
-  ## One report line. RSS is the soak's memory-flatness signal.
+proc report*(label: string, c: StatusCounter, elapsed: float, final = false) =
+  ## One report line. RSS is the soak's memory-flatness signal; the ops/s field is
+  ## the rate over the interval since the previous line (the first line's window
+  ## starts at the run's start), so a throughput dip shows where it happened.
+  ## `final` prints the whole-run average instead and leaves the interval
+  ## bookkeeping untouched. The bookkeeping lives in the counter so the async and
+  ## sync clients, which drive report() on their own cadences, print the same thing.
   let rss = rssBytes()
   let rssStr = if rss > 0: fmtBytes(rss) else: "n/a"
+  let winOps = if final: c.ops else: c.ops - c.lastOps
+  let winSecs = if final: elapsed else: elapsed - c.lastElapsed
+  if not final:
+    c.lastOps = c.ops
+    c.lastElapsed = elapsed
   echo label, " ", c.render, " | RSS ", rssStr,
        " | heap ", fmtBytes(getOccupiedMem()),
+       " | ", fmtRate(winOps, winSecs), " ops/s",
        " | t=", elapsed.int, "s"
 
 # --- chaos tallies ----------------------------------------------------------
