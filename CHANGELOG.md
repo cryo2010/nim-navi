@@ -308,6 +308,28 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **`src/navi/backend/h3client.h` ships with the package, so `-d:naviHttp3` builds
+  against an INSTALLED navi compile again (#465).** `installExt = @["nim", "cpp"]`
+  copied the HTTP/3 driver's `h3client.cpp` into an installed package but not the
+  `h3client.h` it includes, so `nimble install navi` followed by
+  `nim c --mm:orc --threads:on -d:ssl -d:naviHttp3 app.nim` ended in
+  `h3client.cpp:30:10: fatal error: h3client.h: No such file or directory`, on every
+  client and every memory manager, while the same program built with
+  `--path:<checkout>/src` was fine. Nothing here could see it: every build in this
+  repo and every CI job compiles `--path:src`, where the whole checkout is present,
+  so the header was reachable everywhere except the one place a user gets navi from.
+  The list is now `@["nim", "cpp", "h"]` -- an extension rather than an
+  `installFiles` path, so a renamed or relocated backend cannot reintroduce the gap.
+  Downstreams that worked around it by pointing `--path` at a checkout (nim-vortex's
+  stress client image, cryo2010/nim-vortex#397) can go back to the installed package
+  once a tag carries this. The blind spot itself is closed by a new `packaging` CI
+  job plus a step in the HTTP/3 job: `tests/packaging/installed_build.sh` installs
+  the working tree into a throwaway nimble dir, asserts that every non-.nim build
+  input under `src/` arrived (what `{.compile.}` names, what those sources
+  `#include` transitively, and every file carrying a build-input extension), and
+  then compiles and runs a consumer of all three native entries against that
+  install, `-d:ssl` on a plain runner and `-d:naviHttp3` inside the h3 toolchain
+  image, where the installed `h3client.cpp` is actually handed to the C++ compiler.
 - **An encrypted PKCS#8 DER private key is decrypted with `tls.password`, and PEM is
   detected by its `-----BEGIN` boundary rather than by the first byte (#436).** A DER
   key file went to `SSL_CTX_use_PrivateKey_file(..., SSL_FILETYPE_ASN1)`, which calls
