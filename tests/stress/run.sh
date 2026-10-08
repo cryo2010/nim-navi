@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
-# Per-workload stress harness. Stands up N TLS servers (FastAPI via hypercorn for
-# h1/h2; a Caddy front for h3; aioquic for an h3 WebSocket, which Caddy cannot
-# bridge), then builds and runs the workload client for each client x protocol
-# cell, distributing requests across the servers. Every cell prints a status+RSS
-# report each interval; the three checksum-verifying cells (streamUpload,
-# streamDownload and the two stream slices of mixed) verify the transfer and fail
-# hard on mismatch.
+# Per-workload stress harness. Stands up N TLS servers, then builds and runs the
+# workload client for each client x protocol cell, distributing requests across
+# the servers. Every cell prints a status+RSS report each interval; the three
+# checksum-verifying cells (streamUpload, streamDownload and the two stream
+# slices of mixed) verify the transfer and fail hard on mismatch.
+#
+# NAVI_SERVER picks what those servers are:
+#   hypercorn (default)  FastAPI via hypercorn for h1/h2, a Caddy front for h3,
+#                        and aioquic for an h3 WebSocket, which Caddy cannot
+#                        bridge. The interop reference: a green run proves navi
+#                        talks to widely deployed servers under load.
+#   vortex               one Nim process per instance terminating h1, h2 and
+#                        (h3 cells) QUIC natively on the SAME port, WebSocket
+#                        included over Extended CONNECT -- so no Caddy hop, no
+#                        +1000 backend band and no aioquic ws band. Chosen when
+#                        the question is navi's own throughput, h3 behaviour or
+#                        fairness rather than interop (see README.md).
 #
 # Driven by `nimble stress<Workload>` (Dockerized). Config via NAVI_* env.
 set -uo pipefail
@@ -19,6 +29,15 @@ client="${NAVI_CLIENT:-all}"
 servers="${NAVI_SERVER_COUNT:-5}"
 host="${NAVI_HOST:-127.0.0.1}"
 base_port="${NAVI_BASE_PORT:-9443}"
+
+# Which origin implementation the cells run against. Validated here, loudly, the
+# same way an unknown NAVI_WORKLOAD is (exit 2): a typo must never silently fall
+# back to the default and report a vortex run that was really hypercorn.
+server="${NAVI_SERVER:-hypercorn}"
+case "$server" in
+  hypercorn|vortex) ;;
+  *) echo "unknown NAVI_SERVER: $server (hypercorn|vortex)"; exit 2 ;;
+esac
 
 # Opt-in misbehaving-server (chaos) sidecar. `none` (default) => byte-identical
 # to a pre-chaos run: no sidecar, no extra ports, no timeout wrapper. When on,
@@ -43,18 +62,50 @@ case "$ws_band" in
 esac
 [ "$ws_band" -gt 0 ] || {
   echo "NAVI_WS_H3_PORTBAND must be a positive integer (got '$ws_band')"; exit 2; }
-# The h3 backend hypercorns sit at base+1000 .. base+1000+servers (start_servers).
-if [ "$ws_band" -ge 1000 ] && [ "$ws_band" -le $((1000 + servers)) ]; then
-  echo "NAVI_WS_H3_PORTBAND=$ws_band overlaps the h3 backend band (1000..$((1000 + servers)))"
-  exit 2
-fi
-if [ "$chaos" != none ] && [ "$ws_band" -eq "$chaos_band" ]; then
-  echo "NAVI_WS_H3_PORTBAND=$ws_band collides with NAVI_CHAOS_PORTBAND=$chaos_band"
-  exit 2
+# Both collision checks below are about ports the HYPERCORN layout actually
+# binds: the h3 backend hypercorns at base+1000 .. base+1000+servers and the
+# aioquic ws origins on the band (start_servers). A vortex run binds neither --
+# one process serves every protocol on the base port -- so the band indexes
+# nothing there and a value that would collide is simply unused. The band is
+# still validated as an integer above, because the mixed client parses it either
+# way.
+if [ "$server" = hypercorn ]; then
+  if [ "$ws_band" -ge 1000 ] && [ "$ws_band" -le $((1000 + servers)) ]; then
+    echo "NAVI_WS_H3_PORTBAND=$ws_band overlaps the h3 backend band (1000..$((1000 + servers)))"
+    exit 2
+  fi
+  if [ "$chaos" != none ] && [ "$ws_band" -eq "$chaos_band" ]; then
+    echo "NAVI_WS_H3_PORTBAND=$ws_band collides with NAVI_CHAOS_PORTBAND=$chaos_band"
+    exit 2
+  fi
 fi
 
+# Which vortex the binary was built from, for the cell banner: the image writes
+# "<ref> <runtime>" to /opt/vortex/build-id beside the compile. A throughput
+# figure is only reproducible if the server build is named with it, and the
+# runtime (sync/async/chronos) is baked in at image build time, so the banner is
+# the only place a reader of the log can see either. Empty for hypercorn, which
+# keeps its banner byte-identical.
+vortex_build=""
+# Set per cell by start_vortex_servers and printed after the banner: how much of
+# NAVI_RECYCLE this protocol actually gets under vortex.
+vortex_notice=""
+
 command -v openssl >/dev/null || { echo "openssl required"; exit 127; }
-command -v hypercorn >/dev/null || { echo "hypercorn required (pip install -r server/requirements.txt)"; exit 127; }
+if [ "$server" = vortex ]; then
+  # Only the h3 image carries it: vortex serves TLS and HTTP/3 from one build, so
+  # there is no TLS-without-QUIC configuration to put in the lighter image (see
+  # Dockerfile.h3). navi.nimble already selects that image for NAVI_SERVER=vortex.
+  command -v vortex_server >/dev/null || {
+    echo "vortex_server required for NAVI_SERVER=vortex (use the h3 image, tests/stress/Dockerfile.h3)"
+    exit 127; }
+  if [ -r /opt/vortex/build-id ]; then
+    read -r vb_ref vb_rt </opt/vortex/build-id || true
+    vortex_build="@${vb_ref:0:12}/${vb_rt:-?}"
+  fi
+else
+  command -v hypercorn >/dev/null || { echo "hypercorn required (pip install -r server/requirements.txt)"; exit 127; }
+fi
 
 work="$(mktemp -d)"
 cert="$work/cert.pem"; key="$work/key.pem"
@@ -110,8 +161,58 @@ start_ws_h3_servers() {
   done
 }
 
-# --- start N servers for a given protocol -----------------------------------
-start_servers() {
+# --- vortex origins ---------------------------------------------------------
+# One vortex process per instance on base_port + i, serving h1 + h2 over TLS with
+# ALPN on that TCP port and, for an h3 cell, h3 over QUIC on the same UDP port
+# (settings.http3, which also turns on vortex's own Alt-Svc advertisement -- the
+# client discovers h3 exactly as it does through Caddy's). No Caddy, no +1000
+# backend band, no aioquic: the ws h3 cell and the mixed h3 ws slice dial the base
+# ports and vortex terminates the Extended CONNECT. The binary is compiled once at
+# image build time (Dockerfile.h3), never per cell.
+start_vortex_servers() {
+  local p="$1" i port
+  # Same two lifecycle knobs the hypercorn branch sets, mapped onto vortex:
+  #  - NAVI_KEEPALIVE_TIMEOUT -> keepAliveTimeout (idle between requests; the h3
+  #    spelling is QUIC's idle timeout). Defaulted past the whole soak as there.
+  #  - NAVI_KEEPALIVE_MAX     -> maxRequestsPerSocket, which vortex applies to
+  #    HTTP/1 keep-alive only. 0 is unlimited.
+  local ka_max="${NAVI_KEEPALIVE_MAX:-0}"
+  local ka_to="${NAVI_KEEPALIVE_TIMEOUT:-$(( ${NAVI_SECONDS:-600} + 3600 ))}"
+  vortex_notice=""
+  if [ "${NAVI_RECYCLE:-0}" != "0" ]; then
+    ka_max="${NAVI_KEEPALIVE_MAX:-200}"      # recycle each h1 connection after ~200 requests
+    ka_to="${NAVI_KEEPALIVE_TIMEOUT:-2}"     # and idle-close after 2s, every protocol
+    # State the real coverage per protocol rather than let the knob imply
+    # hypercorn's behaviour. Three different answers, and none of them is a
+    # skipped cell (the cell runs either way), so these are notices:
+    #  - h1: maxRequestsPerSocket is vortex's only per-connection request
+    #    counter, and it applies to HTTP/1 keep-alive. Busy connections really
+    #    are recycled here.
+    #  - h2: keepAliveTimeout is a true IDLE timer (unlike hypercorn's
+    #    keep_alive_timeout, which fires on a busy connection too), so only
+    #    pooled-and-quiet connections are churned; an h2 idle close is a GOAWAY.
+    #    No request cap is reachable from handler code.
+    #  - h3: no coverage at all. vortex advertises the idle window and then arms
+    #    ngtcp2's keep-alive PING at a third of it, so a live QUIC connection is
+    #    never idle-closed, and there is no request cap either.
+    case "$p" in
+      h1) vortex_notice="[$workload $p server=vortex] notice: maxRequestsPerSocket=$ka_max caps requests per connection; idle close at ${ka_to}s is idle-only" ;;
+      h2) vortex_notice="[$workload $p server=vortex] notice: idle-only recycle (keepAliveTimeout=${ka_to}s); no per-connection request cap" ;;
+      h3) vortex_notice="[$workload $p server=vortex] notice: no recycle coverage under vortex (QUIC keep-alive PING defeats the idle close; no request cap)" ;;
+    esac
+  fi
+  local want_h3=0; [ "$p" = h3 ] && want_h3=1
+  for ((i=0; i<servers; i++)); do
+    port=$((base_port + i))
+    NAVI_SERVER_PORT="$port" NAVI_KEY="$key" NAVI_HTTP3="$want_h3" \
+      NAVI_KEEPALIVE_TIMEOUT="$ka_to" NAVI_KEEPALIVE_MAX="$ka_max" \
+      setsid vortex_server >"$work/srv-$i.log" 2>&1 &
+    pids+=($!)
+  done
+}
+
+# --- hypercorn (+ Caddy for h3) origins -------------------------------------
+hypercorn_servers() {
   local p="$1" i port
   # hypercorn's connection-lifecycle defaults are too aggressive for a loopback soak
   # and manufacture spurious transport errors a real keep-alive server would not:
@@ -144,12 +245,6 @@ start_servers() {
     printf 'keep_alive_max_requests = %s\n' "$ka_max"
     printf 'keep_alive_timeout = %s\n' "$ka_to"
   } >"$hcfg"
-  if [ "$p" = "h3" ] && [ "$workload" = "ws" ]; then
-    # The ws workload's h3 cell is ws-only, so the aioquic origins take the base
-    # ports outright: no Caddy, no hypercorn, and no /echo to curl for readiness.
-    start_ws_h3_servers "$base_port" || return 1
-    return 0
-  fi
   if [ "$p" = "h3" ]; then
     command -v caddy >/dev/null || { echo "caddy required for h3 (use the h3 image)"; return 1; }
     local caddyfile="$work/Caddyfile"
@@ -187,6 +282,25 @@ start_servers() {
       pids+=($!)
     done
   fi
+}
+
+# --- start N servers for a given protocol -----------------------------------
+# Dispatch to the chosen origin, then wait for readiness the same way for both.
+start_servers() {
+  local p="$1" i port
+  if [ "$server" = hypercorn ] && [ "$p" = "h3" ] && [ "$workload" = "ws" ]; then
+    # The ws workload's h3 cell is ws-only, so under hypercorn the aioquic
+    # origins take the base ports outright: no Caddy, no hypercorn, and no /echo
+    # to curl for readiness. (A vortex origin serves /echo on that same port and
+    # terminates the ws itself, so it takes the normal path below.)
+    start_ws_h3_servers "$base_port" || return 1
+    return 0
+  fi
+  if [ "$server" = vortex ]; then
+    start_vortex_servers "$p" || return 1
+  else
+    hypercorn_servers "$p" || return 1
+  fi
   # Wait until each public port actually serves a 200 -- not just accepts TLS. For
   # h3 the public port is Caddy; a bare TLS-accept check passes as soon as Caddy is
   # up, before the hypercorn backend behind it is ready, so navi's first request
@@ -201,15 +315,17 @@ start_servers() {
     [ -n "$ok" ] || {
       echo "server on :$port did not start"
       cat "$work"/srv-*.log 2>/dev/null
-      [ "$p" = "h3" ] && { echo "--- caddy.log ---"; cat "$work/caddy.log" 2>/dev/null; }
+      [ "$p" = "h3" ] && [ "$server" = hypercorn ] && { echo "--- caddy.log ---"; cat "$work/caddy.log" 2>/dev/null; }
       return 1
     }
   done
-  # The mixed h3 cell needs BOTH origins: Caddy on the base ports (above) for
-  # /echo, /events, /upload and /download, and the aioquic ws servers on the ws
-  # band for the ws slice. navi direct-dials QUIC for an h3 WebSocket, so the
-  # band needs no Alt-Svc discovery leg of its own.
-  if [ "$p" = "h3" ] && [ "$workload" = "mixed" ]; then
+  # Under hypercorn the mixed h3 cell needs BOTH origins: Caddy on the base ports
+  # (above) for /echo, /events, /upload and /download, and the aioquic ws servers
+  # on the ws band for the ws slice. navi direct-dials QUIC for an h3 WebSocket,
+  # so the band needs no Alt-Svc discovery leg of its own. A vortex origin needs
+  # no band at all: it terminates the h3 Extended CONNECT on the base port, so
+  # the ws slice finally shares a QUIC connection with the other four.
+  if [ "$server" = hypercorn ] && [ "$p" = "h3" ] && [ "$workload" = "mixed" ]; then
     start_ws_h3_servers "$((base_port + ws_band))" || return 1
   fi
 }
@@ -241,31 +357,40 @@ start_chaos() {
 }
 
 # True once every port a cell uses (public base_port+i, and the h3 backend
-# base_port+1000+i) can be bound again -- i.e. no live listener is left. Uses
-# SO_REUSEADDR like the servers do, so a port merely in TIME_WAIT counts as free.
-# When chaos is on, also check the band's TCP ports (data/vanish/stall/control)
-# so the next cell does not race a lingering sidecar listener.
+# base_port+1000+i under hypercorn) can be bound again -- i.e. no live listener
+# is left. Uses SO_REUSEADDR like the servers do, so a port merely in TIME_WAIT
+# counts as free. When chaos is on, also check the band's TCP ports
+# (data/vanish/stall/control) so the next cell does not race a lingering sidecar
+# listener.
 ports_free() {
   python3 - "$host" "$base_port" "$servers" "$chaos" "$chaos_band" \
-           "$workload" "$ws_band" <<'PY' 2>/dev/null
+           "$workload" "$ws_band" "$server" <<'PY' 2>/dev/null
 import socket, sys
 host, base, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 chaos, band = sys.argv[4], int(sys.argv[5])
-workload, ws_band = sys.argv[6], int(sys.argv[7])
+workload, ws_band, server = sys.argv[6], int(sys.argv[7]), sys.argv[8]
 ports = []
 for i in range(n):
-    ports += [base + i, base + 1000 + i]
+    ports.append(base + i)
+    # The +1000 backend band only exists in the hypercorn h3 layout (Caddy in
+    # front, hypercorn behind). A vortex origin serves every protocol on the
+    # base port, so nothing ever binds the band and checking it proves nothing.
+    if server == "hypercorn":
+        ports.append(base + 1000 + i)
 if chaos != "none":
     ports += [base + band, base + band + 1, base + band + 2, base + band + 99]
-# The aioquic ws origins bind UDP only, so a TCP bind on their ports would always
-# succeed and prove nothing. Check them with a UDP bind, which does see a
-# lingering aioquic listener -- and without SO_REUSEADDR, since UDP has no
-# TIME_WAIT to forgive and the question here is simply whether anyone is still
-# bound. Which ports those are depends on the workload: the mixed cell puts them
-# on the ws band beside the Caddy front, while the ws workload's own h3 cell
-# replaces Caddy and takes the BASE ports (which the TCP loop above can only
-# prove free of a TCP listener, not of aioquic).
-if workload == "mixed":
+# A QUIC listener binds UDP only, so a TCP bind on its port would always succeed
+# and prove nothing. Check those with a UDP bind, which does see a lingering
+# listener -- and without SO_REUSEADDR, since UDP has no TIME_WAIT to forgive and
+# the question here is simply whether anyone is still bound. Which ports those
+# are depends on the layout:
+#  - vortex serves h3 on the BASE ports (same port as h1/h2), for every workload.
+#  - hypercorn's aioquic ws origins sit on the ws band for the mixed cell, and
+#    take the BASE ports for the ws workload's own h3 cell (where they replace
+#    Caddy, so the TCP loop above can only prove them free of a TCP listener).
+if server == "vortex":
+    udp_ports = [base + i for i in range(n)]
+elif workload == "mixed":
     udp_ports = [base + ws_band + i for i in range(n)]
 elif workload == "ws":
     udp_ports = [base + i for i in range(n)]
@@ -298,6 +423,7 @@ stop_servers() {
   for p in "${pids[@]:-}"; do wait "$p" 2>/dev/null || true; done
   pids=()
   pkill -9 -f hypercorn 2>/dev/null || true      # belt-and-suspenders for any stray
+  pkill -9 -f vortex_server 2>/dev/null || true  # ditto for a vortex origin
   pkill -9 -f 'caddy run' 2>/dev/null || true
   pkill -9 -f chaos_server.py 2>/dev/null || true   # reap any stray chaos sidecar
   pkill -9 -f 'ws_h3/server.py' 2>/dev/null || true  # reap any stray aioquic ws origin
@@ -318,6 +444,7 @@ esac
 export NAVI_CERT="$cert" NAVI_HOST="$host" NAVI_BASE_PORT="$base_port"
 export NAVI_WORKLOAD="$workload" NAVI_SERVER_COUNT="$servers"
 export NAVI_WS_H3_PORTBAND="$ws_band"     # the mixed client's h3 ws origins
+export NAVI_SERVER="$server"              # mixed's h3 ws slice: band vs base port
 export PYTHONPATH="$here/server"          # so hypercorn finds app.py as `app`
 cd "$here/server"
 
@@ -365,7 +492,13 @@ for be in "${clients[@]}"; do
     start_chaos "$pr" || { stop_servers; fail=1; continue; }
     export NAVI_CLIENT="$be" NAVI_PROTO="$pr"
     chaos_tag=""; [ "$chaos" != none ] && chaos_tag=" | chaos=$chaos"
-    echo "== stress: $workload | $be | $pr | ${servers} servers${chaos_tag} =="
+    # Only named when it is not the default, so a hypercorn log stays
+    # byte-identical to a pre-NAVI_SERVER run (same reason as chaos_tag). For
+    # vortex the segment also carries the build: server=vortex@<sha12>/<runtime>.
+    srv_tag=""; [ "$server" != hypercorn ] && srv_tag=" | server=$server$vortex_build"
+    echo "== stress: $workload | $be | $pr | ${servers} servers${srv_tag}${chaos_tag} =="
+    # After the banner, not before: a notice belongs to the cell it describes.
+    [ -n "$vortex_notice" ] && echo "$vortex_notice"
     # When chaos is on, wrap the cell in coreutils `timeout` as the outermost hang
     # backstop (belt-and-suspenders behind navi's own timeouts and the in-process
     # watchdog, and the sync client's only watchdog): NAVI_SECONDS + 180s slack,

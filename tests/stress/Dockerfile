@@ -6,6 +6,14 @@
 #   docker run --rm -e NAVI_WORKLOAD=requests -e NAVI_SECONDS=60 navi-stress
 #
 # Usually driven by `nimble stressRequests` (etc). For h3, use Dockerfile.h3.
+#
+# Deliberately has NO vortex origin, so a plain hypercorn h1/h2 run stays exactly
+# as cheap as it was: vortex serves TLS and HTTP/3 from one build, so there is no
+# TLS-without-QUIC configuration of it to put here and carrying it would mean
+# building OpenSSL 3.5 + nghttp3 + ngtcp2 in this image too. NAVI_SERVER=vortex
+# therefore lives in Dockerfile.h3, which already has those trees; navi.nimble
+# selects that image for NAVI_SERVER=vortex and run.sh exits 127 naming it if
+# someone runs this one with NAVI_SERVER=vortex by hand.
 FROM nimlang/nim:2.2.10
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

@@ -15,6 +15,12 @@ type
     workload*: string        ## requests|ws|sse|streamUpload|streamDownload|mixed
     proto*: string           ## h1|h2|h3 (concrete; "all" is expanded by run.sh)
     backend*: string         ## sync|asyncdispatch|chronos|js (label; the binary is the backend)
+    server*: string          ## NAVI_SERVER: hypercorn|vortex -- which origin run.sh
+                             ## stood up. The clients talk to origins, not to a
+                             ## server type, so only the `mixed` h3 ws slice reads
+                             ## this: a vortex origin terminates the h3 Extended
+                             ## CONNECT on the base port, while hypercorn needs the
+                             ## separate aioquic band (see wsH3PortBand).
     host*: string
     basePort*: int           ## first server port; instance i listens on basePort+i
     servers*: int            ## server instances to round-robin (NAVI_SERVER_COUNT)
@@ -105,6 +111,7 @@ proc loadConfig*(backend: string): Config =
     workload: getEnv("NAVI_WORKLOAD", "requests"),
     proto: getEnv("NAVI_PROTO", "h2"),
     backend: backend,
+    server: getEnv("NAVI_SERVER", "hypercorn"),
     host: getEnv("NAVI_HOST", "127.0.0.1"),
     basePort: getInt("NAVI_BASE_PORT", 9443),
     servers: max(1, getInt("NAVI_SERVER_COUNT", 5)),

@@ -9,6 +9,8 @@ installExt    = @["nim", "cpp"]   # ship the HTTP/3 driver (h3client.cpp) so a
                                   # downstream -d:naviHttp3 build can compile it
 
 
+import std/strutils   # the NAVI_VORTEX_* build-arg checks in runStress
+
 # Dependencies
 
 requires "nim >= 2.2.10"
@@ -75,25 +77,62 @@ task fuzz, "Coverage-guided libFuzzer run of a sans-io fuzz target (Docker; Linu
 
 proc runStress(workload: string) =
   # Build the stress image and run one workload, passing every NAVI_* knob
-  # through. The h3 image (with the ngtcp2/nghttp3/OpenSSL-3.5 client toolchain +
-  # Caddy) is only used when NAVI_PROTO is h3; h1/h2 use the light image.
+  # through. The h3 image (with the ngtcp2/nghttp3/OpenSSL-3.5 toolchain, Caddy
+  # and the vortex origin) is used when NAVI_PROTO is h3 or NAVI_SERVER is vortex;
+  # a plain hypercorn h1/h2 run uses the light image.
   # Client x protocol are iterated inside the container (run.sh). NB: nimble does
   # not propagate a task's exit code (nim-lang/nimble#1802), so a failure shows in
   # the output but this exits 0 -- run the docker command directly, or read the
   # final "== <workload>: all cells passed ==" banner, for CI-grade pass/fail.
   # `all` includes h3, so it needs the h3 image (ngtcp2/nghttp3/OpenSSL 3.5 + Caddy)
   # too -- that image is a superset and serves h1/h2 as well.
+  #
+  # NAVI_SERVER=vortex needs it for a different reason: vortex serves TLS and
+  # HTTP/3 from one build (there is no TLS-without-QUIC configuration of it), so
+  # vortex_server links the same ngtcp2/nghttp3/OpenSSL-3.5 trees and lives only
+  # in that image. Keeping it out of the light one is deliberate: a plain
+  # hypercorn h1/h2 run must not pay for a server it does not use.
   let proto = getEnv("NAVI_PROTO", "h2")
-  let h3 = proto == "h3" or proto == "all"
+  let server = getEnv("NAVI_SERVER", "hypercorn")
+  let h3 = proto == "h3" or proto == "all" or server == "vortex"
   let dockerfile = if h3: "tests/stress/Dockerfile.h3" else: "tests/stress/Dockerfile"
   let image = if h3: "navi-stress-h3" else: "navi-stress"
-  exec "docker build -f " & dockerfile & " -t " & image & " ."
+  # The vortex build-args, forwarded only to the image that has them: VORTEX_REF
+  # pins the nim-vortex commit (the Dockerfile's default is the pinned sha; bump
+  # it deliberately) and VORTEX_RUNTIME picks vortex's handler runtime, which is
+  # fixed per image build rather than per cell.
+  #
+  # Both are validated here and single-quoted, because they are interpolated
+  # into a shell command line: an unset or empty value is the normal case (the
+  # Dockerfile's own defaults apply, so neither check can break it), but a
+  # non-empty one must be exactly what the Dockerfile expects. VORTEX_REF has to
+  # be a full 40-character sha: a branch or tag name would be baked into the
+  # layer cache and never move again, so the image would keep serving whatever
+  # that name meant the first time. VORTEX_RUNTIME is checked here rather than
+  # only inside the RUN, so a typo costs nothing instead of a full image build.
+  var buildArgs = ""
+  if h3:
+    let vref = getEnv("NAVI_VORTEX_REF").strip()
+    let vrt = getEnv("NAVI_VORTEX_RUNTIME").strip()
+    if vref.len > 0:
+      if vref.len != 40 or not vref.allCharsInSet(HexDigits):
+        quit("NAVI_VORTEX_REF must be a full 40-character commit sha (got '" &
+             vref & "'); a branch or tag name would be cached forever by Docker")
+      buildArgs &= " --build-arg 'VORTEX_REF=" & vref & "'"
+    if vrt.len > 0:
+      if vrt notin ["sync", "async", "chronos"]:
+        quit("NAVI_VORTEX_RUNTIME must be sync, async or chronos (got '" &
+             vrt & "')")
+      buildArgs &= " --build-arg 'VORTEX_RUNTIME=" & vrt & "'"
+  exec "docker build" & buildArgs & " -f " & dockerfile & " -t " & image & " ."
   exec "docker run --rm -e NAVI_WORKLOAD=" & workload &
-       " -e NAVI_PROTO -e NAVI_CLIENT -e NAVI_SERVER_COUNT" &
+       " -e NAVI_PROTO -e NAVI_CLIENT -e NAVI_SERVER -e NAVI_SERVER_COUNT" &
        " -e NAVI_SECONDS -e NAVI_CLIENT_COUNT -e NAVI_CONCURRENCY" &
        " -e NAVI_REQ_COMPRESSION -e NAVI_RESP_COMPRESSION -e NAVI_CONTENT_TYPES" &
        " -e NAVI_STREAM_BYTES -e NAVI_REPORT_SECONDS -e NAVI_LOG_ERRORS" &
        " -e NAVI_RECYCLE -e NAVI_KEEPALIVE_MAX -e NAVI_KEEPALIVE_TIMEOUT" &
+       " -e NAVI_SSE_DROP_EVERY" &   # both servers read it; see tests/stress/README.md
+       " -e NAVI_VORTEX_THREADS -e NAVI_VORTEX_HEADER_TIMEOUT" &  # vortex origin only
        " -e NAVI_H3_CTX_CACHE" &   # 0 rebuilds the h3 SSL_CTX per connection (#454)
        " -e NAVI_WS_H3_PORTBAND" &   # the mixed+h3 ws band (aioquic origins)
        " -e NAVI_CHAOS -e NAVI_CHAOS_CONC -e NAVI_CHAOS_SEED -e NAVI_CHAOS_PORTBAND" &
@@ -116,6 +155,13 @@ task stressMixed, "Stress: all five workloads concurrently against one server se
   # connections) with 20 other workers, so a 1 GiB transfer can easily not
   # complete inside a 60s cell; 256 MiB leaves the stream checks room to pass at
   # the default NAVI_SECONDS. NAVI_STREAM_BYTES still overrides it for a soak.
+  #
+  # On h3 the ws slice is the one slice that may not share a connection with the
+  # rest, and that depends on NAVI_SERVER: under the hypercorn default Caddy
+  # cannot bridge an h3 Extended CONNECT, so run.sh puts aioquic ws origins on
+  # NAVI_WS_H3_PORTBAND beside the Caddy front and the ws slice dials those;
+  # under NAVI_SERVER=vortex there is no band, because one process terminates the
+  # h3 Extended CONNECT on the same port as the other four routes.
   if not existsEnv("NAVI_STREAM_BYTES"): putEnv("NAVI_STREAM_BYTES", "268435456")
   runStress("mixed")
 

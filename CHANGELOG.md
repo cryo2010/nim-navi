@@ -8,6 +8,38 @@ onward (pre-1.0, minor versions may include breaking changes).
 ## [Unreleased]
 
 ### Added
+- **`NAVI_SERVER=hypercorn|vortex` in the stress harness: a native Nim h1/h2/h3
+  origin beside the FastAPI/hypercorn + Caddy + aioquic default (#464).** Every
+  workload (`requests`, `ws`, `sse`, `streamUpload`, `streamDownload`, `mixed`) can
+  now be driven at a [vortex](https://github.com/cryo2010/nim-vortex) origin, which
+  terminates h1, h2 and h3 on one port in one process, WebSocket included over both
+  an h1 Upgrade and h2/h3 Extended CONNECT. It is an **additional** server
+  dimension like `NAVI_PROTO` and `NAVI_CLIENT`, for when the question is navi's own
+  throughput, h3 behaviour or fairness rather than interop: hypercorn stays the
+  default and the interop reference, and the README says why a cell that passes only
+  against vortex is not interop evidence. Two things the hypercorn layout cannot do
+  come with it: the h3 cells no longer detour through Caddy (so they churn a real
+  QUIC connect), and the ws slice of a `mixed` h3 cell finally shares a QUIC
+  connection with the other four instead of dialling a separate aioquic port band,
+  which is the interaction that cell exists for. `tests/stress/server/vortex_server.nim`
+  is navi-owned and implements `server/app.py`'s contract exactly (SSE numbering and
+  `Last-Event-ID` resume, the `{"sha1","size"}` upload reply, the index-stamped
+  download with `x-sha1`, `/echo`'s JSON/form canonicalisation and per-request
+  `x-want-encoding` codec, and the `/status`, `/redirect`, `/needs-auth` and cookie
+  coverage routes), rather than reusing vortex's own stress server, whose route
+  contract is a different client's. `NAVI_VORTEX_RUNTIME` (`sync`, `async`,
+  `chronos`) and `NAVI_VORTEX_REF` (a pinned nim-vortex sha, so a vortex change
+  cannot silently move navi's numbers) are Docker build-args, and `nimble` validates
+  both before it builds anything (`NAVI_VORTEX_REF` must be a full 40-character sha,
+  since a branch name would be baked into the layer cache and never move again).
+  `NAVI_SERVER=hypercorn` runs are unchanged, down to the log shape. One side effect
+  that is not vortex-only: `NAVI_SSE_DROP_EVERY` is now forwarded into the container,
+  so it finally reaches the server. It was documented but never passed through, so
+  until now setting it changed nothing on **either** server and every `sse` cell ran
+  at the 1000-event default. Two costs are also not vortex-only: a hypercorn h3 or
+  `all` run builds `Dockerfile.h3`, so it now pays the vortex install and compile
+  layer (about 25 to 30 s on an otherwise cached image) and a build-time clone of
+  nim-vortex, for a server it never starts.
 - **An opt-in `Expect: 100-continue` gate for HTTP/1.1 uploads (`expectContinueMs`).**
   Setting `config.expectContinueMs` (ms; `0`, the default, disables it) makes the h1
   send path put `Expect: 100-continue` on the request head and wait that long for the
