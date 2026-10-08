@@ -54,6 +54,17 @@ proc keepAlive(mux: H2Mux) {.async.} =
         # re-enable spawns a fresh loop via `applyKeepAlive`, so this one can exit.
         mux.keepAliveRunning = false
         break
+      # `or`, deliberately not the backend's `withinMs` (issue #468). `or` installs
+      # each side with `callback=`, which REPLACES that future's callback list, so
+      # however long this loop runs `readerDone` -- a future that lives as long as
+      # the connection -- carries exactly one tick callback; `withinMs` appends, so
+      # it would leave one spent callback on `readerDone` per tick, forever. The
+      # timer this tick loses is only one keepalive interval long and holds nothing
+      # but the tick, so there is no retention to slice away either. `close()`
+      # depends on the replacing `callback=` not firing again: it sets
+      # `mux.alive = false` BEFORE it parks on `readerDone` (no await in between), so
+      # a tick that wakes after that breaks out at the check below instead of
+      # re-arming the `or` and clearing the continuation `close()` just appended.
       await (sleepAsync(interval) or mux.readerDone)
       if not mux.alive or mux.readerDone.finished: break
       if mux.sawFrameSinceTick:
@@ -98,10 +109,16 @@ proc reader(mux: H2Mux) {.async.} =
     while mux.alive:
       let recvFut = be.recvSome(mux.transport)
       if mux.h2.goneAway and mux.activeStreams > 0:
-        if not await withTimeout(recvFut, goAwayGraceMs):        # peer went silent
-          # asyncdispatch withTimeout does not cancel `recvFut`, so it is still parked
-          # on the fd. Closing the transport under it (the teardown below) crashes --
-          # the exact pattern this module's `close` doc warns of. EOF the read via
+        # `withinMs`, not `withTimeout` (issue #468): `withTimeout` does unlink the
+        # loser (Nim 2.2.10 clears whichever side lost), but its single timer entry
+        # would still sit in the dispatcher's timer heap for the whole 30 s grace
+        # after the read won it, once per read on every GOAWAY'd connection.
+        # `withinMs` arms the grace in one-second slices, so a spent one is reclaimed
+        # within a second of the read landing.
+        if not await be.withinMs(recvFut, goAwayGraceMs):        # peer went silent
+          # asyncdispatch cannot cancel `recvFut`, so it is still parked on the fd.
+          # Closing the transport under it (the teardown below) crashes -- the exact
+          # pattern this module's `close` doc warns of. EOF the read via
           # shutdownConn and drain it first, so the fd is closed with no read pending
           # (issue #267; the chronos twin cancels via withTimeout instead).
           be.shutdownConn(mux.transport)
@@ -177,4 +194,7 @@ proc close*(mux: H2Mux) {.async.} =
   mux.alive = false                    # client-close IOError, not a retryable race
   mux.failAll("navi: client closed")
   be.shutdownConn(mux.transport)       # unblock the reader's pending read/write
+  # `alive = false` above is set with no await before this park, and that ordering is
+  # load-bearing: the keepalive tick races `readerDone` with `or`, whose `callback=`
+  # would clear the continuation this `await` appends. See `keepAlive` (issue #468).
   await mux.readerDone                  # it observes EOF, closes the transport, exits

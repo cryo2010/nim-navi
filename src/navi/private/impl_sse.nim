@@ -95,6 +95,10 @@ proc sse*(client: Navi, target: string, verb = GET,
     idleTimeoutMs: idleTimeoutMs, parser: initSseParser(lastEventId))
   s.client.jar = client.jar          # share cookies with the caller
   let openFut = s.openConn()
+  # `withTimeout` (not asyncdispatch's retention-free `withinMs`, issue #468): this
+  # body is shared with chronos, whose `withTimeout` cancels the loser, and the bound
+  # is armed once per CONNECT rather than per request or per read -- so the timer a
+  # won connect leaves behind is one per stream, not one per unit of traffic.
   if idleTimeoutMs > 0 and not await withTimeout(openFut, msOf(idleTimeoutMs)):
     raise newException(IOError, "navi: SSE connect timed out after " & $idleTimeoutMs & " ms")
   await openFut                      # complete (or surface openConn's own error)

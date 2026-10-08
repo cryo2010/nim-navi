@@ -50,6 +50,119 @@ type
     ## (mirroring `BodySink`). Not replayable: like `bodyStream`, a request carrying
     ## one is sent once and never retried/redirected/digest-replayed.
 
+# --- bounded waits (issue #468) -----------------------------------------------
+#
+# std/asyncdispatch has no timer cancellation: `sleepAsync(ms)` pushes its future
+# onto the global dispatcher's timer heap (`p.timers`) and nothing can take it off
+# again, so until it FIRES everything that future still reaches is reachable --
+# live memory, not cyclic garbage, so no `GC_fullCollect` can reclaim it. Two costs
+# follow, and `withinMs` addresses both:
+#
+#   1. What hangs off the timer, which is `or`'s problem specifically. `complete`
+#      runs a future's callbacks and then nils the list (asyncfutures' `call`), so
+#      the WINNER's side unlinks itself; `or` never unlinks the LOSER's. A spent `or`
+#      timer therefore kept the race it lost: timer -> its callback -> `or`'s `cb`
+#      closure -> the `or` future, and on through that future's callbacks to the
+#      awaiting proc's continuation and env whenever it had NOT itself completed.
+#      `guard`'s `await fut or cancelFut or sleepAsync(ms)` core was navi's one such
+#      race on the hot path, and it is where the 2243 bytes per request came from.
+#      std/asyncdispatch's `withTimeout` does NOT have this half: as of Nim 2.2.10 it
+#      clears the loser's callbacks whichever side wins, so the four `withTimeout`
+#      bounds converted with it (connect, the two per-read bounds, the h2 GOAWAY
+#      grace) retained only the bare entry of (2); for those, the win here is the
+#      slicing, not the unlinking. `withinMs` covers both halves: it keeps the timer
+#      in a local, races it explicitly, and when `fut` wins clears the timer's
+#      callbacks and drops every reference its own closure env holds, so the entry
+#      that outlives the wait reaches nothing but itself (see `guard`, which spells
+#      out the full chain its old `or` core left behind).
+#
+#   2. The timer entry ITSELF, which is small but is not nothing (a `Future[void]`,
+#      its heap slot, and in a non-release build the stack trace `newFuture`
+#      captures: ~0.2 KB release, ~1 KB debug). One per request that lingers for the
+#      full `timeouts.total` is, with (1), what made the resident heap grow with
+#      rate x totalMs -- 610 MB at 12k req/s with a 60 s total (issue #468) -- so a
+#      timeout longer than `naviTimerSliceMs` is armed in slices: each slice's
+#      entry expires within a second and re-arms for what is left of a MonoTime
+#      deadline (no drift, so the expiry lands at the same instant as before). A
+#      finished request's spent slice is therefore reclaimed in at most a second
+#      instead of in `totalMs`, and retention stops scaling with the timeout. This
+#      is the half that applies to every bound, however it was previously written.
+const
+  naviTimerSliceMs = 1000
+    ## Longest single `sleepAsync` a bounded wait arms; longer bounds are re-armed
+    ## in slices (see above). A wait at or under this is armed exactly once, so
+    ## every sub-second timeout behaves identically to a plain `withTimeout`.
+  naviTimerMaxMs = 2_000_000_000
+    ## Clamp on a bound before it becomes a `Duration`: `initDuration(milliseconds
+    ## = int.high)` overflows its nanosecond conversion. Also a 32-bit-safe literal
+    ## (it fits a 32-bit `int`, so navi still compiles for i386/armv7, where a bound
+    ## cannot exceed `int.high` = 2_147_483_647 ms anyway). About 23 days: longer
+    ## than any real deadline, and the conversion stays 4 billion-fold short of the
+    ## nanosecond edge.
+
+proc withinMs*[T](fut: Future[T]; ms: int;
+                  alt: Future[void] = nil): Future[bool] =
+  ## Wait for `fut`, giving up after `ms` milliseconds (`ms <= 0`: no timer) or when
+  ## `alt` completes (`nil`: no alternative). Completes `true` if `fut` finished
+  ## first and `false` if the timer or `alt` won; it never fails, so the caller reads
+  ## the value and the error off `fut` itself.
+  ##
+  ## The loser is NOT cancelled -- asyncdispatch cannot -- so an abandoned `fut`
+  ## drains in the background and the caller still has to dispose of it (park it,
+  ## retire it, or shut the socket down), exactly as with `withTimeout`. What this
+  ## adds over `withTimeout` is the SLICING: a long bound is armed a second at a
+  ## time, so no spent timer outlives the exchange by more than `naviTimerSliceMs`
+  ## instead of by the whole `ms`. (Unlinking the loser it shares with `withTimeout`,
+  ## which has cleared both sides since Nim 2.2.10; what neither `or` nor
+  ## `withTimeout` does is empty the shared closure env, which `settle` below does on
+  ## either outcome.)
+  ##
+  ## It also APPENDS its callback instead of replacing `fut`'s callback list, so it
+  ## never drops a callback the caller installed -- but for the same reason the same
+  ## future must not be raced through it over and over (each lost race leaves one
+  ## spent, reference-free callback behind on it); a future that is re-raced per
+  ## interval, like `kaRecv`'s parked read, stays on `withTimeout`.
+  var res = newFuture[bool]("navi.withinMs")
+  result = res
+  if fut.finished or (alt != nil and alt.finished):
+    res.complete(fut.finished)
+    return
+  var
+    target = fut                      # NOT `fut` itself: the env must be droppable
+    timer: Future[void] = nil
+    deadline: MonoTime
+
+  proc settle() {.closure, gcsafe.} =
+    ## The race is over: unlink the timer and empty this env, so nothing the
+    ## dispatcher still holds can reach the exchange.
+    if res == nil: return             # already decided
+    let won = target.finished
+    if timer != nil:
+      timer.clearCallbacks()          # its heap entry can no longer reach us
+      timer = nil
+    target = nil
+    let r = res
+    res = nil
+    r.complete(won)
+
+  proc tick() {.closure, gcsafe.} =
+    ## A slice elapsed. Expire the wait if the deadline is up, else re-arm for what
+    ## is left; the slice that just fired is spent and collectable either way.
+    if res == nil: return
+    let left = (deadline - getMonoTime()).inMilliseconds.int
+    if left <= 0 or target.finished:
+      settle()
+      return
+    timer = sleepAsync(min(left, naviTimerSliceMs))
+    timer.addCallback(tick)
+
+  if ms > 0:
+    deadline = getMonoTime() + initDuration(milliseconds = min(ms, naviTimerMaxMs))
+    timer = sleepAsync(min(ms, naviTimerSliceMs))
+    timer.addCallback(tick)
+  fut.addCallback(settle)
+  if alt != nil: alt.addCallback(settle)
+
 # Disable Nagle on the connection socket: without it the TLS handshake's final
 # flight plus the first request stall ~40ms on the peer's delayed ACK, paid on
 # every fresh (unpooled) connection.
@@ -313,7 +426,7 @@ proc happyConnect*(ips: seq[string], port: int):
   ## interleaved by family) staggered by ~250ms, and return the (fd, index) of the
   ## first to complete, so a slow or blackholed address does not stall the others.
   ## Losing attempts are closed. The overall bound is applied by the caller
-  ## (`withTimeout` on `establish`). asyncdispatch has no cancellation, so a loser's
+  ## (`withinMs` on `establish`). asyncdispatch has no cancellation, so a loser's
   ## connect future drains in the background once its fd is closed.
   if ips.len == 0:
     raise newException(IOError, "navi: no address to connect to")
@@ -557,7 +670,7 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   # chaos FD assertion catches. Reclaim the conn when the abandoned establish
   # settles; a failed establish already closed its own fd, so closeSync then no-ops.
   let estFut = establish()
-  if connectMs > 0 and not await withTimeout(estFut, connectMs):
+  if connectMs > 0 and not await withinMs(estFut, connectMs):
     # The establish future is abandoned here (asyncdispatch has no cancellation). It
     # is typically parked in the TLS handshake against a peer too busy to answer -- an
     # h2 headerbomb flood can starve even loopback handshakes past connectMs -- and if
@@ -648,7 +761,7 @@ proc recvSome*(c: Conn): Future[string] {.async.} =
   ## down). A read parked by an earlier `recvWithin` is resumed here, so its bytes are
   ## delivered to this caller instead of being lost.
   let readFut = c.startRead()
-  if c.readMs > 0 and not await withTimeout(readFut, c.readMs):
+  if c.readMs > 0 and not await withinMs(readFut, c.readMs):
     raise newException(response.TimeoutError, readTimeoutMsg(c.readMs))
   return await readFut
 
@@ -664,7 +777,7 @@ proc recvWithin*(c: Conn, ms: int): Future[tuple[timedOut: bool, data: string]] 
   ## needs. Parking it in `Conn.parked` hands those bytes to the next read instead.
   if ms <= 0: return (true, "")
   let readFut = c.startRead()
-  if not await withTimeout(readFut, ms):
+  if not await withinMs(readFut, ms):
     # A `close` that landed while we were waiting has already run `discardParked`,
     # so parking here would leave the read unowned on a freed connection and its
     # failure unobserved (the orphaned-stack-trace leak). Retire it instead.

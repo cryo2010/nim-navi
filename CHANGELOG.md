@@ -330,6 +330,46 @@ onward (pre-1.0, minor versions may include breaking changes).
   then compiles and runs a consumer of all three native entries against that
   install, `-d:ssl` on a plain runner and `-d:naviHttp3` inside the h3 toolchain
   image, where the installed `h3client.cpp` is actually handed to the C++ compiler.
+- **On asyncdispatch, `timeouts.total` no longer means "memory retained for this
+  long": a finished request is released at once instead of staying reachable from its
+  own timeout timer (#468).** `guard` bounded a request with
+  `await fut or cancelFut or sleepAsync(ms)` and std/asyncdispatch cannot take a timer
+  back off the dispatcher's heap, so when the request won the race the spent timer
+  stayed in that heap for the rest of `timeouts.total`, still holding the `or`
+  combinator's future and closures -- live memory, reachable rather than cyclic
+  garbage, so no `GC_fullCollect` could reclaim it. The resident heap therefore grew
+  with request rate x `timeouts.total` x per-request state: in a container soak at
+  12k req/s with a 60 s total the heap climbed to 610 MB (RSS 818 MB) and only fell
+  once the timers began expiring, and because the streaming path guards EVERY
+  `readChunk` by what is left of the deadline, a long-`total` download retained a set
+  per 64 KiB chunk read and grew without bound until the client was OOM-killed. The
+  guard, the `connect` bound, both per-read bounds and the h2 GOAWAY grace now share
+  one `withinMs` helper that keeps the timer in a local, races it explicitly, clears
+  the timer's callbacks the moment the request wins, and empties its own closure env
+  so neither loser can keep the other (or the exchange) alive; it also appends its
+  callback instead of replacing the awaited future's callback list, so it can never
+  drop a callback the caller installed. Holding the race was `or`'s half of the
+  problem alone, and `guard`'s core was navi's one `or` race on the hot path: the
+  four `withTimeout` bounds converted alongside it already unlinked the loser, since
+  Nim 2.2.10's `withTimeout` clears whichever side lost, and what they gain here is
+  the second half. Because the heap entry itself cannot be removed -- a few hundred
+  bytes in a release build, about a kilobyte in a debug one, where `newFuture`
+  captures a stack trace -- a bound longer than one second is now armed in one-second
+  slices that re-arm against a monotonic deadline (so expiry lands at the same instant
+  as before, and any timeout at or under a second is armed exactly once, as before). A
+  spent slice is reclaimed within a second of the request finishing instead of in
+  `totalMs`, which is what makes retention independent of the configured timeout:
+  measured per request with a 10-minute total, 2243 bytes stayed live indefinitely
+  before, where the settled figure afterwards is within ~50 bytes of the same client
+  with no total timeout at all. That settled figure is the IDLE one, and the slicing
+  is a cap rather than a cure: under sustained load up to one second's worth of
+  completed requests is still waiting on its spent slice, roughly 1.2 KB each in a
+  debug build, so the soak above would hold ~14 MB at 12k req/s instead of 610 MB --
+  bounded by the rate alone, not by the rate times `timeouts.total`. chronos was never
+  affected (its guard cancels the timer in its `finally`), and the two bounds that are
+  armed once per connection rather than per request or per read, the SSE connect and
+  the WebSocket keepalive's re-raced parked read, keep `withTimeout` on purpose, with
+  the reason recorded at each.
 - **An encrypted PKCS#8 DER private key is decrypted with `tls.password`, and PEM is
   detected by its `-----BEGIN` boundary rather than by the first byte (#436).** A DER
   key file went to `SSL_CTX_use_PrivateKey_file(..., SSL_FILETYPE_ASN1)`, which calls
