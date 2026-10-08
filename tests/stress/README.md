@@ -1,11 +1,15 @@
 # navi stress workloads
 
 Focused, Dockerized soak tests, split by **workload** (what the client does) with
-protocol, client, server count, compression, and runtime as configurable
-dimensions. Each runs many navi clients against N TLS servers, prints a status +
-throughput + memory report every interval (responses are tallied and discarded, so
-memory stays flat over a long soak), and — for the streaming workloads — verifies a
-1 GiB checksum and fails hard on any mismatch.
+protocol, client, **server**, server count, compression, and runtime as
+configurable dimensions. Each runs many navi clients against N TLS servers, prints
+a status + throughput + memory report every interval (responses are tallied and
+discarded, so memory stays flat over a long soak), and, for the streaming
+workloads, verifies a 1 GiB checksum and fails hard on any mismatch.
+
+`NAVI_SERVER` chooses what those servers are: the FastAPI/hypercorn + Caddy +
+aioquic stack (default) or a native Nim [vortex](https://github.com/cryo2010/nim-vortex)
+origin. See [Choosing the server](#choosing-the-server).
 
 ## Report lines
 
@@ -64,6 +68,12 @@ carries the whole-run average.
 | --- | --- | --- |
 | `PROTO` | `h2` | `h1` \| `h2` \| `h3` \| `all` (h3 uses the h3 image) |
 | `CLIENT` | `all` | `sync` \| `asyncdispatch` \| `chronos` \| `js` \| `all` |
+| `SERVER` | `hypercorn` | the origin: `hypercorn` (FastAPI + Caddy + aioquic) or `vortex` (native Nim h1/h2/h3). Unknown value: exit 2. See [Choosing the server](#choosing-the-server) |
+| `VORTEX_RUNTIME` | `sync` | `vortex` only: vortex's handler runtime the server binary is built with (`sync` \| `async` \| `chronos`). A Docker **build-arg**, so it is fixed per image build, not per cell |
+| `VORTEX_REF` | pinned sha | `vortex` only: the nim-vortex commit the image installs. Also a build-arg; the pin lives in `Dockerfile.h3` so a vortex change cannot silently move navi's numbers. Must be a **full 40-character sha** (`nimble` rejects anything else): a branch or tag name would be baked into the Docker layer cache and never move again, so the image would keep serving whatever that name meant on the first build |
+| `VORTEX_THREADS` | `1` | `vortex` only: loop threads per instance. One, to match the one hypercorn worker per instance; vortex's own default is `countProcessors()` |
+| `VORTEX_HEADER_TIMEOUT` | `60` | `vortex` only: seconds from accept to a complete request head, `headerTimeout` (it covers the TLS handshake and any protocol upgrade). vortex's own default is 10 s, which these deliberately oversubscribed cells trip on a descheduled loop thread or a slow WebSocket upgrade; 60 s is the value vortex's own soak uses |
+| `SSE_DROP_EVERY` | `1000` | events the `/events` stream delivers before the server drops the connection, so reconnect + `Last-Event-ID` resume is exercised. Read by both servers |
 | `SERVER_COUNT` | `5` | server instances; requests round-robin across them |
 | `SECONDS` | `60` | runtime per (client × protocol) cell |
 | `CLIENT_COUNT` | `3` | concurrent navi client instances per cell |
@@ -73,7 +83,7 @@ carries the whole-run average.
 | `CONTENT_TYPES` | `octet,text,json,form` | csv restricting the `requests` /echo rotation; unknown tokens hard-fail at startup |
 | `REPORT_SECONDS` | `60` | report cadence |
 | `STREAM_BYTES` | `1073741824` | stream size (1 GiB); lower for a smoke |
-| `WS_H3_PORTBAND` | `3000` | `mixed` + h3 only: the aioquic ws origins are `NAVI_BASE_PORT + band + i`, beside the Caddy front |
+| `WS_H3_PORTBAND` | `3000` | `mixed` + h3 **under hypercorn** only: the aioquic ws origins are `NAVI_BASE_PORT + band + i`, beside the Caddy front. A vortex origin needs no band |
 
 The `requests` workload rotates four body kinds through `/echo`:
 
@@ -87,6 +97,109 @@ Example:
 
 ```
 NAVI_SECONDS=600 NAVI_PROTO=all NAVI_CLIENT=chronos \
+  nimble stressRequests
+```
+
+## Choosing the server
+
+`NAVI_SERVER` is a server dimension alongside `NAVI_PROTO` and `NAVI_CLIENT`, not
+a replacement for the default. Pick by the question you are asking.
+
+| | `hypercorn` (default) | `vortex` |
+| --- | --- | --- |
+| stack | FastAPI on hypercorn (h1/h2), Caddy in front for h3, aioquic for an h3 WebSocket | one Nim process per instance: h1, h2 and h3 on the same port, WebSocket over h1 Upgrade **and** h2/h3 Extended CONNECT |
+| what a green run proves | navi talks to widely deployed servers under load: **the interop evidence** | navi's own throughput, h3 behaviour and fairness, against an independent implementation |
+| server code | `server/app.py` | `server/vortex_server.nim` (navi-owned, implementing `app.py`'s contract) |
+| ports | base + i public; **h3 adds** a hypercorn backend at base + 1000 + i and, for `mixed`, aioquic on the ws band | base + i, TCP and (h3 cells) UDP. No backend band, no ws band |
+
+Use **hypercorn** by default, and for anything that is really a question about
+interop. A CI or nightly run must stay on it.
+
+Use **vortex** when the server is in the way of the measurement:
+
+- **hypercorn is the bottleneck on the hot cells.** It is a Python asyncio server
+  behind the GIL, `run.sh` already carries workarounds for its connection-lifecycle
+  timers, and on `requests` the harness is measuring hypercorn at least as much as
+  navi.
+- **h3 goes through a Caddy detour under hypercorn.** Caddy cannot bridge an h3
+  Extended CONNECT, so the `ws` h3 cell replaces it with aioquic and the `mixed`
+  h3 cell runs aioquic on a separate port band, which means the ws slice of
+  `mixed` never shares a QUIC connection with the other four, the interaction the
+  cell exists for. Caddy also means the h3 cells never churn a QUIC connect.
+  Under vortex every h3 cell, ws included, is served by one process on one port.
+
+### The shared-blind-spot caveat
+
+vortex and navi share an author and conventions, and vortex is **not** interop
+evidence for that reason: a cell that passes only against vortex proves less than
+one that passes against hypercorn. That is why hypercorn stays the default and
+remains what CI/nightly runs. vortex is an independent *implementation* (its only
+dependency is nimcrypto; its h3 is ngtcp2 + nghttp3, not nim-quic), so it is still
+a second opinion, just not a disinterested one.
+
+### Reading a failure under vortex
+
+Two suspects instead of one. Triage in this order:
+
+1. Re-run the same cell with `NAVI_SERVER=hypercorn`. If it passes there, the
+   suspect is vortex, not navi.
+2. Reproduce against the vortex server with a **non-navi** client (`curl`,
+   `h2load`, a browser) before touching navi. Then file it at nim-vortex and
+   either bump `VORTEX_REF` past the fix or record the cell as blocked on it.
+
+### Numbers do not compare across servers
+
+Always say which server produced a figure. Two reasons the same cell reads
+differently:
+
+- **Flow-control windows.** vortex defaults to a 1 MiB stream window, a 1 MiB h2
+  connection window and a 4 MiB h3 connection window; hypercorn advertises HTTP/2's
+  64 KiB initial window. The harness leaves both at their defaults, so every
+  upload number (`up` in `mixed`, the `streamUpload` MB/s) moves, relevant to
+  #461.
+- **No Caddy hop.** Under hypercorn an h3 cell's bytes cross Caddy and then a
+  loopback h1 connection to the backend; under vortex they do not.
+
+### `NAVI_RECYCLE` under vortex
+
+`NAVI_RECYCLE=1` buys **much less** against vortex than against hypercorn, and
+differently on each protocol. Two mappings:
+
+- `NAVI_KEEPALIVE_TIMEOUT` -> `keepAliveTimeout`, which is a **true idle timer**
+  on h1 and h2: it closes a connection that has been quiet, and a busy one is
+  never touched. hypercorn's `keep_alive_timeout` is not that -- measured on
+  hypercorn 0.18 h2 it fires at about the configured value even on a connection
+  carrying 13k req/s, which is why the hypercorn default here is pushed past the
+  whole soak. So the same knob churns busy connections there and only pooled,
+  quiet ones here.
+- `NAVI_KEEPALIVE_MAX` -> `maxRequestsPerSocket`, which vortex applies to
+  **HTTP/1 keep-alive only**. It is vortex's only per-connection request counter,
+  and nothing equivalent is reachable from handler code on h2 or h3.
+
+On h3 the two combine into no coverage at all: vortex advertises the idle window
+as QUIC's `max_idle_timeout` and then arms ngtcp2's keep-alive PING at a third of
+it, so a live QUIC connection is never idle-closed, and there is no request cap
+either.
+
+The cell runs either way, and says which of the three it got, after its banner:
+
+```
+== stress: streamDownload | chronos | h1 | 5 servers | server=vortex@006b4de68835/sync ==
+[streamDownload h1 server=vortex] notice: maxRequestsPerSocket=200 caps requests per connection; idle close at 2s is idle-only
+== stress: streamDownload | chronos | h2 | 5 servers | server=vortex@006b4de68835/sync ==
+[streamDownload h2 server=vortex] notice: idle-only recycle (keepAliveTimeout=2s); no per-connection request cap
+== stress: streamDownload | chronos | h3 | 5 servers | server=vortex@006b4de68835/sync ==
+[streamDownload h3 server=vortex] notice: no recycle coverage under vortex (QUIC keep-alive PING defeats the idle close; no request cap)
+```
+
+So a recycle soak that has to churn **busy** connections is a hypercorn run, on
+every protocol, and h1 is the only vortex cell with a per-connection request cap
+at all.
+
+Example:
+
+```
+NAVI_SERVER=vortex NAVI_SECONDS=600 NAVI_PROTO=all NAVI_CLIENT=all \
   nimble stressRequests
 ```
 
@@ -131,13 +244,20 @@ cannot hide behind a healthy `/echo` rate. The ws and sse checks read
 all-failing slice would otherwise clear the check. All shared instances are passed to
 `chaosFinish`, so the process-wide FD/heap bracket stays honest under chaos.
 
-**h3 needs two origins.** Caddy's `reverse_proxy` does not bridge an h3 Extended
-CONNECT to a backend WebSocket, so for a mixed h3 cell `run.sh` keeps the Caddy
-front on `NAVI_BASE_PORT + i` (for `/echo`, `/events`, `/upload`, `/download`) and
-*also* starts aioquic ws servers on a band at `NAVI_BASE_PORT +
+**h3 needs two origins under hypercorn.** Caddy's `reverse_proxy` does not bridge
+an h3 Extended CONNECT to a backend WebSocket, so for a mixed h3 cell `run.sh`
+keeps the Caddy front on `NAVI_BASE_PORT + i` (for `/echo`, `/events`, `/upload`,
+`/download`) and *also* starts aioquic ws servers on a band at `NAVI_BASE_PORT +
 NAVI_WS_H3_PORTBAND + i`; the ws slice dials those. navi direct-dials QUIC for an
 h3 WebSocket, so the band needs no Alt-Svc discovery leg. On h1 and h2 the ws
 slice shares the base origins with everything else.
+
+The consequence is that under hypercorn the ws slice of a mixed h3 cell shares the
+instances and the event loop but **not** a QUIC connection with the other four,
+the one gap in the cell's premise. `NAVI_SERVER=vortex` closes it: one process
+terminates the h3 Extended CONNECT on the same port as the other four routes, so
+there is no band, the ws slice rides the shared connection, and the h3 mixed cell
+finally tests what the h1/h2 ones do.
 
 **Gaps.** `sync` has **no mixed client**: the sync client is blocking, so a real
 concurrent mix needs either `--threads:on` with a thread per slice or an
@@ -338,10 +458,29 @@ NAVI_CHAOS=all NAVI_PROTO=h1 NAVI_CLIENT=all nimble stressRequests
   `*_js.nim` runs under Node. run.sh skips any client whose source is absent, so
   partial client coverage degrades gracefully (there is no `mixed_sync.nim`).
 - `server/app.py` — one FastAPI app (echo, ws, events, upload, download) served by
-  hypercorn (h1/h2); Caddy fronts it for h3.
-- `Dockerfile` (h1/h2) and `Dockerfile.h3` (adds the ngtcp2/nghttp3/OpenSSL-3.5
-  client toolchain + Caddy). `run.sh` orchestrates: cert, N servers, the
-  client × protocol matrix, cleanup, and a final pass/fail banner.
+  hypercorn (h1/h2); Caddy fronts it for h3. The **contract spec** for both servers.
+- `server/vortex_server.nim`: the `NAVI_SERVER=vortex` origin, the same routes on
+  [vortex](https://github.com/cryo2010/nim-vortex), h1 + h2 + h3 and WebSocket
+  over h1 Upgrade and h2/h3 Extended CONNECT in one process. navi-owned rather
+  than vortex's own `conformance/stress/stress_server.nim`, whose route contract is
+  the vortex Python client's (different SSE numbering, no `x-sha1` on `/download`,
+  no `/echo` canonicalisation, none of the coverage routes). It does its own
+  gzip/deflate/br/zstd on both directions instead of using vortex's negotiation,
+  because the catalogue expects exactly the codec `x-want-encoding` asked for --
+  the same zlib/brotli/zstd libraries `app.py` reaches through Python, so both
+  servers put the same bytes on the wire.
+- `Dockerfile` (h1/h2, hypercorn only) and `Dockerfile.h3` (adds the
+  ngtcp2/nghttp3/OpenSSL-3.5 toolchain, Caddy, aioquic **and** the vortex origin,
+  compiled once at image build time). vortex serves TLS and HTTP/3 from one build,
+  so it needs those trees and lives only in the h3 image; `navi.nimble` selects
+  that image whenever `NAVI_PROTO` includes h3 **or** `NAVI_SERVER=vortex`, which
+  keeps a plain hypercorn h1/h2 run as cheap as it was. It does **not** keep an
+  h3 run cheap: a hypercorn h3 or `all` run builds this file too, so it now pays
+  the vortex install and compile layer (about 25 to 30 s on an otherwise cached
+  image) and a build-time clone of nim-vortex from GitHub, for a server that run
+  never starts. The nightly `stress-chaos` workflow builds this image and pays it
+  as well. `run.sh` orchestrates: cert, N servers, the client × protocol matrix,
+  cleanup, and a final pass/fail banner.
 
 ## Notes
 

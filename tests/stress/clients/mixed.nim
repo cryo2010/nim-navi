@@ -11,10 +11,14 @@
 ## delayed every inbound frame for every other stream on it) is the shape this
 ## cell exists to catch; no single-workload cell can produce it.
 ##
-## One caveat: on h3 the ws slice shares the instances and the event loop but NOT
-## a connection. Caddy's `reverse_proxy` cannot bridge an h3 Extended CONNECT, so
-## that slice dials a separate aioquic QUIC origin on its own port band (see
-## mixedWsUrl); the other four slices still share the Caddy origins' connections.
+## One caveat, and only under `NAVI_SERVER=hypercorn`: on h3 the ws slice shares
+## the instances and the event loop but NOT a connection. Caddy's `reverse_proxy`
+## cannot bridge an h3 Extended CONNECT, so that slice dials a separate aioquic
+## QUIC origin on its own port band (see mixedWsUrl); the other four slices still
+## share the Caddy origins' connections. `NAVI_SERVER=vortex` removes the caveat:
+## one vortex process terminates the h3 Extended CONNECT on the same port as the
+## rest, so the ws slice finally shares a QUIC connection with the other four --
+## which is the interaction this cell exists for.
 ##
 ## Each slice keeps its own verification and its own counter, exactly as the
 ## single-workload client does -- per-response `checkVersion` for requests and
@@ -49,15 +53,20 @@ include parts/stream_upload_part     # one verified streamed upload
 include parts/stream_download_part   # one verified streamed download
 
 proc mixedWsUrl(cfg: Config, pool: ptr ServerPool, i: int): string =
-  ## The ws origin for ws worker `i`. On h1/h2 the WebSocket rides the same
-  ## origins as the rest of the mix (the whole point of the cell). On h3 it
-  ## cannot share them: Caddy's `reverse_proxy` does not bridge an h3 Extended
-  ## CONNECT to a backend WebSocket, so run.sh stands aioquic ws servers up on
-  ## their own band (`NAVI_WS_H3_PORTBAND`) beside the Caddy front, and the ws
-  ## slice dials those. navi direct-dials QUIC for an h3 WebSocket, so the band
-  ## origin needs no Alt-Svc discovery leg; the other four slices keep the Caddy
-  ## origins and their /echo, /events, /upload and /download routes.
-  if cfg.proto == "h3":
+  ## The ws origin for ws worker `i`. Everywhere except one cell this is just
+  ## another of the shared origins, so the WebSocket rides the same connections
+  ## as the rest of the mix (the whole point of the cell).
+  ##
+  ## The exception is h3 under `NAVI_SERVER=hypercorn`: Caddy's `reverse_proxy`
+  ## does not bridge an h3 Extended CONNECT to a backend WebSocket, so run.sh
+  ## stands aioquic ws servers up on their own band (`NAVI_WS_H3_PORTBAND`)
+  ## beside the Caddy front and the ws slice dials those. navi direct-dials QUIC
+  ## for an h3 WebSocket, so the band origin needs no Alt-Svc discovery leg; the
+  ## other four slices keep the Caddy origins and their /echo, /events, /upload
+  ## and /download routes. Under `NAVI_SERVER=vortex` there is no band and no
+  ## detour: the vortex origin on the base port terminates the h3 Extended
+  ## CONNECT itself, so every protocol takes the shared-origin path.
+  if cfg.proto == "h3" and cfg.server == "hypercorn":
     "wss://" & cfg.host & ":" &
       $(cfg.basePort + cfg.wsH3PortBand + i mod cfg.servers) & "/ws"
   else:

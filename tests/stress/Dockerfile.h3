@@ -1,8 +1,12 @@
 # Per-workload stress image WITH HTTP/3. Adds the client QUIC toolchain that a
 # -d:naviHttp3 build links (OpenSSL 3.5 + nghttp3 + ngtcp2, same layers as
 # tests/interop/http3/Dockerfile) and Caddy as the h1/h2/h3 origin, on top of the
-# Python (FastAPI/hypercorn) + Node stack. Heavier build than the plain image, so
-# it is only used for h3 cells (run.sh sets -d:naviHttp3 when PROTO includes h3).
+# Python (FastAPI/hypercorn) + Node stack. It also carries the vortex origin
+# (NAVI_SERVER=vortex), which needs the same three trees: vortex serves TLS and
+# HTTP/3 from one build, so there is no "TLS but no QUIC" configuration of it to
+# put in the lighter image. Heavier build than the plain image, so it is used for
+# h3 cells and for every NAVI_SERVER=vortex run (run.sh sets -d:naviHttp3 when
+# PROTO includes h3; navi.nimble picks this file for either reason).
 #
 #   docker build -f tests/stress/Dockerfile.h3 -t navi-stress-h3 .
 #   docker run --rm -e NAVI_WORKLOAD=requests -e NAVI_PROTO=h3 navi-stress-h3
@@ -36,6 +40,84 @@ COPY --from=caddy:2 /usr/bin/caddy /usr/bin/caddy
 
 ENV PKG_CONFIG_PATH=$OSSL/lib/pkgconfig:$NGHTTP3/lib/pkgconfig:$NGTCP2/lib/pkgconfig
 ENV LD_LIBRARY_PATH=$OSSL/lib:$NGHTTP3/lib:$NGTCP2/lib
+
+# --- the vortex origin (NAVI_SERVER=vortex) ---------------------------------
+# zlib/brotli/zstd: tests/stress/server/vortex_server.nim loads them by soname
+# (dynlib), so only the runtime libraries are needed -- the -dev packages pull
+# them in and are what a future --passL build would want anyway.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      zlib1g-dev libbrotli-dev libzstd-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# VORTEX_REF is a PINNED commit on purpose: vortex is an independent server, and
+# an unpinned ref would let a change there move navi's numbers between two runs
+# of the same navi commit. Bump it deliberately (nimble stress ... passes
+# NAVI_VORTEX_REF through as this build-arg). VORTEX_RUNTIME selects vortex's
+# handler runtime, so it is fixed per image build, not per cell: the h3 image
+# already OOMs a small VM at a four-wide fan-out of overlapping Nim compiles, and
+# a per-cell server compile would make that worse.
+ARG VORTEX_REF=006b4de688359c7ddb612d87573fc7190ad665ae
+ARG VORTEX_RUNTIME=sync
+RUN nimble install -y "nimcrypto@>= 0.6.0" "chronos@>= 4.0.0" \
+ && nimble install -y "https://github.com/cryo2010/nim-vortex@#$VORTEX_REF"
+
+# Its own COPY, before the repo-wide one below, so editing a navi source file
+# does not rebuild the server (the vortex compile with the C++ QUIC shim is the
+# slowest layer here and the server depends on none of navi).
+COPY tests/stress/server/vortex_server.nim /opt/vortex/vortex_server.nim
+# vortex's HTTP/3 shim does NOT go through pkg-config: src/vortex/http3/ngtcp2/
+# backend.nim hard-codes `-lngtcp2 -lngtcp2_crypto_ossl -lnghttp3 -lssl -lcrypto
+# -lstdc++` and compiles vq_ngtcp2.cpp, whose includes expect ngtcp2/, nghttp3/
+# and openssl/ on the default search path (its own Arch image gets them from
+# distro packages). Point the compiler and linker at the /opt trees instead.
+# The flag set is vortex's own `soak` profile: -d:release WITH the runtime checks
+# and native tracebacks, because a server crash must print where it died instead
+# of reaching navi as an unexplained ConnectError.
+#
+# -DSSL_OP_SERVER_PREFERENCE is a portability patch for the shim, not a tuning
+# knob. vq_ngtcp2.cpp names the server-cipher-preference option
+# SSL_OP_SERVER_PREFERENCE and takes it from <openssl/ssl.h>. What was verified
+# in this image: its OpenSSL (built from the openssl-3.5 branch,
+# OPENSSL_FULL_VERSION_STR "3.5.9-dev") defines only
+# `SSL_OP_CIPHER_SERVER_PREFERENCE SSL_OP_BIT(22)`, and the name the shim uses is
+# absent from the header -- so the shim does not compile here. Which OpenSSL
+# release did introduce the new spelling is not something this image can tell,
+# and the claim is not needed: vortex's own README and HARDENING.md document
+# OpenSSL >= 3.5 as its minimum, which a 3.5 header that lacks the name
+# contradicts. Filed upstream as
+# https://github.com/cryo2010/nim-vortex/issues/398 (suggesting an #ifndef
+# fallback in the shim). The pin here cannot move anyway: OpenSSL 3.5 is what
+# navi's own HTTP/3 client toolchain is built against, and changing it would
+# change the hypercorn h3 cells too. Both names are SSL_OP_BIT(22), i.e. the
+# same value, so defining the one as the other is exactly equivalent. Drop the
+# define once VORTEX_REF points past a vortex fix. Harmless on the Nim-generated
+# C files passC also reaches: nothing there includes <openssl/ssl.h>.
+#
+# --nimcache is explicit so the artefacts land somewhere this RUN can delete:
+# the default is under $HOME/.cache/nim (about 36 MiB for this binary), not
+# beside the source, so removing /opt/vortex/nimcache would delete nothing.
+#
+# This whole section is the price every user of THIS image pays, hypercorn runs
+# included: an h3 cell under the default server, and the nightly stress-chaos
+# workflow that builds this file, now carry the vortex install plus this compile
+# (measured at about 25 to 30 s on an otherwise cached image) and a build-time
+# clone of nim-vortex from GitHub. That is the trade for not building the
+# ngtcp2/nghttp3/OpenSSL trees a second time in the light image.
+RUN case "$VORTEX_RUNTIME" in \
+      sync)    rtflag="" ;; \
+      async)   rtflag="-d:naviVortexAsync" ;; \
+      chronos) rtflag="-d:naviVortexChronos" ;; \
+      *) echo "unknown VORTEX_RUNTIME: $VORTEX_RUNTIME (sync|async|chronos)" >&2; exit 1 ;; \
+    esac; \
+    nim c --mm:orc --threads:on -d:release --hints:off \
+      --stackTrace:on --stackTraceMsgs:on --lineTrace:on --panics:on \
+      --debugger:native $rtflag --nimcache:/tmp/nc-vortex \
+      --passC:-I$NGTCP2/include --passC:-I$NGHTTP3/include --passC:-I$OSSL/include \
+      --passC:-DSSL_OP_SERVER_PREFERENCE=SSL_OP_CIPHER_SERVER_PREFERENCE \
+      --passL:-L$NGTCP2/lib --passL:-L$NGHTTP3/lib --passL:-L$OSSL/lib \
+      -o:/usr/local/bin/vortex_server /opt/vortex/vortex_server.nim \
+ && echo "$VORTEX_REF $VORTEX_RUNTIME" >/opt/vortex/build-id \
+ && rm -rf /tmp/nc-vortex
 
 WORKDIR /navi
 COPY . .
