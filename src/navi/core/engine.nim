@@ -533,7 +533,7 @@ template h1Exchange*(transport, req, sink, keep, decompress, cap: typed;
     h1DrainBody(transport, parser, sink, keep, decompress, cap)
     parser.toResponse()
 
-template h2SendRequest*(transport, h2, req: typed): uint32 =
+template h2SendRequest*(transport, h2, req: typed; cap: typed = -1): uint32 =
   ## Open a new h2 stream and send `req` on it, returning the stream id (response
   ## still to be read). A buffered body goes in one shot; a streamed body
   ## (`bodyStream`) is sent as DATA pulled from the producer, reading between frames
@@ -541,9 +541,16 @@ template h2SendRequest*(transport, h2, req: typed): uint32 =
   ## only once the queued bytes are on the wire, so buffered upload memory stays
   ## ~one chunk. This is the h2 analog of h1's `sendRequest`; both h2Stream and
   ## h2SendAndReadHeaders drive their read loop from the id it returns.
+  ##
+  ## `cap` is the REQUESTING client's `maxResponseBytes`, applied to this stream alone
+  ## (-1 inherits the connection's): a pooled h2 connection outlives the request that
+  ## opened it and is shared with callers configured differently -- an `sse()` stream
+  ## runs on the caller's own connections with the cap off (#466) -- so the cap
+  ## belongs to the stream, not to the connection.
   mixin await, sendAll, recvSome
   block:
     let sid = h2.openStream()
+    if cap >= 0: h2.setStreamMaxBody(sid, cap)   # this requester's cap, not the conn's
     if req.bodyStream != nil:
       await sendAll(transport, h2.encodeRequestHead(sid, h2HeaderList(req)))
       var sending = true
@@ -578,7 +585,7 @@ template h2Stream(transport, h2, req, sink, decompress, cap: typed): Response =
   ## One HTTP/2 request/response on a new stream of the shared connection `h2`.
   block:
     mixin BodySink
-    let sid = h2SendRequest(transport, h2, req)
+    let sid = h2SendRequest(transport, h2, req, cap)
     # Deliver the body to the sink incrementally as DATA arrives (bounded memory),
     # or buffer it for a non-streaming request. The decoder is built once the
     # response headers are in (so content-encoding is known); the loop runs once
@@ -627,7 +634,7 @@ template h2GatedStream(transport, h2, req, userSink, gate,
   ## the stream from the connection.
   mixin await, sendAll, recvSome, BodySink
   block:
-    let sid = h2SendAndReadHeaders(transport, h2, req)
+    let sid = h2SendAndReadHeaders(transport, h2, req, cap)
     let snap = toResponse(h2.respSnapshot(sid))
     let eff = effectiveSink(userSink, gate, snap.httpVersion, snap.status, snap.headers)
     var cd = initCappedDecoder(decompress, cap)
@@ -671,15 +678,16 @@ template h2GatedStream(transport, h2, req, userSink, gate,
       if not eff.isNil: r.body = ""      # delivered incrementally above
       r
 
-template h2SendAndReadHeaders*(transport, h2, req: typed): uint32 =
+template h2SendAndReadHeaders*(transport, h2, req: typed; cap: typed = -1): uint32 =
   ## Open an h2 stream, send the request (including a streamed upload body), and
   ## read frames until the final response headers arrive; returns the stream id.
   ## The header/body split lets a pull-based caller return a handle here and drain
   ## the body later. Raises if the stream fails before any headers (so the caller's
-  ## retry/redirect loop can react), mirroring `h2Stream`'s terminal errors.
+  ## retry/redirect loop can react), mirroring `h2Stream`'s terminal errors. `cap` is
+  ## this requester's `maxResponseBytes` for the stream (see `h2SendRequest`).
   mixin await, sendAll, recvSome
   block:
-    let sid = h2SendRequest(transport, h2, req)
+    let sid = h2SendRequest(transport, h2, req, cap)
     while not h2.headersReady(sid) and not h2.streamDone(sid):
       let chunk = await recvSome(transport)
       if chunk.len == 0: break
@@ -787,14 +795,18 @@ template serveOnce(client, pc, rq, sink, key: typed;
   ## error, not a flag. The caller must guard the call so a raised exchange closes the
   ## transport before re-raising; the pool/close below runs only on success, so a pooled
   ## connection is never double-closed.
-  mixin sendAll, await, BodySink
+  mixin sendAll, await, BodySink, sharedConnCap
   block:
     let gated = not userSink.isNil and not gate.isNil
     var r: Response
     var keep = false
     if pc.h2 != nil or pc.transport.protocol == "h2":
       if pc.h2 == nil:
-        pc.h2 = initH2Conn(client.config.maxResponseBytes)
+        # `sharedConnCap`, not `config.maxResponseBytes`: a pooled h2 connection
+        # outlives the request that opened it and is shared with an `sse()` view,
+        # whose cap is 0 (#466). It is only the connection default -- every request
+        # registers its own cap on its own stream below.
+        pc.h2 = initH2Conn(client.sharedConnCap)
         await sendAll(pc.transport, pc.h2.preamble())
       if gated:
         r = h2GatedStream(pc.transport, pc.h2, rq, userSink, gate,

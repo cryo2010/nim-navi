@@ -20,6 +20,13 @@ OPENSSL_CONF=/dev/null "$OSSL/bin/openssl" req -x509 -newkey rsa:2048 -nodes -da
 export BIG
 BIG=$(printf 'navi%.0s' $(seq 1 250))   # 1000 bytes, gzips well
 
+# The /sse route's body: two events, framed exactly as text/event-stream requires
+# (blank line terminates an event). Real newlines, inlined into the Caddyfile's
+# quoted token by its {$SSE_BODY} substitution; a Caddyfile quoted string may span
+# lines, so the bytes arrive verbatim.
+export SSE_BODY
+SSE_BODY=$': hello\n\ndata: one\nid: 1\n\ndata: two\nid: 2\n\n'
+
 # Start the h3 origin (h3 on UDP 4433). Fatal if it fails: the test dials it.
 caddy start --config "$DIR/Caddyfile" --adapter caddyfile >/tmp/caddy.log 2>&1 \
   || { echo "caddy failed to start"; cat /tmp/caddy.log; exit 1; }
@@ -131,6 +138,18 @@ nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/stream_async_te
 echo ">>> building and running the h3 streaming test (chronos backend)"
 nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/stream_chronos_test "$DIR/stream_chronos_test.nim"
 /tmp/stream_chronos_test
+
+echo ">>> building and running the SSE-over-h3 test (#466, sync client)"
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/sse_test "$DIR/sse_test.nim"
+/tmp/sse_test
+
+echo ">>> building and running the SSE-over-h3 test (#466, asyncdispatch client)"
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/sse_async_test "$DIR/sse_async_test.nim"
+/tmp/sse_async_test
+
+echo ">>> building and running the SSE-over-h3 test (#466, chronos client)"
+nim c --hints:off --path:"$ROOT/src" -d:ssl -d:naviHttp3 -o:/tmp/sse_chronos_test "$DIR/sse_chronos_test.nim"
+/tmp/sse_chronos_test
 
 echo ">>> building and running the h3 SSL_CTX cache test (sharing, release, bound)"
 # A PKCS#12 client credential for the benchmark below: decoding one is the slowest

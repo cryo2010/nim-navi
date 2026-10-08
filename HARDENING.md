@@ -286,6 +286,27 @@ servers: on the native backends the cap counts *decompressed* bytes, so it is th
 decompression-bomb guard. The overflowing chunk is never delivered and, for
 HTTP/2, the stream is RST.
 
+The cap belongs to the **request**, not to the connection it rides: on HTTP/2 it is
+applied per stream, so a pooled or multiplexed connection applies the cap each
+request was issued with rather than the one its opener happened to have. Two
+consequences worth knowing when you set a cap:
+
+* **An SSE stream is not covered by it.** `sse()` deliberately runs with the cap off
+  (an event stream is unbounded by design). If you need a bound on one, bound it
+  yourself in the `each`/`next` loop (count bytes, or stop after N events);
+  `maxSseEventBytes` already caps a single event, not the stream's total.
+* **HTTP/3 buffered responses are capped per connection, not per request.** The h3
+  driver enforces the cap while it buffers a whole response in C memory, and a shared
+  h3 connection carries the cap of whichever client opened it. navi hands it the cap
+  of the client that *owns* the connection, never an `sse()` view's, so a cap you set
+  is never silently dropped by a stream that happened to open the connection. h3
+  **streamed** reads (`stream()`, and so every SSE stream) are submitted with that
+  connection-wide enforcement switched off, because the body is drained incrementally
+  and nothing accumulates: they are capped navi-side per request instead, from the
+  `maxResponseBytes` of the client that issued the read, and a breach raises the same
+  `ResponseTooLargeError`. So an SSE stream reads unbounded over a connection your
+  capped requests share, and your own `stream()` on it still stops at your cap.
+
 ### Redirects
 
 ```nim
@@ -327,6 +348,28 @@ config.decompress = false   # hand back the raw encoded body
 
 On by default (decodes gzip/deflate/br). Leave it on with `maxResponseBytes` set;
 the cap counts decoded bytes, so the two together bound a compression bomb.
+
+### Read deadlines on a shared HTTP/2 connection
+
+`timeouts.read` is a **connection-level** bound on an async client's shared HTTP/2
+connection, not a per-stream one: it is the transport's socket read timeout, bound
+once from the config that opened the connection and carried for its whole life. A
+whole `read` with no inbound byte on the connection means the peer has gone dark, so
+the reader exits, every in-flight stream on that connection fails with a replayable
+error class, and the connection is retired and replaced. It is therefore navi's
+dead-connection detector, and it cannot be two values at once -- which is why an
+`sse()` stream, which must run with no read bound, rides a **separate SSE-only** h2
+connection per origin instead of yours (all of one client's streams share that one;
+see [Server-Sent Events](README.md#server-sent-events)).
+
+Because that SSE connection has no read bound, its only liveness check is the HTTP/2
+PING keepalive, `timeouts.h2KeepAlive` (20 s by default). An SSE stream therefore
+always runs the keepalive on its connection: if you set `h2KeepAlive = 0`, your
+requests' connections go without it but the SSE connection falls back to the 20 s
+default, so a black-holed peer is still detected rather than leaving a zombie
+connection that every later `sse()` on the client reconnects onto. Leave it on for
+your requests too: with `0` and a hostile or flaky peer, a dead connection stays
+pooled and every request dispatched on it burns its own read timeout before failing.
 
 ### HTTP/2 limits
 

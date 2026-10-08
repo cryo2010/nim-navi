@@ -34,6 +34,14 @@ https://localhost:4433, https://127.0.0.1:4433 {
 		respond "{$BIG}" 200
 	}
 
+	# A fixed `text/event-stream` body (its bytes are SSE_BODY, exported by run.sh
+	# with real newlines in it) for the SSE-over-h3 probe. `header` pins the content
+	# type, which navi's `sse()` requires; without it Go would sniff text/plain.
+	handle /sse {
+		header Content-Type "text/event-stream"
+		respond "{$SSE_BODY}" 200
+	}
+
 	# Echoes the TLS server_name the client sent, so the #451 probe can assert that
 	# an IP-literal origin sends no SNI at all (RFC 6066 3) while a DNS origin does.
 	handle /sni {

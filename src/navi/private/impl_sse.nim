@@ -9,7 +9,11 @@ type
   SseStreamObj = object
     ## A first-class SSE stream. Pulls parsed events via `next`/`each`, reconnecting
     ## transparently (Last-Event-ID + the server's retry:) unless `reconnect` is off.
-    client: Navi
+    client: Navi          ## a config-carrying `sharedView` of the caller's client: the
+                          ## SSE-tuned config (no size cap, no read/total timeout) over
+                          ## the caller's own pool, h3 connections, Alt-Svc cache,
+                          ## cookie jar and TLS stores, and over the client's
+                          ## SSE-only h2 mux table (#466)
     verb: HttpVerb
     target: string
     headers: Headers
@@ -63,8 +67,47 @@ proc sse*(client: Navi, target: string, verb = GET,
   ## (none at end) or `each` (a real loop, so break/return work). Reconnects
   ## transparently on a drop -- resending Last-Event-ID and honoring the server's
   ## retry: with backoff to `maxRetryMs` -- unless `reconnect` is false. `verb`/
-  ## `body`/headers allow POST-SSE and auth. The underlying stream runs with the
-  ## size cap and read/total timeouts off and shares the client's cookie jar.
+  ## `body`/headers allow POST-SSE and auth.
+  ##
+  ## The stream runs ON THE CALLER'S CLIENT: it reuses the client's pooled http/1.1
+  ## connections, its shared h2 and HTTP/3 connections, its Alt-Svc cache, its cookie
+  ## jar and its TLS session cache, and anything it learns (a cookie, an `Alt-Svc`
+  ## advertisement) lands there too. So repeated `sse()` calls cost no extra handshake,
+  ## and an origin this client already knows speaks h3 is dialled over HTTP/3 from the
+  ## FIRST request, with `reconnect` off as well as on (issue #466). Only three config
+  ## values are overridden, all to 0, because an SSE stream is long-lived:
+  ## `maxResponseBytes`, `timeouts.read` and `timeouts.total`. `idleTimeoutMs` below is
+  ## the stream's only read bound.
+  ##
+  ## With `timeouts.read` off, the HTTP/2 PING keepalive is the only thing that can
+  ## notice a peer that has gone dark on the SSE connection, so a stream ALWAYS runs
+  ## one: `timeouts.h2KeepAlive` is taken from the client, except that a client which
+  ## disabled it (`0`) gets `defaultH2KeepAliveMs` on its SSE connections. Without
+  ## that, such a connection would stay reusable forever and every later `sse()` on
+  ## the client would loop open / idle-timeout / reconnect on the same zombie. A live
+  ## change to `timeouts.h2KeepAlive` reaches an SSE connection already up, as it does
+  ## a request connection.
+  ##
+  ## On HTTP/2 the streams of one client share an h2 connection per origin with EACH
+  ## OTHER but not with the client's requests, which have their own. An h2 connection
+  ## carries one read bound for every stream on it (the transport's, from the
+  ## `timeouts.read` of whoever opened it, and its expiry fails the connection and all
+  ## of its streams), so a stream that must run unbounded and a request that must give
+  ## up at `timeouts.read` cannot ride the same connection in either direction. So an
+  ## h2 origin costs one extra handshake for the first stream, and nothing after that.
+  ## http/1.1 (the pool) and HTTP/3 (one multiplexed connection, bounded only at the
+  ## handshake and then per request) are shared with the client's requests as they are
+  ## with each other.
+  ##
+  ## Everything else is the client's live configuration, with these exceptions:
+  ##
+  ## * `tls`, `http` and `proxy` are bound when a connection is opened, as they are for
+  ##   any navi request -- so a stream that REUSES one of the caller's connections gets
+  ##   what that connection was opened with.
+  ## * `decompress` is likewise fixed per shared h2/h3 connection, so a stream riding
+  ##   one another stream opened decodes (or does not) as that connection was opened.
+  ## * `timeouts.connect` is NOT overridden; the whole (re)open is instead bounded by
+  ##   `idleTimeoutMs` below, which is the smaller bound in practice.
   ##
   ## `idleTimeoutMs` bounds how long a single read or (re)open may block before the
   ## stream is treated as wedged and reconnected (resending Last-Event-ID), so a
@@ -83,17 +126,22 @@ proc sse*(client: Navi, target: string, verb = GET,
   cfg.maxResponseBytes = 0
   cfg.timeouts.read = 0
   cfg.timeouts.total = 0
+  # With the read bound off, the PING keepalive is the SSE connection's ONLY
+  # dark-peer detector, so a stream always runs one: a client that disabled the
+  # keepalive gets the default on its SSE connections rather than a connection with
+  # no liveness check at all, which would stay `canReuse` forever and make every
+  # later sse() loop open / idle-timeout / reconnect on the same zombie (#466).
+  if cfg.timeouts.h2KeepAlive <= 0: cfg.timeouts.h2KeepAlive = defaultH2KeepAliveMs
   var h = headers
   if not h.contains("accept"): h["accept"] = "text/event-stream"
   if not h.contains("cache-control"): h["cache-control"] = "no-cache"
   let s = SseStream(
-    client: newNavi(cfg), verb: verb, target: target, headers: h, params: params,
-    cancel: cancel, reconnect: reconnect,
+    client: client.sharedView(cfg), verb: verb, target: target, headers: h,
+    params: params, cancel: cancel, reconnect: reconnect,
     baseRetryMs: sseRetryDelay(retryMs, minRetryMs, maxRetryMs),
     retryMs: sseRetryDelay(retryMs, minRetryMs, maxRetryMs),
     minRetryMs: minRetryMs, maxRetryMs: maxRetryMs,
     idleTimeoutMs: idleTimeoutMs, parser: initSseParser(lastEventId))
-  s.client.jar = client.jar          # share cookies with the caller
   let openFut = s.openConn()
   # `withTimeout` (not asyncdispatch's retention-free `withinMs`, issue #468): this
   # body is shared with chronos, whose `withTimeout` cancels the loser, and the bound
@@ -106,20 +154,58 @@ proc sse*(client: Navi, target: string, verb = GET,
   return s
 
 proc close*(s: SseStream): Future[void] {.async.} =
-  ## Stop consuming and dispose the connection, including the dedicated internal
-  ## client (its pool and h2 mux, whose reader is joined). Idempotent. Call it when
-  ## done with the stream so the mux does not linger.
+  ## Stop consuming and dispose THIS STREAM: the handle is closed, which closes an
+  ## http/1.1 connection that is still mid-body (one cannot be pooled) or RSTs the
+  ## stream on the shared h2/h3 connection, leaving that connection up. Idempotent.
+  ## Call it when done with the stream.
+  ##
+  ## Nothing of the caller's is torn down (issue #466): the client keeps its pool, its
+  ## shared h2/h3 connections, its Alt-Svc cache and its TLS session cache, and stays
+  ## usable -- including for another `sse()` on the very connection this stream used.
+  ## Closing the CLIENT is what disposes those, as for any other request (its `close`
+  ## reaps the SSE h2 connections too).
   if s.closed: return
   s.closed = true
   if s.handle != nil:
     await s.handle.close()
     s.handle = nil
-  await s.client.close()
 
 proc httpVersion*(s: SseStream): string =
   ## HTTP version of the current underlying connection, or "" between reconnects.
-  ## An SSE stream starts on h1/h2 and upgrades to h3 only after a reconnect.
+  ## A stream opened on a client that has already learned the origin's
+  ## `Alt-Svc: h3` is "HTTP/3" from the first connection; one whose client has not
+  ## starts on h1/h2 and upgrades once the advertisement has been learned (on the
+  ## next connection, which with `reconnect` off means on the client's next stream).
   if s.handle != nil: s.handle.httpVersion else: ""
+
+proc sharesConnections*(s: SseStream, client: Navi): bool =
+  ## Whether this stream runs on `client`'s own connection and discovery state: its
+  ## pool, cookie jar, TLS session cache and context store, its SSE h2 mux table (the
+  ## one `client.close()` reaps and the client's other streams reuse, which on h2 is
+  ## deliberately not the table its REQUESTS use -- see `sharedView`), and -- on an
+  ## `-d:naviHttp3` build -- its h3 connections and Alt-Svc cache. True for the client
+  ## the stream was opened on. Introspection, for tests and for diagnosing an
+  ## unexpected handshake or a stream that did not ride h3 (#466).
+  if client == nil or s.client == nil: return false
+  result = s.client.owner == client and                    # it is a view OF this client
+           s.client.pool == client.pool and s.client.jar == client.jar and
+           sameTable(s.client.muxes, client.sseMuxes) and
+           sameTable(s.client.pendingMux, client.ssePendingMux) and
+           s.client.orphanCloses == client.orphanCloses and
+           s.client.config.tls.sessionCache == client.config.tls.sessionCache and
+           s.client.config.tls.contextStore == client.config.tls.contextStore
+  when defined(naviHttp3):
+    result = result and s.client.altSvc == client.altSvc and
+             sameTable(s.client.h3conns, client.h3conns) and
+             sameTable(s.client.pendingH3, client.pendingH3)
+
+proc sharesH2Connections*(s: SseStream, client: Navi): bool =
+  ## Whether this stream's h2 connections are the ones `client`'s own REQUESTS use.
+  ## Always false, deliberately: see `sharedView` for why a stream with no read bound
+  ## cannot ride a connection whose `timeouts.read` the client's requests depend on
+  ## (#466). Present so the distinction is assertable rather than implied by
+  ## `sharesConnections`.
+  s.client != nil and client != nil and sameTable(s.client.muxes, client.muxes)
 
 proc lastEventId*(s: SseStream): string = s.parser.lastEventId()
 

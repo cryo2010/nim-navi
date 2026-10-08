@@ -67,7 +67,11 @@ type
     decoders: Table[uint32, CappedDecoder]  ## per-sink-stream decode + size-cap state,
                                             ## created lazily once headers are in
     decompress: bool                   ## decode content-encoding before the sink
-    cap: int                           ## max decoded response bytes (maxResponseBytes)
+    cap: int                           ## DEFAULT max decoded response bytes
+                                       ## (`maxResponseBytes` of whoever opened the
+                                       ## connection). A request that passes its own
+                                       ## `cap` overrides it for its stream alone
+                                       ## (see `streamCap`)
     sendTail: Future[void]   ## tail of the serialized send chain
     alive: bool
     deliberateClose: bool    ## set by `close()` before it tears the mux down, so an
@@ -151,6 +155,18 @@ proc releaseSlot(mux: H2Mux) =
     if not s.finished:
       s.complete()
       break
+
+proc streamCap(mux: H2Mux, sid: uint32): int =
+  ## The decoded-body cap for `sid`: the cap the REQUEST registered on its own stream,
+  ## or the connection's default for a stream that registered none (a tunnel, or an
+  ## internal open). A shared connection outlives the request that opened it, and
+  ## `maxResponseBytes` is live configuration a caller may change between requests, so
+  ## the cap is a property of the stream rather than of the connection it rides
+  ## (#466). It is kept in the sans-io connection's own stream state
+  ## (`setStreamMaxBody`), which already dies with the stream, rather than in a second
+  ## table here that would have to be pruned in lockstep with it.
+  let own = mux.h2.streamMaxBody(sid)
+  if own >= 0: own else: mux.cap
 
 proc resetError(mux: H2Mux, sid: uint32): ref CatchableError {.gcsafe, raises: [].} =
   ## The exception a RST_STREAM maps to, classified from the recorded stream flags:
@@ -490,7 +506,10 @@ proc readChunk*(mux: H2Mux, sid: uint32): Future[string] {.async.} =
         var raw = mux.recvq[sid].popFirst()
         let rawLen = raw.len   # window is acked by raw (wire) bytes, captured before the move
         if not mux.decoders.hasKey(sid):
-          mux.decoders[sid] = initCappedDecoder(mux.decompress, mux.cap)
+          # The cap is the REQUESTING client's, not the connection's: a shared mux
+          # serves callers with different `maxResponseBytes`, and an `sse()` stream
+          # on it must stay uncapped (#466).
+          mux.decoders[sid] = initCappedDecoder(mux.decompress, mux.streamCap(sid))
         var decoded: string
         # CappedDecoder enforces the decoded-size cap (and truncation) here, matching
         # the sync single-connection h2 path -- a bare StreamDecoder let a compression
@@ -567,7 +586,8 @@ proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: strin
                          bodyStream: BodyProducer = nil,
                          trailers: seq[(string, string)] = @[],
                          connectTunnel = false,
-                         asyncStream: be.AsyncBodyProducer = nil): Future[uint32] {.async.} =
+                         asyncStream: be.AsyncBodyProducer = nil,
+                         cap = -1): Future[uint32] {.async.} =
   ## Open a sink stream, send the request, and await only until the response HEADERS
   ## arrive; return the stream id with the stream left open and its body queuing into
   ## `recvq` for a later `drainDownload`. The header/body split lets a pull-based
@@ -578,6 +598,11 @@ proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: strin
   ## `connectTunnel` (RFC 8441 Extended CONNECT) sends the header block WITHOUT
   ## END_STREAM and streams no body, so the send side stays open for full-duplex
   ## tunnel DATA (see `tunnelSend`). Used for WebSocket-over-h2.
+  ##
+  ## `cap` is the REQUESTING client's `maxResponseBytes`, applied to this stream alone
+  ## (#466): the connection outlives the request that opened it and the cap is live
+  ## configuration, so it cannot be a property of the connection. -1 inherits the
+  ## connection's default.
   if not mux.alive:                        # died between the router's canReuse check and
     raise newException(UnprocessedError,   # here (TOCTOU): the request was NEVER sent on
       "navi: http/2 request not processed") # this connection -> provably unprocessed
@@ -595,6 +620,7 @@ proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: strin
     raise newException(UnprocessedError,   # more would alias an old id. Retry on a fresh
       "navi: http/2 request not processed") # connection; canReuse already retires this one.
   let sid = mux.h2.openStream()
+  if cap >= 0: mux.h2.setStreamMaxBody(sid, cap)   # this requester's cap, not the conn's
   mux.h2.setSinkMode(sid)                 # gate the receive window; drainDownload acks it
   mux.sinkStreams.incl sid
   try:
@@ -734,12 +760,16 @@ proc abandon*(mux: H2Mux, sid: uint32): Future[void] {.async.} =
 proc request*(mux: H2Mux, headers: seq[(string, string)], body: string,
               bodyStream: BodyProducer = nil,
               trailers: seq[(string, string)] = @[],
-              asyncStream: be.AsyncBodyProducer = nil): Future[H2Response] {.async.} =
+              asyncStream: be.AsyncBodyProducer = nil,
+              cap = -1): Future[H2Response] {.async.} =
   ## Open a stream, send the request, and await this stream's response. Blocks while
   ## the connection is at the peer's MAX_CONCURRENT_STREAMS, resuming when a stream
   ## completes (so a burst of concurrent requests is queued, not RST). When
   ## `bodyStream` is set the body is streamed chunk by chunk instead of `body`;
   ## `asyncStream` (awaited per chunk) outranks both when set.
+  ##
+  ## `cap` is the REQUESTING client's `maxResponseBytes` for this stream alone (#466);
+  ## see `sendAndReadHeaders`.
   if not mux.alive:                        # the mux died between the router's canReuse
     raise newException(UnprocessedError,   # check and here (TOCTOU): the request was NEVER
       "navi: http/2 request not processed") # sent on this connection -> provably unprocessed
@@ -760,6 +790,7 @@ proc request*(mux: H2Mux, headers: seq[(string, string)], body: string,
   # the handle, not here, so this path is buffered: it waits for the whole response.
   # (`bodyStream` still streams the request body up.)
   let sid = mux.h2.openStream()
+  if cap >= 0: mux.h2.setStreamMaxBody(sid, cap)   # this requester's cap, not the conn's
   let fut = newFuture[H2Response]("h2mux.stream")
   mux.waiters[sid] = fut
   try:

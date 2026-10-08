@@ -530,6 +530,10 @@ proc sse*(client: Navi, target: string, verb = GET,
   ## retry: (backoff to `maxRetryMs`), unless `reconnect` is false. Redirects,
   ## cookies, and decoding are the runtime's, as elsewhere on js.
   ##
+  ## The stream runs on the caller's client (it always has here, since `fetch` owns
+  ## connections and the runtime pools them), so it shares the client's config and
+  ## cookie jar, matching the native clients since #466.
+  ##
   ## `minRetryMs` floors every reconnect delay, including one the server asked for
   ## with `retry:`, so a `retry: 0` (or a server that answers 200 and closes with no
   ## events) cannot spin the reconnect loop. It is capped by `maxRetryMs`. A connect
@@ -560,6 +564,17 @@ proc close*(s: SseStream) =
     s.haveConn = false
 
 proc lastEventId*(s: SseStream): string = s.parser.lastEventId()
+
+proc sharesConnections*(s: SseStream, client: Navi): bool = s.client == client
+  ## Whether this stream runs on `client`. True for the client it was opened on: this
+  ## backend has always used the caller's client, since `fetch` owns the connections.
+  ## Present for parity with the native clients, where #466 made it so.
+
+proc sharesH2Connections*(s: SseStream, client: Navi): bool = s.client == client
+  ## Whether this stream's HTTP/2 connections are the ones `client`'s own requests
+  ## use. True here, like the native sync backend: `fetch` owns the connections and
+  ## the runtime pools them, so navi has nothing to separate. Present for parity with
+  ## the async backends, which answer false (#466).
 
 proc dropConn(s: SseStream) =
   ## Release the current connection and fold it into the reconnect delay: a connect

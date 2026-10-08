@@ -269,7 +269,7 @@ let api = newNavi(config)
 | `throwHttpErrors` | `bool` | `true` | Raise `HttpError` on a non-2xx response. |
 | `unixSocket` | `string` | `""` | Dial this Unix socket path instead of TCP (POSIX; native clients); the URL host is used only for the Host header and TLS SNI. Bypasses proxies. |
 | `timeouts.connect` | `int` | `0` | TCP connect + TLS handshake deadline (ms); `0` disables. |
-| `timeouts.read` | `int` | `0` | Per-read idle deadline (ms); `0` disables. |
+| `timeouts.read` | `int` | `0` | Per-read idle deadline (ms); `0` disables. On a shared HTTP/2 connection it bounds the connection: an expiry retires it and replays its in-flight requests on a fresh one. |
 | `timeouts.total` | `int` | `0` | Whole-request deadline including retries/redirects (ms); `0` disables. |
 | `timeouts.attempt` | `int` | `0` | Per-attempt deadline, `min(attempt, remaining total)` (ms); retryable on expiry. `0` disables. |
 | `tls.caBundle` | `string` | `""` | Extra trusted CA certificates as an in-memory PEM string, **added** to the trust store (alongside `caFile` / the system roots). The additive option. |
@@ -598,6 +598,7 @@ api.config.timeouts.total   = 30_000  # whole request, including retries/redirec
 ```
 
 - **connect** and **read** are enforced on the native clients (sync, asyncdispatch, chronos).
+- **read** is one bound per *connection* on HTTP/2, taken from the config that opened it: a whole `read` with no inbound bytes means the peer has gone dark, so the connection is retired and its in-flight requests are replayed on a fresh one (which is also why an `sse()` stream, which runs with no read bound, gets its own h2 connection rather than riding your requests' -- see [Server-Sent Events](#server-sent-events)). A peer that answers HTTP/2 PINGs but never the request is caught by `timeouts.h2KeepAlive` instead.
 - **total** and **attempt** are enforced on all four clients (an **attempt** timeout is retryable; a **total** timeout is terminal).
 - On `navi/js` only **total** and **attempt** apply (via `AbortSignal.timeout` — `fetch` hides the connect/read phases).
 
@@ -1026,11 +1027,63 @@ delivered at least one event resets it to the base. Together those bound a
 misbehaving server (200 then instant close) to backing off instead of being
 hammered.
 
-The stream runs with the size cap and read/total timeouts off (SSE is long-lived)
-and shares the client's cookie jar. **Call `close()` when done** so the connection
-is disposed (on the native clients it also joins the h2 mux reader). On `navi/js`
-events go through `fetch`, so any method/headers work and chunks are decoded as
-UTF-8 text.
+The stream **runs on the client you called it on**: it reuses that client's pooled
+http/1.1 connections, its shared h2 and HTTP/3 connections, its Alt-Svc cache, its
+cookie jar and its TLS session cache, and anything the stream learns (a cookie, an
+`Alt-Svc` advertisement) lands there too. So repeated `sse()` calls cost no extra
+handshake, and an origin the client already knows speaks h3 is dialled over HTTP/3
+from the stream's **first** request, with `reconnect` off as well as on. Only three
+config values are overridden, since an SSE stream is long-lived: `maxResponseBytes`
+and `timeouts.total` go to 0 on every client, and `timeouts.read` goes to 0 on the
+async clients (on the **sync** client it is instead set *from* `idleTimeoutMs`, since
+a blocking read needs a socket-level bound to come back from a wedged server).
+
+**HTTP/2 is the exception to the sharing.** An h2 connection carries a single read
+bound for every stream on it, and `timeouts.read` is how navi notices a peer that has
+gone dark -- so a stream that must run unbounded cannot ride the connection your
+bounded requests use, in either direction. On the async clients the client therefore
+keeps a second h2 connection per origin for its streams: all of its streams share it
+with each other (so the first stream to an h2 origin costs one extra handshake and
+later ones cost none), and `close()` on the client reaps it like any other. http/1.1,
+HTTP/3, and the sync client's h2 (pooled, checked out one request at a time) are
+shared with your requests as usual.
+
+Because that SSE-only h2 connection has no read bound, the **PING keepalive is its
+only dark-peer detector**, so a stream always runs one: `timeouts.h2KeepAlive` comes
+from your client, except that a client which set it to `0` still gets the 20 s default
+on its SSE connections. Without that, a black-holed peer would leave a connection that
+looks reusable forever and every later `sse()` on the client would loop open /
+idle-timeout / reconnect on the same zombie. A live change to `timeouts.h2KeepAlive`
+reaches an SSE connection already up, as it does a request connection.
+
+Over **HTTP/3** a stream shares the client's one QUIC connection, and `maxResponseBytes`
+does not leak across that sharing: a streamed h3 read is capped from the config of the
+client that *issued* it, not from the connection, so the stream reads unbounded while
+your own `stream()` and `get()` on that connection still stop at your cap.
+
+Everything else is the client's live configuration, with these exceptions:
+`tls`, `http`, `proxy` and `decompress` are bound when a connection is opened (as for
+any navi request), so a stream that reuses one of the caller's connections gets what
+that connection was opened with; and the **sync** client's streamed HTTP/3 leg has no
+read bound at all (its body read drives the QUIC pump until a chunk lands), so neither
+`idleTimeoutMs` nor `timeouts.read` bounds it. A sync `SseStream` also shares mutable
+state with its client (the pool, the cookie jar, the h3 connection table), so the two
+are one thread-affine unit.
+
+**Call `close()` when done** so the stream's connection is released. What that costs
+differs by client. On the **async** clients an http/1.1 connection still mid-body is
+closed (a half-read response cannot be pooled), while a stream on a shared h2/h3
+connection is reset and that connection stays up for the rest of the client's work. On
+the **sync** client a stream closed mid-stream -- the usual case, since an event stream
+is open-ended -- closes its connection outright, on a pooled h2 connection too: a
+half-read response cannot be pooled and there is no background reader to drain the rest
+of it off a connection worth keeping (the sync streamed h3 leg's own QUIC connection
+likewise). A sync stream that instead *ended* on its own was already pooled by that
+last read, and `close()` is then a no-op. `close()` on the stream never touches
+anything of the client's;
+`close()` on the **client** is what disposes the pool and the shared connections, as
+for any other request. On `navi/js` events go through `fetch`, so any method/headers
+work and chunks are decoded as UTF-8 text.
 
 ### WebSocket
 

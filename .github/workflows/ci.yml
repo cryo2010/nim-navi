@@ -385,6 +385,16 @@ jobs:
       - name: Run the WebSocket-over-h2 interop test
         run: bash tests/interop/ws_h2/run.sh
 
+      # SSE connection sharing over HTTP/2 (#466): a Node h2 TLS origin that counts
+      # its h2 sessions, so which connection a stream rides is checked against a
+      # real server -- on the async clients the owner's read timeout must kill its
+      # own connection and not the stream, a client's streams must share one
+      # connection with each other, and close() must reap that one too; on the sync
+      # client the stream must share the pooled connection with the client's
+      # requests, and the response size cap must apply per stream on it.
+      - name: Run the SSE-over-h2 sharing interop test
+        run: bash tests/interop/sse_h2/run.sh
+
   streaming:
     runs-on: ubuntu-latest
     strategy:

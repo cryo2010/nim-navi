@@ -34,6 +34,10 @@ type
     ## `requiresInit`: build it with `initNaviConfig()`, not a bare `NaviConfig(...)`.
     middleware*: seq[NaviMiddleware]
 
+  OrphanCloses = ref seq[Future[void]]
+    ## The detached-teardown list, behind a ref so a client and any `sharedView` of
+    ## it append to (and reap from) the same one (see `Navi.orphanCloses`).
+
   Navi* = ref object
     config*: NaviConfig
       ## The client's live configuration. Mutate it to reconfigure between
@@ -46,11 +50,33 @@ type
     jar*: CookieJar
     muxes: TableRef[string, H2Mux]              ## live shared h2 connections
     pendingMux: TableRef[string, Future[H2Mux]] ## in-flight connects (coalescing)
-    orphanCloses: seq[Future[void]]             ## detached teardowns of displaced/evicted
+    sseMuxes: TableRef[string, H2Mux]           ## the same, for this client's SSE
+    ssePendingMux: TableRef[string, Future[H2Mux]]  ## streams only (#466). An h2
+                                                ## connection carries ONE read bound for
+                                                ## every stream on it (the transport's,
+                                                ## from `timeouts.read`), and an SSE
+                                                ## stream has to run with none while the
+                                                ## client's requests keep theirs, so the
+                                                ## two cannot share a connection. The
+                                                ## streams of one client DO share these
+                                                ## with each other, so repeated `sse()`
+                                                ## calls to one origin still cost one
+                                                ## handshake. `nil` on a `sharedView`,
+                                                ## whose own `muxes` IS this table.
+    orphanCloses: OrphanCloses                  ## detached teardowns of displaced/evicted
                                                 ## shared connections (h2 muxes, h3 conns);
                                                 ## close() awaits them so their fds are
                                                 ## reaped deterministically, not left to
                                                 ## background draining (see trackOrphan).
+                                                ## A ref, so a `sharedView` shares the one
+                                                ## list and its owner's close() still reaps
+                                                ## what the view orphaned (#466).
+    owner: Navi                                 ## non-nil only on a `sharedView`: the client
+                                                ## this handle borrows its connections from.
+                                                ## A view must never be `close`d (that would
+                                                ## tear down the owner's state) and reads its
+                                                ## owner's config where a value has to be the
+                                                ## owner's (see `sharedConnCap`).
     when defined(naviHttp3):
       altSvc: AltSvcCache                       ## per-origin h3 discovery cache
       h3conns: TableRef[string, QuicConn]  ## live multiplexed h3 connections
@@ -67,6 +93,10 @@ proc initNaviConfig*(): NaviConfig =
     maxIdleConns: 0, maxIdleConnsPerHost: 0, idleConnTimeout: 0,
     timeouts: Timeouts(h2KeepAlive: defaultH2KeepAliveMs), resolvedProxy: nil,
     middleware: @[])
+
+proc newOrphanCloses(): OrphanCloses =
+  ## A fresh (empty) detached-teardown list; one per real client.
+  new(result)
 
 when not defined(naviHttp3):
   var h3BuildWarned {.threadvar.}: bool   # per-thread once-flag (a shared global races)
@@ -88,7 +118,10 @@ proc newNavi*(config = initNaviConfig()): Navi =
        pool: newPool[PooledConn[Conn]](cfg.idlePerHost, cfg.idleGlobal, cfg.idleTimeoutMs),
        jar: newCookieJar(),
        muxes: newTable[string, H2Mux](),
-       pendingMux: newTable[string, Future[H2Mux]]())
+       pendingMux: newTable[string, Future[H2Mux]](),
+       sseMuxes: newTable[string, H2Mux](),
+       ssePendingMux: newTable[string, Future[H2Mux]](),
+       orphanCloses: newOrphanCloses())
   when defined(naviHttp3):
     result.altSvc = newAltSvcCache()
     result.h3conns = newTable[string, QuicConn]()
@@ -107,11 +140,104 @@ proc extend*(client: Navi, config: NaviConfig): Navi =
        pool: newPool[PooledConn[Conn]](merged.idlePerHost, merged.idleGlobal, merged.idleTimeoutMs),
        jar: newCookieJar(),
        muxes: newTable[string, H2Mux](),
-       pendingMux: newTable[string, Future[H2Mux]]())
+       pendingMux: newTable[string, Future[H2Mux]](),
+       sseMuxes: newTable[string, H2Mux](),
+       ssePendingMux: newTable[string, Future[H2Mux]](),
+       orphanCloses: newOrphanCloses())
   when defined(naviHttp3):
     result.altSvc = newAltSvcCache()
     result.h3conns = newTable[string, QuicConn]()
     result.pendingH3 = newTable[string, Future[QuicConn]]()
+
+proc sharedView(client: Navi, config: NaviConfig): Navi =
+  ## A CONFIG-CARRYING VIEW of `client`: a second `Navi` handle that overrides the
+  ## configuration (`config`) while sharing, by reference, every piece of connection
+  ## and discovery state the owner has -- the pool, the cookie jar, the h3 connection
+  ## tables, the Alt-Svc cache, and (through the copied config) the TLS session cache
+  ## and context store. It exists because `sse` has to run its stream with the size cap
+  ## and the read/total timeouts off, and `stream` reads those off `client.config` at
+  ## call time; everything else about the stream must be the caller's (issue #466).
+  ##
+  ## The ONE thing a view does not share is the h2 mux table: its `muxes` is the
+  ## owner's `sseMuxes`. An h2 connection has a single read bound for all of its
+  ## streams -- the transport's, taken from the `timeouts.read` of whoever opened it,
+  ## whose expiry fails the connection and every stream on it -- so a stream that must
+  ## run unbounded cannot ride a connection the owner's bounded requests also use, in
+  ## either direction. The views of one client all get the SAME table, so the streams
+  ## of a client still share one h2 connection per origin with each other.
+  ##
+  ## NOT built with `newNavi`, which deliberately REPLACES `tls.sessionCache` and
+  ## `tls.contextStore` on a copied config so a cloned config yields an isolated
+  ## client. A view is the opposite: it must resume the owner's TLS sessions and reuse
+  ## its contexts. `config` is therefore taken as given, with the owner's stores still
+  ## in it -- so derive it from `client.config` and change only value fields.
+  ##
+  ## A view owns nothing, so it must never be `close`d: `close` would drain the
+  ## owner's pool and tear down its shared connections. `owner` records the
+  ## relationship, both as the marker that this is a view and so that a value which
+  ## has to be the OWNER's (the response size cap bound into a shared connection, see
+  ## `sharedConnCap`) can still be read. `sseMuxes`/`ssePendingMux` are left nil: a
+  ## view has no streams of its own below it, and nil is what `muxTables` (which the
+  ## owner's close/prune sweeps walk) reads as "this handle is the SSE table".
+  result = Navi(config: config, pool: client.pool, jar: client.jar,
+                muxes: client.sseMuxes, pendingMux: client.ssePendingMux,
+                orphanCloses: client.orphanCloses, owner: client)
+  when defined(naviHttp3):
+    result.altSvc = client.altSvc
+    result.h3conns = client.h3conns
+    result.pendingH3 = client.pendingH3
+
+iterator muxTables(client: Navi): TableRef[string, H2Mux] =
+  ## Every h2 mux table reachable through this handle: its own, plus -- on a real
+  ## client -- the separate table its SSE streams use (`sseMuxes`, see `sharedView`).
+  ## Every sweep that walks the live connections (`close`, `pruneDeadMuxes`) goes
+  ## through this, so an SSE connection is reaped and pruned exactly like a request
+  ## connection (#466). A view yields one table: its `muxes` IS the owner's
+  ## `sseMuxes`, and its `sseMuxes` is nil.
+  yield client.muxes
+  if client.sseMuxes != nil: yield client.sseMuxes
+
+iterator pendingMuxTables(client: Navi): TableRef[string, Future[H2Mux]] =
+  ## The in-flight-connect twin of `muxTables`.
+  yield client.pendingMux
+  if client.ssePendingMux != nil: yield client.ssePendingMux
+
+proc sameTable[A, B](a, b: TableRef[A, B]): bool =
+  ## Reference identity for two `TableRef`s. `tables`' own `==` compares CONTENTS, so
+  ## two freshly built empty tables belonging to unrelated clients compare equal under
+  ## it: anything asserting that two handles share one table (`sharesConnections`) has
+  ## to compare the references themselves.
+  cast[pointer](a) == cast[pointer](b)
+
+proc sharedConnCap(client: Navi): int =
+  ## The DEFAULT response size cap to bind into a newly opened SHARED connection. On a
+  ## `sharedView` that is the OWNER's cap, never the view's: a view lowers the cap to 0
+  ## for its own per-handle decoding, and a connection it opens with 0 would be
+  ## installed in the owner's table and silently serve the owner's later requests with
+  ## no cap at all (#466). A real client answers with its own.
+  ##
+  ## For an h2 mux this is only a fallback: every request registers its OWN cap on its
+  ## own stream (`H2Mux.request`/`sendAndReadHeaders` take it, and the sans-io
+  ## connection applies it per stream), so the cap a mux was opened with never decides
+  ## a request's. It still matters for h3, which a view and its owner DO share: the
+  ## driver holds it as the connection's `max_body` and enforces it on a BUFFERED
+  ## response, because such a response is accumulated in C memory and has to be
+  ## bounded there. A STREAMING h3 read (so every SSE stream) is submitted with
+  ## `cap_body = 0` (`submitStream`), which switches that connection-wide enforcement
+  ## OFF for the stream: unread body is bounded by the per-stream QUIC flow-control
+  ## window (8 MiB) rather than by `max_body`, and the cap that applies is the
+  ## REQUESTING client's own
+  ## `config.maxResponseBytes`, enforced navi-side per chunk by `openStreamConn`'s
+  ## `CappedDecoder` (same `ResponseTooLargeError`). So an SSE view, whose cap is 0,
+  ## reads an unbounded stream over the owner's connection while the owner's own
+  ## `stream()` on it still stops at the owner's cap. Sharing the h3 connection is
+  ## safe in the other direction too, because an h3 connection has no
+  ## connection-level READ bound a view and its owner could disagree on: the only
+  ## bound `openQuicConn` installs is on the handshake (quic_async.nim's
+  ## `handshakeMs`/`hsDeadline`, quic_chronos.nim's the same), and a request's own
+  ## budget is the caller's `guard` above it.
+  if client.owner != nil: client.owner.config.maxResponseBytes
+  else: client.config.maxResponseBytes
 
 proc close*(client: Navi): Future[void] {.async.} =
   ## Close all pooled connections and shared h2 connections, freeing their TLS
@@ -120,9 +246,13 @@ proc close*(client: Navi): Future[void] {.async.} =
   ##
   ## The TLS session cache is closed for good, so a request made on the client
   ## after this does a full handshake rather than resuming. That is deliberate: a
-  ## connection checked out rather than pooled (a live WebSocket or SSE stream)
-  ## stays up across `close` and could otherwise still hand a late TLS 1.3 ticket
-  ## to a table nothing will ever free again (issue #441).
+  ## connection checked out rather than pooled (a live WebSocket, or an SSE stream on
+  ## http/1.1) stays up across `close` and could otherwise still hand a late TLS 1.3
+  ## ticket to a table nothing will ever free again (issue #441). The h2 connection
+  ## this client's SSE streams share (`sseMuxes`, see `sharedView`) is torn down here
+  ## too, and an SSE stream riding it is an in-flight request on it like any other, so
+  ## closing the client ends that stream (#466): close the client when you are done
+  ## with its streams, not while one is running.
   for pc in client.pool.drain():
     await close(pc.transport)
   # Teardown of the shared-connection tables runs as a STABILIZING loop, not a single
@@ -146,16 +276,18 @@ proc close*(client: Navi): Future[void] {.async.} =
   while true:
     inc sweeps
     var pendingMuxes: seq[Future[H2Mux]]
-    for f in client.pendingMux.values: pendingMuxes.add f
-    client.pendingMux.clear()
+    for t in client.pendingMuxTables:          # the request table AND the SSE one (#466)
+      for f in t.values: pendingMuxes.add f
+      t.clear()
     for f in pendingMuxes:
       try:
         let mux = await f
         if mux != nil: await mux.close()
       except CatchableError: discard   # a failed connect has nothing to close
     var muxList: seq[H2Mux]
-    for mux in client.muxes.values: muxList.add mux
-    client.muxes.clear()
+    for t in client.muxTables:                 # ditto: an SSE mux is reaped here like
+      for mux in t.values: muxList.add mux     # any other, so `close` leaves no fd and
+      t.clear()                                # ends a running stream (#466)
     for mux in muxList:
       await mux.close()
     when defined(naviHttp3):
@@ -178,9 +310,9 @@ proc close*(client: Navi): Future[void] {.async.} =
     # completion by background draining before the process samples its fds, so awaiting
     # them here makes close() deterministic instead of leaving one un-closed connection
     # per eviction.
-    while client.orphanCloses.len > 0:
-      let batch = client.orphanCloses
-      client.orphanCloses.setLen(0)
+    while client.orphanCloses[].len > 0:
+      let batch = client.orphanCloses[]
+      client.orphanCloses[].setLen(0)
       for f in batch:
         try: await f
         except CatchableError: discard
@@ -190,8 +322,9 @@ proc close*(client: Navi): Future[void] {.async.} =
     # land in a table before we re-check. Loop again only if a straggler materialised;
     # a stable-empty pass, or the sweep cap, ends the loop.
     await sleepAsync(msOf(0))   # msOf: 0 for asyncdispatch, 0.milliseconds for chronos
-    var refilled = client.pendingMux.len > 0 or client.muxes.len > 0 or
-                   client.orphanCloses.len > 0
+    var refilled = client.orphanCloses[].len > 0
+    for t in client.pendingMuxTables: refilled = refilled or t.len > 0
+    for t in client.muxTables: refilled = refilled or t.len > 0
     when defined(naviHttp3):
       refilled = refilled or client.pendingH3.len > 0 or client.h3conns.len > 0
     if not refilled or sweeps >= 64: break
@@ -267,14 +400,21 @@ proc muxRequest(client: Navi, mux: H2Mux, req: Request,
   # buffer via an accumulator sink for the policy layer. `mux.readChunk` returns DECODED
   # bytes (per-sid CappedDecoder), so a buffered body is already plaintext -- mark it
   # decoded so `decodeBody` upstream does not inflate it twice.
+  #
+  # `maxResponseBytes` goes with the REQUEST, not the connection: a request mux is
+  # shared between the client and anything that `extend`s nothing of it, and the cap
+  # is live configuration the caller may change between requests (#466), so the mux
+  # applies it per stream.
   if userSink.isNil or gate.isNil:
     # The buffered request path: `sink` is always nil here (stream() drains via the
     # handle's own sendAndReadHeaders, not muxRequest), so this buffers into r.body.
     result = toResponse(await mux.request(h2HeaderList(req), req.body, req.bodyStream,
-                                          h2TrailerList(req), asyncStream))
+                                          h2TrailerList(req), asyncStream,
+                                          client.config.maxResponseBytes))
     return
   let sid = await mux.sendAndReadHeaders(h2HeaderList(req), req.body, req.bodyStream,
-                                         h2TrailerList(req), false, asyncStream)
+                                         h2TrailerList(req), false, asyncStream,
+                                         client.config.maxResponseBytes)
   var snap = toResponse(mux.respSnapshot(sid))
   mux.captureTrailers(sid)                 # so a full drain keeps the trailing HEADERS
   let eff = (if gate.wantsDelivery(snap.httpVersion, snap.status, snap.headers):
@@ -337,10 +477,11 @@ proc pruneDeadMuxes(client: Navi) =
   ## has no await, so it is atomic w.r.t. the event loop; an in-flight request holds
   ## its own mux ref, so dropping the table entry never disturbs a request under way
   ## (issue #312).
-  var dead: seq[string]
-  for origin, mux in client.muxes:
-    if not mux.canReuse: dead.add origin
-  for origin in dead: client.muxes.del(origin)
+  for t in client.muxTables:            # the request table AND the SSE one (#466)
+    var dead: seq[string]
+    for origin, mux in t:
+      if not mux.canReuse: dead.add origin
+    for origin in dead: t.del(origin)
 
 proc closeOrphanMux(mux: H2Mux) {.async.} =
   ## Fire-and-forget close of a mux that was displaced from `client.muxes` while still
@@ -359,10 +500,10 @@ proc trackOrphan(client: Navi, fut: Future[void]) =
   ## entries opportunistically so a long-lived client under heavy eviction churn
   ## does not accumulate the seq unboundedly between closes.
   var live: seq[Future[void]]
-  for f in client.orphanCloses:
+  for f in client.orphanCloses[]:
     if not f.finished: live.add f
   live.add fut
-  client.orphanCloses = live
+  client.orphanCloses[] = live
 
 proc resolveReusableMux(client: Navi, origin: string): Future[H2Mux] {.async.} =
   ## Resolve a shared h2 connection to reuse for `origin`: a live cached mux, or -- when
@@ -414,7 +555,7 @@ proc openFreshConn(client: Navi, rq: Request, origin: string,
                              client.config.tls, proxyTarget, alpn,
                              client.config.connectMs, client.config.readMs)
     if conn.protocol == "h2":
-      let mux = await newH2Mux(conn, client.config.maxResponseBytes,
+      let mux = await newH2Mux(conn, client.sharedConnCap,
                                client.config.wantsDecompress,
                                client.config.h2KeepAliveMs)
       # Installing into `muxes` must not silently orphan a DIFFERENT live mux another
@@ -584,7 +725,7 @@ when defined(naviHttp3):
         # is shared with the sync openers (#453).
         let qc = client.altSvc.openH3Tracked(req.url.host, req.url.port,
           await openQuicConn(ep.host, ep.port, req.url.host, client.config.tls,
-                             uint64(max(0, client.config.maxResponseBytes)),
+                             uint64(max(0, client.sharedConnCap)),
                              client.config.connectMs, client.config.totalMs))
         # A dead-but-uncleaned prior conn can occupy this slot: the loop above only
         # returns a cached entry when it is `alive`, so a `not alive` one falls
