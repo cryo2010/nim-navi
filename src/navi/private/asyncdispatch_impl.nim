@@ -65,22 +65,48 @@ proc guard[T](totalMs: int; fut: Future[T];
   ## (asyncdispatch has no true cancellation); its socket is later reclaimed.
   ## Shared scaffolding (hook arming + expiry error) lives in guard_common; the
   ## await/timeout CORE below is asyncdispatch-specific and must not be unified.
+  ##
+  ## The timeout must not outlive the request it bounds. asyncdispatch cannot take a
+  ## `sleepAsync` back off the dispatcher's timer heap, so until this used `withinMs`
+  ## (issue #468) a won race left the whole race behind in it. Verified against
+  ## std/asyncdispatch, the chain from a spent `sleepAsync(ms)` was:
+  ##
+  ##   dispatcher.timers -> timerFut -> timerFut.callbacks -> the `callback=`
+  ##     wrapper -> `or`'s `cb` env -> the `or` future this proc awaited
+  ##
+  ## and it stopped there only because `complete` runs a future's callbacks and then
+  ## nils the list (asyncfutures' `call`), which is what unhooked this proc's
+  ## continuation -- and with it the env holding `fut`, the response and its body.
+  ## So the response escaped by an accident of ordering, but two futures and two
+  ## closures per request did not: ~2.1 KB each, held for the rest of `totalMs`
+  ## (~0.7 KB in a release build, which captures no stack traces). That is a heap
+  ## that grows with request rate x `totalMs`, i.e. `timeouts.total` meaning "memory
+  ## retained for this long" -- 610 MB at 12k req/s with a 60 s total. `withinMs`
+  ## keeps the timer in a local, races it explicitly, unlinks it the moment the
+  ## request wins, and slices a long bound so the spent entry (which cannot be
+  ## removed) is reclaimed within a second instead of in `totalMs`.
+  ##
+  ## The reverse case is unchanged: on expiry or cancellation `fut` is abandoned and
+  ## drains in the background, and the callback `withinMs` leaves on it holds an
+  ## emptied env, so the losers do not keep each other (or the timer) alive either.
+  ## (chronos never had this: its guard cancels the timer in its `finally`.)
   let ms = totalMs
   if ms <= 0 and cancel == nil:
     return await fut
   var cancelFut = newFuture[void]("navi.cancel")
   armCancelHook(cancel, cancelFut)
   try:
-    # CORE (asyncdispatch): race the future against cancel and a plain timer; on
-    # expiry `fut` is left to drain in the background (no cancellation).
-    if ms > 0:
-      await fut or cancelFut or sleepAsync(ms)
-    else:
-      await fut or cancelFut
+    # CORE (asyncdispatch): race the future against cancel and -- when there is one
+    # -- a timer, dropping the loser's hold on the winner either way; on expiry
+    # `fut` is left to drain in the background (no cancellation). `withinMs` never
+    # fails, so a failed request surfaces through `fut.read` below, as before.
+    discard await withinMs(fut, ms, cancelFut)
     if fut.finished:
       return fut.read
     raiseGuardExpiry(ms, cancel)
   finally:
+    # Completing `cancelFut` here runs (and so clears) the callback `withinMs` left
+    # on it when the request won, which is what releases the race's closure env.
     if cancel != nil: cancel.disarmHook()
     if not cancelFut.finished: cancelFut.complete()
 
@@ -89,6 +115,12 @@ include navi/private/impl_common
 # kaRecv: per-backend (forward-declared in the shared body). asyncdispatch has no
 # cancellation, so a single in-flight read is parked in `pendingRecv` and raced
 # against a timeout via withTimeout, kept across timeouts so it is never orphaned.
+# This one keeps `withTimeout` rather than the backend's `withinMs` (issue #468):
+# the SAME parked read is re-raced once per keepalive interval, and withTimeout's
+# replacing `callback=` leaves exactly one callback on it however long it is parked
+# (and clears it on a timeout), where an appending race would leave one spent
+# callback per interval. The timer it loses is a keepalive interval long, bounded by
+# one per parked read rather than one per request, and holds no request state.
 proc kaRecv(ws: WebSocket): Future[string] {.async.} =
   ## One read chunk. With keepalive off, a plain read. With it on, a single
   ## outstanding read is kept in `pendingRecv` (so a timed-out read is never

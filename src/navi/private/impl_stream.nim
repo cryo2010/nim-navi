@@ -126,8 +126,13 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
     while true:
       let mux = await client.resolveReusableMux(origin)
       if mux == nil: break           # no live/pending mux (or it turned out h1): fall through
+      mux.applyKeepAlive(client.config.h2KeepAliveMs)   # adopt the CURRENT keepalive
+      # (as the buffered path does): `timeouts.h2KeepAlive` is live configuration, and
+      # on an SSE connection -- which has no read bound at all -- the PING is the only
+      # dark-peer detector, so a change has to reach a connection already up (#466).
       try:
-        let sid = await mux.sendAndReadHeaders(h2HeaderList(req), req.body, req.bodyStream, h2TrailerList(req))
+        let sid = await mux.sendAndReadHeaders(h2HeaderList(req), req.body,
+          req.bodyStream, h2TrailerList(req), false, nil, cap)
         return StreamResponse(kind: skH2, mux: mux, sid: sid,
           resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
           decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
@@ -141,6 +146,15 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
     await close(dead.transport)            # (the buffered path reaps too; issue #313)
   var (found, pc) = popIdle(client.pool, origin)
   if found:
+    # A pooled connection adopts the CURRENT config's read timeout, not the one it was
+    # opened with (issue #360, which fixed only the buffered path). It matters here
+    # because the pool is shared with an `sse()` stream's config-carrying view (#466):
+    # without this, an SSE read on a connection the caller opened would inherit the
+    # caller's read timeout -- which SSE deliberately turns off -- and, the other way
+    # round, the caller's next streamed request on a connection the SSE stream pooled
+    # would inherit the stream's. The whole-request deadline is enforced by `stream`'s
+    # own `guard`/`deadline`, so only `readMs` is re-armed.
+    rearm(pc.transport, client.config.readMs)
     try:
       let parser = h1SendAndReadHeaders(pc.transport, req, true)
       return StreamResponse(kind: skH1, transport: pc.transport, parser: parser,
@@ -161,7 +175,8 @@ proc openStreamConn(client: Navi, req: Request): Future[StreamResponse] {.async.
   rq.absoluteForm = usesAbsoluteForm(resolveProxy(client.config, rq.url), rq.url.isTls)
   let (conn, mux) = await client.openFreshConn(rq, origin, wantH2)
   if mux != nil:
-    let sid = await mux.sendAndReadHeaders(h2HeaderList(rq), rq.body, rq.bodyStream, h2TrailerList(rq))
+    let sid = await mux.sendAndReadHeaders(h2HeaderList(rq), rq.body,
+      rq.bodyStream, h2TrailerList(rq), false, nil, cap)
     return StreamResponse(kind: skH2, mux: mux, sid: sid,
       resp: toResponse(mux.respSnapshot(sid)), client: client, key: origin,
       decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
@@ -190,7 +205,9 @@ proc streamOpen(client: Navi, verb: HttpVerb, target: string,
     let handle = await openStreamConn(client, rreq)
     handle.cancel = cancel
     when defined(naviHttp3):                       # learn h3 from a streamed response
-      client.recordAltSvc(rreq, handle.resp)        # too, so SSE/stream can upgrade
+      client.recordAltSvc(rreq, handle.resp)        # too; the cache is the caller's, so
+                                                    # an SSE stream's own response teaches
+                                                    # the client (#466)
     # Arm the leak-guard for the synchronous fallback teardown if the handle is
     # dropped without drain/close. Captures only the connection essentials (never
     # `handle`, which would cycle): the h1 transport, or the mux + stream id.

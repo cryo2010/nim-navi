@@ -5,8 +5,15 @@ author        = "Craig Younker"
 description   = "A fast HTTP/1.1-3 client with TLS, streaming, SSE and WebSockets"
 license       = "MIT"
 srcDir        = "src"
-installExt    = @["nim", "cpp"]   # ship the HTTP/3 driver (h3client.cpp) so a
-                                  # downstream -d:naviHttp3 build can compile it
+installExt    = @["nim", "cpp", "h"]   # ship the HTTP/3 driver, h3client.cpp AND the
+                                       # h3client.h it includes, so a downstream
+                                       # -d:naviHttp3 build can compile it (#465)
+# An extension list, not installFiles: nimble has honoured installExt since long
+# before 0.16 (it is what already ships the .cpp), it needs no update when the
+# backend is renamed or moved, and it keeps the rule "this is a build input" in
+# one place. The cost is that a new extension (a .hpp, a .inc, a staticRead'd data
+# file) has to be added here; tests/packaging/installed_build.sh fails on exactly
+# that, by installing this package and diffing it against src/.
 
 
 import std/strutils   # the NAVI_VORTEX_* build-arg checks in runStress
@@ -31,6 +38,21 @@ task test, "Run the unit test suite (via checkmate)":
   # is visible in the output, but CI runs `checkmate` directly so a real failure
   # actually fails the job.
   exec "checkmate"
+
+task packaging, "Packaging check: install this checkout as a package and build consumers against it":
+  # The one check that does not compile `--path:src`, where the whole checkout is
+  # present: it installs the working tree into a throwaway nimble dir, asserts
+  # every non-.nim build input under src/ arrived (the `installExt` above), and
+  # compiles AND runs a consumer of each native entry against that install. The
+  # `-d:naviHttp3` leg additionally compiles the installed h3client.cpp, which is
+  # what #465 broke, so it needs the ngtcp2/nghttp3/OpenSSL-3.5 toolchain -- run
+  # that one in the h3 image:
+  #   docker build -f tests/interop/http3/Dockerfile -t navi-h3 .
+  #   docker run --rm --entrypoint bash navi-h3 tests/packaging/installed_build.sh --h3
+  #
+  # NB: nimble does not propagate a task's exit code (nim-lang/nimble#1802), so a
+  # failure shows in the output but this exits 0; CI runs the script directly.
+  exec "bash tests/packaging/installed_build.sh"
 
 task leak, "Memory-growth check: every verb + request in a 100,000x loop":
   # Not in the default `test` suites (800k requests); its own PR job. NAVI_MM

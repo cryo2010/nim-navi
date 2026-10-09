@@ -241,7 +241,9 @@ proc websocketH2(client: Navi, u: Url, headers: Headers,
     let got = if conn.protocol.len > 0: conn.protocol else: "http/1.1"
     raise newException(ProtocolError,
       "navi: WebSocket over h2 requested but the server negotiated " & got)
-  let h2 = initH2Conn(client.config.maxResponseBytes)
+  # `sharedConnCap` for consistency with the other connection openers (#466); this
+  # one is a dedicated tunnel connection, so owner and view agree on it either way.
+  let h2 = initH2Conn(client.sharedConnCap)
   conn.sendAll(h2.preamble())
   # RFC 8441 forbids sending an Extended CONNECT before the peer's SETTINGS
   # (which carries ENABLE_CONNECT_PROTOCOL) has been seen. Read until that initial

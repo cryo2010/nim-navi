@@ -38,7 +38,10 @@ proc transportGroup(client: Navi, items: seq[BatchItem],
                         totalMsFor(client.config, items[members[0]].req))
     pc = PooledConn[Conn](transport: transport)
     if transport.protocol == "h2":
-      h2 = initH2Conn(client.config.maxResponseBytes)
+      # `sharedConnCap` (the connection DEFAULT), not `config.maxResponseBytes`: this
+      # connection is pooled and may later serve an `sse()` view, whose cap is 0
+      # (#466). Each request still registers its own cap on its own stream.
+      h2 = initH2Conn(client.sharedConnCap)
       pc.h2 = h2
       transport.sendAll(h2.preamble())
 

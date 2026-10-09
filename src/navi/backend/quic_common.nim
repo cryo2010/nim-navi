@@ -128,9 +128,18 @@ proc submitStream*(qc: QuicConn, verb, path: string,
   let reqTrl = encodeH3Fields(trailers)
   var b = body
   let bp = if pull == nil and b.len > 0: cast[ptr char](addr b[0]) else: nil
+  # cap_body = 0: a STREAMING read is never capped connection-wide. The driver's
+  # max_body is the OWNER's maxResponseBytes (`sharedConnCap`), and an h3 connection
+  # is shared by a client and its `sse()` views, so enforcing it here would cut a
+  # long stream off at the owner's cap (#466). Unread body then sits in C memory
+  # only up to the per-stream QUIC flow-control window (8 MiB; the stream's offset
+  # is credited as navi reads), so a slow consumer is bounded by that window rather
+  # than by max_body; the cap that applies is the REQUESTING client's, enforced
+  # navi-side per chunk by impl_stream/stream_download's `CappedDecoder`, which
+  # raises the same `ResponseTooLargeError`.
   result = navi_h3_submit(qc.c, verb.cstring, path.cstring, reqHdr.cstring, bp,
                           csize_t(if pull != nil: 0 else: b.len), pull, pullEnv,
-                          reqTrl.cstring, 1)   # cap_body: bound the C-side buffer at max_body
+                          reqTrl.cstring, 0)
   wake(qc)
 
 proc awaitHeaders*(qc: QuicConn, sid: int64):

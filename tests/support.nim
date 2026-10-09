@@ -1327,3 +1327,83 @@ proc startTrickleProxy*(th: var Thread[TrickleCtx], port: var int, reply: string
     TrickleCtx(portOut: addr port, ready: addr ready, socks: socks,
                reply: reply, gapMs: gapMs))
   waitFlag(addr ready)
+
+# --- fixed-size payload servers for the memory-retention tests ----------------
+# The retention suites need a per-request payload big enough that holding on to
+# one is unmistakable in `getOccupiedMem`, so these two serve a body of exactly
+# `bodyBytes`: one as N keep-alive responses (the request path), one as a single
+# long response written in `bodyBytes`-sized pieces (the streaming path).
+
+type FixedBodyCtx* = object
+  portOut: ptr int      ## bind an ephemeral port and report it here
+  ready: ptr bool
+  pieces: int           ## responses to answer, or body pieces to write
+  bodyBytes: int        ## bytes per response (or per piece)
+
+proc serveFixedBody(ctx: FixedBodyCtx) {.thread.} =
+  ## Accept one connection and answer `pieces` keep-alive responses on it, each
+  ## carrying a `bodyBytes`-long body.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(0), "127.0.0.1")     # ephemeral: no cross-iteration collision
+  server.listen()
+  ctx.portOut[] = server.getLocalAddr()[1].int
+  ctx.ready[] = true
+  var client = acceptClient(server)
+  let body = repeat('b', ctx.bodyBytes)
+  let head = "HTTP/1.1 200 OK\r\nContent-Length: " & $ctx.bodyBytes &
+             "\r\nConnection: keep-alive\r\n\r\n"
+  try:
+    for _ in 0 ..< ctx.pieces:
+      if client.recvUntil("\r\n\r\n").len == 0: break
+      # `flags = {}` (not SafeDisconn): a swallowed disconnect spins this loop on
+      # Windows and `joinThread` then never returns.
+      client.send(head & body, flags = {})
+  except CatchableError:
+    discard                     # the client left early; the loop is bounded anyway
+  client.close()
+  server.close()
+
+proc startFixedBody*(th: var Thread[FixedBodyCtx], port: var int,
+                     responses, bodyBytes: int) =
+  ## Serve one keep-alive connection on an ephemeral port (written to `port`) with
+  ## `responses` replies of `bodyBytes` body bytes each.
+  var ready = false
+  createThread(th, serveFixedBody,
+    FixedBodyCtx(portOut: addr port, ready: addr ready,
+                 pieces: responses, bodyBytes: bodyBytes))
+  waitFlag(addr ready)
+
+proc serveBigBody(ctx: FixedBodyCtx) {.thread.} =
+  ## Accept one connection and answer one request with a `pieces * bodyBytes`
+  ## Content-Length body, written in `pieces` sends so the client's streaming
+  ## reader sees many chunks.
+  var server = newSocket()
+  server.setSockOpt(OptReuseAddr, true)
+  server.bindAddr(Port(0), "127.0.0.1")
+  server.listen()
+  ctx.portOut[] = server.getLocalAddr()[1].int
+  ctx.ready[] = true
+  var client = acceptClient(server)
+  let piece = repeat('b', ctx.bodyBytes)
+  try:
+    discard client.recvUntil("\r\n\r\n")
+    client.send("HTTP/1.1 200 OK\r\nContent-Length: " &
+                $(ctx.pieces * ctx.bodyBytes) &
+                "\r\nConnection: close\r\n\r\n", flags = {})
+    for _ in 0 ..< ctx.pieces:
+      client.send(piece, flags = {})
+  except CatchableError:
+    discard
+  client.close()
+  server.close()
+
+proc startBigBody*(th: var Thread[FixedBodyCtx], port: var int,
+                   pieces, bodyBytes: int) =
+  ## Serve one connection on an ephemeral port (written to `port`) with a single
+  ## response whose body is `pieces` x `bodyBytes` bytes.
+  var ready = false
+  createThread(th, serveBigBody,
+    FixedBodyCtx(portOut: addr port, ready: addr ready,
+                 pieces: pieces, bodyBytes: bodyBytes))
+  waitFlag(addr ready)

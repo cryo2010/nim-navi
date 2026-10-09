@@ -15,9 +15,9 @@ fall into six groups:
 
 The **CI** column says which check runs it on every PR (see
 `.github/workflows/`). "local" means it is not wired into per-PR CI and is run on
-demand; "nightly" runs on a schedule. A green PR is **97 checks** from
+demand; "nightly" runs on a schedule. A green PR is **98 checks** from
 `ci.yml` (66 of them the leak-check matrix and its image build, 10 fuzz, 1
-badssl, 1 HTTP/3) plus the `windows.yml` jobs; `nightly.yml` and
+badssl, 1 HTTP/3, 1 packaging) plus the `windows.yml` jobs; `nightly.yml` and
 `stress-chaos.yml` run on a schedule only.
 
 ## Running at a glance
@@ -29,6 +29,15 @@ checkmate --nimflags:"--mm:arc"   # same suite under the arc memory manager
 # Under AddressSanitizer + UBSan (the `sanitizers` CI job; each flag is its own
 # --passC/--passL because checkmate space-splits --nimflags):
 checkmate --nimflags:"--mm:orc -d:useMalloc --passC:-fsanitize=address --passC:-fsanitize=undefined --passC:-fno-omit-frame-pointer --passC:-g --passL:-fsanitize=address --passL:-fsanitize=undefined"
+
+# Packaging (the one check that does NOT compile --path:src: it installs this
+# checkout as a nimble package into a throwaway nimble dir and builds consumers
+# against the INSTALL, which is what #465 broke):
+nimble packaging          # install + manifest + -d:ssl consumers of all three native entries
+# and the -d:naviHttp3 leg, which needs the h3 toolchain (it compiles the
+# installed h3client.cpp):
+#   docker build -f tests/interop/http3/Dockerfile -t navi-h3 .
+#   docker run --rm --entrypoint bash navi-h3 tests/packaging/installed_build.sh --h3
 
 # Interop (each stands up a real server and exits non-zero on failure):
 nimble interop            # HTTP/2 vs nghttpd (needs nghttpd + openssl)
@@ -209,6 +218,7 @@ way its consumers will build it. These jobs are compile-only unless noted.
 | `tests/interop/jsws.sh` | **yes** (`compile navi/js`) | navi/js WebSocket client runs under Node 22+ (global WebSocket) against a native echo server |
 | `tests/js_ws_codec.nim` | **yes** (`compile navi/js`) | The sans-io WebSocket codec compiles under `nim js` and its RFC 6455 vectors pass under Node. navi/js does not use `proto/ws` at runtime, but js is navi's only 32-bit-`int` target, so this is where the 64-bit frame-length guards (#285) meet an `int` that can actually truncate |
 | `tests/interop/js_cookiejar.sh` | **yes** (`compile navi/js`) | navi/js opt-in cookie jar replays a cookie across requests under Node (undici has no cookie store), and the default does not |
+| `tests/packaging/installed_build.sh` | **yes** (`packaging`; its `--h3` leg as a step of `HTTP/3 interop`) | A consumer built against the **installed** package rather than `--path:src`. Installs the working tree into a throwaway nimble dir, asserts every non-.nim build input under `srcDir` arrived (what a `{.compile.}` pragma or a `staticRead`/`slurp` names in any of the spellings Nim accepts, including the `("x.cpp", "-flags")` tuple, the `{.compile("x.c").}` call form, the paren-less `staticRead "x"` and any of them wrapped across lines; what those C/C++ sources `#include` transitively; and every file with a build-input extension), then compiles and runs a hello world on `navi`, `navi/asyncdispatch` and `navi/chronos` against that install, asserting from the compiler's own module list that it read the install and never the checkout. The `--h3` leg repeats it with `-d:naviHttp3`, which is the step that hands the installed `h3client.cpp` to the C++ compiler, so it runs in the h3 toolchain image. This is the only check that can see an `installExt` gap: #465 shipped `h3client.cpp` without `h3client.h` and every other job stayed green |
 
 ---
 

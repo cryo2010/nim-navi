@@ -43,6 +43,21 @@ type
                           ## 6.9.1) -> RST_STREAM(FLOW_CONTROL_ERROR)
     bodyTotal: int        ## total body bytes received (for the size cap; `resp.body`
                           ## is drained incrementally by `takeBody`)
+    bodyCap: int          ## per-stream override of `H2Conn.maxBodyBytes` (the cap this
+                          ## stream's REQUESTER configured), or -1 to inherit the
+                          ## connection's. A shared connection outlives the request that
+                          ## opened it, `maxResponseBytes` is live configuration a caller
+                          ## may change between requests, and the sync client's pooled h2
+                          ## connections are shared with an `sse()` stream, which runs
+                          ## uncapped (#466) -- so the cap has to be per stream, not per
+                          ## connection. `setStreamMaxBody` sets it; see `openStream`.
+                          ##
+                          ## NOTE the encoding: `-1` inherits, `0` means UNCAPPED, and
+                          ## `0` is also `int`'s default. A `Stream` built without
+                          ## naming this field would therefore read as "no cap at all"
+                          ## rather than "inherit the connection's", so `openStream`
+                          ## (the only construction site) sets `-1` explicitly. Keep
+                          ## that if another construction site is ever added.
     sinkMode: bool        ## hold the stream receive window until `ackRecv`, so a
                           ## slow sink backpressures the peer (see setSinkMode)
     sendBuf: string       ## request body not yet on the wire (flow-control bound)
@@ -60,7 +75,9 @@ type
     frames: FrameDecoder
     nextId: uint32
     maxFrameSize: int
-    maxBodyBytes: int            ## cap on a response body; 0 disables (maxResponseBytes)
+    maxBodyBytes: int            ## default cap on a response body; 0 disables
+                                 ## (maxResponseBytes). A stream may override it via
+                                 ## `setStreamMaxBody` (see `Stream.bodyCap`)
     streams: Table[uint32, Stream]
     sawFirstFrame: bool          ## the server's first frame must be SETTINGS (the preface)
     sawSettings: bool            ## the peer's initial (non-ACK) SETTINGS has been processed
@@ -129,7 +146,10 @@ proc preamble*(c: H2Conn): string =
 proc openStream*(c: H2Conn): uint32 =
   result = c.nextId
   c.nextId += 2
-  c.streams[result] = Stream(sendWindow: c.peerInitialWindow, recvWindow: recvWindowSize)
+  # bodyCap MUST be named here: -1 inherits the connection's maxBodyBytes, while the
+  # field's default (0) would mean UNCAPPED and silently drop the connection's cap.
+  c.streams[result] = Stream(sendWindow: c.peerInitialWindow, recvWindow: recvWindowSize,
+                             bodyCap: -1)
 
 proc encodeHeaderFrames(c: H2Conn, streamId: uint32, headers: openArray[HeaderPair],
                         endStream: bool): string =
@@ -544,7 +564,8 @@ proc handleData(c: H2Conn, h: FrameHeader, outbuf: var string) =
         s.resp.body = newStringOfCap(c.frames.dataRunLen(h.streamId))
       c.frames.appendPayload(s.resp.body, contentOff, contentLen)
       s.bodyTotal += contentLen
-      if c.maxBodyBytes > 0 and s.bodyTotal > c.maxBodyBytes:  # over the size cap: RST
+      let bodyLimit = if s.bodyCap >= 0: s.bodyCap else: c.maxBodyBytes
+      if bodyLimit > 0 and s.bodyTotal > bodyLimit:           # over the size cap: RST
         outbuf.add encodeRstStream(h.streamId, errCancel)
         s.reset = true; s.ended = true; s.tooLarge = true
         closeSendSide(h.streamId, s, outbuf)   # drop any queued body; no DATA after RST
@@ -922,6 +943,26 @@ proc respSnapshot*(c: H2Conn, streamId: uint32): H2Response =
   if s != nil:
     result.status = s.resp.status
     result.headers = s.resp.headers
+
+proc setStreamMaxBody*(c: H2Conn, streamId: uint32, maxBody: int) =
+  ## Cap THIS stream's response body at `maxBody` bytes (0 = uncapped), overriding
+  ## the connection-wide `maxBodyBytes` it was opened with. A shared connection serves
+  ## requests whose `maxResponseBytes` may differ from its opener's -- live
+  ## configuration changed between requests, or the sync client's pooled h2 connection
+  ## carrying an uncapped `sse()` stream and the caller's capped requests in turn
+  ## (#466) -- so the cap belongs to the stream, not to the connection. Call it right
+  ## after `openStream`, before any DATA can arrive.
+  let s = c.streams.getOrDefault(streamId)
+  if s != nil: s.bodyCap = max(0, maxBody)
+
+proc streamMaxBody*(c: H2Conn, streamId: uint32): int =
+  ## `streamId`'s own body cap, or -1 when it has none (so the caller falls back to
+  ## whatever default it holds). The stream is the single owner of the cap, so a
+  ## driver that needs it for its own decoding (the async mux's per-stream
+  ## `CappedDecoder`) reads it back from here rather than keeping a second table that
+  ## would have to be pruned in lockstep with the streams (#466).
+  let s = c.streams.getOrDefault(streamId)
+  if s != nil: s.bodyCap else: -1
 
 proc setSinkMode*(c: H2Conn, streamId: uint32) =
   ## Defer this stream's receive-window replenishment to `ackRecv`, so the stream

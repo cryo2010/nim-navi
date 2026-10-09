@@ -2,9 +2,9 @@
 #
 # Both the asyncdispatch and chronos guards bound a request by a total timeout and
 # a CancelToken. Their timeout/cancel CORE differs fundamentally and MUST stay
-# per-backend: asyncdispatch uses `await fut or cancelFut or sleepAsync(ms)` and
-# orphans a timed-out future (it drains in the background, as it has no true
-# cancellation), while chronos uses `race(...)` + `await fut.cancelAndWait()`
+# per-backend: asyncdispatch races the future against cancel and a sliced timer
+# (`withinMs`) and orphans a timed-out future (it drains in the background, as it
+# has no true cancellation), while chronos uses `race(...)` + `cancelAndWait()`
 # (structured cancellation). Only the pieces that are IDENTICAL and carry no
 # scheduling semantics live here: arming the cancel hook and the cancel-vs-timeout
 # error to raise once the core has settled. See asyncdispatch_impl / chronos_impl.

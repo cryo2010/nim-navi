@@ -61,6 +61,11 @@ proc step(qc: QuicConn) {.async.} =
     raise newException(QuicError, h3Reason("navi HTTP/3: send failed"))
 
   # Cap the wait so a lost wake costs at most ~100 ms even on an idle connection.
+  # That cap is also what bounds this timer's retention, so this one stays a plain
+  # `await` on the signal with a fire-and-forget fallback timer rather than moving to
+  # `withinMs` (issue #468): a spent entry here lives 100 ms, never a configured
+  # timeout, and routing the hottest wait in the h3 pump through a second future
+  # would add an event-loop hop to every I/O cycle.
   # Use sleepAsync (a heap timer) rather than addTimer, which would leak a timerfd
   # per iteration. The fd-readable callback is registered ONCE (openConnAsync), not
   # here: a per-step addRead leaks, since asyncdispatch only removes a read callback

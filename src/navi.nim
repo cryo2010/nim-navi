@@ -79,14 +79,19 @@ type
       ## `extend`), not in place.
     pool*: Pool[PooledConn[Conn]]
     jar*: CookieJar
+    owner: Navi                ## non-nil only on a `sharedView`: the client this
+                               ## handle borrows its connections from. A view owns
+                               ## nothing, so neither `close` nor `=destroy` may tear
+                               ## anything down through it (#466).
     when defined(naviHttp3):
       altSvc: AltSvcCache      ## per-origin h3 discovery cache (HTTP/3 builds)
-      h3conns: Table[string, H3Cached]
+      h3conns: TableRef[string, H3Cached]
         ## Live per-origin HTTP/3 connections, the QUIC twin of `pool`. Requests to
         ## the same origin reuse one connection (new h3 stream each) instead of
         ## paying a fresh QUIC handshake -- and, far worse, leaving the server a
         ## dead connection to time out -- per request. Unsynchronised, like `pool`:
-        ## one sync client is used by one thread at a time.
+        ## one sync client is used by one thread at a time. A `TableRef`, so a
+        ## `sharedView` reaches the very same connections (#466).
   Navi* = ref NaviObj
 
 proc closeIdle(pool: Pool[PooledConn[Conn]]) =
@@ -98,12 +103,15 @@ proc closeIdle(pool: Pool[PooledConn[Conn]]) =
     except CatchableError: discard
 
 when defined(naviHttp3):
-  proc closeH3Conns(conns: var Table[string, H3Cached]) =
+  proc closeH3Conns(conns: TableRef[string, H3Cached]) =
     ## Close and forget every pooled h3 connection (each owns a UDP socket plus
     ## ngtcp2/nghttp3/OpenSSL state, and its `close` sends the peer a
     ## CONNECTION_CLOSE so the server drops its half immediately). Shared by
     ## `close` and the destructor leak-guard; safe to call twice, and never raises
-    ## out of a destructor.
+    ## out of a destructor. `nil`-tolerant: the destructor can run on a `NaviObj`
+    ## whose construction never reached the table (a raise inside `newNavi`, or a
+    ## zeroed temporary), and a `TableRef` deref would crash there (#466, nit 6).
+    if conns == nil: return
     for e in conns.mvalues:
       try: e.conn.close()
       except CatchableError: discard
@@ -117,13 +125,18 @@ proc `=destroy`(o: var NaviObj) =
   ## `close`, and doing it here could double-free). No-op after `close`, which has
   ## already drained the pool. `close` remains the recommended shutdown. Declared
   ## before `newNavi` so it binds before NaviObj is first constructed.
-  if o.pool != nil: closeIdle(o.pool)
-  when defined(naviHttp3): closeH3Conns(o.h3conns)
+  # A `sharedView` (#466) borrows the owner's pool and h3 connections: closing them
+  # here would dispose connections the OWNER is still using, so a view only drops its
+  # references.
+  if o.owner == nil:
+    if o.pool != nil: closeIdle(o.pool)
+    when defined(naviHttp3): closeH3Conns(o.h3conns)   # nil-tolerant
   # A custom `=destroy` suppresses the compiler's field destruction, so destroy the
   # managed fields explicitly or they leak. Keep in sync with NaviObj's fields.
   `=destroy`(o.config)
   `=destroy`(o.pool)
   `=destroy`(o.jar)
+  `=destroy`(o.owner)
   when defined(naviHttp3):
     `=destroy`(o.altSvc)
     `=destroy`(o.h3conns)
@@ -162,7 +175,7 @@ proc newNavi*(config = initNaviConfig()): Navi =
     jar: newCookieJar())
   when defined(naviHttp3):
     result.altSvc = newAltSvcCache()
-    result.h3conns = initTable[string, H3Cached]()
+    result.h3conns = newTable[string, H3Cached]()
 
 proc extend*(client: Navi, config: NaviConfig): Navi =
   ## Derive a new client, layering `config` over this client's (middleware is
@@ -180,7 +193,61 @@ proc extend*(client: Navi, config: NaviConfig): Navi =
     jar: newCookieJar())
   when defined(naviHttp3):
     result.altSvc = newAltSvcCache()
-    result.h3conns = initTable[string, H3Cached]()
+    result.h3conns = newTable[string, H3Cached]()
+
+proc sharedView(client: Navi, config: NaviConfig): Navi =
+  ## A CONFIG-CARRYING VIEW of `client`: a second `Navi` handle that overrides the
+  ## configuration (`config`) while sharing, by reference, every piece of connection
+  ## and discovery state the owner has -- the pool, the cookie jar, the h3 connection
+  ## table, the Alt-Svc cache, and (through the copied config) the TLS session cache
+  ## and context store. It exists because `sse` has to run its stream with the size cap
+  ## and the total timeout off and its own per-read limit, and `stream` reads those off
+  ## `client.config` at call time; everything else about the stream must be the
+  ## caller's (issue #466).
+  ##
+  ## NOT built with `newNavi`, which deliberately REPLACES `tls.sessionCache` and
+  ## `tls.contextStore` on a copied config so a cloned config yields an isolated
+  ## client. A view is the opposite: it must resume the owner's TLS sessions and reuse
+  ## its contexts. `config` is therefore taken as given, with the owner's stores still
+  ## in it -- so derive it from `client.config` and change only value fields.
+  ##
+  ## A view owns nothing, so it must never be `close`d: `close` would drain the owner's
+  ## pool and free its TLS stores. `owner` records the relationship, both as the marker
+  ## `=destroy` checks and so that a value which has to be the OWNER's (the response
+  ## size cap bound into a shared connection, see `sharedConnCap`) can still be read.
+  ##
+  ## Unlike the async clients, this backend shares the owner's h2 connections too: a
+  ## sync h2 connection lives in the pool and is checked out EXCLUSIVELY for one
+  ## request at a time, and every checkout re-arms its socket read timeout from the
+  ## checking-out config (`stream`/`request`/`batch`), so the view and the owner never
+  ## hold conflicting bounds on it at once. The async backends, where one h2
+  ## connection carries many concurrent streams under one bound, give SSE streams
+  ## their own connections instead.
+  result = Navi(config: config, pool: client.pool, jar: client.jar, owner: client)
+  when defined(naviHttp3):
+    result.altSvc = client.altSvc
+    result.h3conns = client.h3conns
+
+proc sharedConnCap(client: Navi): int =
+  ## The DEFAULT response size cap to bind into a newly opened SHARED connection (a
+  ## pooled h2 connection or an h3 connection, both of which outlive the request that
+  ## opened them). On a `sharedView` that is the OWNER's cap, never the view's: a view
+  ## lowers the cap to 0 for its own per-handle decoding, and a connection it opened
+  ## with 0 would go on to serve the owner's later requests with no cap at all (#466).
+  ## A real client answers with its own.
+  ##
+  ## For a pooled h2 connection it is only a fallback: every request registers its own
+  ## cap on its own stream (`setStreamMaxBody`, via `h2SendAndReadHeaders`). For h3 the
+  ## driver holds it as the connection's `max_body` and enforces it on a BUFFERED
+  ## response, which it accumulates in C memory and so has to bound there. A STREAMING
+  ## h3 read (so every SSE stream) is submitted with `cap_body = 0` (`submitStream`),
+  ## turning that connection-wide enforcement off for the stream: unread body is
+  ## bounded by the per-stream QUIC flow-control window (8 MiB) rather than by
+  ## `max_body`, and the cap that applies is the REQUESTING client's own
+  ## `config.maxResponseBytes`, enforced navi-side per chunk by `openStreamConn`'s
+  ## `CappedDecoder` with the same `ResponseTooLargeError`.
+  if client.owner != nil: client.owner.config.maxResponseBytes
+  else: client.config.maxResponseBytes
 
 proc close*(client: Navi) =
   ## Close all idle pooled connections, freeing their TLS contexts and cached
@@ -190,9 +257,13 @@ proc close*(client: Navi) =
   ##
   ## The TLS session cache is closed for good, so requests made on the client
   ## after this do full handshakes rather than resuming (issue #441: a connection
-  ## that was checked out rather than pooled outlives `close` and could otherwise
-  ## still insert a late TLS 1.3 ticket into a table nothing will free again).
-  ## Build a new client, or `extend` this one, to get resumption back.
+  ## that was checked out rather than pooled -- a live WebSocket, or an SSE stream --
+  ## outlives `close` and could otherwise still insert a late TLS 1.3 ticket into a
+  ## table nothing will free again). Build a new client, or `extend` this one, to get
+  ## resumption back. A live SSE stream now runs on this client's connections (#466),
+  ## so close the client when you are done with its streams, not while one is running:
+  ## an idle pooled connection a finished stream left behind is reaped here, and an h3
+  ## connection a running one shares would be closed under it.
   closeIdle(client.pool)
   when defined(naviHttp3): closeH3Conns(client.h3conns)
   closeTlsStore(client.config.tls.sessionCache)
@@ -251,7 +322,7 @@ when defined(naviHttp3):
   proc evictH3(client: Navi, origin: string, conn: QuicConn) =
     ## Drop `conn` from the pool (if it is still the entry for `origin`) and close it,
     ## which also sends the peer a CONNECTION_CLOSE so it releases its state at once.
-    client.h3conns.withValue(origin, e):
+    client.h3conns[].withValue(origin, e):
       if e.conn == conn: client.h3conns.del(origin)
     try: conn.close()
     except CatchableError: discard
@@ -261,7 +332,7 @@ when defined(naviHttp3):
     ## closed and dropped the unusable one). "Usable" is `alive` -- the handle is open
     ## and the peer is not draining -- plus recently used: see `h3MaxIdleSec` for why
     ## a long-idle connection is retired rather than probed.
-    client.h3conns.withValue(origin, e):
+    client.h3conns[].withValue(origin, e):
       if e.conn.alive and epochTime() - e.lastUse < h3MaxIdleSec:
         return e.conn
       let dead = e.conn
@@ -322,7 +393,7 @@ when defined(naviHttp3):
       try:
         let r = conn.request($req.verb, req.url.requestTarget, fwd, req.body,
                              req.bodyStream, fwdTrl, deadlineMs = capMs)
-        client.h3conns.withValue(origin, e):
+        client.h3conns[].withValue(origin, e):
           if e.conn == conn: e.lastUse = epochTime()
         result = initResponse(r.status, "", "HTTP/3", initHeaders(r.headers), r.body)
         result.trailers = initHeaders(r.trailers)

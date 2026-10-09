@@ -116,6 +116,108 @@ onward (pre-1.0, minor versions may include breaking changes).
   `BodySink`), since the `Future` type differs per backend (#367).
 
 ### Changed
+- **`sse()` now runs on the caller's client instead of a private one, so an SSE
+  stream reaches HTTP/3 with `reconnect = false` and reuses the client's connections
+  (#466).** The stream used to be built on `newNavi(client.config)`: a second client
+  with its own pool, its own h2/h3 connections, its own TLS session cache and -- the
+  part that bit -- its own, empty Alt-Svc cache. navi only reaches h3 through that
+  cache, so a `config.http = {H1, H2, H3}` client that had already learned an origin's
+  `Alt-Svc: h3` still got an **h2** SSE stream: the private client started cold, and
+  with `reconnect = false` there was no reconnect to upgrade on. A caller who needed
+  a pinned h3 stream (so it could see connection boundaries, or stop a reconnect loop
+  against a stream that is legitimately finished) had to bypass `sse()` entirely and
+  hand-roll a `text/event-stream` parser over `api.stream`. The private pool cost the
+  rest: every `sse()` paid a fresh connect and TLS handshake, five of them per
+  100-event sequence against a server that batches 20 events per connection -- the
+  connect churn #145 removed from every other route. The stream now gets a
+  config-carrying VIEW of the caller's client (`sharedView`): the SSE-tuned config
+  (size cap and read/total timeouts off, and on the sync client the per-read limit set
+  from `idleTimeoutMs`) over the caller's own pool, cookie jar, h3 connection tables,
+  Alt-Svc cache and TLS session cache plus context store, all by reference, plus a
+  second h2 mux table the client keeps for its streams alone (see below). It is deliberately not built through `newNavi`, which replaces the two
+  TLS stores on a copied config precisely so a cloned config yields an isolated
+  client. So a warm client opens the stream on h3 from its first request with
+  `reconnect` off as well as on; an `Alt-Svc` the SSE response itself carries lands in
+  the caller's cache (its next request upgrades); and repeated `sse()` calls reuse the
+  pooled h1 connection, the h2 mux or the h3 connection with no new handshake.
+  `navi/js` already used the caller's client and is unchanged.
+
+  Listed as Changed rather than Fixed because two observable behaviours move with it.
+  `SseStream.close()` no longer closes a client: it releases the stream (closing an
+  http/1.1 connection that is still mid-body, resetting the stream on a shared h2/h3
+  connection) and touches nothing of the caller's, so the client stays usable -- and
+  the pool, the shared connections and the TLS caches now live until the **client** is
+  closed, which is what already happened for every other request. The flip side is
+  that a stream multiplexed onto a shared h2/h3 connection is an in-flight request on
+  it like any other, so closing the **client** now ends such a stream (an SSE stream
+  on its own http/1.1 connection is checked out and still outlives `close`, per #441):
+  close the client when you are done with its streams, as both `close` docs now say.
+  And several SSE streams on one client now share one h2/h3 connection rather than one
+  each, so they share its concurrent-stream budget too (relevant only well past a
+  server's typical `SETTINGS_MAX_CONCURRENT_STREAMS`). On the sync client a stream and
+  the client it came from now share mutable state (the connection pool, the cookie jar
+  and, on an `-d:naviHttp3` build, the h3 connection table), so the two are **one
+  thread-affine unit**: a stream must not be consumed on one thread while its client
+  is used on another. Two supporting changes come along: `orphanCloses` on the async
+  clients became a ref so the view's displaced-connection teardowns are still reaped by
+  the owner's `close()`, and the streaming pooled-reuse path now re-arms a reused
+  connection's read timeout from the current config, which #360 had fixed only for the
+  buffered path and which matters once a pool is shared between configurations.
+
+  **HTTP/2 is the one thing a stream does not share with the client's requests**: on
+  the async clients the client keeps a second mux table for its streams, so an h2
+  origin costs one extra handshake for a client's first stream and nothing after it
+  (all of a client's streams share that connection with each other, and
+  `client.close()` reaps it exactly like a request connection). `timeouts.read` on an
+  h2 connection is the transport's socket read timeout, one bound for every stream on
+  it, taken from the config that opened it and carried for the connection's whole
+  life; its expiry means the peer has gone dark, so the reader exits, `failAll` fails
+  every in-flight stream with a replayable class and the connection is retired and
+  replaced. That is a *connection* property, and it cannot be two values at once: a
+  connection the stream opened (read timeout off) would silently disable the caller's
+  `timeouts.read` for every later request on it, and an SSE stream riding a connection
+  the caller opened would be killed after one `timeouts.read` of silence -- which is
+  exactly what a live, quiet event stream looks like -- taking the caller's other
+  in-flight requests with it. Separate connections is the only arrangement where both
+  bounds mean what they say, and it keeps `timeouts.read` working as the
+  dead-connection detector it has always been. Because that SSE connection then has
+  no read bound, the PING keepalive is its only dark-peer detector, so a stream now
+  always runs one: `timeouts.h2KeepAlive` comes from the client, except that a client
+  which disabled it (`0`) still gets `defaultH2KeepAliveMs` on its SSE connections.
+  Without that, a black-holed peer would leave a connection that looks reusable
+  forever and every later `sse()` on the client would loop open / idle-timeout /
+  reconnect on the same zombie. A live change to `timeouts.h2KeepAlive` reaches an SSE
+  connection already up, as it already did a request connection. http/1.1 (pooled, one
+  request at a time, read timeout re-armed on checkout) and HTTP/3 (bounded at the
+  handshake and then per request, never connection-wide) are shared with the client's
+  requests as before, and so is the sync client's h2, whose connections live in that
+  same exclusively-checked-out pool -- where, since a half-read response cannot be
+  pooled and the sync backend has no background reader to drain one, closing a stream
+  mid-stream closes its connection (a stream left to end on its own pools it, and its
+  `close()` is then a no-op).
+
+  `maxResponseBytes`, unlike the read bound, *has* become a property of the
+  **request**: it moved down into the sans-io HTTP/2 connection, which now caps a
+  response body per stream, on the async muxes and the sync client's pooled h2
+  connections alike. It is live configuration a caller may change between requests on
+  one connection, and the sync client's pooled h2 path previously applied the cap of
+  whichever request opened the connection to every later one. `sharedConnCap` still
+  binds the owner's cap as a connection default, which is what h3 buffered responses
+  -- capped per connection by the driver, since such a response is accumulated in C
+  memory and has to be bounded there -- use.
+
+  HTTP/3 **streamed** reads needed the same move, and this is the one behaviour fix
+  left in the design: because a view and its owner genuinely share one QUIC
+  connection, a streaming submit used to carry the driver's connection-wide
+  `cap_body`, so an SSE stream was cut off at the OWNER's `maxResponseBytes` (a
+  `ResponseTooLargeError`, or with reconnect on a silent reconnect every N bytes with
+  the straddling event lost) where the pre-#466 private client had no cap at all. A
+  streaming submit now passes `cap_body = 0`: the body is drained incrementally so
+  nothing accumulates in C memory, and the only cap on a streamed h3 read is the
+  requesting client's own, applied navi-side per chunk by the same `CappedDecoder` the
+  h1 path uses and raising the same `ResponseTooLargeError`. So an `sse()` view reads
+  unbounded over the owner's connection while the owner's own `get()` and `stream()`
+  on it still stop at the owner's cap; the h3 SSE interop tests now pin all three.
 - **The docs now state that `tls.caFile` replaces the system trust store rather than
   adding to it (#437).** Setting `caFile` has curl's `--cacert` semantics on every
   backend, HTTP/3 included: std/net's `newContext` scans the system store only when
@@ -308,6 +410,68 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **`src/navi/backend/h3client.h` ships with the package, so `-d:naviHttp3` builds
+  against an INSTALLED navi compile again (#465).** `installExt = @["nim", "cpp"]`
+  copied the HTTP/3 driver's `h3client.cpp` into an installed package but not the
+  `h3client.h` it includes, so `nimble install navi` followed by
+  `nim c --mm:orc --threads:on -d:ssl -d:naviHttp3 app.nim` ended in
+  `h3client.cpp:30:10: fatal error: h3client.h: No such file or directory`, on every
+  client and every memory manager, while the same program built with
+  `--path:<checkout>/src` was fine. Nothing here could see it: every build in this
+  repo and every CI job compiles `--path:src`, where the whole checkout is present,
+  so the header was reachable everywhere except the one place a user gets navi from.
+  The list is now `@["nim", "cpp", "h"]` -- an extension rather than an
+  `installFiles` path, so a renamed or relocated backend cannot reintroduce the gap.
+  Downstreams that worked around it by pointing `--path` at a checkout (nim-vortex's
+  stress client image, cryo2010/nim-vortex#397) can go back to the installed package
+  once a tag carries this. The blind spot itself is closed by a new `packaging` CI
+  job plus a step in the HTTP/3 job: `tests/packaging/installed_build.sh` installs
+  the working tree into a throwaway nimble dir, asserts that every non-.nim build
+  input under `src/` arrived (what `{.compile.}` names, what those sources
+  `#include` transitively, and every file carrying a build-input extension), and
+  then compiles and runs a consumer of all three native entries against that
+  install, `-d:ssl` on a plain runner and `-d:naviHttp3` inside the h3 toolchain
+  image, where the installed `h3client.cpp` is actually handed to the C++ compiler.
+- **On asyncdispatch, `timeouts.total` no longer means "memory retained for this
+  long": a finished request is released at once instead of staying reachable from its
+  own timeout timer (#468).** `guard` bounded a request with
+  `await fut or cancelFut or sleepAsync(ms)` and std/asyncdispatch cannot take a timer
+  back off the dispatcher's heap, so when the request won the race the spent timer
+  stayed in that heap for the rest of `timeouts.total`, still holding the `or`
+  combinator's future and closures -- live memory, reachable rather than cyclic
+  garbage, so no `GC_fullCollect` could reclaim it. The resident heap therefore grew
+  with request rate x `timeouts.total` x per-request state: in a container soak at
+  12k req/s with a 60 s total the heap climbed to 610 MB (RSS 818 MB) and only fell
+  once the timers began expiring, and because the streaming path guards EVERY
+  `readChunk` by what is left of the deadline, a long-`total` download retained a set
+  per 64 KiB chunk read and grew without bound until the client was OOM-killed. The
+  guard, the `connect` bound, both per-read bounds and the h2 GOAWAY grace now share
+  one `withinMs` helper that keeps the timer in a local, races it explicitly, clears
+  the timer's callbacks the moment the request wins, and empties its own closure env
+  so neither loser can keep the other (or the exchange) alive; it also appends its
+  callback instead of replacing the awaited future's callback list, so it can never
+  drop a callback the caller installed. Holding the race was `or`'s half of the
+  problem alone, and `guard`'s core was navi's one `or` race on the hot path: the
+  four `withTimeout` bounds converted alongside it already unlinked the loser, since
+  Nim 2.2.10's `withTimeout` clears whichever side lost, and what they gain here is
+  the second half. Because the heap entry itself cannot be removed -- a few hundred
+  bytes in a release build, about a kilobyte in a debug one, where `newFuture`
+  captures a stack trace -- a bound longer than one second is now armed in one-second
+  slices that re-arm against a monotonic deadline (so expiry lands at the same instant
+  as before, and any timeout at or under a second is armed exactly once, as before). A
+  spent slice is reclaimed within a second of the request finishing instead of in
+  `totalMs`, which is what makes retention independent of the configured timeout:
+  measured per request with a 10-minute total, 2243 bytes stayed live indefinitely
+  before, where the settled figure afterwards is within ~50 bytes of the same client
+  with no total timeout at all. That settled figure is the IDLE one, and the slicing
+  is a cap rather than a cure: under sustained load up to one second's worth of
+  completed requests is still waiting on its spent slice, roughly 1.2 KB each in a
+  debug build, so the soak above would hold ~14 MB at 12k req/s instead of 610 MB --
+  bounded by the rate alone, not by the rate times `timeouts.total`. chronos was never
+  affected (its guard cancels the timer in its `finally`), and the two bounds that are
+  armed once per connection rather than per request or per read, the SSE connect and
+  the WebSocket keepalive's re-raced parked read, keep `withTimeout` on purpose, with
+  the reason recorded at each.
 - **An encrypted PKCS#8 DER private key is decrypted with `tls.password`, and PEM is
   detected by its `-----BEGIN` boundary rather than by the first byte (#436).** A DER
   key file went to `SSL_CTX_use_PrivateKey_file(..., SSL_FILETYPE_ASN1)`, which calls

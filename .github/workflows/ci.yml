@@ -180,6 +180,45 @@ jobs:
       - name: navi/js binary body round-trip test
         run: bash tests/interop/js_bytes.sh
 
+  # --- Packaging ----------------------------------------------------------------
+  # `installExt` in navi.nimble decides which non-.nim files reach an INSTALLED
+  # package, and until this job nothing in CI ever built against one: every other
+  # job compiles `--path:src`, where the whole checkout is present. #465 is what
+  # that blind spot cost -- h3client.cpp shipped without the h3client.h it
+  # includes, so every `-d:naviHttp3` build against the installed package died in
+  # the C++ step while CI stayed green. This installs the checkout into a
+  # throwaway nimble dir, asserts every non-.nim build input under src/ arrived,
+  # and compiles AND runs a consumer of each native entry against that install.
+  #
+  # The `-d:naviHttp3` half of the same script runs as a step of the `http3` job:
+  # that image is the only place CI has the toolchain to compile the installed
+  # h3client.cpp. Ubuntu's libngtcp2-dev cannot stand in for it -- it is built
+  # against OpenSSL 3.0 and carries no libngtcp2_crypto_ossl, which needs the
+  # OpenSSL >= 3.5 client QUIC API.
+  packaging:
+    runs-on: ubuntu-latest
+    name: packaging (build against the installed package)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # navi `requires` checksums; every other navi-compiling job installs it up
+      # front rather than leaving it to a transitive resolve, so a registry
+      # hiccup fails the same way everywhere instead of reddening only this job.
+      - name: Install checksums
+        run: nimble install -y checksums
+
+      # So the navi/chronos consumer is compiled rather than skipped.
+      - name: Install chronos
+        run: nimble install -y "chronos@>= 4.0.0"
+
+      - name: Install the checkout as a package and build consumers against it
+        run: bash tests/packaging/installed_build.sh
+
   sanitize:
     runs-on: ubuntu-latest
     name: sanitizers (asan + ubsan)
@@ -345,6 +384,16 @@ jobs:
       # driven by the sync, asyncdispatch, and chronos clients (config.http={H2}).
       - name: Run the WebSocket-over-h2 interop test
         run: bash tests/interop/ws_h2/run.sh
+
+      # SSE connection sharing over HTTP/2 (#466): a Node h2 TLS origin that counts
+      # its h2 sessions, so which connection a stream rides is checked against a
+      # real server -- on the async clients the owner's read timeout must kill its
+      # own connection and not the stream, a client's streams must share one
+      # connection with each other, and close() must reap that one too; on the sync
+      # client the stream must share the pooled connection with the client's
+      # requests, and the response size cap must apply per stream on it.
+      - name: Run the SSE-over-h2 sharing interop test
+        run: bash tests/interop/sse_h2/run.sh
 
   streaming:
     runs-on: ubuntu-latest
@@ -782,7 +831,22 @@ jobs:
     name: HTTP/3 interop (Caddy h3 origin)
     steps:
       - uses: actions/checkout@v4
-      - name: Build the HTTP/3 toolchain image and run the h3 suite
-        run: |
-          docker build -f tests/interop/http3/Dockerfile -t navi-h3 .
-          docker run --rm navi-h3
+      - name: Build the HTTP/3 toolchain image
+        run: docker build -f tests/interop/http3/Dockerfile -t navi-h3 .
+
+      # The -d:naviHttp3 half of the packaging check (#465). The `packaging` job
+      # proves the installed package is complete and builds -d:ssl consumers
+      # against it; only this image can compile the installed h3client.cpp, which
+      # is the step the missing header actually broke. It runs here rather than as
+      # its own job because a separate one would rebuild the whole OpenSSL 3.5 +
+      # ngtcp2 + nghttp3 toolchain from source for three compiles.
+      #
+      # It runs BEFORE the interop suite deliberately: the image is all it needs,
+      # it takes seconds, and behind the suite a single h3 interop flake would
+      # skip the only check in CI that hands the installed h3client.cpp to a C++
+      # compiler, which is exactly the blind spot #465 came from.
+      - name: Packaging check, -d:naviHttp3 against the installed package
+        run: docker run --rm --entrypoint bash navi-h3 tests/packaging/installed_build.sh --h3
+
+      - name: Run the h3 interop suite
+        run: docker run --rm navi-h3

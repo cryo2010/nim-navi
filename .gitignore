@@ -13,6 +13,7 @@ tests/fuzz/corpus/
 tests/test_h1
 tests/test_entries
 tests/test_async
+tests/test_async_guard_retention
 tests/test_chronos
 tests/test_h2_conn
 tests/test_h2_frame

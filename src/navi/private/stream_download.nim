@@ -89,7 +89,7 @@ proc openStream(client: Navi, req0: Request): StreamResponse =
           let conn = client.altSvc.openH3Tracked(rq.url.host, rq.url.port,
             h3Open(ep.get.host, ep.get.port, sni = rq.url.host,
                    tls = client.config.tls,
-                   maxBody = uint64(max(0, client.config.maxResponseBytes)),
+                   maxBody = uint64(max(0, client.sharedConnCap)),
                    connectMs = client.config.connectMs,
                    totalMs = client.config.totalMs))
           var fwd: seq[(string, string)]
@@ -117,9 +117,19 @@ proc openStream(client: Navi, req0: Request): StreamResponse =
     try: dead.transport.close() except CatchableError: discard
   var (found, pc) = popIdle(client.pool, key)
   if found:
+    # A pooled connection adopts the CURRENT config's read timeout and per-attempt
+    # deadline, not the ones it was opened with (issue #360, which fixed only the
+    # buffered path). It matters here because the pool is shared with an `sse()`
+    # stream's config-carrying view (#466): without this, an SSE read on a connection
+    # the caller opened would inherit the caller's read timeout where the stream wants
+    # its own idle bound, and the caller's next streamed request on a connection the
+    # SSE stream pooled would inherit the stream's (45 s by default, total off).
+    rearm(pc.transport, client.config.readMs, client.config.totalMs)
     try:
       if pc.h2 != nil:
-        let sid = h2SendAndReadHeaders(pc.transport, pc.h2, rq)
+        # The cap is THIS client's, not the one the pooled connection was opened with:
+        # the pool is shared with an `sse()` stream's view, whose cap is off (#466).
+        let sid = h2SendAndReadHeaders(pc.transport, pc.h2, rq, cap)
         return StreamResponse(kind: skH2, h2pc: pc, sid: sid,
                               resp: toResponse(pc.h2.respSnapshot(sid)), client: client,
                               key: key, decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
@@ -146,9 +156,9 @@ proc openStream(client: Navi, req0: Request): StreamResponse =
                           client.config.totalMs)
   var npc = PooledConn[Conn](transport: transport)
   if transport.protocol == "h2":
-    npc.h2 = initH2Conn(client.config.maxResponseBytes)
+    npc.h2 = initH2Conn(client.sharedConnCap)
     transport.sendAll(npc.h2.preamble())
-    let sid = h2SendAndReadHeaders(transport, npc.h2, rq)
+    let sid = h2SendAndReadHeaders(transport, npc.h2, rq, cap)
     result = StreamResponse(kind: skH2, h2pc: npc, sid: sid,
                             resp: toResponse(npc.h2.respSnapshot(sid)), client: client,
                             key: key, decompress: decompress, cap: cap, capped: initCappedDecoder(decompress, cap))
@@ -183,7 +193,8 @@ proc stream*(client: Navi, verb: HttpVerb, target: string,
     let handle = openStream(client, rreq)
     handle.cancel = cancel
     when defined(naviHttp3):
-      # Learn h3 from a streamed response too, so SSE/stream upgrade on a reconnect.
+      # Learn h3 from a streamed response too, so a later stream (or SSE stream, which
+      # shares this cache) can be opened on h3 straight away.
       if client.altSvc != nil:
         let alt = handle.resp.headers.get("alt-svc")
         if alt.len > 0:
