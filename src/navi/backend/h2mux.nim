@@ -11,6 +11,19 @@ import ../core/response          # for ResponseTooLargeError
 import ../core/request           # for BodyProducer
 import ../core/decompress        # for streaming response decompression
 import ./asyncdispatch as be     # for Conn / BodySink
+import ./api as beapi            # naviReadBufSize (the mux turn budget)
+
+proc yieldTurn(): Future[void] =
+  ## Give the event loop one turn unconditionally (the mux's turn budget, issue
+  ## #461: the reader and the body puller each yield once per `muxTurnBudget` bytes
+  ## moved without parking). The transport's own time slice (`fairness`, #462) is not
+  ## enough on its own: it yields per 2000 us, and an upload next to a download needs
+  ## a loop turn per peer window, so the turn rate has to follow the bytes read.
+  ## A zero-delay timer, not `callSoon`: asyncdispatch runs callbacks queued while
+  ## it drains its callback list in that same drain, so a `callSoon` yield would
+  ## never let the selector run. A due timer completes on the next `poll`, after its
+  ## I/O pass.
+  sleepAsync(0)
 
 include ./h2mux_common
 
@@ -115,9 +128,11 @@ proc applyKeepAlive*(mux: H2Mux, keepAliveMs: int) =
     asyncCheck keepAlive(mux)
 
 proc reader(mux: H2Mux) {.async.} =
+  var spent = 0      # bytes read without the read parking since the last turn (#461)
   try:
     while mux.alive:
       let recvFut = be.recvSome(mux.transport)
+      if not recvFut.finished: spent = 0   # the read parks: the loop turns anyway
       if mux.h2.goneAway and mux.activeStreams > 0:
         # `withinMs`, not `withTimeout` (issue #468): `withTimeout` does unlink the
         # loser (Nim 2.2.10 clears whichever side lost), but its single timer entry
@@ -148,6 +163,16 @@ proc reader(mux: H2Mux) {.async.} =
       mux.wakeSenders()                           # a WINDOW_UPDATE may have drained a send
       if mux.h2.connError.len > 0: break          # fatal: fail all in-flight below
       if mux.h2.goneAway and mux.activeStreams == 0: break
+      spent += chunk.len
+      if spent >= muxTurnBudget:
+        # A read buffer's worth arrived without the read parking, so the loop has
+        # not turned since. Yield one AFTER the dispatch and wakes above, so the
+        # pullers and senders they woke run on this turn, and so does every other
+        # connection's reader: an upload's WINDOW_UPDATE gets parsed once per read's
+        # worth of download, not once per fairness slice (#461; see h2mux_common).
+        spent = 0
+        await yieldTurn()
+        sliceRestart()                            # the loop just turned
   except CatchableError as e:
     mux.readerError = e.msg   # capture WHY the reader exited (a transport read error, a
                               # runtime fault) before swallowing it, so `connDeathError`

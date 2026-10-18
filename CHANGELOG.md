@@ -410,8 +410,49 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
-- **A saturated TLS transfer no longer starves everything else on the async event
-  loop (#462).** Both async runtimes resume an `await` on an already-finished
+- **A fast HTTP/2 download no longer holds the event loop, so a streamed upload next to
+  it runs at 6.5x its old rate and the requests, WebSocket and SSE traffic beside it
+  4x to 15x (#461).** The mixed soak's h2 cells moved an upload at about 6 MB/s
+  next to a 450 MB/s download, on both async clients (h1 and h3 were fine). The cause
+  was scheduling, not flow control: an `await` on a future that is already finished
+  does not return to the event loop on chronos or asyncdispatch, so a mux loop whose
+  reads kept completing at once never yielded. The connection reader on a TLS socket
+  that always had bytes buffered went on reading, and the body puller (`each`,
+  `drain`, a sink) whose stream queue had filled then drained all of it, up to the
+  whole 8 MiB receive window, in a single pass. Meanwhile every other connection
+  waited, including the one carrying the upload, which can only send one peer window
+  (64 KiB under hypercorn) per WINDOW_UPDATE its reader gets to read, so what bounds
+  it is the number of loop turns per byte downloaded. The transport's fairness slice
+  (#462, below) yields at most every 2000 us, about 500 turns a second however fast
+  the download runs, which alone caps such an upload near 500 x 64 KiB = 32 MB/s. So
+  the mux reader and the body puller (`readChunk`, shared by `each`, `drain`, the
+  sink path and the WebSocket tunnel, which pops bytes the reader already queued and
+  never enters the transport at all) each give the loop a turn every 64 KiB (one read
+  buffer) they move without parking, and the turn rate follows the download. A loop
+  that parks for real resets its count, so a transfer the network paces pays
+  nothing. The streamed request body needs no budget: its sends go through the
+  slice and it parks on the peer's window. The yield is a
+  zero-delay timer on both runtimes: asyncdispatch runs callbacks queued during its
+  callback drain in that same drain (so `callSoon` would never let the selector in),
+  and chronos leaves tick callbacks out of its poll timeout (so `stepsAsync` can park
+  in the selector on an idle loop).
+  Measured on the mixed h2 cell (20 s, 64 MiB transfers, hypercorn, main vs this
+  branch back to back on one machine, with the #462 slice in both layers' final
+  form): chronos upload 128 MB to 832 MB, requests 3778 to 22809, ws round-trips
+  1704 to 16625, sse events 0.66M to 2.55M; asyncdispatch upload 128 MB to 832 MB,
+  requests 4900 to 24794, ws 1901 to 29489, sse 0.42M to 2.64M. The download slice
+  gives up the share it was taking from the others (10624 MB to 4288 MB on chronos,
+  10112 MB to 3648 MB on asyncdispatch); a solo h2 `streamDownload` cell is
+  unchanged within noise (chronos 514 vs 502 MB/s over three runs each,
+  asyncdispatch 513 vs 537 MB/s) and so is solo `streamUpload`. What remains of the
+  gap is the server's receive window: hypercorn's 64 KiB caps an upload at one window
+  per round trip, which navi cannot widen. `test_h2_fairness` (both async backends)
+  queues a whole 8 MB download and then drains it next to an upload on the same mux:
+  the drain must let the loop turn and the upload get past its first window, where
+  before it took zero turns and the upload sat at 64 KiB until the drain finished.
+- **A saturated TLS transfer no longer holds the async event loop across a run of
+  synchronous reads or writes (#462).** Both async runtimes resume an `await` on
+  an already-finished
   future in place, and both TLS read/write paths can complete without parking while
   the socket keeps up: the asyncdispatch backend calls `SSL_read`/`SSL_write`
   straight on the fd and only waits on WANT_READ/WANT_WRITE, and on chronos 4.4 (what

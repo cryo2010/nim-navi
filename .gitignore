@@ -55,6 +55,8 @@ tests/test_ws_async
 tests/test_ws_chronos
 tests/test_fairness_async
 tests/test_fairness_chronos
+tests/test_h2_fairness
+tests/test_h2_fairness_chronos
 tests/interop/jsws_server
 tests/interop/jsws_client.js
 tests/js_ws_codec.js

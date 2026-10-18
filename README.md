@@ -844,6 +844,23 @@ of the body piling up in memory. Over HTTP/1.1 the awaited consumer pauses the r
 loop, which back-pressures the peer through TCP. The size cap
 (`maxResponseBytes`) is enforced incrementally on the streamed bytes.
 
+The reverse holds too: a consumer that keeps up never monopolizes the event loop.
+On the async clients every connection read and write yields the loop a turn once
+the thread's I/O has run a whole time slice without waiting (#462), and the HTTP/2
+connection reader and the chunk puller behind `each` and `drain` (which hands out
+bytes the reader has already queued without touching the socket) each yield after
+64 KiB moved without waiting (#461), so the loop turns in step with a fast download
+rather than once per slice. So a fast download cannot hold the loop for long
+stretches against an upload, a WebSocket or ordinary requests running beside it.
+The bound is checked when a read starts or a write ends, so one large buffered write (an in-memory request
+body is encrypted in a single call) still runs to completion, and the HTTP/3 leg
+does not go through these entry points. The slice is a build-time knob,
+`-d:naviFairSliceUs=<microseconds>` (default 2000): smaller hands the loop back
+more often at the cost of an extra poll per slice, larger favours raw throughput of
+a single transfer. `fairYield()` (exported by `navi/asyncdispatch` and
+`navi/chronos`) runs the same check, for your own loops over work that can
+complete without parking.
+
 #### Sink downloads (push)
 
 `stream()` is the pull model: you drive the body. `request(..., sink = ...)` is the
