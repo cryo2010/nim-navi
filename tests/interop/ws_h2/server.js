@@ -1,6 +1,6 @@
 // HTTP/2 server (TLS) advertising SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441),
 // accepting a WebSocket Extended CONNECT and echoing WS frames (client frames are
-// masked; server frames must be unmasked).
+// masked; server frames must be unmasked). GET /big answers a 4 KiB body.
 const http2 = require('http2');
 const fs = require('fs');
 
@@ -54,6 +54,10 @@ server.on('stream', (stream, headers) => {
       }
     });
     stream.on('error', () => {});
+  } else if (headers[':path'] === '/big') {
+    // A 4 KiB body for the clients' maxResponseBytes = 1024 check (#470).
+    stream.respond({ ':status': 200, 'content-type': 'text/plain' });
+    stream.end(Buffer.alloc(4096, 'b'));
   } else {
     stream.respond({ ':status': 404 });
     stream.end();

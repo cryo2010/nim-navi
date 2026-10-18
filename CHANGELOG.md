@@ -410,6 +410,40 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **A WebSocket over HTTP/2 is no longer reset once it has carried
+  `maxResponseBytes` (#470).** `websocket(..., http = {H2})` opened its dedicated
+  h2 connection with the client's `config.maxResponseBytes` as the connection's body
+  cap (the asyncdispatch and chronos clients via `newH2Mux`, the sync client via
+  `initH2Conn(sharedConnCap)`), and the Extended CONNECT tunnel stream registers no
+  cap of its own, so it inherited that one: every inbound DATA frame counted toward
+  the stream's body total, and once the frames received over the socket's whole life
+  passed the cap the h2 layer sent RST_STREAM. The async clients then raised
+  `ResponseTooLargeError` from `receive()`, and the sync one saw the tunnel close.
+  With the 32 MiB or 5 MiB cap `HARDENING.md` recommends, a long-lived socket died
+  after that much traffic, while the same client over h1 or h3 ran indefinitely
+  (the h3 leg already opens its QUIC connection with no body cap). The h2 tunnel
+  connection is now opened with cap 0 on all three native clients, which is safe
+  because nothing but the tunnel ever rides it. The asyncdispatch and chronos tunnel
+  mux also no longer content-decodes: it used to run tunnel bytes through the
+  response decoder whenever the CONNECT 2xx named a `content-encoding` (a CONNECT
+  2xx has no content, RFC 9110 9.3.6), which with cap 0 would have been an unbounded
+  decompression bomb; tunnel bytes now pass through verbatim, as they already did on
+  the sync, h1 and h3 legs. So `maxMessageBytes` on
+  `websocket()` is the only size bound on a WebSocket over every protocol, as the
+  docs already said; plain h2 responses on the same client still honour
+  `maxResponseBytes`. `HARDENING.md` and the README now say outright that
+  `maxResponseBytes` is a response-body cap and does not bound a WebSocket. Tests:
+  the h2 ws legs need TLS + ALPN, so the regression guard for the call sites is the
+  `ws_h2` Docker interop, which fails on the unfixed code. The unit tests cover the
+  layers below: the h2 mux cap spec (both async backends) drives `newH2TunnelMux`,
+  the constructor `doWebsocketH2` now uses, carrying 4x a 1 KiB cap and passing a
+  gzip-labelled tunnel through undecoded, with a capped mux (reset) and a
+  decompressing one (decoded) as controls; `test_h2_connect` checks the sans-io
+  `H2Conn` the sync driver builds (cap 0 unbounded, cap 1024 reset). The `ws_h2`
+  interop runs all three clients with
+  `maxResponseBytes = 1024`, tunnelling over 20 KB (312 KB on sync), checking that
+  `maxMessageBytes` still rejects an oversize message and that a 4 KiB h2 response
+  on the same client still raises `ResponseTooLargeError`.
 - **`src/navi/backend/h3client.h` ships with the package, so `-d:naviHttp3` builds
   against an INSTALLED navi compile again (#465).** `installExt = @["nim", "cpp"]`
   copied the HTTP/3 driver's `h3client.cpp` into an installed package but not the

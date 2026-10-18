@@ -629,7 +629,7 @@ token.cancel()
 
 ### Response size limits
 
-`maxResponseBytes` caps the response body; a larger response raises `ResponseTooLargeError`. Streaming enforces the cap incrementally (per chunk); buffered requests enforce it on the assembled body. On the native clients the cap counts decompressed bytes, so it also guards against decompression bombs.
+`maxResponseBytes` caps the response body; a larger response raises `ResponseTooLargeError`. Streaming enforces the cap incrementally (per chunk); buffered requests enforce it on the assembled body. On the native clients the cap counts decompressed bytes, so it also guards against decompression bombs. It does not bound a WebSocket on any protocol (h1, h2 or h3), and none is exposed to that bomb: WebSocket tunnel bytes are never content-decoded, even if the server's handshake response names a `content-encoding`. Use `maxMessageBytes` on `websocket()` to bound a WebSocket.
 
 ```nim
 let api = newNavi()
@@ -1137,6 +1137,9 @@ Pass `maxMessageBytes` to bound a reassembled message; a peer can otherwise grow
 single message without limit via continuation frames. When a message exceeds the cap,
 `receive` closes the connection with code 1009 (Message Too Big) and raises
 `WsMessageTooLarge`. It is `0` (unlimited) by default, so set it for untrusted servers.
+It is the only size bound on a WebSocket: `config.maxResponseBytes` caps response
+bodies and never a WebSocket tunnel, over h1, h2 or h3 alike (the tunnel is neither
+capped nor content-decoded).
 
 Pass `keepAlive` (ms) to detect a dead peer: while a `receive` is in progress, navi
 sends a ping after that long with no data and, if another interval passes with still

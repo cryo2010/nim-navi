@@ -295,6 +295,15 @@ consequences worth knowing when you set a cap:
   (an event stream is unbounded by design). If you need a bound on one, bound it
   yourself in the `each`/`next` loop (count bytes, or stop after N events);
   `maxSseEventBytes` already caps a single event, not the stream's total.
+* **A WebSocket is not covered by it, on any protocol.** `maxResponseBytes` is a
+  response-body cap, and a WebSocket is a tunnel, not a response body: an h1 Upgrade,
+  an h2 Extended CONNECT (RFC 8441) and an h3 one (RFC 9220) all carry frames for as
+  long as the socket lives, whatever the cap. Tunnel bytes are also never
+  content-decoded (a `content-encoding` on the handshake's 2xx is ignored), so there
+  is no decompression bomb for the cap to guard against there. Bound a WebSocket with
+  `maxMessageBytes` on `websocket()` (a larger message closes with 1009 and raises
+  `WsMessageTooLarge`), and set it for untrusted servers, since it defaults to
+  unlimited.
 * **HTTP/3 buffered responses are capped per connection, not per request.** The h3
   driver enforces the cap while it buffers a whole response in C memory, and a shared
   h3 connection carries the cap of whichever client opened it. navi hands it the cap

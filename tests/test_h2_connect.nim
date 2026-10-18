@@ -181,3 +181,50 @@ suite "ws-over-h2 tunnel receive-window backpressure (#407)":
     check streamWindowCredit(more.ctrl, sid) == 0
     check not c.streamReset(sid)
     check c.connError.len == 0
+
+suite "ws-over-h2 tunnel is not a response body (#470)":
+  ## The sync WebSocket-over-h2 driver opens its dedicated connection with
+  ## `initH2Conn(0)`: `maxResponseBytes` caps a response body, and every DATA frame
+  ## on the tunnel stream counts toward the body total, so a capped connection RSTs
+  ## the tunnel once it has carried that many frame bytes in all. These drive the
+  ## same H2Conn calls the driver makes, sans-io; the driver itself needs TLS + ALPN
+  ## and is exercised end to end (with `maxResponseBytes` set) by tests/interop/ws_h2.
+
+  proc acceptedTunnel(maxBody: int): (H2Conn, uint32) =
+    let c = initH2Conn(maxBody)
+    discard c.preamble()
+    discard c.feed(encodeSettings({settingsEnableConnectProtocol: 1'u32}))
+    let sid = c.openTunnelStream()
+    discard c.encodeRequestHead(sid,
+      h2ConnectHeaderList(parseUrl("https://example.com/chat"), "websocket",
+                          initHeaders()))
+    let enc = HpackEncoder()
+    discard c.feed(encodeHeaders(sid, enc.encode(@[(":status", "200")]),
+                                 endStream = false, endHeaders = true))
+    (c, sid)
+
+  proc carry(c: H2Conn, sid: uint32, bytes: int): int =
+    ## Feed `bytes` of tunnel DATA in 1 KiB frames, consuming and acking each the way
+    ## `h2Recv` does, and return how many bytes the tunnel delivered.
+    let payload = repeat('w', 1024)
+    var sent = 0
+    while sent < bytes and not c.streamReset(sid):
+      discard c.feed(encodeData(sid, payload, endStream = false))
+      let got = c.takeBody(sid)
+      result += got.len
+      if got.len > 0: discard c.ackRecv(sid, got.len)
+      sent += payload.len
+
+  test "a cap-0 connection carries tunnel bytes far past any response cap":
+    let (c, sid) = acceptedTunnel(0)
+    check c.carry(sid, 8 * 1024 * 1024) == 8 * 1024 * 1024   # 8 MiB, acked as read
+    check not c.streamReset(sid)
+    check not c.streamTooLarge(sid)
+    check c.connError.len == 0
+
+  test "a connection opened with maxResponseBytes resets the tunnel at the cap (control)":
+    let (c, sid) = acceptedTunnel(1024)
+    check c.carry(sid, 4 * 1024) < 4 * 1024   # cut off part way (the RST lands at
+                                              # the first frame past the cap)
+    check c.streamReset(sid)
+    check c.streamTooLarge(sid)

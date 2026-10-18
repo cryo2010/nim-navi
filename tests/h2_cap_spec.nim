@@ -18,6 +18,11 @@ proc reqHeaders(path: string): seq[(string, string)] =
   @[(":method", "GET"), (":scheme", "http"), (":authority", "127.0.0.1"),
     (":path", path)]
 
+proc tunnelHeaders(): seq[(string, string)] =
+  ## An Extended CONNECT (RFC 8441) header block, as `doWebsocketH2` sends it.
+  @[(":method", "CONNECT"), (":protocol", "websocket"), (":scheme", "http"),
+    (":authority", "127.0.0.1"), (":path", "/chat")]
+
 proc cappedRequest(mux: H2Mux, path: string, cap: int): Future[string] {.async.} =
   ## Run a buffered request with its own cap and report what it failed with ("" when
   ## it completed).
@@ -34,6 +39,25 @@ proc collect(mux: H2Mux, sid: uint32): Future[seq[string]] {.async.} =
     if c.len == 0: break
     result.add c
 
+proc drainTunnel(mux: H2Mux): Future[(string, string)] {.async.} =
+  ## Open the Extended CONNECT tunnel and read it to its end: (bytes, failure).
+  var got, failed: string
+  try:
+    let sid = await mux.openConnect(tunnelHeaders())
+    while true:
+      let c = await mux.tunnelRecv(sid)
+      if c.len == 0: break
+      got.add c
+  except CatchableError as e:
+    failed = $e.name & ": " & e.msg
+  await mux.close()
+  return (got, failed)
+
+const
+  # gzip -n of 64 KiB of zeros: 96 bytes on the wire, 65536 decoded (a small bomb).
+  gzipZeros = parseHexStr("1f8b0800000000000213edc101010000008090feafee080a000000000000000000000000" &
+    "000000000000000000000000000000000000000000000000000000000000000000000000" &
+    "0000000000000000000000000000006aeb8e97d700000100")
 const
   evOne = "data: one\nid: 1\n\n"
   evTwo = "data: two\nid: 2\n\n"
@@ -75,4 +99,91 @@ suite "http/2 per-stream size cap (" & h2BackendName & ", #466)":
       return outcome
     let outcome = waitFor run()
     check outcome.startsWith("ResponseTooLargeError")
+    joinThread(th)
+
+  test "a WebSocket tunnel on the cap-0 mux carries more than maxResponseBytes (#470)":
+    # `doWebsocketH2` dials a dedicated mux for its Extended CONNECT tunnel. It used
+    # to build it with `config.maxResponseBytes`, and since the tunnel stream
+    # registers no cap of its own it inherited that one, so the stream was RST once
+    # its frames passed the cap in total. It now builds the mux with cap 0, which
+    # must let a tunnel carry any number of bytes; `maxMessageBytes` is the bound.
+    var th: Thread[CapPeerArg]
+    let port = h2CapBasePort + 2
+    let frames = repeat("ws-frame-bytes|", 300)         # 4500 bytes, > 4x the cap
+    startCapPeer(th, CapPeerArg(port: port, script: "t", body: frames))
+    proc run(): Future[(string, string)] {.async.} =
+      let mux = await connectCapMux(port, tunnel = true)   # doWebsocketH2's mux
+      var got, failed: string
+      try:
+        let sid = await mux.openConnect(tunnelHeaders())
+        while true:
+          let c = await mux.tunnelRecv(sid)
+          if c.len == 0: break
+          got.add c
+      except CatchableError as e:
+        failed = $e.name & ": " & e.msg
+      await mux.close()
+      return (got, failed)
+    let (got, failed) = waitFor run()
+    check failed == ""
+    check got == frames
+    joinThread(th)
+
+  test "the same tunnel on a mux opened with the cap is reset (the #470 failure)":
+    # The control: the tunnel stream inherits a mux's connection-wide default, so the
+    # pre-fix construction (`newH2Mux(conn, maxResponseBytes)`) RSTs it mid-stream.
+    var th: Thread[CapPeerArg]
+    let port = h2CapBasePort + 3
+    let frames = repeat("ws-frame-bytes|", 300)
+    startCapPeer(th, CapPeerArg(port: port, script: "t", body: frames))
+    proc run(): Future[(int, string)] {.async.} =
+      let mux = await connectCapMux(port, maxBody = 1024)
+      var got = 0
+      var failed: string
+      try:
+        let sid = await mux.openConnect(tunnelHeaders())
+        while true:
+          let c = await mux.tunnelRecv(sid)
+          if c.len == 0: break
+          got += c.len
+      except CatchableError as e:
+        failed = $e.name & ": " & e.msg
+      await mux.close()
+      return (got, failed)
+    let (got, failed) = waitFor run()
+    check failed.startsWith("ResponseTooLargeError")
+    check got <= 1024
+    joinThread(th)
+
+  test "a tunnel whose CONNECT 2xx says content-encoding: gzip is not decoded (#470)":
+    # A CONNECT 2xx has no content (RFC 9110 9.3.6), so its `content-encoding` must
+    # not turn the tunnel into a decoder. On the cap-0 tunnel mux that decoder would
+    # also be unbounded: a decompression bomb materialized before the ws framing
+    # layer (and `maxMessageBytes`) sees a byte. The tunnel mux never decodes, so
+    # the gzip bytes arrive verbatim, as on the sync, h1 and h3 legs.
+    var th: Thread[CapPeerArg]
+    let port = h2CapBasePort + 4
+    startCapPeer(th, CapPeerArg(port: port, script: "t", body: gzipZeros,
+                                encoding: "gzip"))
+    proc run(): Future[(string, string)] {.async.} =
+      let mux = await connectCapMux(port, tunnel = true)   # doWebsocketH2's mux
+      return await mux.drainTunnel()
+    let (got, failed) = waitFor run()
+    check failed == ""
+    check got == gzipZeros                     # 96 raw bytes, not 64 KiB of zeros
+    joinThread(th)
+
+  test "the same tunnel on a decompressing mux is decoded (the #470 review failure)":
+    # The control: the construction #470 first shipped, `newH2Mux(conn, 0,
+    # wantsDecompress)`, runs the tunnel bytes through an uncapped decoder.
+    var th: Thread[CapPeerArg]
+    let port = h2CapBasePort + 5
+    startCapPeer(th, CapPeerArg(port: port, script: "t", body: gzipZeros,
+                                encoding: "gzip"))
+    proc run(): Future[(string, string)] {.async.} =
+      let mux = await connectCapMux(port, maxBody = 0, decompress = true)
+      return await mux.drainTunnel()
+    let (got, failed) = waitFor run()
+    check failed == ""
+    check got == repeat('\0', 65536)          # 96 bytes in, 64 KiB out
     joinThread(th)

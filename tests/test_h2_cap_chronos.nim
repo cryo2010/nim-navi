@@ -16,7 +16,8 @@ const
 
 template napMs(ms: int): untyped = sleepAsync(chronos.milliseconds(ms))
 
-proc connectCapMux(port: int, maxBody = 0): Future[H2Mux] {.async.} =
+proc connectCapMux(port: int, maxBody = 0, decompress = false,
+                   tunnel = false): Future[H2Mux] {.async.} =
   ## Connect and take over the h2 transport, retrying until the peer thread has
   ## bound its listener. See the asyncdispatch twin for what `maxBody` is doing here.
   var lastErr: ref CatchableError
@@ -24,7 +25,8 @@ proc connectCapMux(port: int, maxBody = 0): Future[H2Mux] {.async.} =
     try:
       let conn = await be.connect("127.0.0.1", port, false, TlsConfig(),
                                   ProxyTarget(), @[], 0, 0)
-      return await newH2Mux(conn, maxBody)
+      if tunnel: return await newH2TunnelMux(conn)   # what doWebsocketH2 opens
+      return await newH2Mux(conn, maxBody, decompress)
     except CatchableError as e:
       lastErr = e
       await napMs(20)

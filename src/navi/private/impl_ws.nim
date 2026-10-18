@@ -123,9 +123,12 @@ proc doWebsocketH2(client: Navi, u: Url, headers: Headers,
     await conn.close()
     raise newException(ProtocolError,
       "navi: WebSocket over h2 requested but the server negotiated " & got)
-  let mux = await newH2Mux(conn, client.config.maxResponseBytes,
-                           client.config.wantsDecompress,
-                           client.config.h2KeepAliveMs)
+  # The tunnel mux is neither capped nor decoding (see newH2TunnelMux): the tunnel
+  # is not a response body, so `maxResponseBytes` must not bound it (#470), and a
+  # CONNECT 2xx carrying `content-encoding` must not turn the tunnel into an
+  # (uncapped) decoder. `maxMessageBytes` is the WebSocket's size bound, as on the
+  # h1 and h3 legs.
+  let mux = await newH2TunnelMux(conn, client.config.h2KeepAliveMs)
   try:
     # One field policy for every Extended CONNECT (h2 and h3): wsExtraFields drops
     # the h1-only handshake fields and the hop-by-hop ones, and adds

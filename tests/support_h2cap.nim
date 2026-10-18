@@ -12,6 +12,14 @@
 ##        silent -- what an SSE stream between events looks like on the wire, and
 ##        what an uncapped stream delivers its body in here.
 ##   'f'  FAST: the whole response immediately.
+##   't'  TUNNEL: `:status: 200` for an Extended CONNECT, then `body` as a run of
+##        512-byte DATA frames and END_STREAM. A WebSocket tunnel's inbound frames,
+##        which no response-body cap may bound (#470). With `encoding` set, the 2xx
+##        also carries `content-encoding: <encoding>`, which a tunnel must ignore:
+##        its bytes are never content-decoded (#470 review).
+##
+## The initial SETTINGS advertises ENABLE_CONNECT_PROTOCOL (RFC 8441), so a client
+## may open a 't' stream with `openConnect`; it changes nothing for plain requests.
 ##
 ## Actions are queued with absolute due times and flushed from the same loop that
 ## polls the socket, so one thread can keep several streams on different schedules.
@@ -19,15 +27,17 @@
 ## has given up on is not answered on a stream it has already closed.
 import std/[net, monotimes, times]
 from std/nativesockets import selectRead, SocketHandle
-from navi/proto/h2/frame import encodeSettings, encodeHeaders, encodeData
+from navi/proto/h2/frame import encodeSettings, encodeHeaders, encodeData,
+                                 settingsEnableConnectProtocol
 
 type
   CapPeerArg* = object
     port*: int
-    script*: string    ## one letter ('q'/'f') per client stream, in arrival order
+    script*: string    ## one letter ('q'/'f'/'t') per client stream, in arrival order
     quietMs*: int      ## the silent gap in the middle of a 'q' stream
-    body*: string      ## the body an 'f' stream answers with
+    body*: string      ## the body an 'f' stream answers with ('t': the tunnel bytes)
     events*: seq[string]  ## the two chunks a 'q' stream delivers (before/after the gap)
+    encoding*: string  ## 't' only: a `content-encoding` for the CONNECT 2xx ("" = none)
   Action = object
     due: MonoTime
     sid: uint32
@@ -45,7 +55,7 @@ proc runCapPeer*(arg: CapPeerArg) {.thread.} =
   listener.listen()
   var client: Socket
   listener.accept(client)                        # inherits the unbuffered mode
-  client.send(encodeSettings([]))                # a real h2 peer's mandatory first frame
+  client.send(encodeSettings({settingsEnableConnectProtocol: 1'u32}))  # mandatory first frame
   var
     rest: string                                 # unparsed bytes after the preface
     prefaceDropped = false
@@ -103,6 +113,20 @@ proc runCapPeer*(arg: CapPeerArg) {.thread.} =
           queue.add Action(due: now + initDuration(milliseconds = arg.quietMs), sid: sid,
                            bytes: encodeData(sid, ev[1], false) &
                                   encodeData(sid, "", true))
+        of 't':
+          var frames = head
+          if arg.encoding.len > 0:
+            # HPACK literal without indexing, name = static index 26
+            # (content-encoding): 0x0f 0x0b, then a plain (non-Huffman) value.
+            frames = encodeHeaders(sid, status200Block & "\x0f\x0b" &
+                                   chr(arg.encoding.len) & arg.encoding,
+                                   endStream = false, endHeaders = true)
+          var off = 0
+          while off < arg.body.len:
+            let n = min(512, arg.body.len - off)
+            frames.add encodeData(sid, arg.body[off ..< off + n], false)
+            off += n
+          queue.add Action(due: now, sid: sid, bytes: frames & encodeData(sid, "", true))
         else:
           queue.add Action(due: now, sid: sid,
                            bytes: head & encodeData(sid, arg.body, true))

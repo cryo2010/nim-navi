@@ -160,6 +160,20 @@ proc newH2Mux*(transport: be.Conn, maxBody = 0, decompress = false,
     asyncSpawn keepAlive(mux)   # self-exits when readerDone completes
   result = mux
 
+proc newH2TunnelMux*(transport: be.Conn, keepAliveMs = 0): Future[H2Mux] {.async.} =
+  ## The dedicated mux for an Extended CONNECT tunnel (a WebSocket over h2,
+  ## `doWebsocketH2`): nothing but the tunnel ever rides it, so it is opened with
+  ## neither a body cap nor content decoding.
+  ## - Cap 0: the tunnel is not a response body, so `maxResponseBytes` must not
+  ##   bound it (#470). A capped mux would RST the tunnel once its frames passed
+  ##   the cap in total; `maxMessageBytes` is the WebSocket's bound.
+  ## - No decoding: a CONNECT 2xx has no content (RFC 9110 9.3.6), so a
+  ##   `content-encoding` on it must not turn the tunnel into a decoder. With cap 0
+  ##   that decoder would also be unbounded, a decompression bomb that materializes
+  ##   whole decoded chunks before the ws framing layer sees them. Tunnel bytes pass
+  ##   through verbatim, as on the sync, h1 and h3 legs.
+  result = await newH2Mux(transport, 0, false, keepAliveMs)
+
 proc close*(mux: H2Mux) {.async.} =
   ## Shut the shared connection down: fail any in-flight streams, close the
   ## transport so the reader's parked read completes with EOF, then let the reader
