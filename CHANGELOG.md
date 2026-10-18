@@ -410,6 +410,60 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **A saturated TLS transfer no longer starves everything else on the async event
+  loop (#462).** Both async runtimes resume an `await` on an already-finished
+  future in place, and both TLS read/write paths can complete without parking while
+  the socket keeps up: the asyncdispatch backend calls `SSL_read`/`SSL_write`
+  straight on the fd and only waits on WANT_READ/WANT_WRITE, and on chronos 4.4 (what
+  `chronos >= 4.0.0` resolves to today) the stream transport's `fastRead` reads
+  straight off a readable socket and `fastWrite` writes straight into a writable one,
+  so the TLS pump's reads and writes finish in place too (chronos 4.0 and 4.2 have
+  only `fastWrite`, so there only the write side ran this way). So an h1 download (or
+  SSE feed) arriving faster than it was consumed, or an upload whose send buffer kept
+  draining, ran read after read with the loop never getting a turn. On Windows the
+  asyncdispatch backend did it over plain TCP too: a WSASend that completes at once
+  still resolved asyncdispatch's string `send` future from a callback, which looked
+  like a real park (restarting the slice) while the callback queue, drained in a loop
+  that services no timers, ran the upload back to back; `sendAll` now uses the
+  pointer overload, whose future completes in place. In the mixed h1
+  stress cell that held the client loop for 160-250 ms per turn (a 10 ms timer fired
+  ~175 ms late), and the buffered `/echo` requests sharing it fell to ~50 ops/s
+  against ~2300 solo, against hypercorn and the native vortex origin alike, which is
+  what ruled out the server. `recvSome` and `sendAll` on both backends now yield to
+  the loop once the thread's connection I/O has run `naviFairSliceUs` (default 2000,
+  an `intdefine`) without a real suspension, and any real suspension restarts the
+  slice. The yield is a due zero-length timer rather than `stepsAsync`, whose tick
+  chronos leaves out of the poll timeout (alone on the loop it would block in the
+  selector forever). The bound is per I/O call, not absolute: the slice is checked
+  when a read starts or a write ends (a write is issued first, so concurrent writes on
+  one connection still start in call order), so one large buffered write (an in-memory body is
+  encrypted in a single call) still runs to completion, and HTTP/3 does not pass
+  through these entry points at all. On the h2 mux the yield runs in the mux's own
+  send, before the stream is recorded as on the wire, and a stream abandoned before
+  its first frame reached the transport (a chronos cancellation on the mux's send
+  chain or on the yield) is now dropped without a RST_STREAM: the peer never saw it,
+  and a RST_STREAM on an idle stream is a connection error (RFC 9113 6.4) that took
+  every other stream on the connection down with it. A sender cancelled while queued
+  on that chain also no longer releases the senders behind it before the send it was
+  waiting on has written, which could put a higher stream id on the wire first. An
+  upload chunk cancelled at the same points had already debited the connection's
+  send window when it was framed; that credit is now given back, where before every
+  such cancel shrank the window for good (`refundUnsent`). Mixed
+  h1, 20 s, 64 MiB transfers, back to back on one machine: chronos `req` 40-51 to
+  260-326 ops/s and asyncdispatch 50 to 562-676 ops/s, with ws round-trips and SSE
+  events up 6-19x, loop lag 160-250 ms to 4-7 ms, and both stream slices still
+  moving 450-500 MB/s between them (the download's share drops, since it no longer
+  monopolises the loop). The mixed h2 cell gains too (chronos `req` 194 to 260
+  ops/s, lag 13.6 to 7.5 ms), and the solo `requests` cells are unchanged within
+  noise. The h2 mux reader rides the same `recvSome`, so it is bounded the same way.
+  `fairYield()` exposes the check for code that loops on work that can complete
+  without parking. The mixed stress cells' final line now reports the client
+  loop lag (`lag avg Xms max Yms`) so a starved slice can be told from a slow
+  origin. The js mixed cell's ~70 ops/s is a different case: each js request worker
+  manages ~7 ops/s both solo (~170 ops/s over 24 workers) and mixed (~70 over 10),
+  so that cell is bound by the js client's own per-request latency, not by navi or
+  the other slices, and the stress README now says to read it against the js solo
+  cell.
 - **A WebSocket over HTTP/2 is no longer reset once it has carried
   `maxResponseBytes` (#470).** `websocket(..., http = {H2})` opened its dedicated
   h2 connection with the client's `config.maxResponseBytes` as the connection's body

@@ -6,6 +6,7 @@
 import std/[tables, deques, sets]
 import pkg/chronos
 import ../proto/h2/conn
+import ./fairness                # sliceRestart after a real park (#462)
 from ../proto/h2/frame import encodePing   # keepalive PING (a non-stream control frame)
 import ../core/response          # for ResponseTooLargeError
 import ../core/request           # for BodyProducer
@@ -19,6 +20,20 @@ proc isCancellation(e: ref CatchableError): bool {.gcsafe, raises: [].} =
   ## Such a cancellation is NOT a keep-alive race: the shared send-phase classifier
   ## re-raises it untouched so structured cancellation propagates.
   e of CancelledError
+
+proc chainWait(prev: Future[void]): Future[void] {.gcsafe, raises: [].} =
+  ## `join`: completes with `prev` but cancels alone. chronos propagates a
+  ## cancellation into the future being awaited, so a bare `await prev` from a
+  ## cancelled sender would cancel the previous sender's link.
+  prev.join()
+
+proc releaseLink(prev, mine: Future[void]) {.gcsafe, raises: [].} =
+  ## A sender cancelled on `chainWait` gets here with `prev` still pending: its
+  ## link is handed over to `prev`, so the senders behind it keep waiting for it.
+  if prev == nil or prev.finished():
+    mine.complete()
+  else:
+    prev.addCallback(proc(udata: pointer) {.gcsafe, raises: [].} = mine.complete())
 
 proc trySend(mux: H2Mux, data: string) {.async.} =
   ## Fire-and-forget send that swallows errors, so it is safe to `asyncSpawn`.

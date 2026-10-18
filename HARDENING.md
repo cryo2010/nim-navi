@@ -380,6 +380,23 @@ connection that every later `sse()` on the client reconnects onto. Leave it on f
 your requests too: with `0` and a hostile or flaky peer, a dead connection stays
 pooled and every request dispatched on it burns its own read timeout before failing.
 
+### Event-loop fairness slice (`-d:naviFairSliceUs`)
+
+```sh
+nim c -d:naviFairSliceUs=1000 app.nim   # build-time; microseconds, default 2000
+```
+
+On the async clients a peer that keeps a TLS socket readable (a flood) or writable
+can make every read or write complete without the event loop running in between.
+`recvSome` and `sendAll` therefore yield the loop once a thread's connection I/O
+has run this long without a real wait, so one fast or hostile connection cannot
+hold every other request, timer and timeout on that loop hostage. It is checked
+when a read starts or a write ends, so a single large call (one `sendAll` of a big
+in-memory body) still runs to completion, and the HTTP/3 leg is not covered.
+Smaller values hand the loop back more often at the cost of an extra poll per
+slice; `0` yields at every I/O call that follows an in-place completion. There
+is no runtime setting: it is one slice per thread, shared by every client on it.
+
 ### HTTP/2 limits
 
 The HTTP/2 bounds (HPACK decoded-list cap, 128 KiB CONTINUATION accumulation cap,

@@ -281,6 +281,27 @@ byte-based for the same reason -- `no upload bytes moved` / `no download bytes
 moved`, not "no transfer completed" -- since a healthy short cell can legitimately
 end with a transfer still in flight and none finished.
 
+**The final line carries the client loop lag.** `lag avg Xms max Yms`
+(`common/looplag`) is how late a 10 ms timer fired on the client's event loop over
+the measured phase. It is the first thing to read when one slice collapses next to
+the others: a large lag means the slices are starving each other on the *client*
+loop, not that the origin is slow. That is what #462 turned out to be. The mixed h1
+`req` slice sat at ~50 ops/s against ~2300 solo, against hypercorn and the native
+vortex origin alike, because an h1 TLS transfer whose socket stayed readable (or
+writable) completed read after read in place and never handed the loop back: the
+probe measured 160-250 ms of lag per turn. navi's async backends now yield once
+per 2 ms of unbroken connection I/O (`-d:naviFairSliceUs`), and the same cell runs
+at a few ms of lag with `req` 5-13x higher. What remains is honest sharing of one
+client thread with ~500 MB/s of TLS + SHA-1 stream traffic and tens of thousands of
+SSE events per second, so `req` still sits well below its solo rate; compare it to
+itself across runs. The js cell is a different case: each js request worker
+manages ~7 ops/s whether it runs solo (the js `requests` h1 cell does ~170 ops/s
+over 24 workers) or mixed (~70 ops/s over the mixed cell's 10 request workers), so
+that slice is bound by the js client's own per-request latency (~140 ms per op),
+not by navi's native transport or by the other slices. Where that latency comes
+from has not been measured; do not read it as a CPU ceiling. Measure js against
+the js solo cell, never against the native ones.
+
 **The deadline is soft for the stream slices.** A stream worker will not *start* a
 transfer it has no time left to finish (it compares the time remaining against its
 own last transfer's duration), but one already in flight at the deadline runs to
@@ -439,6 +460,7 @@ NAVI_CHAOS=all NAVI_PROTO=h1 NAVI_CLIENT=all nimble stressRequests
   `servers` (round-robin), `streamcontent` (fixed-block + incremental SHA-1 + the
   MB/MB/s accounting shared with the js download client + the `StreamProgress` both
   stream slices report from), `mixsplit` (the mixed worker split, shared with js),
+  `looplag` (the mixed cells' client event-loop lag probe, shared with js),
   `httpset` (proto → version set),
   `chaos` (client-side chaos driver: seeded schedule, workers/watchdog, outcome
   classification; split into `chaos_async`/`chaos_sync` for the two client models),

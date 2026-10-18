@@ -312,6 +312,26 @@ proc queueSend*(c: H2Conn, streamId: uint32, data: string): string =
     s.sendBuf.add data
   c.flushSend(streamId, s, result)
 
+proc refundUnsent*(c: H2Conn, wire: string) =
+  ## Give back the send-window credit of DATA frames that were encoded but never
+  ## reached the transport: framing a DATA frame (`queueSend`, `finishSend`,
+  ## `encodeRequest`, a window-released tail from `feed`) debits the stream and
+  ## connection send windows at once, so when the send carrying `wire` is abandoned
+  ## before its write (a chronos cancel on the mux's send chain or fairness yield),
+  ## the peer never sees those bytes and never credits them back. Without this the
+  ## connection window would shrink by them for good, and a long-lived mux would slowly
+  ## run out of room to upload. A stream that still exists gets its credit back too; a
+  ## dropped one needs none. A body tail that was staged (window-blocked) and never
+  ## framed was never debited, so dropping it with its stream needs no refund.
+  for (sid, n) in dataFrameLens(wire):
+    c.connSendWindow += n
+    let s = c.streams.getOrDefault(sid)
+    if s != nil: s.sendWindow += n
+
+proc connSendCredit*(c: H2Conn): int = c.connSendWindow
+  ## The connection-level send window left (what the peer still lets us send
+  ## across every stream before its next WINDOW_UPDATE).
+
 proc finishSend*(c: H2Conn, streamId: uint32,
                  trailers: openArray[HeaderPair] = []): string =
   ## Mark the streamed request body complete. Emits END_STREAM -- on the last DATA

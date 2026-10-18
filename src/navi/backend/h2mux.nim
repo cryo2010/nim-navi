@@ -5,6 +5,7 @@
 
 import std/[asyncdispatch, tables, deques, sets]
 import ../proto/h2/conn
+import ./fairness                # sliceRestart after a real park (#462)
 from ../proto/h2/frame import encodePing   # keepalive PING (a non-stream control frame)
 import ../core/response          # for ResponseTooLargeError
 import ../core/request           # for BodyProducer
@@ -18,6 +19,15 @@ proc isCancellation(e: ref CatchableError): bool {.gcsafe, raises: [].} =
   ## cancellation here (the shared classifier treats it as a transport failure).
   discard e
   false
+
+proc chainWait(prev: Future[void]): Future[void] {.gcsafe, raises: [].} =
+  ## asyncdispatch has no cancellation: the previous link itself is the wait.
+  prev
+
+proc releaseLink(prev, mine: Future[void]) {.gcsafe, raises: [].} =
+  ## Without cancellation `prev` has always finished by the time a sender lets go.
+  try: mine.complete()
+  except Exception: discard
 
 proc trySend(mux: H2Mux, data: string) {.async.} =
   ## Fire-and-forget send that swallows errors, so it is safe to `asyncCheck`.
