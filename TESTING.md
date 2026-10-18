@@ -301,6 +301,28 @@ Where each is exercised:
 - **Unit** — `test_entries`/`test_async`/`test_chronos` cover headers-first,
   full-drain-pools-and-reuses, failed-drain-closes, and an incremental cap;
   `test_stream_decompress` decodes a streamed body through `each`.
+- **Event-loop fairness (`test_fairness_async`, `test_fairness_chronos`, shared
+  `fairness_spec`)**: the transport's time slice (#462). Two tests drive a raw
+  connection through `recvSome` (a flood from `support_fair`) and `sendAll` (a
+  draining sink) with per-chunk CPU slower than loopback, next to a 1 ms ticker. On
+  chronos those calls complete in place (4.4's `fastRead`, `fastWrite`) and each
+  test fails with the yield removed from its entry point or with
+  `-d:naviFairSliceUs=2000000000`. asyncdispatch's plaintext `recv`/`send` always park
+  and its in-place path is TLS, which the unit suite cannot reach, so there they
+  pass either way: its transport wiring is covered only by the mixed stress cell.
+  A third test issues two un-awaited `sendAll` calls on one connection with the
+  slice spent and a fresh slice in between, and asserts a mirroring peer gets them
+  in call order (it failed on both backends while the write yielded before writing).
+- **Unwritten-stream cancel (`test_h2_unsent_cancel_chronos`, `support_h2rst`)**: a
+  chronos request cancelled while its HEADERS wait on the mux's send chain or the
+  fairness yield sends no RST_STREAM (the peer, which treats a RST on an idle stream
+  or a falling stream id as a connection error, stays up for the next request); a
+  sender cancelled in the middle of the chain does not let the one behind it
+  overtake; an upload chunk cancelled before its write gives its connection-window
+  credit back, so a later body of exactly the peer's 64 KiB window (the peer never
+  sends WINDOW_UPDATE) still completes; control: a request cancelled after its
+  HEADERS went out is still RST. `test_h2_conn` covers `refundUnsent` at the sans-io
+  level.
 
 `navi/js` **buffers** a streamed request body (`body = producer`) (drains the producer, then sends one body):
 `fetch` cannot reliably stream a request body. See the client matrix in the

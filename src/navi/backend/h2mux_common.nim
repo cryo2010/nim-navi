@@ -84,6 +84,15 @@ type
                              ## behind the serialized send chain and never flushed -- so
                              ## it is provably unprocessed (`UnprocessedError`), not the
                              ## ambiguous keep-alive race (see `connDeathError`).
+    wireStreams: HashSet[uint32]  ## streams whose first frame has been HANDED TO THE
+                             ## TRANSPORT: `send` marks the stream after its last
+                             ## cancellable wait (the send chain, the fairness yield)
+                             ## and immediately before the write. Only these may be
+                             ## RST: a RST_STREAM for a stream whose HEADERS never left
+                             ## is a frame on an idle stream, which the peer must treat
+                             ## as a connection error (RFC 9113 5.1, 6.4), failing every
+                             ## sibling stream. A stream abandoned before this point is
+                             ## dropped locally without a frame (see `rstOrDrop`).
     readerDone: Future[void] ## completed once the reader has exited and the
                              ## transport is closed, so `close` can join it
     settingsSeen: Future[void]  ## completed once the peer's initial SETTINGS is seen
@@ -135,6 +144,17 @@ proc isCancellation(e: ref CatchableError): bool {.gcsafe, raises: [].}
   ## keep-alive race. Defined per backend after the include: asyncdispatch has no
   ## cancellation so it is always false there; chronos checks `e of CancelledError`.
 
+proc chainWait(prev: Future[void]): Future[void] {.gcsafe, raises: [].}
+  ## The wait for the previous link of the send chain, defined per backend after the
+  ## include. It must not OWN `prev`: on chronos a cancelled sender's `await prev`
+  ## would cancel the previous sender's link, the sender queued behind would start
+  ## while that previous send is still parked before its write, and the two would
+  ## reach the wire out of order (new stream ids must rise, RFC 9113 5.1.1).
+
+proc releaseLink(prev, mine: Future[void]) {.gcsafe, raises: [].}
+  ## Complete a sender's link `mine` of the send chain, never before `prev`: a sender
+  ## cancelled on `chainWait` hands its link over to `prev` (defined per backend).
+
 const goAwayGraceMs = 30_000
   ## After a GOAWAY the peer promises (via last-stream-id) to finish the covered
   ## streams, so the reader keeps waiting for their responses. Bound that wait with
@@ -180,6 +200,19 @@ proc resetError(mux: H2Mux, sid: uint32): ref CatchableError {.gcsafe, raises: [
   else:
     newException(IOError, "navi: http/2 stream reset")
 
+proc rstOrDrop(mux: H2Mux, sid: uint32, onWire: bool): string =
+  ## Drop an abandoned stream from the connection state and return the RST_STREAM
+  ## (CANCEL) to send, or "" when the stream never reached the transport (`onWire`:
+  ## it was in `wireStreams`, read by the caller before it cleared the stream's
+  ## bookkeeping). A stream whose HEADERS never left is idle to the peer, and a
+  ## RST_STREAM on an idle stream is a connection error (RFC 9113 6.4): every other
+  ## stream on the mux would die with it. Dropping it locally is enough; its id is
+  ## simply never used (a later, higher stream id closes it implicitly, 5.1.1).
+  if onWire:
+    result = mux.h2.resetStream(sid)
+  else:
+    discard mux.h2.takeResponse(sid)
+
 proc detachSink(mux: H2Mux, sid: uint32) =
   ## Drop a sink stream that failed while its response headers were still awaited
   ## (connection closed, stream reset, or gone-away-unprocessed): remove its
@@ -187,6 +220,7 @@ proc detachSink(mux: H2Mux, sid: uint32) =
   ## already dead or the peer has gone away -- and release its concurrency slot.
   mux.sinkStreams.excl sid
   mux.sentStreams.excl sid
+  mux.wireStreams.excl sid
   mux.recvq.del(sid)
   discard mux.h2.takeResponse(sid)
   mux.releaseSlot()
@@ -212,6 +246,7 @@ proc dispatch(mux: H2Mux) =
       discard mux.h2.takeResponse(sid)
       mux.waiters.del(sid)
       mux.sentStreams.excl sid
+      mux.wireStreams.excl sid
       mux.releaseSlot()
       fut.fail(err)
     elif mux.h2.streamEnded(sid):
@@ -219,6 +254,7 @@ proc dispatch(mux: H2Mux) =
       let resp = mux.h2.takeResponse(sid)
       mux.waiters.del(sid)
       mux.sentStreams.excl sid
+      mux.wireStreams.excl sid
       mux.releaseSlot()
       if lengthBad: fut.fail(newException(IOError, bodyLengthErr))  # body != Content-Length
       else: fut.complete(resp)
@@ -229,6 +265,7 @@ proc dispatch(mux: H2Mux) =
       # it ends, or `failAll` fails it on the real connection close.
       mux.waiters.del(sid)
       mux.sentStreams.excl sid
+      mux.wireStreams.excl sid
       mux.releaseSlot()
       fut.fail(newException(UnprocessedError, "navi: http/2 request not processed"))
 
@@ -279,7 +316,8 @@ proc waitSendable(mux: H2Mux, sid: uint32) {.async.} =
   await ready
 
 proc reapStream(mux: H2Mux, sid: uint32) {.gcsafe, raises: [].} =
-  ## RST the live stream (so the peer frees its side), drop all per-stream
+  ## RST the live stream (so the peer frees its side; only if its first frame reached
+  ## the transport, see `wireStreams`), drop all per-stream
   ## bookkeeping, wake anything parked on it, and release its concurrency slot.
   ## Handles both a buffered waiter and a sink stream (the absent-key ops are no-ops),
   ## so it serves the send-phase failure (#261) and the cancelled-waiter reap (#262).
@@ -287,15 +325,17 @@ proc reapStream(mux: H2Mux, sid: uint32) {.gcsafe, raises: [].} =
   ## (chronos, strict raises) and the async request paths alike -- completing a future
   ## can raise on asyncdispatch, and there is nothing useful to do with that here.
   try:
+    let onWire = sid in mux.wireStreams
     mux.waiters.del(sid)
     mux.sinkStreams.excl sid
     mux.sentStreams.excl sid
+    mux.wireStreams.excl sid
     mux.recvq.del(sid)
     mux.clearSendReady(sid)
     mux.wakeRecver(sid)                              # wake a parked reader; it re-checks
     mux.decoders.del(sid)
     if mux.alive:
-      let rst = mux.h2.resetStream(sid)
+      let rst = mux.rstOrDrop(sid, onWire)   # never RST a stream the peer never saw
       if rst.len > 0: mux.fireSend(rst)
     else:
       discard mux.h2.takeResponse(sid)
@@ -393,9 +433,23 @@ proc failAll(mux: H2Mux, msg: string) =
   mux.wakeSenders()                               # unblock in-flight streaming uploads
   mux.wakeRecvers()                               # unblock in-flight sink drains
 
-proc send(mux: H2Mux, data: string) {.async.} =
+proc send(mux: H2Mux, data: string, sid = 0'u32) {.async.} =
   ## Serialize writes (chained on the previous send) so concurrent streams don't
-  ## interleave frame bytes on the wire.
+  ## interleave frame bytes on the wire. `sid` names the stream whose frames `data`
+  ## carries (0: none, or not the first frame); it is recorded in `wireStreams` once
+  ## nothing can stop the write any more, so a cancelled request is RST only when the
+  ## peer can have seen it.
+  ##
+  ## Every cancellable wait comes BEFORE that record: the chain wait and the fairness
+  ## yield (#462), which runs here rather than inside `sendAll` (`fair = false`) for
+  ## exactly that reason. A cancellation that lands inside the transport write itself
+  ## counts as on the wire: a torn frame breaks the connection either way, and chronos
+  ## may still flush bytes it had queued.
+  ##
+  ## DATA frames in `data` already debited the send windows when they were framed. A
+  ## cancellation on one of those waits means the peer never sees them, so their
+  ## credit is refunded (`refundUnsent`); otherwise the connection window would lose
+  ## those bytes for good.
   if data.len == 0: return
   let prev = mux.sendTail
   let mine = newFuture[void]("h2mux.send")
@@ -404,12 +458,18 @@ proc send(mux: H2Mux, data: string) {.async.} =
   # CancelToken, SSE withTimeout) can land while we are parked here, and `mine` is
   # already installed as `sendTail`. If it were not completed on that path, every
   # later send on the connection would chain behind it forever (issue #258).
+  var handed = false
   try:
     if prev != nil and not prev.finished:
-      await prev
-    await be.sendAll(mux.transport, data)
+      await chainWait(prev)        # chronos: a cancel here leaves `prev` alone
+      sliceRestart()               # really parked: the loop ran, a fresh slice
+    await be.fairYield()
+    if sid != 0'u32: mux.wireStreams.incl sid
+    handed = true                  # sendAll issues the write before it can suspend
+    await be.sendAll(mux.transport, data, fair = false)
   finally:
-    mine.complete()
+    if not handed: mux.h2.refundUnsent(data)   # cancelled before the write
+    releaseLink(prev, mine)        # never ahead of `prev`, even when cancelled
 
 proc canReuse*(mux: H2Mux): bool = mux.alive and mux.h2.canReuse
 
@@ -461,10 +521,12 @@ proc endStream(mux: H2Mux, sid: uint32) =
   ## through the drain loop, so the slot is released only on the call that actually
   ## removes the stream (guarded by `wasActive`) -- never twice.
   let wasActive = sid in mux.sinkStreams
+  let onWire = sid in mux.wireStreams
   mux.recvReady.del(sid)
   mux.recvq.del(sid)
   mux.sinkStreams.excl sid
   mux.sentStreams.excl sid
+  mux.wireStreams.excl sid
   mux.decoders.del(sid)
   if wasActive and mux.alive and not mux.h2.streamEnded(sid) and
      not mux.h2.streamReset(sid):
@@ -473,7 +535,7 @@ proc endStream(mux: H2Mux, sid: uint32) =
     # send up to a full stream window of discarded DATA, then stalls forever, leaking
     # a server-side zombie stream per abort on a pooled connection (issue #260). RST
     # it (also drops the stream locally) instead of a silent takeResponse.
-    let rst = mux.h2.resetStream(sid)
+    let rst = mux.rstOrDrop(sid, onWire)
     if rst.len > 0: mux.fireSend(rst)
   else:
     # Clean end: the streaming drain normally discards the response (and its trailers).
@@ -625,15 +687,15 @@ proc sendAndReadHeaders*(mux: H2Mux, headers: seq[(string, string)], body: strin
   mux.sinkStreams.incl sid
   try:
     if connectTunnel:
-      await mux.send(mux.h2.encodeRequestHead(sid, headers))   # no END_STREAM: send side open
+      await mux.send(mux.h2.encodeRequestHead(sid, headers), sid)   # no END_STREAM: send side open
     elif asyncStream != nil:
-      await mux.send(mux.h2.encodeRequestHead(sid, headers))
+      await mux.send(mux.h2.encodeRequestHead(sid, headers), sid)
       await mux.streamBodyAsync(sid, asyncStream, trailers)
     elif bodyStream != nil:
-      await mux.send(mux.h2.encodeRequestHead(sid, headers))
+      await mux.send(mux.h2.encodeRequestHead(sid, headers), sid)
       await mux.streamBody(sid, bodyStream, trailers)
     else:
-      await mux.send(mux.h2.encodeRequest(sid, headers, body, trailers))
+      await mux.send(mux.h2.encodeRequest(sid, headers, body, trailers), sid)
     mux.sentStreams.incl sid              # request fully on the wire (see connDeathError)
   except CatchableError as e:
     # The send raised at WRITE time (a transport OSError/AsyncStreamError), or the user's
@@ -724,15 +786,17 @@ proc dropStream*(mux: H2Mux, sid: uint32) =
   ## RST_STREAM is fired and forgotten (the event loop flushes it later); it may not
   ## be sent if the connection is already gone.
   if sid notin mux.sinkStreams: return
+  let onWire = sid in mux.wireStreams
   mux.sinkStreams.excl sid
   mux.sentStreams.excl sid
+  mux.wireStreams.excl sid
   mux.recvq.del(sid)
   mux.wakeRecver(sid)                          # wake a parked readChunk racing us
   mux.clearSendReady(sid)                     # a tunnel may have a parked send
   mux.decoders.del(sid)
   mux.releaseSlot()
   if mux.alive:
-    let rst = mux.h2.resetStream(sid)        # also drops the stream in the conn
+    let rst = mux.rstOrDrop(sid, onWire)     # also drops the stream in the conn
     if rst.len > 0:
       mux.fireSend(rst)
   else:
@@ -742,15 +806,17 @@ proc abandon*(mux: H2Mux, sid: uint32): Future[void] {.async.} =
   ## Await-capable abandon (from `close`): RST the stream and flush it, then free its
   ## slot and buffers.
   if sid notin mux.sinkStreams: return
+  let onWire = sid in mux.wireStreams
   mux.sinkStreams.excl sid
   mux.sentStreams.excl sid
+  mux.wireStreams.excl sid
   mux.recvq.del(sid)
   mux.wakeRecver(sid)                          # wake a parked readChunk racing us
   mux.clearSendReady(sid)                     # a tunnel may have a parked send
   mux.decoders.del(sid)
   mux.releaseSlot()
   if mux.alive:
-    let rst = mux.h2.resetStream(sid)
+    let rst = mux.rstOrDrop(sid, onWire)
     if rst.len > 0:
       try: await mux.send(rst)
       except CatchableError: discard
@@ -795,13 +861,13 @@ proc request*(mux: H2Mux, headers: seq[(string, string)], body: string,
   mux.waiters[sid] = fut
   try:
     if asyncStream != nil:
-      await mux.send(mux.h2.encodeRequestHead(sid, headers))
+      await mux.send(mux.h2.encodeRequestHead(sid, headers), sid)
       await mux.streamBodyAsync(sid, asyncStream, trailers)
     elif bodyStream != nil:
-      await mux.send(mux.h2.encodeRequestHead(sid, headers))
+      await mux.send(mux.h2.encodeRequestHead(sid, headers), sid)
       await mux.streamBody(sid, bodyStream, trailers)
     else:
-      await mux.send(mux.h2.encodeRequest(sid, headers, body, trailers))
+      await mux.send(mux.h2.encodeRequest(sid, headers, body, trailers), sid)
     mux.sentStreams.incl sid              # request fully on the wire (see connDeathError)
   except CatchableError as e:
     # The send raised at WRITE time (transport error), or the user's BodyProducer raised.

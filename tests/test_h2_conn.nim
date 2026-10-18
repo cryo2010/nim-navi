@@ -235,6 +235,41 @@ suite "h2 send-side flow control":
     let out3 = c.feed(encodeWindowUpdate(sid, 200_000) & encodeWindowUpdate(0, 200_000))
     check dataBytes(out1) + dataBytes(out2) + dataBytes(out3) == 200_000
 
+  test "DATA framed but never written gives its send-window credit back":
+    # The async mux frames an upload chunk (debiting both send windows) before its
+    # send can be cancelled on the send chain or the fairness yield; those bytes
+    # never reach the peer, so the credit must come back or the connection window
+    # shrinks for good.
+    let c = newServerConn()
+    let sid = c.openStream()
+    let head = @[(":method", "POST"), (":scheme", "https"),
+                 (":path", "/"), (":authority", "x")]
+    let hdr = c.encodeRequestHead(sid, head)
+    check c.connSendCredit == 65535
+    let unsent = c.queueSend(sid, repeat("x", 20_000))
+    check dataBytes(unsent) == 20_000
+    check c.connSendCredit == 65535 - 20_000
+    c.refundUnsent(hdr)                       # no DATA in a HEADERS block: no change
+    check c.connSendCredit == 65535 - 20_000
+    c.refundUnsent(unsent)
+    check c.connSendCredit == 65535
+    # the live stream got its credit back too: a full window still goes out
+    check dataBytes(c.queueSend(sid, repeat("y", 65535))) == 65535
+
+  test "the refund reaches the connection window when the stream is already dropped":
+    let c = newServerConn()
+    let a = c.openStream()
+    let head = @[(":method", "POST"), (":scheme", "https"),
+                 (":path", "/"), (":authority", "x")]
+    discard c.encodeRequestHead(a, head)
+    let unsent = c.queueSend(a, repeat("x", 30_000))
+    discard c.resetStream(a)                  # the cancelled request is reaped
+    c.refundUnsent(unsent)
+    check c.connSendCredit == 65535
+    let b = c.openStream()
+    let out1 = c.encodeRequest(b, head, repeat("z", 65535))
+    check dataBytes(out1) == 65535            # a later upload gets the whole window
+
 suite "h2 early response closes the send side (RFC 9113 8.1)":
   # A server may answer completely before consuming the whole request body (413, auth
   # reject, an /echo that errors early). Once the complete response is in, the client

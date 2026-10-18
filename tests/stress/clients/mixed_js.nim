@@ -16,7 +16,7 @@
 
 import std/[strutils, json]
 import navi/js
-import ../common/[harness_js, payloads, streamcontent, mixsplit]
+import ../common/[harness_js, payloads, streamcontent, mixsplit, looplag]
 include parts/requests_js_part          # /echo: verbs x js-safe payload catalog
 include parts/ws_js_part                # ws: text+binary echo round-trips
 include parts/sse_js_part               # sse: events + Last-Event-ID resume
@@ -82,6 +82,7 @@ proc main() {.async.} =
   var bytes = 0.0                        # cumulative bytes rx
   var lastBytes = 0.0                    # `bytes` as of the previous report line
   var lastMs = start                     # timestamp of the previous report line
+  let lag = newLoopLag()                 # client event-loop lag (common/looplag)
 
   proc mixedReport(final = false) =
     ## ONE line for the whole mix: every slice's own numbers side by side, never
@@ -107,7 +108,8 @@ proc main() {.async.} =
       sseCounter.segment("sse", "ev", opsStart, final = final), " | ",
       "down ", megabytes(bytes), "MB ", mbps, " MB/s ", transfers,
       " done ", retried, " retried | RSS ", rssMb(), "MB | heap ", heapUsedMb(),
-      "MB | t=", int((now - start) / 1000.0), "s"
+      "MB", (if final: " | " & lag.render() else: ""),
+      " | t=", int((now - start) / 1000.0), "s"
 
   let timer = setIntervalJs(proc () = mixedReport(), cfg.reportSeconds * 1000)
 
@@ -137,7 +139,15 @@ proc main() {.async.} =
         echo label, " download retried: ", e.msg
         await sleepMs(250)             # do not hot-spin on an immediate refusal
 
+  proc lagProbe() {.async.} =
+    ## Sample the event-loop lag until the deadline, as the native cell does.
+    while nowMs() < deadline:
+      let t0 = nowMs()
+      await sleepMs(lagTickMs)
+      lag.add(nowMs() - t0)
+
   var futs: seq[Future[void]]
+  futs.add lagProbe()
   for i in 0 ..< sp.req:
     futs.add requestsWorker(apis[k mod apis.len], label, pool, payloads,
                             reqCounter, deadline, i)

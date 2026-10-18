@@ -36,7 +36,7 @@ import std/[times, strutils, json]
 from std/os import getEnv
 import ../zlibcodec
 import ../common/[config, reporter, servers, payloads, streamcontent, mixsplit,
-                  leakcheck]
+                  leakcheck, looplag]
 
 when defined(useChronos):
   import navi/chronos
@@ -139,7 +139,7 @@ proc streamSeg(name: string, prog: StreamProgress, now, ran: float,
 
 proc mixedReport(label: string, reqC, wsC, sseC: StatusCounter,
                  up, down: StreamProgress, start, now: float, final = false,
-                 opsRan = 0.0) =
+                 opsRan = 0.0, lag: LoopLag = nil) =
   ## ONE line for the whole mix: every slice's own numbers side by side, never a
   ## sum. Request-shaped slices render through reporter.segment (status tallies
   ## for requests, bare counts for ws/sse), the streaming slices through
@@ -150,6 +150,9 @@ proc mixedReport(label: string, reqC, wsC, sseC: StatusCounter,
   ## not charged for a stream transfer that was still in flight then. The two
   ## streaming slices divide by the full elapsed, because their bytes really did
   ## take that long to move. On an interval line the two are the same window.
+  ##
+  ## The final line also carries the client event-loop lag (`lag`, see
+  ## common/looplag), so a starved slice can be told apart from a slow server.
   let elapsed = now - start
   let opsElapsed = if final: opsRan else: elapsed
   let rss = rssBytes()
@@ -161,7 +164,16 @@ proc mixedReport(label: string, reqC, wsC, sseC: StatusCounter,
     streamSeg("up", up, now, elapsed, final), " | ",
     streamSeg("down", down, now, elapsed, final),
     " | RSS ", rssStr, " | heap ", fmtBytes(getOccupiedMem()),
+    (if lag.isNil: "" else: " | " & lag.render()),
     " | t=", elapsed.int, "s"
+
+proc lagProbe(lag: LoopLag, deadline: float) {.async.} =
+  ## Sample the event-loop lag until the deadline: every `lagTickMs` sleep that
+  ## comes back late was late because something else held the loop (#462).
+  while epochTime() < deadline:
+    let t0 = epochTime()
+    await sleep(lagTickMs)
+    lag.add((epochTime() - t0) * 1000.0)
 
 type Live = ref object
   ## How many slice futures are still running. The reporter watches this instead
@@ -266,6 +278,8 @@ proc main() {.async.} =
   for _ in 0 ..< split.down:
     slices.add downloadSlice(apis[k mod apis.len], cfg, addr pool, down, deadline)
     inc k
+  let lag = newLoopLag()
+  slices.add lagProbe(lag, deadline)
   let live = Live(workers: slices.len)
   var futs: seq[Future[void]]
   for f in slices: futs.add track(live, f)
@@ -299,7 +313,7 @@ proc main() {.async.} =
     cfg.failHard("no download bytes moved (" & $down.errors & " errors)")
 
   mixedReport(cfg.label & " final", reqCounter, wsCounter, sseCounter, up, down,
-              start, start + elapsed, final = true, opsRan = opsRan)
+              start, start + elapsed, final = true, opsRan = opsRan, lag = lag)
   await chaosFinish(chaos, leakBase, cfg, apis)  # close all clients, drain, leak assert
   echo "== mixed ", backend, " ", cfg.proto, " passed (req ", reqCounter.ops,
     " ops ", fmtRate(reqCounter.ops, opsRan), " ops/s, ws ", wsCounter.ops,

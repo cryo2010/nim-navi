@@ -11,7 +11,7 @@ import std/[strutils, base64]
 import pkg/chronos, pkg/chronos/transports/stream
 import pkg/chronos/streams/asyncstream
 import ./api
-import ./tls_store, ./tunnel, ./timing
+import ./tls_store, ./tunnel, ./timing, ./fairness
 import ../core/response  # for navi's TimeoutError
 import ../core/socks
 
@@ -374,20 +374,58 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   await est
   return conn
 
-proc sendAll*(c: Conn, data: string): Future[void] {.async.} =
-  when defined(ssl):
-    if not c.tls.isNil:
-      await c.tls.write(data)
-      return
-  # A conn with neither a live TLS session nor a plaintext writer is closed/half-
-  # established (e.g. a connection whose ALPN never resolved under event-loop
-  # starvation, mis-routed onto the h1 path): writing would deref a nil
-  # AsyncStreamWriter and SIGSEGV. Raise a typed transport error instead, so the
-  # h1 write-time classifier tears the conn down and retries on a fresh one rather
-  # than crashing the whole loop (surfaced by the h2 headerbomb chaos mode).
-  if c.writer.isNil:
-    raise newException(IOError, "navi: send on a closed connection")
-  await c.writer.write(data)
+template yieldSlice() =
+  ## Give the event loop a turn when this thread's connection I/O has run a whole
+  ## fairness slice without one (see `fairness`). A zero-length sleep is a timer
+  ## that is already due, so the next `poll()` resumes us after it has serviced
+  ## every ready transport. Not `stepsAsync(1)`: chronos ignores pending ticks when
+  ## it computes the poll timeout, so with no other work queued that would block
+  ## in the selector forever.
+  if sliceSpent():
+    await sleepAsync(ZeroDuration)
+    sliceRestart()
+
+proc fairYield*(): Future[void] {.async.} =
+  ## The connection layer's fairness check as a standalone step: yields to the
+  ## event loop only when this thread's I/O has used up its slice. `recvSome` and
+  ## `sendAll` run the same check inline; this is the hook for code that loops on
+  ## work which can complete without parking, and what the unit tests drive.
+  yieldSlice()
+
+template awaitFairVoid(fut: typed) =
+  ## Await an I/O future, restarting the fairness slice when it really parked: a
+  ## resume from a pending future means the event loop ran in between.
+  let ioFut = fut
+  let parks = not ioFut.finished()
+  await ioFut
+  if parks: sliceRestart()
+
+proc sendAll*(c: Conn, data: string, fair = true): Future[void] {.async.} =
+  ## Write all of `data`. chronos's `fastWrite` writes straight into a writable
+  ## socket, so an upload whose send buffer keeps draining never returns to the loop
+  ## on its own; with `fair` (the default) the call yields once the write is done if
+  ## the thread's slice is spent (#462). The write is issued first, synchronously, so
+  ## concurrent un-awaited `sendAll` calls on one Conn enter the transport's FIFO
+  ## write lock (and reach the wire) in call order: a WebSocket's automatic pong or
+  ## Close reply cannot overtake a frame the user sent before it. A cancel landing on
+  ## the trailing yield therefore finds the bytes already written. The h2 mux passes
+  ## `fair = false` and runs the yield itself before it records a stream as on the
+  ## wire, which its send chain keeps in order.
+  block write:
+    when defined(ssl):
+      if not c.tls.isNil:
+        awaitFairVoid(c.tls.write(data))
+        break write
+    # A conn with neither a live TLS session nor a plaintext writer is closed/half-
+    # established (e.g. a connection whose ALPN never resolved under event-loop
+    # starvation, mis-routed onto the h1 path): writing would deref a nil
+    # AsyncStreamWriter and SIGSEGV. Raise a typed transport error instead, so the
+    # h1 write-time classifier tears the conn down and retries on a fresh one rather
+    # than crashing the whole loop (surfaced by the h2 headerbomb chaos mode).
+    if c.writer.isNil:
+      raise newException(IOError, "navi: send on a closed connection")
+    awaitFairVoid(c.writer.write(data))
+  if fair: yieldSlice()
 
 proc plaintextRead(c: Conn): Future[string] {.async.} =
   var buf = newStringUninit(naviReadBufSize)   # overwritten by readOnce then setLen(n): no zero-fill
@@ -434,11 +472,20 @@ proc recvSome*(c: Conn): Future[string] {.async.} =
   ## timeout) when set; on expiry the read is cancelled and TimeoutError is raised
   ## (terminal: the caller tears the connection down). A read parked by an earlier
   ## `recvWithin` is resumed here, so its bytes reach this caller instead of being lost.
+  ##
+  ## A read that completes without parking (the peer keeps the socket readable, and
+  ## chronos 4.4's transport `fastRead` reads straight off it) never returns to the
+  ## event loop on its own, so a saturated download would
+  ## starve every other task on it; `yieldSlice` bounds that run (#462). The yield
+  ## comes before the read starts, so a cancellation landing on it loses no bytes.
+  yieldSlice()
   let readFut = c.startRead()
+  let parks = not readFut.finished()
   if c.readMs > 0:
     if not await withTimeout(readFut, c.readMs.milliseconds):
       raise newException(response.TimeoutError, readTimeoutMsg(c.readMs))
   result = await readFut
+  if parks: sliceRestart()       # the read waited on the loop: a fresh slice
 
 proc recvWithin*(c: Conn, ms: int): Future[tuple[timedOut: bool, data: string]] {.async.} =
   ## A bounded read that leaves the connection usable when it expires: waits at most
