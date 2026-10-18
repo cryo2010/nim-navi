@@ -298,6 +298,21 @@ Where each is exercised:
   `WINDOW_UPDATE` past the replenish threshold until `ackRecv` releases it (a normal
   stream replenishes eagerly, as the control case), so a slow consumer stalls the
   peer. Also covers incremental `takeBody` drain and the running-total size cap.
+- **Fairness (`test_h2_fairness`, `test_h2_fairness_chronos`)**: the h2 mux's drain
+  budget (#461): a download whose whole body is already queued is drained next to an
+  upload on the same mux (`support_h2flood`, 64 KiB peer windows). The upload is
+  parked on its first window and the peer's grant for the rest is already unread in
+  the client's socket when the drain starts (the test blocks its thread while the
+  peer writes it), so nothing depends on the peer thread's speed: the drain must
+  give the loop a turn per 64 KiB of body (~122 for 8 MB; 0-1 before the budget)
+  and the upload must move within the first MiB of it (before the budget, not
+  until the 4 MiB window ack).
+- **Close after a complete response (`test_h2_close_drain`, `test_h2_close_drain_chronos`,
+  shared `h2_close_drain_spec`, `support_h2close`)**: a peer sends a whole 2 MB body
+  with END_STREAM (optionally a GOAWAY) and closes 150 ms later, while a CPU-bound or
+  awaiting consumer is still pulling the queue; the consumer must get every byte and a
+  clean end. With no END_STREAM (a tunnel's last frames) it must get every queued
+  byte before "connection closed".
 - **Unit** — `test_entries`/`test_async`/`test_chronos` cover headers-first,
   full-drain-pools-and-reuses, failed-drain-closes, and an incremental cap;
   `test_stream_decompress` decodes a streamed body through `each`.

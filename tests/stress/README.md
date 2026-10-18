@@ -155,8 +155,10 @@ differently:
 - **Flow-control windows.** vortex defaults to a 1 MiB stream window, a 1 MiB h2
   connection window and a 4 MiB h3 connection window; hypercorn advertises HTTP/2's
   64 KiB initial window. The harness leaves both at their defaults, so every
-  upload number (`up` in `mixed`, the `streamUpload` MB/s) moves, relevant to
-  #461.
+  upload number (`up` in `mixed`, the `streamUpload` MB/s) moves: an h2 upload
+  sends at most one server window per round trip, and in a `mixed` cell that
+  round trip includes waiting behind the download for an event-loop turn. #461
+  bounded that wait on navi's side; the window itself is the server's.
 - **No Caddy hop.** Under hypercorn an h3 cell's bytes cross Caddy and then a
   loopback h1 connection to the backend; under vortex they do not.
 
