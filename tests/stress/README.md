@@ -84,6 +84,7 @@ carries the whole-run average.
 | `REPORT_SECONDS` | `60` | report cadence |
 | `STREAM_BYTES` | `1073741824` | stream size (1 GiB); lower for a smoke |
 | `WS_H3_PORTBAND` | `3000` | `mixed` + h3 **under hypercorn** only: the aioquic ws origins are `NAVI_BASE_PORT + band + i`, beside the Caddy front. A vortex origin needs no band |
+| `RUN_ID` | PID of the nim process running the task | isolation id for the docker image tag and container name, so runs can go **in parallel**. See [Parallel runs](#parallel-runs) |
 
 The `requests` workload rotates four body kinds through `/echo`:
 
@@ -99,6 +100,31 @@ Example:
 NAVI_SECONDS=600 NAVI_PROTO=all NAVI_CLIENT=chronos \
   nimble stressRequests
 ```
+
+## Parallel runs
+
+Runs are isolated by `NAVI_RUN_ID` (mirrors vortex's `VORTEX_RUN_ID`), so several
+can go at once on one host:
+
+```
+NAVI_RUN_ID=a NAVI_PROTO=h1 nimble stressWs &
+NAVI_RUN_ID=b NAVI_PROTO=h2 nimble stressWs &
+```
+
+Each run builds its image as `navi-stress:<id>` (or `navi-stress-h3:<id>`) and
+runs its one container as `navi-stress-<workload>-<id>`, so a watcher finds it
+with `docker ps --filter name=navi-stress-ws-a` and the id is in the container's
+environment as `NAVI_RUN_ID`. Before the id existed, two concurrent `nimble
+stress*` both ran `docker build -t navi-stress`, re-tagging the shared name under
+each other's running container, which then showed a bare image id and escaped
+`docker ps --filter ancestor=navi-stress`. The id defaults to the PID of the nim
+process running the task, so the six workloads of one `nimble stress` share it
+and an id is never needed unless you want a readable one. It must be 1-64
+characters of `[A-Za-z0-9_.-]` starting with a letter or digit, the subset a
+docker tag and a container name both accept; anything else is refused before any
+build. The build also keeps the plain `navi-stress` tag on the image, so the next
+build is a cache hit, and drops the per-run tag when the run ends; a run killed
+from outside leaves its tag for `docker rmi navi-stress:<id>`.
 
 ## Choosing the server
 

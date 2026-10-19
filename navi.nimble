@@ -118,7 +118,27 @@ proc runStress(workload: string) =
   let server = getEnv("NAVI_SERVER", "hypercorn")
   let h3 = proto == "h3" or proto == "all" or server == "vortex"
   let dockerfile = if h3: "tests/stress/Dockerfile.h3" else: "tests/stress/Dockerfile"
-  let image = if h3: "navi-stress-h3" else: "navi-stress"
+  # NAVI_RUN_ID isolates concurrent runs (vortex's VORTEX_RUN_ID): it suffixes the
+  # image tag and names the container, so two `nimble stress*` launched at once
+  # neither re-tag each other's image out from under a running container nor
+  # leave a watcher with no name to `docker ps --filter` on. Defaults to the PID
+  # of the nim process running this task, which lives for the whole run, so the
+  # six workloads of one `nimble stress` share an id; the default is put in the
+  # environment for exactly that reason, and forwarded to the container so the
+  # id is in its env too. The id lands in a docker tag and a container name, so
+  # it is held to the characters both accept ([A-Za-z0-9_.-], leading
+  # alphanumeric) and refused loudly otherwise, before any build is paid for.
+  if getEnv("NAVI_RUN_ID").strip().len == 0:
+    putEnv("NAVI_RUN_ID", gorgeEx("echo $PPID").output.strip())
+  let runId = getEnv("NAVI_RUN_ID").strip()
+  if runId.len > 64 or runId[0] notin {'a'..'z', 'A'..'Z', '0'..'9'} or
+     not runId.allCharsInSet({'a'..'z', 'A'..'Z', '0'..'9', '_', '.', '-'}):
+    quit("NAVI_RUN_ID must be 1-64 characters of [A-Za-z0-9_.-] starting with " &
+         "a letter or digit (got '" & runId & "'); it names a docker image tag " &
+         "and container")
+  let repo = if h3: "navi-stress-h3" else: "navi-stress"
+  let image = repo & ":" & runId
+  let container = repo & "-" & workload & "-" & runId
   # The vortex build-args, forwarded only to the image that has them: VORTEX_REF
   # pins the nim-vortex commit (the Dockerfile's default is the pinned sha; bump
   # it deliberately) and VORTEX_RUNTIME picks vortex's handler runtime, which is
@@ -146,8 +166,19 @@ proc runStress(workload: string) =
         quit("NAVI_VORTEX_RUNTIME must be sync, async or chronos (got '" &
              vrt & "')")
       buildArgs &= " --build-arg 'VORTEX_RUNTIME=" & vrt & "'"
-  exec "docker build" & buildArgs & " -f " & dockerfile & " -t " & image & " ."
-  exec "docker run --rm -e NAVI_WORKLOAD=" & workload &
+  # Tagged twice: the per-run tag is what this run uses, and the plain repo name
+  # (what `docker build -t navi-stress` by hand has always produced) keeps the
+  # image alive for the next build's cache once the per-run tag is dropped
+  # below. A concurrent run that built a different image moves the plain tag to
+  # its own; this run's container is unaffected, it holds the image by id.
+  exec "docker build" & buildArgs & " -f " & dockerfile & " -t " & repo &
+       " -t " & image & " ."
+  # The per-run tag is removed after the run whatever its outcome, so parallel
+  # runs do not pile up tags; the exit code is the container's, as before (nimble
+  # still does not propagate it, see above). A run killed from outside leaves its
+  # tag behind, which `docker rmi <image>` cleans up.
+  exec "docker run --rm --name " & container & " -e NAVI_RUN_ID" &
+       " -e NAVI_WORKLOAD=" & workload &
        " -e NAVI_PROTO -e NAVI_CLIENT -e NAVI_SERVER -e NAVI_SERVER_COUNT" &
        " -e NAVI_SECONDS -e NAVI_CLIENT_COUNT -e NAVI_CONCURRENCY" &
        " -e NAVI_REQ_COMPRESSION -e NAVI_RESP_COMPRESSION -e NAVI_CONTENT_TYPES" &
@@ -159,7 +190,8 @@ proc runStress(workload: string) =
        " -e NAVI_WS_H3_PORTBAND" &   # the mixed+h3 ws band (aioquic origins)
        " -e NAVI_CHAOS -e NAVI_CHAOS_CONC -e NAVI_CHAOS_SEED -e NAVI_CHAOS_PORTBAND" &
        " -e NAVI_CHAOS_WATCHDOG -e NAVI_CHAOS_FD_SLACK -e NAVI_CHAOS_HEAP_SLACK_MB" &
-       " -e NAVI_CHAOS_RSS_SLACK_MB -e NAVI_CHAOS_SELFTEST " & image
+       " -e NAVI_CHAOS_RSS_SLACK_MB -e NAVI_CHAOS_SELFTEST " & image &
+       "; rc=$?; docker rmi " & image & " >/dev/null 2>&1; exit $rc"
 
 task stressRequests, "Stress: buffered request/response soak (verbs, compression, auth, mw, pool/mux)":
   runStress("requests")

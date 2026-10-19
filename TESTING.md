@@ -477,6 +477,7 @@ no work never reads as a pass.
 | `NAVI_KEEPALIVE_MAX` | `1000000000` | hypercorn `keep_alive_max_requests` (`200` under `NAVI_RECYCLE=1`) |
 | `NAVI_KEEPALIVE_TIMEOUT` | `NAVI_SECONDS + 3600` | hypercorn `keep_alive_timeout` (`2` under `NAVI_RECYCLE=1`) |
 | `NAVI_WS_H3_PORTBAND` | `3000` | `mixed` + h3 only: the aioquic WebSocket origins sit at `NAVI_BASE_PORT + band + i`, beside the Caddy front |
+| `NAVI_RUN_ID` | the PID of the nim process running the task | Isolation id for the docker image tag (`navi-stress:<id>`) and container name (`navi-stress-<workload>-<id>`), so several runs can go in parallel without clobbering one another; `[A-Za-z0-9_.-]`, 1-64 characters |
 | `NAVI_CHAOS*` | off | The opt-in misbehaving-server sidecar and its leak bounds: `NAVI_CHAOS`, `_CONC`, `_SEED`, `_PORTBAND`, `_WATCHDOG`, `_FD_SLACK`, `_HEAP_SLACK_MB`, `_RSS_SLACK_MB`, `_SELFTEST`. Documented in [`tests/stress/README.md`](tests/stress/README.md) |
 
 (`NAVI_WORKLOAD` is set by each task; `NAVI_HOST` / `NAVI_BASE_PORT` /
