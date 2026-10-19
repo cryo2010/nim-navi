@@ -169,6 +169,19 @@ proc startSseKeepAlive*(th: var Thread[SseKeepAliveSrv], port: var int,
   createThread(th, serveSseKeepAlive, c)
   while not ready: os.sleep(1)
 
+proc waitSseRequests*(requests: ptr int, want: int) =
+  ## Wait (bounded) for the keep-alive origin's `requests` to reach `want`.
+  ## The origin counts a request only AFTER its response bytes are out (see the
+  ## Windows note in serveSseKeepAlive), so a client can hold the whole response
+  ## while the server thread has yet to be scheduled for the increment; a `check
+  ## requests == N` read straight after the client returned raced that increment
+  ## and came up one short, on CI, about once in twenty runs. Waiting here keeps
+  ## the check exact: a count that never arrives still fails it, after 2 s.
+  var guard = 0
+  while requests[] < want and guard < 400:
+    inc guard
+    os.sleep(5)
+
 proc drainSseKeepAlive*(port: int, want: int, accepts: ptr int) =
   ## Unblock the server's parked `accept` so its thread can be joined when the client
   ## opened fewer connections than `maxConns` -- which, for these tests, is the point.

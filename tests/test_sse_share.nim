@@ -46,6 +46,7 @@ suite "sync SSE shares the caller's client (#466)":
     s2.close()
     check got1 == @["one", "two"]
     check got2 == @["one", "two"]
+    waitSseRequests(addr requests, 2)
     check requests == 2                  # both streams were served
     check accepts == 1                   # ...on ONE connection, no second handshake
     api.close()
@@ -67,6 +68,7 @@ suite "sync SSE shares the caller's client (#466)":
     check got == @["one", "two"]
     check res.status == 200
     check accepts == 1                   # the client's pooled connection survived
+    waitSseRequests(addr requests, 2)
     check requests == 2
     # The SSE response's Set-Cookie went into the CALLER's jar, so the caller's own
     # request carried it back: proof the jar is shared, not copied.
@@ -101,6 +103,7 @@ suite "sync SSE shares the caller's client (#466)":
     check first.isSome and first.get.data == "one"
     check res.status == 200
     check accepts == 2                   # only the stream's own connection was lost
+    waitSseRequests(addr requests, 3)
     check requests == 3
     api.close()
     drainSseKeepAlive(port, 4, addr accepts)
@@ -120,6 +123,7 @@ suite "sync SSE shares the caller's client (#466)":
     s.close()
     check first.status == 200
     check accepts == 1                   # the stream ran on the pooled connection
+    waitSseRequests(addr requests, 2)
     check requests == 2
     api.close()                          # reaps the connection the stream pooled
     check accepts == 1
