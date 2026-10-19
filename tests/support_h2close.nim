@@ -5,7 +5,8 @@
 ## `endStream = false` leaves the stream open, like a tunnel peer that sends its last
 ## bytes (a WebSocket Close frame) and drops the connection. Run on its own thread so
 ## it stays off navi's event loop. Used by `h2_close_drain_spec` (#461 round 2).
-import std/[net, os]
+import std/[net, monotimes, times]
+from std/nativesockets import selectRead
 from navi/proto/h2/frame import encodeSettings, encodeSettingsAck, encodeHeaders,
   encodeData, encodeGoAway
 
@@ -53,7 +54,20 @@ proc runClosePeer*(arg: ClosePeerArg) {.thread.} =
             client.send(encodeData(sid, chunk[0 ..< n],
                                    endStream = arg.endStream and left == 0))
           if arg.goaway: client.send(encodeGoAway(sid, 0))
-          sleep(arg.closeDelayMs)
+          # Keep reading what the client sends meanwhile (its WINDOW_UPDATEs): a
+          # close with unread bytes in the receive buffer sends an RST rather than a
+          # FIN, and on Windows an RST discards whatever the client has not read
+          # yet, so the test would hinge on its reader having read the whole body
+          # within the delay. The close must be a clean EOF behind the body.
+          let closeAt = getMonoTime() + initDuration(milliseconds = arg.closeDelayMs)
+          while true:
+            let left = (closeAt - getMonoTime()).inMilliseconds
+            if left <= 0: break
+            var ready = @[client.getFd()]
+            if selectRead(ready, int(left)) > 0:
+              try:
+                if client.recv(65536).len == 0: break
+              except CatchableError: break
           break serve
   client.close()
   listener.close()
