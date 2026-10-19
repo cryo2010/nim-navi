@@ -325,6 +325,9 @@ Where each is exercised:
   `-d:naviFairSliceUs=2000000000`. asyncdispatch's plaintext `recv`/`send` always park
   and its in-place path is TLS, which the unit suite cannot reach, so there they
   pass either way: its transport wiring is covered only by the mixed stress cell.
+  The exception is Windows, where a plaintext WSASend completes in place and the
+  upload test is a real control for asyncdispatch too (one tick in 300 ms while
+  `sendAll` used the string `send`, whose callback completion looked like a park).
   A third test issues two un-awaited `sendAll` calls on one connection with the
   slice spent and a fresh slice in between, and asserts a mirroring peer gets them
   in call order (it failed on both backends while the write yielded before writing).
@@ -335,7 +338,9 @@ Where each is exercised:
   sender cancelled in the middle of the chain does not let the one behind it
   overtake; an upload chunk cancelled before its write gives its connection-window
   credit back, so a later body of exactly the peer's 64 KiB window (the peer never
-  sends WINDOW_UPDATE) still completes; control: a request cancelled after its
+  sends WINDOW_UPDATE) still completes (the chunk is a future the test completes
+  once the HEADERS write is done, and a callback behind the mux's continuation
+  cancels it on the yield, so no step depends on a write completing in place); control: a request cancelled after its
   HEADERS went out is still RST. `test_h2_conn` covers `refundUnsent` at the sans-io
   level.
 

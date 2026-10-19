@@ -466,7 +466,12 @@ onward (pre-1.0, minor versions may include breaking changes).
   so the TLS pump's reads and writes finish in place too (chronos 4.0 and 4.2 have
   only `fastWrite`, so there only the write side ran this way). So an h1 download (or
   SSE feed) arriving faster than it was consumed, or an upload whose send buffer kept
-  draining, ran read after read with the loop never getting a turn. In the mixed h1
+  draining, ran read after read with the loop never getting a turn. On Windows the
+  asyncdispatch backend did it over plain TCP too: a WSASend that completes at once
+  still resolved asyncdispatch's string `send` future from a callback, which looked
+  like a real park (restarting the slice) while the callback queue, drained in a loop
+  that services no timers, ran the upload back to back; `sendAll` now uses the
+  pointer overload, whose future completes in place. In the mixed h1
   stress cell that held the client loop for 160-250 ms per turn (a 10 ms timer fired
   ~175 ms late), and the buffered `/echo` requests sharing it fell to ~50 ops/s
   against ~2300 solo, against hypercorn and the native vortex origin alike, which is

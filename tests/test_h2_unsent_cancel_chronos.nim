@@ -134,22 +134,31 @@ when naviFairSliceUs <= 100_000:
       proc run(): Future[(bool, bool, int)] {.async.} =
         let mux = await connectMux(basePort + 3)
         discard await mux.request(hdrs("GET", "/warm"), "")
-        # The first chunk comes back at once but only after a slice of CPU, so its
-        # send (framed: 20000 bytes debited from the 65535 connection window) parks
-        # on the fairness yield before writing. The second never comes.
+        # The first chunk is a future the test owns, so `a` is parked in the
+        # producer (its HEADERS written, however long that write took) when the
+        # chunk arrives. The second never comes.
+        let gate = newFuture[string]("test.gate")
         let never = newFuture[string]("test.never")
         var calls = 0
         let producer = AsyncBodyProducer(proc(): Future[string] =
           inc calls
-          if calls > 1: return never
-          spendSlice()
-          let f = newFuture[string]("test.chunk")
-          f.complete(repeat('x', 20_000))
-          f)
-        sliceRestart()               # the HEADERS go straight out
+          if calls > 1: never else: gate)
         let a = mux.request(hdrs("POST", "/a"), "", asyncStream = producer)
-        let parked = calls == 1 and not a.finished()
-        await a.cancelAndWait()
+        await waitUntil(proc(): bool = calls == 1)
+        # `a` registered its continuation on `gate` first, so on completion it runs
+        # first: it frames the chunk (20000 bytes debited from the 65535 connection
+        # window) and, with the slice spent, parks on the fairness yield before the
+        # write. This callback runs right after it, before the loop can turn and
+        # fire the yield's timer, and cancels `a` there.
+        var parked = false
+        var cancelled: Future[void]
+        gate.addCallback(proc(udata: pointer) {.gcsafe, raises: [].} =
+          parked = calls == 1 and not a.finished()
+          cancelled = a.cancelAndWait())
+        spendSlice()
+        gate.complete(repeat('x', 20_000))
+        await waitUntil(proc(): bool = not cancelled.isNil)
+        await cancelled
         # The peer never sends WINDOW_UPDATE: a body of exactly the default window
         # completes only if the cancelled chunk's 20000 bytes were given back.
         let b = mux.request(hdrs("POST", "/b"), repeat('z', 65535))

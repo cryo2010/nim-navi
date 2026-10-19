@@ -17,7 +17,8 @@
 ## plaintext `recv`/`send` always park on the selector, and its in-place TLS path
 ## needs an origin the unit suite does not have (no libcrypto on macOS), so there
 ## they pass with or without the yield: the asyncdispatch transport wiring is
-## covered only by the mixed stress cell. The last test is the end-to-end contract
+## covered only by the mixed stress cell. Except on Windows, where a plaintext
+## WSASend completes in place, so the upload test is a real control there too. The last test is the end-to-end contract
 ## over plain h1 (buffered requests on one `Navi` complete while a streamed download
 ## holds a pooled connection); its download sleeps per chunk, so it does not depend
 ## on the yield either.
@@ -25,6 +26,10 @@
 import navi/backend/fairness   # sliceRestart (the write-order test)
 
 const ioRunMs = 300       # how long each transport-level loop runs
+const minIoTicks = when defined(windows): 10 else: 20
+  ## Ticks a 1 ms ticker must get in `ioRunMs` next to a transfer: ~130 elsewhere,
+  ## 0-1 without the yield. Windows timers and completion-port waits round to its
+  ## ~15.6 ms clock tick whenever the loop has nothing due, so expect fewer there.
 const ioWorkUs = 500      # CPU per chunk: the consumer/producer is slower than
                           # loopback, so the socket stays readable / writable
 
@@ -127,18 +132,20 @@ suite "event-loop fairness (" & fairBackendName & ")":
     let (ticks, worstGapMs, moved) = waitFor ioLoopLag(srv.port, upload = false)
     stopFair(srv)
     check moved > 0
-    check ticks >= 20          # 0-2 on chronos without the yield
+    check ticks >= minIoTicks  # 0-2 on chronos without the yield
     check worstGapMs < 100     # the whole run without the yield
 
   test "an upload whose socket keeps draining lets a concurrent task run (#462)":
     # Through the real `sendAll`: chronos's `fastWrite` completes in place while the
-    # send buffer has room, as SSL_write does on asyncdispatch over TLS.
+    # send buffer has room, as SSL_write does on asyncdispatch over TLS, and so does
+    # a plaintext WSASend on Windows asyncdispatch, which used to look parked there
+    # (its string `send` completes from a callback) and never yielded.
     var srv: FairServer
     startFair(srv)
     let (ticks, worstGapMs, moved) = waitFor ioLoopLag(srv.port, upload = true)
     stopFair(srv)
     check moved > 0
-    check ticks >= 20
+    check ticks >= minIoTicks
     check worstGapMs < 100
 
   test "concurrent un-awaited sendAll calls on one connection write in call order":
@@ -176,11 +183,15 @@ suite "event-loop fairness (" & fairBackendName & ")":
       let api = newNavi()
       var got = 0
       var downloadDone = false
+      var reqsDone = false
       proc download() {.async.} =
         let res = await api.stream.get(base & "/big")
         res.each(chunk):
           got += chunk.len
-          await sleep(1)       # a slow consumer keeps the connection checked out
+          # A slow consumer keeps the connection checked out while the requests
+          # run; after that it drains at full speed (a 1 ms sleep is ~15.6 ms on
+          # Windows, which made 32 MiB of chunks take most of a minute there).
+          if not reqsDone: await sleep(1)
         downloadDone = true
       let dl = download()
       while got == 0: await sleep(1)       # the download holds its connection now
@@ -191,6 +202,7 @@ suite "event-loop fairness (" & fairBackendName & ")":
         let r = await f
         if r.status == 200 and r.body == "ok": inc ok
       let finishedFirst = not downloadDone
+      reqsDone = true
       await dl
       await api.close()
       return (ok, got, finishedFirst)

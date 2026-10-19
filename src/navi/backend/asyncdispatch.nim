@@ -749,7 +749,17 @@ proc sendAll*(c: Conn, data: string, fair = true): Future[void] {.async.} =
     # the number, is the authority (the plaintext twin of the `sslWrite` guard).
     if c.fd == invalidFd or (not c.state.isNil and c.state[] == csClosed):
       raise newException(IOError, "navi: send on a closed connection")
-    awaitFairVoid(send(c.fd, data))
+    if data.len > 0:
+      # The pointer overload, not `send(fd, string)`: on Windows a WSASend that
+      # completes at once finishes the pointer future in place, but the string
+      # wrapper completes its own future from a `callSoon` callback, so it looks
+      # parked and restarted the slice on every write. asyncdispatch drains its
+      # callback queue in a loop without servicing timers, so an upload whose send
+      # buffer kept draining ran back to back inside that loop and never yielded
+      # (a 1 ms ticker saw one tick in 300 ms). `data` lives in this proc's
+      # environment until the await returns, so the pointer stays valid. On POSIX
+      # both overloads park on the selector.
+      awaitFairVoid(send(c.fd, unsafeAddr data[0], data.len))
   if fair: yieldSlice()
 
 proc rearm*(c: var Conn, readMs = 0, totalMs = 0) =
