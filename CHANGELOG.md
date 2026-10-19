@@ -450,6 +450,11 @@ onward (pre-1.0, minor versions may include breaking changes).
   queues a whole 8 MB download and then drains it next to an upload on the same mux:
   the drain must let the loop turn and the upload get past its first window, where
   before it took zero turns and the upload sat at 64 KiB until the drain finished.
+  The body puller also no longer ends a stream short: a read carrying a stream's
+  last DATA and END_STREAM marked it ended before the reader moved that body into
+  the stream's queue (the reader awaits its acks in between), so a pull that ran in
+  that gap, or a reader that died there, dropped the tail. On Windows chronos, where
+  the ack's write parks, a WebSocket-over-h2 tunnel lost its last frames this way.
 - **A saturated TLS transfer no longer holds the async event loop across a run of
   synchronous reads or writes (#462).** Both async runtimes resume an `await` on
   an already-finished

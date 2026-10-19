@@ -373,17 +373,20 @@ proc reapStream(mux: H2Mux, sid: uint32) {.gcsafe, raises: [].} =
   except Exception:
     discard
 
+proc queueBody(mux: H2Mux, sid: uint32) =
+  ## Move the body the connection holds for sink stream `sid` into its `recvq`.
+  let raw = mux.h2.takeBody(sid)
+  if raw.len > 0:
+    if not mux.recvq.hasKey(sid): mux.recvq[sid] = initDeque[string]()
+    mux.recvq[sid].addLast(raw)
+
 proc queueBodies(mux: H2Mux) =
   ## Move each sink stream's newly-arrived body out of the connection into its
   ## `recvq` as one discrete chunk per feed. Draining the connection per feed keeps
   ## its buffer small and keeps delivery incremental: the drain pops chunks one at a
   ## time, so a fast reader can't collapse the whole body into a single sink call.
   ## Non-blocking (no sink here); the receive window still gates memory via ackRecv.
-  for sid in mux.sinkStreams:
-    let raw = mux.h2.takeBody(sid)
-    if raw.len > 0:
-      if not mux.recvq.hasKey(sid): mux.recvq[sid] = initDeque[string]()
-      mux.recvq[sid].addLast(raw)
+  for sid in mux.sinkStreams: mux.queueBody(sid)
 
 proc wakeRecvers(mux: H2Mux) =
   ## Wake every sink stream's drain loop so it re-checks its queue and the
@@ -598,6 +601,14 @@ proc readChunk*(mux: H2Mux, sid: uint32): Future[string] {.async.} =
   ## client's own teardown and still raises at once.
   try:
     while true:
+      # The reader feeds a read into the connection, then may await a send (its
+      # acks) before `queueBodies` moves the body over; a read that carried a
+      # stream's last DATA and END_STREAM leaves the stream ended with that body
+      # still in the connection. A pull that ran in that window (the send parked:
+      # an IOCP write on Windows, a busy send chain) saw "ended, queue empty" and
+      # ended the stream without its tail, and a reader that died in that send
+      # never moved it at all. Take whatever the connection holds first.
+      if sid in mux.sinkStreams: mux.queueBody(sid)
       if not mux.alive:
         let queued = mux.recvq.hasKey(sid) and mux.recvq[sid].len > 0
         let endedClean = mux.h2.streamEnded(sid) and not mux.h2.streamReset(sid)

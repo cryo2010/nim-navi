@@ -6,20 +6,30 @@
 ##     window, so the whole body lands in the client's per-stream queue without
 ##     waiting for a single WINDOW_UPDATE;
 ##   * the second request (a POST) is an upload against the default 64 KiB windows
-##     this peer advertises (an empty SETTINGS), acked like a real server: every DATA
-##     frame is answered with a stream and a connection WINDOW_UPDATE for its length,
-##     and END_STREAM gets a 200 with END_STREAM.
+##     this peer advertises (an empty SETTINGS). The peer acks none of it until the
+##     test says so: once a whole first window has arrived it raises
+##     `floodUploadBlocked` and waits for `floodRelease`, then grants one stream and
+##     one connection WINDOW_UPDATE big enough for the rest of the upload, raises
+##     `floodGranted`, and answers END_STREAM with a 200.
 ##
-## So the upload can only move one window per round trip through the client's event
-## loop, which is exactly what starved next to a busy download.
+## The handshake lets the test put the grant in the client's socket buffer while
+## its own thread is blocked, so nothing on the client has read it when the drain
+## starts: the upload then moves past its first window exactly when the client's
+## event loop gives the mux reader a turn, with no dependence on how fast this
+## thread answers (under ASan it answered too late for the drain to see it).
 ##
 ## Binds 127.0.0.1 explicitly (the CI sandbox rejects the wildcard) and unbuffered,
 ## and owns its whole listener, like support_h2peer.
-import std/net
+import std/[net, os, atomics, monotimes, times]
 from navi/proto/h2/frame import encodeSettings, encodeSettingsAck, encodeHeaders,
   encodeData, encodeWindowUpdate
 
 type FloodArg* = tuple[port: int, downloadBytes: int]
+
+var
+  floodUploadBlocked*: Atomic[bool]   ## a whole first upload window has arrived
+  floodRelease*: Atomic[bool]         ## set by the test: send the grant now
+  floodGranted*: Atomic[bool]         ## the grant has been written to the socket
 
 const
   clientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
@@ -29,6 +39,9 @@ const
   frameSettings = 0x4
   flagEndStream = 0x1
   flagAck = 0x1
+  firstWindow = 65_535                # the default window this peer advertises
+  uploadGrant = 4 * 1024 * 1024       # covers the rest of any upload the tests send
+  handshakeMs = 10_000                # give up waiting for the test after this
 
 proc readU31(s: string, i: int): uint32 =
   (uint32(s[i].uint8 and 0x7f) shl 24) or (uint32(s[i+1].uint8) shl 16) or
@@ -41,10 +54,11 @@ proc runFlood*(arg: FloodArg) {.thread.} =
   listener.listen()
   var client: Socket
   listener.accept(client)
-  client.send(encodeSettings([]))     # defaults: 64 KiB windows for the upload
+  client.send(encodeSettings([]), flags = {})   # defaults: 64 KiB windows for the upload
   var rest: string
   var prefaceDropped = false
   var downloadSid = 0'u32
+  var uploadSeen = 0
   var chunk = newString(16384)
   for i in 0 ..< chunk.len: chunk[i] = char(i mod 251)
   block serve:
@@ -64,25 +78,38 @@ proc runFlood*(arg: FloodArg) {.thread.} =
         let sid = readU31(rest, 5)
         rest = rest[9 + length .. ^1]
         if ftype == frameSettings and (flags and flagAck) == 0:
-          client.send(encodeSettingsAck())
+          client.send(encodeSettingsAck(), flags = {})
         elif ftype == frameHeaders and downloadSid == 0:
           # The download: answer the whole body now, END_STREAM on the last frame.
           downloadSid = sid
-          client.send(encodeHeaders(sid, status200, endStream = false, endHeaders = true))
+          client.send(encodeHeaders(sid, status200, endStream = false, endHeaders = true),
+                      flags = {})
           var left = arg.downloadBytes
           while left > 0:
             let n = min(left, chunk.len)
             left -= n
-            client.send(encodeData(sid, chunk[0 ..< n], endStream = left == 0))
+            client.send(encodeData(sid, chunk[0 ..< n], endStream = left == 0), flags = {})
         elif ftype == frameData and sid != downloadSid:
-          # Upload DATA: hand the window straight back, then answer at END_STREAM.
-          if length > 0:
-            client.send(encodeWindowUpdate(sid, uint32(length)) &
-                        encodeWindowUpdate(0, uint32(length)))
+          # Upload DATA: hold the first window until the test releases it, then
+          # grant the rest in one go; answer at END_STREAM.
+          let before = uploadSeen
+          uploadSeen += length
+          if before < firstWindow and uploadSeen >= firstWindow:
+            floodUploadBlocked.store(true)
+            let giveUp = getMonoTime() + initDuration(milliseconds = handshakeMs)
+            while not floodRelease.load and getMonoTime() < giveUp:
+              sleep(1)
+            client.send(encodeWindowUpdate(sid, uint32(uploadGrant)) &
+                        encodeWindowUpdate(0, uint32(uploadGrant)), flags = {})
+            floodGranted.store(true)
           if (flags and flagEndStream) != 0:
-            client.send(encodeHeaders(sid, status200, endStream = true, endHeaders = true))
+            client.send(encodeHeaders(sid, status200, endStream = true, endHeaders = true),
+                        flags = {})
   client.close()
   listener.close()
 
 proc startFlood*(t: var Thread[FloodArg], port: int, downloadBytes: int) =
+  floodUploadBlocked.store(false)
+  floodRelease.store(false)
+  floodGranted.store(false)
   createThread(t, runFlood, (port, downloadBytes))
