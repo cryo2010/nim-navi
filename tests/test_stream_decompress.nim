@@ -188,8 +188,14 @@ suite "the buffered path runs on the streaming decoder":
     startRaw(th, port, payload)
     var cfg = initNaviConfig()
     cfg.retry.limit = retries
-    result = newNavi(cfg).get("http://127.0.0.1:" & $port & "/")
-    joinThread(th)
+    # Join on every path: a get() that raises (the truncated-body and trailing-bytes
+    # tests expect one) used to skip the join, so `th` was destroyed, freeing the
+    # payload the server thread was still handing to send(); ASan caught that as a
+    # heap-use-after-free, once in a while, attributed to whichever test ran next.
+    try:
+      result = newNavi(cfg).get("http://127.0.0.1:" & $port & "/")
+    finally:
+      joinThread(th)
 
   test "a zlib-wrapped deflate body should decode":
     let res = rawGet(9235, hexToBytes("789cab56cacf56b22a292a4dad050016e30411"), "deflate")
