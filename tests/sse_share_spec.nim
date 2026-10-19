@@ -52,6 +52,7 @@ suite "SSE shares the caller's client (" & sseBackendName & ", #466)":
     check not sharesH2
     check got1 == @["one", "two"]
     check got2 == @["one", "two"]
+    waitSseRequests(addr requests, 2)
     check requests == 2                  # both streams were served
     check accepts == 1                   # ...on ONE connection, no second handshake
     drainSseKeepAlive(port, 3, addr accepts)
@@ -81,6 +82,7 @@ suite "SSE shares the caller's client (" & sseBackendName & ", #466)":
     check got == @["one", "two"]
     check status == 200
     check accepts == 1                   # the client's pooled connection survived
+    waitSseRequests(addr requests, 2)
     check requests == 2
     # The SSE response's Set-Cookie went into the CALLER's jar, so the caller's own
     # request carried it back: proof the jar is shared, not copied.
@@ -123,6 +125,7 @@ suite "SSE shares the caller's client (" & sseBackendName & ", #466)":
     check first == "one"
     check status == 200
     check accepts == 2                   # only the stream's own connection was lost
+    waitSseRequests(addr requests, 3)
     check requests == 3
     drainSseKeepAlive(port, 4, addr accepts)
     joinThread(th)
@@ -151,6 +154,7 @@ suite "SSE shares the caller's client (" & sseBackendName & ", #466)":
     let (firstStatus, afterStream, status) = waitFor run()
     check firstStatus == 200
     check afterStream == 1
+    waitSseRequests(addr requests, 3)
     check requests == 3
     check status == 200
     check accepts == 2

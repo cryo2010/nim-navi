@@ -8,6 +8,19 @@ onward (pre-1.0, minor versions may include breaking changes).
 ## [Unreleased]
 
 ### Added
+- **`NAVI_RUN_ID` in the stress harness: an isolation id for parallel runs,
+  mirroring vortex's `VORTEX_RUN_ID`.** Every `nimble stress*` task now tags its
+  image `navi-stress:<id>` (or `navi-stress-h3:<id>`) and names its container
+  `navi-stress-<workload>-<id>`, so two runs launched at once no longer re-tag the
+  shared `navi-stress` name under each other's running container (which then
+  showed a bare image id and escaped `docker ps --filter ancestor=`), and a watcher
+  can find a cell by name. The id defaults to the PID of the nim process running
+  the task, so one `nimble stress` shares it across its six workloads, and is
+  forwarded into the container's environment. It must be 1-64 characters of
+  `[A-Za-z0-9_.-]` starting with a letter or digit, which a docker tag and a
+  container name both accept, and is refused before any build otherwise. The plain
+  `navi-stress` tag is still applied, so the next build stays a cache hit, and the
+  per-run tag is removed when the run ends.
 - **`NAVI_SERVER=hypercorn|vortex` in the stress harness: a native Nim h1/h2/h3
   origin beside the FastAPI/hypercorn + Caddy + aioquic default (#464).** Every
   workload (`requests`, `ws`, `sse`, `streamUpload`, `streamDownload`, `mixed`) can

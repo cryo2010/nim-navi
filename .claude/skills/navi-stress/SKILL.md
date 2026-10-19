@@ -68,14 +68,18 @@ Only include the env vars you actually set. Keep the invariant `<env> nimble str
 
 ## 2. Launch the soak
 
-- Image: `NAVI_PROTO` of `h3` or `all` → image `navi-stress-h3` (heavier build); otherwise
-  `navi-stress`. The nimble task builds the image then does `docker run --rm … <image>`.
+- Set `NAVI_RUN_ID=<workload>-<proto>-<client>` (e.g. `ws-h3-chronos`) on every cell you fan
+  out: it isolates the cell's docker image tag and container name from the sibling cells, so
+  concurrent builds cannot re-tag one another's image and every container has a name.
+- Image: `NAVI_PROTO` of `h3` or `all` → image `navi-stress-h3:<NAVI_RUN_ID>` (heavier build);
+  otherwise `navi-stress:<NAVI_RUN_ID>`. The nimble task builds the image then does
+  `docker run --rm --name navi-stress-<workload>-<NAVI_RUN_ID> … <image>`.
 - Run the built command with **Bash `run_in_background`**, redirecting to
   `<scratchpad>/<workload>.log` (2>&1). The first `docker build` can take a while (minutes for
   the h3 image) — that's expected.
 - Once `docker run` has started, find the container id:
-  `docker ps --filter ancestor=<image> --format '{{.ID}}'` (retry until non-empty; the build
-  must finish first).
+  `docker ps --filter name=navi-stress-<workload>-<NAVI_RUN_ID> --format '{{.ID}}'` (retry
+  until non-empty; the build must finish first).
 
 ## 3. Monitor via `docker logs`, not the piped file
 
