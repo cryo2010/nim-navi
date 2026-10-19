@@ -5,6 +5,10 @@ var cfg = initNaviConfig()
 cfg.tls.verify = false          # self-signed test cert
 cfg.http = {H2}                  # WebSocket over h2 Extended CONNECT (RFC 8441)
 cfg.retry.limit = 0
+# A response-body cap far below what the tunnel carries below (#470): it bounds a
+# response body, never a WebSocket, so the tunnel must outlive it. Step 2's ~312 KB
+# echo alone is 300x the cap.
+cfg.maxResponseBytes = 1024
 let api = newNavi(cfg)
 let port = getEnv("WS_PORT", "8443")
 let ws = api.websocket("wss://127.0.0.1:" & port & "/chat")
@@ -33,6 +37,22 @@ for i in 1 .. 3:
   let r = ws.receive()
   doAssert r.kind == wmText and r.data == p, "round-trip " & $i & " mismatch"
 
-echo "H2_WS_SYNC_OK payload=", msg.data, " big=", $big.len
 ws.close()
+
+# 4. maxMessageBytes is still the WebSocket's size bound.
+let small = api.websocket("wss://127.0.0.1:" & port & "/chat", maxMessageBytes = 256)
+small.send("x".repeat(512))
+var tooBig = false
+try: discard small.receive()
+except WsMessageTooLarge: tooBig = true
+doAssert tooBig, "maxMessageBytes did not reject a 512-byte message"
+small.close()
+
+# 5. A plain h2 response on the same client still honours maxResponseBytes.
+var capped = false
+try: discard api.get("https://127.0.0.1:" & port & "/big")
+except ResponseTooLargeError: capped = true
+doAssert capped, "a 4 KiB h2 response passed maxResponseBytes = 1024"
+
+echo "H2_WS_SYNC_OK payload=", msg.data, " big=", $big.len, " cap=", cfg.maxResponseBytes
 api.close()

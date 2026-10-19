@@ -5,11 +5,25 @@
 
 import std/[asyncdispatch, tables, deques, sets]
 import ../proto/h2/conn
+import ./fairness                # sliceRestart after a real park (#462)
 from ../proto/h2/frame import encodePing   # keepalive PING (a non-stream control frame)
 import ../core/response          # for ResponseTooLargeError
 import ../core/request           # for BodyProducer
 import ../core/decompress        # for streaming response decompression
 import ./asyncdispatch as be     # for Conn / BodySink
+import ./api as beapi            # naviReadBufSize (the mux turn budget)
+
+proc yieldTurn(): Future[void] =
+  ## Give the event loop one turn unconditionally (the mux's turn budget, issue
+  ## #461: the reader and the body puller each yield once per `muxTurnBudget` bytes
+  ## moved without parking). The transport's own time slice (`fairness`, #462) is not
+  ## enough on its own: it yields per 2000 us, and an upload next to a download needs
+  ## a loop turn per peer window, so the turn rate has to follow the bytes read.
+  ## A zero-delay timer, not `callSoon`: asyncdispatch runs callbacks queued while
+  ## it drains its callback list in that same drain, so a `callSoon` yield would
+  ## never let the selector run. A due timer completes on the next `poll`, after its
+  ## I/O pass.
+  sleepAsync(0)
 
 include ./h2mux_common
 
@@ -18,6 +32,15 @@ proc isCancellation(e: ref CatchableError): bool {.gcsafe, raises: [].} =
   ## cancellation here (the shared classifier treats it as a transport failure).
   discard e
   false
+
+proc chainWait(prev: Future[void]): Future[void] {.gcsafe, raises: [].} =
+  ## asyncdispatch has no cancellation: the previous link itself is the wait.
+  prev
+
+proc releaseLink(prev, mine: Future[void]) {.gcsafe, raises: [].} =
+  ## Without cancellation `prev` has always finished by the time a sender lets go.
+  try: mine.complete()
+  except Exception: discard
 
 proc trySend(mux: H2Mux, data: string) {.async.} =
   ## Fire-and-forget send that swallows errors, so it is safe to `asyncCheck`.
@@ -105,9 +128,11 @@ proc applyKeepAlive*(mux: H2Mux, keepAliveMs: int) =
     asyncCheck keepAlive(mux)
 
 proc reader(mux: H2Mux) {.async.} =
+  var spent = 0      # bytes read without the read parking since the last turn (#461)
   try:
     while mux.alive:
       let recvFut = be.recvSome(mux.transport)
+      if not recvFut.finished: spent = 0   # the read parks: the loop turns anyway
       if mux.h2.goneAway and mux.activeStreams > 0:
         # `withinMs`, not `withTimeout` (issue #468): `withTimeout` does unlink the
         # loser (Nim 2.2.10 clears whichever side lost), but its single timer entry
@@ -138,6 +163,16 @@ proc reader(mux: H2Mux) {.async.} =
       mux.wakeSenders()                           # a WINDOW_UPDATE may have drained a send
       if mux.h2.connError.len > 0: break          # fatal: fail all in-flight below
       if mux.h2.goneAway and mux.activeStreams == 0: break
+      spent += chunk.len
+      if spent >= muxTurnBudget:
+        # A read buffer's worth arrived without the read parking, so the loop has
+        # not turned since. Yield one AFTER the dispatch and wakes above, so the
+        # pullers and senders they woke run on this turn, and so does every other
+        # connection's reader: an upload's WINDOW_UPDATE gets parsed once per read's
+        # worth of download, not once per fairness slice (#461; see h2mux_common).
+        spent = 0
+        await yieldTurn()
+        sliceRestart()                            # the loop just turned
   except CatchableError as e:
     mux.readerError = e.msg   # capture WHY the reader exited (a transport read error, a
                               # runtime fault) before swallowing it, so `connDeathError`
@@ -183,6 +218,20 @@ proc newH2Mux*(transport: be.Conn, maxBody = 0, decompress = false,
     mux.keepAliveRunning = true
     asyncCheck keepAlive(mux)
   result = mux
+
+proc newH2TunnelMux*(transport: be.Conn, keepAliveMs = 0): Future[H2Mux] {.async.} =
+  ## The dedicated mux for an Extended CONNECT tunnel (a WebSocket over h2,
+  ## `doWebsocketH2`): nothing but the tunnel ever rides it, so it is opened with
+  ## neither a body cap nor content decoding.
+  ## - Cap 0: the tunnel is not a response body, so `maxResponseBytes` must not
+  ##   bound it (#470). A capped mux would RST the tunnel once its frames passed
+  ##   the cap in total; `maxMessageBytes` is the WebSocket's bound.
+  ## - No decoding: a CONNECT 2xx has no content (RFC 9110 9.3.6), so a
+  ##   `content-encoding` on it must not turn the tunnel into a decoder. With cap 0
+  ##   that decoder would also be unbounded, a decompression bomb that materializes
+  ##   whole decoded chunks before the ws framing layer sees them. Tunnel bytes pass
+  ##   through verbatim, as on the sync, h1 and h3 legs.
+  result = await newH2Mux(transport, 0, false, keepAliveMs)
 
 proc close*(mux: H2Mux) {.async.} =
   ## Shut the shared connection down: fail any in-flight streams, wake the

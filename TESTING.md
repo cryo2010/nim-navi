@@ -298,9 +298,51 @@ Where each is exercised:
   `WINDOW_UPDATE` past the replenish threshold until `ackRecv` releases it (a normal
   stream replenishes eagerly, as the control case), so a slow consumer stalls the
   peer. Also covers incremental `takeBody` drain and the running-total size cap.
+- **Fairness (`test_h2_fairness`, `test_h2_fairness_chronos`)**: the h2 mux's drain
+  budget (#461): a download whose whole body is already queued is drained next to an
+  upload on the same mux (`support_h2flood`, 64 KiB peer windows). The upload is
+  parked on its first window and the peer's grant for the rest is already unread in
+  the client's socket when the drain starts (the test blocks its thread while the
+  peer writes it), so nothing depends on the peer thread's speed: the drain must
+  give the loop a turn per 64 KiB of body (~122 for 8 MB; 0-1 before the budget)
+  and the upload must move within the first MiB of it (before the budget, not
+  until the 4 MiB window ack).
+- **Close after a complete response (`test_h2_close_drain`, `test_h2_close_drain_chronos`,
+  shared `h2_close_drain_spec`, `support_h2close`)**: a peer sends a whole 2 MB body
+  with END_STREAM (optionally a GOAWAY) and closes 150 ms later, while a CPU-bound or
+  awaiting consumer is still pulling the queue; the consumer must get every byte and a
+  clean end. With no END_STREAM (a tunnel's last frames) it must get every queued
+  byte before "connection closed".
 - **Unit** — `test_entries`/`test_async`/`test_chronos` cover headers-first,
   full-drain-pools-and-reuses, failed-drain-closes, and an incremental cap;
   `test_stream_decompress` decodes a streamed body through `each`.
+- **Event-loop fairness (`test_fairness_async`, `test_fairness_chronos`, shared
+  `fairness_spec`)**: the transport's time slice (#462). Two tests drive a raw
+  connection through `recvSome` (a flood from `support_fair`) and `sendAll` (a
+  draining sink) with per-chunk CPU slower than loopback, next to a 1 ms ticker. On
+  chronos those calls complete in place (4.4's `fastRead`, `fastWrite`) and each
+  test fails with the yield removed from its entry point or with
+  `-d:naviFairSliceUs=2000000000`. asyncdispatch's plaintext `recv`/`send` always park
+  and its in-place path is TLS, which the unit suite cannot reach, so there they
+  pass either way: its transport wiring is covered only by the mixed stress cell.
+  The exception is Windows, where a plaintext WSASend completes in place and the
+  upload test is a real control for asyncdispatch too (one tick in 300 ms while
+  `sendAll` used the string `send`, whose callback completion looked like a park).
+  A third test issues two un-awaited `sendAll` calls on one connection with the
+  slice spent and a fresh slice in between, and asserts a mirroring peer gets them
+  in call order (it failed on both backends while the write yielded before writing).
+- **Unwritten-stream cancel (`test_h2_unsent_cancel_chronos`, `support_h2rst`)**: a
+  chronos request cancelled while its HEADERS wait on the mux's send chain or the
+  fairness yield sends no RST_STREAM (the peer, which treats a RST on an idle stream
+  or a falling stream id as a connection error, stays up for the next request); a
+  sender cancelled in the middle of the chain does not let the one behind it
+  overtake; an upload chunk cancelled before its write gives its connection-window
+  credit back, so a later body of exactly the peer's 64 KiB window (the peer never
+  sends WINDOW_UPDATE) still completes (the chunk is a future the test completes
+  once the HEADERS write is done, and a callback behind the mux's continuation
+  cancels it on the yield, so no step depends on a write completing in place); control: a request cancelled after its
+  HEADERS went out is still RST. `test_h2_conn` covers `refundUnsent` at the sans-io
+  level.
 
 `navi/js` **buffers** a streamed request body (`body = producer`) (drains the producer, then sends one body):
 `fetch` cannot reliably stream a request body. See the client matrix in the

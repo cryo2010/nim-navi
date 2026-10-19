@@ -257,6 +257,18 @@ proc encodeContinuation*(streamId: uint32, headerBlock: string,
   encodeFrame(ftContinuation, if endHeaders: flagEndHeaders else: 0'u8,
               streamId, headerBlock)
 
+iterator dataFrameLens*(wire: string): (uint32, int) =
+  ## The stream id and payload length of every DATA frame in `wire`, a run of whole
+  ## frames as the connection encodes them (the bytes a send was about to write).
+  ## The payload length is what the frame cost in flow-control credit: navi pads
+  ## nothing, and padding would count in full anyway (RFC 9113 6.9.1).
+  var p = 0
+  while p + 9 <= wire.len:
+    let length = readU24(wire, p)
+    if uint8(wire[p + 3]) == uint8(ftData):
+      yield (readU32(wire, p + 5) and 0x7fffffff'u32, length)
+    p += 9 + length
+
 proc parseSettings*(payload: string): seq[(uint16, uint32)] =
   ## Decode a SETTINGS payload into id/value pairs.
   var i = 0

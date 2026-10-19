@@ -295,6 +295,15 @@ consequences worth knowing when you set a cap:
   (an event stream is unbounded by design). If you need a bound on one, bound it
   yourself in the `each`/`next` loop (count bytes, or stop after N events);
   `maxSseEventBytes` already caps a single event, not the stream's total.
+* **A WebSocket is not covered by it, on any protocol.** `maxResponseBytes` is a
+  response-body cap, and a WebSocket is a tunnel, not a response body: an h1 Upgrade,
+  an h2 Extended CONNECT (RFC 8441) and an h3 one (RFC 9220) all carry frames for as
+  long as the socket lives, whatever the cap. Tunnel bytes are also never
+  content-decoded (a `content-encoding` on the handshake's 2xx is ignored), so there
+  is no decompression bomb for the cap to guard against there. Bound a WebSocket with
+  `maxMessageBytes` on `websocket()` (a larger message closes with 1009 and raises
+  `WsMessageTooLarge`), and set it for untrusted servers, since it defaults to
+  unlimited.
 * **HTTP/3 buffered responses are capped per connection, not per request.** The h3
   driver enforces the cap while it buffers a whole response in C memory, and a shared
   h3 connection carries the cap of whichever client opened it. navi hands it the cap
@@ -370,6 +379,23 @@ default, so a black-holed peer is still detected rather than leaving a zombie
 connection that every later `sse()` on the client reconnects onto. Leave it on for
 your requests too: with `0` and a hostile or flaky peer, a dead connection stays
 pooled and every request dispatched on it burns its own read timeout before failing.
+
+### Event-loop fairness slice (`-d:naviFairSliceUs`)
+
+```sh
+nim c -d:naviFairSliceUs=1000 app.nim   # build-time; microseconds, default 2000
+```
+
+On the async clients a peer that keeps a TLS socket readable (a flood) or writable
+can make every read or write complete without the event loop running in between.
+`recvSome` and `sendAll` therefore yield the loop once a thread's connection I/O
+has run this long without a real wait, so one fast or hostile connection cannot
+hold every other request, timer and timeout on that loop hostage. It is checked
+when a read starts or a write ends, so a single large call (one `sendAll` of a big
+in-memory body) still runs to completion, and the HTTP/3 leg is not covered.
+Smaller values hand the loop back more often at the cost of an extra poll per
+slice; `0` yields at every I/O call that follows an in-place completion. There
+is no runtime setting: it is one slice per thread, shared by every client on it.
 
 ### HTTP/2 limits
 

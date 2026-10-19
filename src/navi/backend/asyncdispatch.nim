@@ -10,7 +10,7 @@
 ## async: the per-connection cost drops to roughly the sync backend's.
 
 import std/[asyncdispatch, nativesockets, strutils, monotimes, times, base64]
-import ./api, ./openssl_ctx, ./happyeyeballs, ./tls_store, ./tunnel, ./timing
+import ./api, ./openssl_ctx, ./happyeyeballs, ./tls_store, ./tunnel, ./timing, ./fairness
 import ../core/response  # for navi's TimeoutError
 import ../core/socks
 when defined(ssl):
@@ -701,21 +701,66 @@ proc connect*(host: string, port: int, tls: bool, cfg: TlsConfig,
   await estFut
   return conn
 
-proc sendAll*(c: Conn, data: string): Future[void] {.async.} =
-  when defined(ssl):
-    if not c.ssl.isNil:
-      await sslWrite(c, data); return
-  # A conn with no TLS session and no valid fd is closed/half-established (e.g. a
-  # connection whose ALPN never resolved under event-loop starvation, mis-routed
-  # onto the h1 path). Raise a typed transport error instead of writing to a dead
-  # fd, so the h1 write-time classifier tears it down and retries on a fresh conn.
-  # `freeConn` closes the fd without clearing the value copies' `fd` field, so a
-  # send that raced a close still holds a live-looking descriptor number that the
-  # process may already have handed to something else: the shared state flag, not
-  # the number, is the authority (the plaintext twin of the `sslWrite` guard).
-  if c.fd == invalidFd or (not c.state.isNil and c.state[] == csClosed):
-    raise newException(IOError, "navi: send on a closed connection")
-  await send(c.fd, data)
+template yieldSlice() =
+  ## Give the event loop a turn when this thread's connection I/O has run a whole
+  ## fairness slice without one (see `fairness`). A zero-length sleep is a timer
+  ## that is already due, so it resumes us from the next `poll()`, after the
+  ## dispatcher has serviced every ready fd.
+  if sliceSpent():
+    await sleepAsync(0)
+    sliceRestart()
+
+proc fairYield*(): Future[void] {.async.} =
+  ## The connection layer's fairness check as a standalone step: yields to the
+  ## event loop only when this thread's I/O has used up its slice. `recvSome` and
+  ## `sendAll` run the same check inline; this is the hook for code that loops on
+  ## work which can complete without parking, and what the unit tests drive.
+  yieldSlice()
+
+template awaitFairVoid(fut: typed) =
+  ## Await an I/O future, restarting the fairness slice when it really parked: a
+  ## resume from a pending future means the event loop ran in between.
+  let ioFut = fut
+  let parks = not ioFut.finished
+  await ioFut
+  if parks: sliceRestart()
+
+proc sendAll*(c: Conn, data: string, fair = true): Future[void] {.async.} =
+  ## Write all of `data`. `sslWrite` writes straight to the fd and only parks on
+  ## WANT_WRITE, so an upload whose send buffer keeps draining never returns to the
+  ## loop on its own; with `fair` (the default) the call yields once the write is
+  ## done if the thread's slice is spent (#462). The write is issued first,
+  ## synchronously, so concurrent un-awaited `sendAll` calls on one Conn start
+  ## writing in call order: a WebSocket's automatic pong or Close reply cannot
+  ## overtake a frame the user sent before it. The h2 mux passes `fair = false` and
+  ## runs the yield itself before it records a stream as on the wire.
+  block write:
+    when defined(ssl):
+      if not c.ssl.isNil:
+        awaitFairVoid(sslWrite(c, data))
+        break write
+    # A conn with no TLS session and no valid fd is closed/half-established (e.g. a
+    # connection whose ALPN never resolved under event-loop starvation, mis-routed
+    # onto the h1 path). Raise a typed transport error instead of writing to a dead
+    # fd, so the h1 write-time classifier tears it down and retries on a fresh conn.
+    # `freeConn` closes the fd without clearing the value copies' `fd` field, so a
+    # send that raced a close still holds a live-looking descriptor number that the
+    # process may already have handed to something else: the shared state flag, not
+    # the number, is the authority (the plaintext twin of the `sslWrite` guard).
+    if c.fd == invalidFd or (not c.state.isNil and c.state[] == csClosed):
+      raise newException(IOError, "navi: send on a closed connection")
+    if data.len > 0:
+      # The pointer overload, not `send(fd, string)`: on Windows a WSASend that
+      # completes at once finishes the pointer future in place, but the string
+      # wrapper completes its own future from a `callSoon` callback, so it looks
+      # parked and restarted the slice on every write. asyncdispatch drains its
+      # callback queue in a loop without servicing timers, so an upload whose send
+      # buffer kept draining ran back to back inside that loop and never yielded
+      # (a 1 ms ticker saw one tick in 300 ms). `data` lives in this proc's
+      # environment until the await returns, so the pointer stays valid. On POSIX
+      # both overloads park on the selector.
+      awaitFairVoid(send(c.fd, unsafeAddr data[0], data.len))
+  if fair: yieldSlice()
 
 proc rearm*(c: var Conn, readMs = 0, totalMs = 0) =
   ## Re-apply the current config's read timeout to a connection taken from the idle
@@ -760,10 +805,17 @@ proc recvSome*(c: Conn): Future[string] {.async.} =
   ## abandoned and TimeoutError is raised (terminal: the caller tears the connection
   ## down). A read parked by an earlier `recvWithin` is resumed here, so its bytes are
   ## delivered to this caller instead of being lost.
+  ##
+  ## `sslRead` calls SSL_read on the fd and only parks on WANT_READ, so while the
+  ## peer keeps the socket readable every read completes in place and a saturated
+  ## download never hands the loop back; `yieldSlice` bounds that run (#462).
+  yieldSlice()
   let readFut = c.startRead()
+  let parks = not readFut.finished
   if c.readMs > 0 and not await withinMs(readFut, c.readMs):
     raise newException(response.TimeoutError, readTimeoutMsg(c.readMs))
-  return await readFut
+  result = await readFut
+  if parks: sliceRestart()       # the read waited on the loop: a fresh slice
 
 proc recvWithin*(c: Conn, ms: int): Future[tuple[timedOut: bool, data: string]] {.async.} =
   ## A bounded read that leaves the connection usable when it expires: waits at most

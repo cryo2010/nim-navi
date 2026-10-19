@@ -410,6 +410,140 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **A fast HTTP/2 download no longer holds the event loop, so a streamed upload next to
+  it runs at 6.5x its old rate and the requests, WebSocket and SSE traffic beside it
+  4x to 15x (#461).** The mixed soak's h2 cells moved an upload at about 6 MB/s
+  next to a 450 MB/s download, on both async clients (h1 and h3 were fine). The cause
+  was scheduling, not flow control: an `await` on a future that is already finished
+  does not return to the event loop on chronos or asyncdispatch, so a mux loop whose
+  reads kept completing at once never yielded. The connection reader on a TLS socket
+  that always had bytes buffered went on reading, and the body puller (`each`,
+  `drain`, a sink) whose stream queue had filled then drained all of it, up to the
+  whole 8 MiB receive window, in a single pass. Meanwhile every other connection
+  waited, including the one carrying the upload, which can only send one peer window
+  (64 KiB under hypercorn) per WINDOW_UPDATE its reader gets to read, so what bounds
+  it is the number of loop turns per byte downloaded. The transport's fairness slice
+  (#462, below) yields at most every 2000 us, about 500 turns a second however fast
+  the download runs, which alone caps such an upload near 500 x 64 KiB = 32 MB/s. So
+  the mux reader and the body puller (`readChunk`, shared by `each`, `drain`, the
+  sink path and the WebSocket tunnel, which pops bytes the reader already queued and
+  never enters the transport at all) each give the loop a turn every 64 KiB (one read
+  buffer) they move without parking, and the turn rate follows the download. A loop
+  that parks for real resets its count, so a transfer the network paces pays
+  nothing. The streamed request body needs no budget: its sends go through the
+  slice and it parks on the peer's window. The yield is a
+  zero-delay timer on both runtimes: asyncdispatch runs callbacks queued during its
+  callback drain in that same drain (so `callSoon` would never let the selector in),
+  and chronos leaves tick callbacks out of its poll timeout (so `stepsAsync` can park
+  in the selector on an idle loop).
+  Measured on the mixed h2 cell (20 s, 64 MiB transfers, hypercorn, main vs this
+  branch back to back on one machine, with the #462 slice in both layers' final
+  form): chronos upload 128 MB to 832 MB, requests 3778 to 22809, ws round-trips
+  1704 to 16625, sse events 0.66M to 2.55M; asyncdispatch upload 128 MB to 832 MB,
+  requests 4900 to 24794, ws 1901 to 29489, sse 0.42M to 2.64M. The download slice
+  gives up the share it was taking from the others (10624 MB to 4288 MB on chronos,
+  10112 MB to 3648 MB on asyncdispatch); a solo h2 `streamDownload` cell is
+  unchanged within noise (chronos 514 vs 502 MB/s over three runs each,
+  asyncdispatch 513 vs 537 MB/s) and so is solo `streamUpload`. What remains of the
+  gap is the server's receive window: hypercorn's 64 KiB caps an upload at one window
+  per round trip, which navi cannot widen. `test_h2_fairness` (both async backends)
+  queues a whole 8 MB download and then drains it next to an upload on the same mux:
+  the drain must let the loop turn and the upload get past its first window, where
+  before it took zero turns and the upload sat at 64 KiB until the drain finished.
+  The body puller also no longer ends a stream short: a read carrying a stream's
+  last DATA and END_STREAM marked it ended before the reader moved that body into
+  the stream's queue (the reader awaits its acks in between), so a pull that ran in
+  that gap, or a reader that died there, dropped the tail. On Windows chronos, where
+  the ack's write parks, a WebSocket-over-h2 tunnel lost its last frames this way.
+- **A saturated TLS transfer no longer holds the async event loop across a run of
+  synchronous reads or writes (#462).** Both async runtimes resume an `await` on
+  an already-finished
+  future in place, and both TLS read/write paths can complete without parking while
+  the socket keeps up: the asyncdispatch backend calls `SSL_read`/`SSL_write`
+  straight on the fd and only waits on WANT_READ/WANT_WRITE, and on chronos 4.4 (what
+  `chronos >= 4.0.0` resolves to today) the stream transport's `fastRead` reads
+  straight off a readable socket and `fastWrite` writes straight into a writable one,
+  so the TLS pump's reads and writes finish in place too (chronos 4.0 and 4.2 have
+  only `fastWrite`, so there only the write side ran this way). So an h1 download (or
+  SSE feed) arriving faster than it was consumed, or an upload whose send buffer kept
+  draining, ran read after read with the loop never getting a turn. On Windows the
+  asyncdispatch backend did it over plain TCP too: a WSASend that completes at once
+  still resolved asyncdispatch's string `send` future from a callback, which looked
+  like a real park (restarting the slice) while the callback queue, drained in a loop
+  that services no timers, ran the upload back to back; `sendAll` now uses the
+  pointer overload, whose future completes in place. In the mixed h1
+  stress cell that held the client loop for 160-250 ms per turn (a 10 ms timer fired
+  ~175 ms late), and the buffered `/echo` requests sharing it fell to ~50 ops/s
+  against ~2300 solo, against hypercorn and the native vortex origin alike, which is
+  what ruled out the server. `recvSome` and `sendAll` on both backends now yield to
+  the loop once the thread's connection I/O has run `naviFairSliceUs` (default 2000,
+  an `intdefine`) without a real suspension, and any real suspension restarts the
+  slice. The yield is a due zero-length timer rather than `stepsAsync`, whose tick
+  chronos leaves out of the poll timeout (alone on the loop it would block in the
+  selector forever). The bound is per I/O call, not absolute: the slice is checked
+  when a read starts or a write ends (a write is issued first, so concurrent writes on
+  one connection still start in call order), so one large buffered write (an in-memory body is
+  encrypted in a single call) still runs to completion, and HTTP/3 does not pass
+  through these entry points at all. On the h2 mux the yield runs in the mux's own
+  send, before the stream is recorded as on the wire, and a stream abandoned before
+  its first frame reached the transport (a chronos cancellation on the mux's send
+  chain or on the yield) is now dropped without a RST_STREAM: the peer never saw it,
+  and a RST_STREAM on an idle stream is a connection error (RFC 9113 6.4) that took
+  every other stream on the connection down with it. A sender cancelled while queued
+  on that chain also no longer releases the senders behind it before the send it was
+  waiting on has written, which could put a higher stream id on the wire first. An
+  upload chunk cancelled at the same points had already debited the connection's
+  send window when it was framed; that credit is now given back, where before every
+  such cancel shrank the window for good (`refundUnsent`). Mixed
+  h1, 20 s, 64 MiB transfers, back to back on one machine: chronos `req` 40-51 to
+  260-326 ops/s and asyncdispatch 50 to 562-676 ops/s, with ws round-trips and SSE
+  events up 6-19x, loop lag 160-250 ms to 4-7 ms, and both stream slices still
+  moving 450-500 MB/s between them (the download's share drops, since it no longer
+  monopolises the loop). The mixed h2 cell gains too (chronos `req` 194 to 260
+  ops/s, lag 13.6 to 7.5 ms), and the solo `requests` cells are unchanged within
+  noise. The h2 mux reader rides the same `recvSome`, so it is bounded the same way.
+  `fairYield()` exposes the check for code that loops on work that can complete
+  without parking. The mixed stress cells' final line now reports the client
+  loop lag (`lag avg Xms max Yms`) so a starved slice can be told from a slow
+  origin. The js mixed cell's ~70 ops/s is a different case: each js request worker
+  manages ~7 ops/s both solo (~170 ops/s over 24 workers) and mixed (~70 over 10),
+  so that cell is bound by the js client's own per-request latency, not by navi or
+  the other slices, and the stress README now says to read it against the js solo
+  cell.
+- **A WebSocket over HTTP/2 is no longer reset once it has carried
+  `maxResponseBytes` (#470).** `websocket(..., http = {H2})` opened its dedicated
+  h2 connection with the client's `config.maxResponseBytes` as the connection's body
+  cap (the asyncdispatch and chronos clients via `newH2Mux`, the sync client via
+  `initH2Conn(sharedConnCap)`), and the Extended CONNECT tunnel stream registers no
+  cap of its own, so it inherited that one: every inbound DATA frame counted toward
+  the stream's body total, and once the frames received over the socket's whole life
+  passed the cap the h2 layer sent RST_STREAM. The async clients then raised
+  `ResponseTooLargeError` from `receive()`, and the sync one saw the tunnel close.
+  With the 32 MiB or 5 MiB cap `HARDENING.md` recommends, a long-lived socket died
+  after that much traffic, while the same client over h1 or h3 ran indefinitely
+  (the h3 leg already opens its QUIC connection with no body cap). The h2 tunnel
+  connection is now opened with cap 0 on all three native clients, which is safe
+  because nothing but the tunnel ever rides it. The asyncdispatch and chronos tunnel
+  mux also no longer content-decodes: it used to run tunnel bytes through the
+  response decoder whenever the CONNECT 2xx named a `content-encoding` (a CONNECT
+  2xx has no content, RFC 9110 9.3.6), which with cap 0 would have been an unbounded
+  decompression bomb; tunnel bytes now pass through verbatim, as they already did on
+  the sync, h1 and h3 legs. So `maxMessageBytes` on
+  `websocket()` is the only size bound on a WebSocket over every protocol, as the
+  docs already said; plain h2 responses on the same client still honour
+  `maxResponseBytes`. `HARDENING.md` and the README now say outright that
+  `maxResponseBytes` is a response-body cap and does not bound a WebSocket. Tests:
+  the h2 ws legs need TLS + ALPN, so the regression guard for the call sites is the
+  `ws_h2` Docker interop, which fails on the unfixed code. The unit tests cover the
+  layers below: the h2 mux cap spec (both async backends) drives `newH2TunnelMux`,
+  the constructor `doWebsocketH2` now uses, carrying 4x a 1 KiB cap and passing a
+  gzip-labelled tunnel through undecoded, with a capped mux (reset) and a
+  decompressing one (decoded) as controls; `test_h2_connect` checks the sans-io
+  `H2Conn` the sync driver builds (cap 0 unbounded, cap 1024 reset). The `ws_h2`
+  interop runs all three clients with
+  `maxResponseBytes = 1024`, tunnelling over 20 KB (312 KB on sync), checking that
+  `maxMessageBytes` still rejects an oversize message and that a 4 KiB h2 response
+  on the same client still raises `ResponseTooLargeError`.
 - **`src/navi/backend/h3client.h` ships with the package, so `-d:naviHttp3` builds
   against an INSTALLED navi compile again (#465).** `installExt = @["nim", "cpp"]`
   copied the HTTP/3 driver's `h3client.cpp` into an installed package but not the

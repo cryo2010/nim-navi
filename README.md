@@ -629,7 +629,7 @@ token.cancel()
 
 ### Response size limits
 
-`maxResponseBytes` caps the response body; a larger response raises `ResponseTooLargeError`. Streaming enforces the cap incrementally (per chunk); buffered requests enforce it on the assembled body. On the native clients the cap counts decompressed bytes, so it also guards against decompression bombs.
+`maxResponseBytes` caps the response body; a larger response raises `ResponseTooLargeError`. Streaming enforces the cap incrementally (per chunk); buffered requests enforce it on the assembled body. On the native clients the cap counts decompressed bytes, so it also guards against decompression bombs. It does not bound a WebSocket on any protocol (h1, h2 or h3), and none is exposed to that bomb: WebSocket tunnel bytes are never content-decoded, even if the server's handshake response names a `content-encoding`. Use `maxMessageBytes` on `websocket()` to bound a WebSocket.
 
 ```nim
 let api = newNavi()
@@ -843,6 +843,23 @@ starving the other multiplexed streams or blocking the connection reader) instea
 of the body piling up in memory. Over HTTP/1.1 the awaited consumer pauses the read
 loop, which back-pressures the peer through TCP. The size cap
 (`maxResponseBytes`) is enforced incrementally on the streamed bytes.
+
+The reverse holds too: a consumer that keeps up never monopolizes the event loop.
+On the async clients every connection read and write yields the loop a turn once
+the thread's I/O has run a whole time slice without waiting (#462), and the HTTP/2
+connection reader and the chunk puller behind `each` and `drain` (which hands out
+bytes the reader has already queued without touching the socket) each yield after
+64 KiB moved without waiting (#461), so the loop turns in step with a fast download
+rather than once per slice. So a fast download cannot hold the loop for long
+stretches against an upload, a WebSocket or ordinary requests running beside it.
+The bound is checked when a read starts or a write ends, so one large buffered write (an in-memory request
+body is encrypted in a single call) still runs to completion, and the HTTP/3 leg
+does not go through these entry points. The slice is a build-time knob,
+`-d:naviFairSliceUs=<microseconds>` (default 2000): smaller hands the loop back
+more often at the cost of an extra poll per slice, larger favours raw throughput of
+a single transfer. `fairYield()` (exported by `navi/asyncdispatch` and
+`navi/chronos`) runs the same check, for your own loops over work that can
+complete without parking.
 
 #### Sink downloads (push)
 
@@ -1137,6 +1154,9 @@ Pass `maxMessageBytes` to bound a reassembled message; a peer can otherwise grow
 single message without limit via continuation frames. When a message exceeds the cap,
 `receive` closes the connection with code 1009 (Message Too Big) and raises
 `WsMessageTooLarge`. It is `0` (unlimited) by default, so set it for untrusted servers.
+It is the only size bound on a WebSocket: `config.maxResponseBytes` caps response
+bodies and never a WebSocket tunnel, over h1, h2 or h3 alike (the tunnel is neither
+capped nor content-decoded).
 
 Pass `keepAlive` (ms) to detect a dead peer: while a `receive` is in progress, navi
 sends a ping after that long with no data and, if another interval passes with still

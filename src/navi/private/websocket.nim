@@ -241,9 +241,13 @@ proc websocketH2(client: Navi, u: Url, headers: Headers,
     let got = if conn.protocol.len > 0: conn.protocol else: "http/1.1"
     raise newException(ProtocolError,
       "navi: WebSocket over h2 requested but the server negotiated " & got)
-  # `sharedConnCap` for consistency with the other connection openers (#466); this
-  # one is a dedicated tunnel connection, so owner and view agree on it either way.
-  let h2 = initH2Conn(client.sharedConnCap)
+  # Cap 0, not `sharedConnCap`: the tunnel is not a response body, so
+  # `maxResponseBytes` must not bound it (#470). Every DATA frame on the CONNECT
+  # stream counts toward the h2 body total, so a capped connection would RST the
+  # tunnel once it had carried that many frame bytes in all. This connection is
+  # dedicated to the tunnel, and `maxMessageBytes` is the WebSocket's size bound, as
+  # on the h1 and h3 legs.
+  let h2 = initH2Conn(0)
   conn.sendAll(h2.preamble())
   # RFC 8441 forbids sending an Extended CONNECT before the peer's SETTINGS
   # (which carries ENABLE_CONNECT_PROTOCOL) has been seen. Read until that initial
