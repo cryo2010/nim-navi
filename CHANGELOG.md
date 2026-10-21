@@ -452,8 +452,9 @@ onward (pre-1.0, minor versions may include breaking changes).
   native backends do, and its transport errors now say why they failed.** An 8-hour
   `mixed` js soak failed at about 5h15m on a single `json-array POST -> IOError:
   navi: fetch failed: fetch failed`. undici rejects `fetch` with a bare
-  `TypeError("fetch failed")` and keeps the reason in `err.cause` (here a reused
-  keep-alive socket closing under the request), and navi dropped it. The native engine
+  `TypeError("fetch failed")` and keeps the reason in `err.cause`, and navi dropped
+  it, so the failure could not be told apart from a keep-alive race (a second soak
+  with the cause kept traced it to the dead origin above). The native engine
   raises `KeepAliveRaceError` for that case and replays it on a fresh connection when
   that is safe (an idempotent method, or an `Idempotency-Key`; RFC 9110 9.2.2). navi/js
   had no such path: it retried only the verbs in `retry.methods`, so a keyed POST was
