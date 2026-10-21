@@ -145,6 +145,7 @@ proc runCore(client: Navi, req0: Request, cancel: CancelToken,
   var req = req0
   var resp: Response
   var attempt = 0
+  var replayed = false   # this attempt's one transport-level replay is spent
   let policy = client.config.retry
   if gate != nil:
     # js uploads are buffered (fetch cannot stream), so a js request body is always
@@ -168,12 +169,25 @@ proc runCore(client: Navi, req0: Request, cancel: CancelToken,
       let fetchMs = effectiveAttemptMs(client.config.totalMs, client.config.attemptMs)
       resp = await fetchExchange(req, nil, fetchMs, cancel,
                                  client.config.maxResponseBytes, userSink, gate)
-    except CatchableError:
+    except CatchableError as e:
       throwIfCancelled(cancel)   # a cancel is not a retryable failure
       # A half-delivered gated body must never be re-issued (double-feed): once the
       # sink has been fed, propagate rather than retry.
       if gate != nil and gate.fed: raise
-      if not (attempt < policy.limit and isRetryableVerb(req.verb, policy)):
+      # The native engine replays a request whose pooled connection died before any
+      # response began on a fresh connection, once, outside the retry budget. The
+      # runtime owns the pool here, but a socket-level `fetch` rejection is that same
+      # keep-alive race (`KeepAliveRaceError`, see backend/js `fetchRejected`) and the
+      # runtime discards the dead socket, so mirror it: one immediate replay when it is
+      # safe (`replayableAfterError`: an idempotent method or an Idempotency-Key; RFC
+      # 9110 9.2.2). js request bodies are always buffered, hence replayable.
+      if not replayed and isReplayClassError(e) and replayableAfterError(req, e):
+        replayed = true
+        continue
+      # Then the policy loop, as on native: an idempotent verb via `isRetryableVerb`,
+      # any verb when `replayableAnyMethod` holds (a keyed keep-alive race).
+      if not shouldRetryAfterError(attempt, true, replayableAnyMethod(req, e),
+                                   req.verb, policy):
         raise   # not retryable: propagate the fetch error
       failed = true
     if not failed and not client.jar.isNil:
@@ -183,6 +197,7 @@ proc runCore(client: Navi, req0: Request, cancel: CancelToken,
             isRetryableStatus(resp.status, policy)):
       break
     inc attempt
+    replayed = false
     await sleep(backoffMs(attempt, resp, policy))
   enforceMaxResponse(resp, client.config.maxResponseBytes)
   client.maybeThrow(req, resp)      # HttpError carries the buffered body

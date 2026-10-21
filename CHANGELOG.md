@@ -423,6 +423,27 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **navi/js replays a request whose connection died before any response, as the
+  native backends do, and its transport errors now say why they failed.** An 8-hour
+  `mixed` js soak failed at about 5h15m on a single `json-array POST -> IOError:
+  navi: fetch failed: fetch failed`. undici rejects `fetch` with a bare
+  `TypeError("fetch failed")` and keeps the reason in `err.cause` (here a reused
+  keep-alive socket closing under the request), and navi dropped it. The native engine
+  raises `KeepAliveRaceError` for that case and replays it on a fresh connection when
+  that is safe (an idempotent method, or an `Idempotency-Key`; RFC 9110 9.2.2). navi/js
+  had no such path: it retried only the verbs in `retry.methods`, so a keyed POST was
+  never replayed. Now a `fetch` rejection whose cause is socket-level (`ECONNRESET`,
+  `EPIPE`, `ECONNABORTED`, `UND_ERR_SOCKET`, `UND_ERR_CLOSED`) raises
+  `KeepAliveRaceError`. The js retry loop gives it one immediate replay per attempt
+  when `replayableAfterError` holds, then applies `shouldRetryAfterError`, the native
+  policy, so a keyed POST also retries under `retry.limit`. Connect-phase failures
+  (refused, DNS, TLS) stay a plain `IOError` and are not replayed for POST. Every
+  `fetch` and body-read error message now ends with the cause, for example
+  `navi: fetch failed: fetch failed (UND_ERR_SOCKET: other side closed)`. A body read
+  that fails after the headers (undici's `TypeError("terminated")`) also used to escape
+  every `except CatchableError` as a foreign JS error, including the SSE reconnect
+  loop's and `drain`'s. It is now an `IOError`, so SSE reconnects through it and
+  callers can catch it. `nimble jsReplay` covers all of this under Node.
 - **A fast HTTP/2 download no longer holds the event loop, so a streamed upload next to
   it runs at 6.5x its old rate and the requests, WebSocket and SSE traffic beside it
   4x to 15x (#461).** The mixed soak's h2 cells moved an upload at about 6 MB/s

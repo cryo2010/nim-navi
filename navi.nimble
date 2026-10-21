@@ -441,6 +441,12 @@ task jsSseRetry, "navi/js SSE reconnect-delay runtime test (Node)":
   # must not spin the reconnect loop (#291).
   exec "bash tests/interop/js_sse_retry.sh"
 
+task jsReplay, "navi/js keep-alive race replay + fetch error cause runtime test (Node)":
+  # A request whose socket drops before any response is replayed when safe (GET, or a
+  # POST with an Idempotency-Key), an unkeyed POST surfaces KeepAliveRaceError, and
+  # every fetch/body-read error carries undici's `err.cause`.
+  exec "bash tests/interop/js_replay.sh"
+
 task demoWssBrowser, "Browser wss demo: mkcert cert + wss server + page (needs mkcert, python3)":
   # Generates a browser-trusted cert (mkcert), serves the navi/js page over a
   # wss echo server, and prints the URL to open.
