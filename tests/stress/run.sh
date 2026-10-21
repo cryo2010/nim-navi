@@ -121,6 +121,73 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# --- origin liveness + failure evidence -------------------------------------
+# Every origin process (hypercorn master, vortex, Caddy, aioquic ws, chaos
+# sidecar) is recorded with its log, so a failed cell can say WHICH origin died
+# and show what the servers saw. The logs live in $work, which the EXIT trap
+# removes, and `nimble stress*` runs the container with --rm, so stdout (what
+# `docker logs` and the nimble output carry) is the only place that evidence
+# survives. Not having it cost two 8h soaks: the js mixed cell's ECONNREFUSED
+# was a hypercorn worker SIGKILLed by the VM's OOM killer, and nothing in the
+# log said so.
+origin_logs=()
+track_origin() { pids+=("$1"); origin_logs+=("$2"); }
+
+# True while pid $1 is running (not exited, not a zombie awaiting reaping).
+origin_alive() {
+  local st
+  st="$(awk '{print $3}' "/proc/$1/stat" 2>/dev/null)" || return 1
+  [ -n "$st" ] && [ "$st" != Z ]
+}
+
+# Background watcher for the running cell: polls every origin every 5s and
+# prints ONE line the moment one is gone, so the death is timestamped against
+# the cell's own report lines rather than inferred from a later client error.
+# Cheap (a /proc read per origin per 5s); killed by stop_origin_watch before
+# stop_servers kills the origins on purpose.
+watch_pid=""
+start_origin_watch() {
+  local label="$1"
+  (
+    local t0=$SECONDS i; local -a gone=()
+    while sleep 5; do
+      for i in "${!pids[@]}"; do
+        [ -n "${gone[$i]:-}" ] && continue
+        origin_alive "${pids[$i]}" && continue
+        gone[$i]=1
+        echo "$label origin DIED: pid ${pids[$i]} ($(basename "${origin_logs[$i]}")) at t=$((SECONDS - t0))s"
+      done
+    done
+  ) &
+  watch_pid=$!
+}
+stop_origin_watch() {
+  [ -n "$watch_pid" ] && { kill "$watch_pid" 2>/dev/null; wait "$watch_pid" 2>/dev/null; }
+  watch_pid=""
+}
+
+# After a FAILED cell, while the origins are still up: name every dead origin
+# with its exit status, then print the tail of every origin log. hypercorn's
+# master exits with its worker's exitcode, so a worker killed by signal N shows
+# up as status 256-N (247 = SIGKILL, the OOM killer's signal); a status above
+# 128 is the process itself dying of signal status-128.
+dump_origin_evidence() {
+  local label="$1" i rc why log
+  for i in "${!pids[@]}"; do
+    origin_alive "${pids[$i]}" && continue
+    wait "${pids[$i]}" 2>/dev/null; rc=$?
+    why=""
+    if [ "$rc" -gt 192 ]; then why=" (hypercorn worker killed by signal $((256 - rc)))"
+    elif [ "$rc" -gt 128 ]; then why=" (killed by signal $((rc - 128)))"; fi
+    echo "$label origin pid ${pids[$i]} ($(basename "${origin_logs[$i]}")) is dead: exit status $rc$why"
+  done
+  for log in "$work"/srv-*.log "$work"/caddy.log; do
+    [ -f "$log" ] || continue
+    echo "--- $label tail of $(basename "$log") ---"
+    tail -n 40 "$log"
+  done
+}
+
 # Self-signed cert. DNS:127.0.0.1 (not just the IP SAN) so chronos's TLS, which
 # matches the connect host against dNSName SANs, accepts the loopback IP.
 # `env -u LD_LIBRARY_PATH`: the h3 image points LD_LIBRARY_PATH at the custom
@@ -149,7 +216,7 @@ start_ws_h3_servers() {
     port=$((first + i))
     WS_HOST="$host" WS_PORT="$port" WS_CERT="$cert" WS_KEY="$key" \
       setsid python3 "$root/tests/interop/ws_h3/server.py" >"$work/srv-ws-$i.log" 2>&1 &
-    pids+=($!)
+    track_origin $! "$work/srv-ws-$i.log"
   done
   for ((i=0; i<servers; i++)); do
     local ok=""
@@ -207,7 +274,7 @@ start_vortex_servers() {
     NAVI_SERVER_PORT="$port" NAVI_KEY="$key" NAVI_HTTP3="$want_h3" \
       NAVI_KEEPALIVE_TIMEOUT="$ka_to" NAVI_KEEPALIVE_MAX="$ka_max" \
       setsid vortex_server >"$work/srv-$i.log" 2>&1 &
-    pids+=($!)
+    track_origin $! "$work/srv-$i.log"
   done
 }
 
@@ -263,7 +330,7 @@ hypercorn_servers() {
       port=$((base_port + i))
       local bport=$((base_port + 1000 + i))
       setsid hypercorn "app:app" --bind "127.0.0.1:$bport" --config "$hcfg" >"$work/srv-$i.log" 2>&1 &
-      pids+=($!)
+      track_origin $! "$work/srv-$i.log"
       cat >>"$caddyfile" <<-EOF
 	https://$host:$port {
 		tls $cert $key
@@ -273,13 +340,13 @@ hypercorn_servers() {
 	EOF
     done
     setsid caddy run --config "$caddyfile" --adapter caddyfile >"$work/caddy.log" 2>&1 &
-    pids+=($!)
+    track_origin $! "$work/caddy.log"
   else
     for ((i=0; i<servers; i++)); do
       port=$((base_port + i))
       setsid hypercorn "app:app" --bind "$host:$port" --certfile "$cert" --keyfile "$key" \
         --config "$hcfg" >"$work/srv-$i.log" 2>&1 &
-      pids+=($!)
+      track_origin $! "$work/srv-$i.log"
     done
   fi
 }
@@ -344,7 +411,7 @@ start_chaos() {
   setsid python3 "$here/chaos/chaos_server.py" --proto "$pr" --host "$host" \
     --base-port "$base_port" --band "$chaos_band" --cert "$cert" --key "$key" \
     >"$work/srv-chaos.log" 2>&1 &
-  pids+=($!)
+  track_origin $! "$work/srv-chaos.log"
   local hport=$((base_port + chaos_band + 99))
   local ok=""
   for _ in $(seq 1 150); do
@@ -421,7 +488,7 @@ stop_servers() {
   local p
   for p in "${pids[@]:-}"; do kill -9 -"$p" 2>/dev/null || true; done  # -pid = process group
   for p in "${pids[@]:-}"; do wait "$p" 2>/dev/null || true; done
-  pids=()
+  pids=(); origin_logs=()
   pkill -9 -f hypercorn 2>/dev/null || true      # belt-and-suspenders for any stray
   pkill -9 -f vortex_server 2>/dev/null || true  # ditto for a vortex origin
   pkill -9 -f 'caddy run' 2>/dev/null || true
@@ -510,8 +577,14 @@ for be in "${clients[@]}"; do
         "$@"
       fi
     }
-    if [[ "$bin" == *.js ]]; then NODE_EXTRA_CA_CERTS="$cert" run_cell node "$bin" || fail=1
-    else run_cell "$bin" || fail=1; fi
+    cell_label="[$workload $pr $be]"
+    start_origin_watch "$cell_label"
+    cell_ok=1
+    if [[ "$bin" == *.js ]]; then NODE_EXTRA_CA_CERTS="$cert" run_cell node "$bin" || cell_ok=0
+    else run_cell "$bin" || cell_ok=0; fi
+    stop_origin_watch
+    # Evidence only on failure: a green cell prints nothing extra.
+    [ "$cell_ok" -eq 1 ] || { fail=1; dump_origin_evidence "$cell_label"; }
     ran=$((ran + 1))
     stop_servers
   done

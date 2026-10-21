@@ -423,6 +423,16 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **A failed stress cell now says which origin died and shows what the servers
+  logged.** `nimble stress*` runs the container with `--rm` and `run.sh` keeps the
+  server logs in a temp dir, so a dead origin left nothing behind but the client's
+  `ECONNREFUSED`. `run.sh` now watches every origin process during a cell (a `/proc`
+  read per origin every 5s) and prints one `origin DIED` line, with the cell time,
+  the moment one exits. When a cell fails it also prints each dead origin's exit
+  status (a hypercorn worker killed by signal N shows as status 256-N, so 247 is a
+  SIGKILL, usually the OOM killer) and the last 40 lines of every `srv-*.log` and
+  `caddy.log`, so `docker logs` carries the server side. A passing cell prints nothing
+  extra.
 - **The stress harness's hypercorn origins no longer leak every connection a client
   closes while idle, which OOM-killed one in the js `mixed` soak.** Two 8-hour `mixed`
   js soaks failed at about 5h15m and 5h50m, the second on `ECONNREFUSED
