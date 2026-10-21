@@ -443,7 +443,9 @@ onward (pre-1.0, minor versions may include breaking changes).
   that fails after the headers (undici's `TypeError("terminated")`) also used to escape
   every `except CatchableError` as a foreign JS error, including the SSE reconnect
   loop's and `drain`'s. It is now an `IOError`, so SSE reconnects through it and
-  callers can catch it. `nimble jsReplay` covers all of this under Node.
+  callers can catch it. `nimble jsReplay` covers all of this under Node. The js
+  `mixed` stress cell now sends an `Idempotency-Key` on bodied requests, as the native
+  cell already did.
 - **A fast HTTP/2 download no longer holds the event loop, so a streamed upload next to
   it runs at 6.5x its old rate and the requests, WebSocket and SSE traffic beside it
   4x to 15x (#461).** The mixed soak's h2 cells moved an upload at about 6 MB/s

@@ -50,7 +50,13 @@ proc verifyEcho(label: string, p: Payload, v: HttpVerb, res: Response) =
 
 proc requestsWorker(api: Navi, label: string, pool: JsPool,
                     payloads: seq[Payload], counter: JsCounter,
-                    deadline: float, i: int) {.async.} =
+                    deadline: float, i: int, keyed = false) {.async.} =
+  ## `keyed` (the mixed cell) tags bodied requests with an Idempotency-Key, as the
+  ## native part does there: long /download bodies share the runtime's keep-alive
+  ## sockets with these small POSTs (and NAVI_RECYCLE=1 sweeps `mixed`), so a reused
+  ## socket can die before any response. /echo is idempotent server-side, so the key
+  ## lets navi/js replay that race (RFC 9110 9.2.2) instead of surfacing load-induced
+  ## churn as a canary failure. Off in the plain requests cell (byte-identical).
   var n = i
   while nowMs() < deadline:
     let v = verbs[n mod verbs.len]
@@ -58,6 +64,8 @@ proc requestsWorker(api: Navi, label: string, pool: JsPool,
     let bodied = v in {POST, PUT, PATCH}
     inc n
     var h = initHeaders()
+    if bodied and keyed:
+      h["idempotency-key"] = "stress-" & $n
     # No x-want-encoding: the js cell leaves response compression to the
     # runtime's own codec, so it never asks the server to br/zstd-encode a body
     # undici might not decode.
