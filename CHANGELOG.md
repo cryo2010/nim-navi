@@ -423,6 +423,21 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **The stress harness's hypercorn origins no longer leak every connection a client
+  closes while idle, which OOM-killed one in the js `mixed` soak.** Two 8-hour `mixed`
+  js soaks failed at about 5h15m and 5h50m, the second on `ECONNREFUSED
+  127.0.0.1:9447`. The Docker VM's kernel log showed why: the global OOM killer had
+  SIGKILLed a hypercorn worker at 0.8 to 0.95 GB in each run, and hypercorn's master
+  shuts its port once its worker exits non-zero. hypercorn 0.18 does not stop a
+  connection's idle timer when the client closes it between requests, so the
+  connection, its TLS transport and asyncio's 256 KiB buffer live on until
+  `keep_alive_timeout`, which the harness sets past the whole soak: about 370 KB per
+  closed connection, for the rest of the run. navi's native clients keep pooled
+  connections open and never hit it; undici closes an idle socket after about 4s, so
+  the js cell leaked steadily (the native h1 cells' workers stay at about 75 MB after
+  6h). `tests/stress/server/hypercorn_eof.py`, applied when `app.py` loads, stops the
+  idle timer at EOF and never re-arms it, so a closed connection is released as soon
+  as its in-flight streams finish.
 - **navi/js replays a request whose connection died before any response, as the
   native backends do, and its transport errors now say why they failed.** An 8-hour
   `mixed` js soak failed at about 5h15m on a single `json-array POST -> IOError:

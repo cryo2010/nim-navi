@@ -32,6 +32,12 @@ try:
 except ImportError:
     zstandard = None
 
+import hypercorn_eof
+
+# Before the worker serves: release a connection the client closed while idle
+# instead of holding it until keep_alive_timeout (see hypercorn_eof.py).
+hypercorn_eof.apply()
+
 app = FastAPI()
 
 BLOCK = os.urandom(1 << 20)            # 1 MiB, fixed per process; non-compressible
