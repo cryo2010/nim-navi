@@ -150,7 +150,7 @@ proc main() {.async.} =
   futs.add lagProbe()
   for i in 0 ..< sp.req:
     futs.add requestsWorker(apis[k mod apis.len], label, pool, payloads,
-                            reqCounter, deadline, i)
+                            reqCounter, deadline, i, keyed = true)
     inc k
   for s in socks: futs.add wsWorker(s, wsCounter, deadline)
   for s in streams: futs.add sseWorker(label, s, sseCounter, deadline)

@@ -423,6 +423,55 @@ onward (pre-1.0, minor versions may include breaking changes).
   buffering cannot truncate it (#365).
 
 ### Fixed
+- **A failed stress cell now says which origin died and shows what the servers
+  logged.** `nimble stress*` runs the container with `--rm` and `run.sh` keeps the
+  server logs in a temp dir, so a dead origin left nothing behind but the client's
+  `ECONNREFUSED`. `run.sh` now watches every origin process during a cell (a `/proc`
+  read per origin every 5s) and prints one `origin DIED` line, with the cell time,
+  the moment one exits. When a cell fails it also prints each dead origin's exit
+  status (a hypercorn worker killed by signal N shows as status 256-N, so 247 is a
+  SIGKILL, usually the OOM killer) and the last 40 lines of every `srv-*.log` and
+  `caddy.log`, so `docker logs` carries the server side. A passing cell prints nothing
+  extra.
+- **The stress harness's hypercorn origins no longer leak every connection a client
+  closes while idle, which OOM-killed one in the js `mixed` soak.** Two 8-hour `mixed`
+  js soaks failed at about 5h15m and 5h50m, the second on `ECONNREFUSED
+  127.0.0.1:9447`. The Docker VM's kernel log showed why: the global OOM killer had
+  SIGKILLed a hypercorn worker at 0.8 to 0.95 GB in each run, and hypercorn's master
+  shuts its port once its worker exits non-zero. hypercorn 0.18 does not stop a
+  connection's idle timer when the client closes it between requests, so the
+  connection, its TLS transport and asyncio's 256 KiB buffer live on until
+  `keep_alive_timeout`, which the harness sets past the whole soak: about 370 KB per
+  closed connection, for the rest of the run. navi's native clients keep pooled
+  connections open and never hit it; undici closes an idle socket after about 4s, so
+  the js cell leaked steadily (the native h1 cells' workers stay at about 75 MB after
+  6h). `tests/stress/server/hypercorn_eof.py`, applied when `app.py` loads, stops the
+  idle timer at EOF and never re-arms it, so a closed connection is released as soon
+  as its in-flight streams finish.
+- **navi/js replays a request whose connection died before any response, as the
+  native backends do, and its transport errors now say why they failed.** An 8-hour
+  `mixed` js soak failed at about 5h15m on a single `json-array POST -> IOError:
+  navi: fetch failed: fetch failed`. undici rejects `fetch` with a bare
+  `TypeError("fetch failed")` and keeps the reason in `err.cause`, and navi dropped
+  it, so the failure could not be told apart from a keep-alive race (a second soak
+  with the cause kept traced it to the dead origin above). The native engine
+  raises `KeepAliveRaceError` for that case and replays it on a fresh connection when
+  that is safe (an idempotent method, or an `Idempotency-Key`; RFC 9110 9.2.2). navi/js
+  had no such path: it retried only the verbs in `retry.methods`, so a keyed POST was
+  never replayed. Now a `fetch` rejection whose cause is socket-level (`ECONNRESET`,
+  `EPIPE`, `ECONNABORTED`, `UND_ERR_SOCKET`, `UND_ERR_CLOSED`) raises
+  `KeepAliveRaceError`. The js retry loop gives it one immediate replay per attempt
+  when `replayableAfterError` holds, then applies `shouldRetryAfterError`, the native
+  policy, so a keyed POST also retries under `retry.limit`. Connect-phase failures
+  (refused, DNS, TLS) stay a plain `IOError` and are not replayed for POST. Every
+  `fetch` and body-read error message now ends with the cause, for example
+  `navi: fetch failed: fetch failed (UND_ERR_SOCKET: other side closed)`. A body read
+  that fails after the headers (undici's `TypeError("terminated")`) also used to escape
+  every `except CatchableError` as a foreign JS error, including the SSE reconnect
+  loop's and `drain`'s. It is now an `IOError`, so SSE reconnects through it and
+  callers can catch it. `nimble jsReplay` covers all of this under Node. The js
+  `mixed` stress cell now sends an `Idempotency-Key` on bodied requests, as the native
+  cell already did.
 - **A fast HTTP/2 download no longer holds the event loop, so a streamed upload next to
   it runs at 6.5x its old rate and the requests, WebSocket and SSE traffic beside it
   4x to 15x (#461).** The mixed soak's h2 cells moved an upload at about 6 MB/s

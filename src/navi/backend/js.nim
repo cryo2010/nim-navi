@@ -48,7 +48,7 @@ type
 proc fetch(url: cstring, init: JsObject): Future[JsObject] {.importjs: "fetch(#, #)".}
 proc newHeaders(): JsObject {.importjs: "new Headers()".}
 proc append(h: JsObject, name, value: cstring) {.importjs: "#.append(#, #)".}
-proc jsText(res: JsObject): Future[cstring] {.importjs: "#.text()".}
+proc jsTextRaw(res: JsObject): Future[cstring] {.importjs: "#.text()".}
 proc headerEntries(res: JsObject): JsObject {.importjs: "Array.from(#.headers.entries())".}
 proc setCookieList(res: JsObject): JsObject {.importjs: "(#.headers.getSetCookie?.() ?? [])".}
 proc jsLen(arr: JsObject): int {.importjs: "#.length".}
@@ -75,13 +75,76 @@ proc bytesOfBody*(s: string): seq[byte] {.importjs: "Array.prototype.slice.call(
   ## a per-char loop. For the buffered-body fallback that hands a `.text()` body to
   ## a `seq[byte]` sink.
 proc bodyReader*(res: JsObject): JsObject {.importjs: "#.body.getReader()".}
-proc readChunk(reader: JsObject): Future[JsObject] {.importjs: "#.read()".}
 proc setTimeout(cb: proc (), ms: int) {.importjs: "setTimeout(#, #)".}
 proc abortAfter(ms: int): JsObject {.importjs: "AbortSignal.timeout(#)".}
 proc newAbortController(): JsObject {.importjs: "new AbortController()".}
 proc abort(c: JsObject) {.importjs: "#.abort()".}
 proc signalOf(c: JsObject): JsObject {.importjs: "#.signal".}
 proc anySignal(a, b: JsObject): JsObject {.importjs: "AbortSignal.any([#, #])".}
+
+# --- fetch error classification ---
+proc caughtJsError(): JsObject =
+  ## The raw JS value of the exception being handled (Nim's `lastJSError`). Only
+  ## meaningful inside an `except` branch, before any `await` replaces it.
+  {.emit: "`result` = lastJSError;".}
+proc causeCode(e: JsObject): cstring {.importjs:
+  "((e) => { const c = e && e.cause; return String((c && (c.code || (c.cause && c.cause.code))) || ''); })(#)".}
+  ## `err.cause.code` (or one level deeper), e.g. ECONNRESET / UND_ERR_SOCKET; "" if none.
+proc causeMsg(e: JsObject): cstring {.importjs:
+  "((e) => { const c = e && e.cause; return c ? String(c.message !== undefined ? c.message : c) : ''; })(#)".}
+  ## `err.cause.message`, e.g. "other side closed"; "" if there is no cause.
+
+const raceCauseCodes = ["ECONNRESET", "EPIPE", "ECONNABORTED",
+                        "UND_ERR_SOCKET", "UND_ERR_CLOSED"]
+  ## Socket-level causes of a `fetch` rejection: the connection died after it was
+  ## picked (typically a reused keep-alive socket the peer closed) and no response
+  ## had begun, since `fetch` resolves once the headers arrive. Connect-phase codes
+  ## (ECONNREFUSED, ENOTFOUND, UND_ERR_CONNECT_TIMEOUT) are deliberately absent.
+
+proc describeCaught(prefix: string): (string, string) =
+  ## `prefix & message (code: cause message)` for the error being handled, and the
+  ## cause code. undici's `fetch` rejects with a bare TypeError("fetch failed") and
+  ## puts the real reason in `err.cause`; dropping it made a failure undiagnosable.
+  let e = caughtJsError()
+  let code = $causeCode(e)
+  let cmsg = $causeMsg(e)
+  var msg = prefix & getCurrentExceptionMsg()
+  if code.len > 0 and cmsg.len > 0 and cmsg != code: msg.add " (" & code & ": " & cmsg & ")"
+  elif code.len > 0: msg.add " (" & code & ")"
+  elif cmsg.len > 0: msg.add " (" & cmsg & ")"
+  (msg, code)
+
+proc fetchRejected(): ref IOError =
+  ## Map a `fetch` rejection (a native JS error) to a Nim exception carrying its cause.
+  ## A socket-level cause is a `KeepAliveRaceError`: the request may have been written
+  ## but no response began, the same ambiguous outcome the native engine raises for a
+  ## dropped pooled connection, so the retry layer replays it only when that is safe
+  ## (an idempotent method, or an Idempotency-Key; RFC 9110 9.2.2). Anything else
+  ## (DNS, refused, TLS, a browser's causeless "Failed to fetch") stays a plain IOError.
+  let (msg, code) = describeCaught("navi: fetch failed: ")
+  if code in raceCauseCodes: newException(KeepAliveRaceError, msg)
+  else: newException(IOError, msg)
+
+proc jsText(res: JsObject): Future[cstring] {.async.} =
+  ## `res.text()`, with a native JS rejection mapped to an `IOError` (see `readChunk`).
+  try:
+    result = await jsTextRaw(res)
+  except:  # noqa: bare - a body-read rejection is a native JS error (no Nim m_type)
+    if getCurrentException() != nil: raise
+    raise newException(IOError, describeCaught("navi: body read failed: ")[0])
+
+proc readChunkJs(reader: JsObject): Future[JsObject] {.importjs: "#.read()".}
+
+proc readChunk(reader: JsObject): Future[JsObject] {.async.} =
+  ## `reader.read()`, with a native JS rejection (undici's TypeError("terminated")
+  ## when the connection drops mid-body, an AbortError) turned into a Nim `IOError`
+  ## carrying its cause, so `except CatchableError` handlers (the SSE reconnect loop,
+  ## `drain`, the retry loop) see it instead of a foreign error escaping them all.
+  try:
+    result = await readChunkJs(reader)
+  except:  # noqa: bare - a body-read rejection is a native JS error (no Nim m_type)
+    if getCurrentException() != nil: raise
+    raise newException(IOError, describeCaught("navi: body read failed: ")[0])
 
 proc buildInit(req: Request, signal: JsObject, hasSignal: bool): JsObject =
   result = newJsObject()
@@ -198,7 +261,7 @@ proc fetchExchange*(req: Request, sink: BodySink, timeout = 0,
            # the retry loop and user `try/except` can handle like any transport error.
     if wantCancel and cancel.cancelled:
       raise newException(RequestCancelledError, "navi: request cancelled")
-    raise newException(IOError, "navi: fetch failed: " & getCurrentExceptionMsg())
+    raise fetchRejected()
   finally:
     if wantCancel: cancel.disarmHook()
   if wantGated:
@@ -238,7 +301,7 @@ proc fetchOpen*(req: Request, timeout = 0): Future[(JsObject, JsObject)] {.async
   try:
     res = await fetch(cstring(req.url.absoluteTarget), buildInit(req, signal, true))
   except:  # noqa: bare - a fetch rejection is a native JS error (see fetchExchange).
-    raise newException(IOError, "navi: fetch failed: " & getCurrentExceptionMsg())
+    raise fetchRejected()
   result = (res, controller)
 
 proc headerSnapshot*(res: JsObject): Response = toResponse(res, "")
