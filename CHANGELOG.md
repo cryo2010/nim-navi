@@ -7,6 +7,8 @@ onward (pre-1.0, minor versions may include breaking changes).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-25
+
 ### Added
 - **`NAVI_RUN_ID` in the stress harness: an isolation id for parallel runs,
   mirroring vortex's `VORTEX_RUN_ID`.** Every `nimble stress*` task now tags its
@@ -53,6 +55,18 @@ onward (pre-1.0, minor versions may include breaking changes).
   `all` run builds `Dockerfile.h3`, so it now pays the vortex install and compile
   layer (about 25 to 30 s on an otherwise cached image) and a build-time clone of
   nim-vortex, for a server it never starts.
+- **A `mixed` stress workload (`nimble stressMixed`) that drives all five verified
+  loops at one set of servers through the same clients and connections (#460).**
+  Every soak so far ran one workload at one origin, so no cell could see an
+  interaction between workloads; #444 was exactly that shape (a buffered upload
+  parking an h2 connection's only reader while small `/echo` streams on the same
+  connection waited). `mixed` builds `NAVI_CLIENT_COUNT` `Navi` instances once and
+  shares them across the requests, ws, sse, streamUpload and streamDownload slices
+  (js: four, since it cannot stream a request body), prints one report line with
+  every slice's own numbers side by side, never summed, and ends with a banner per
+  slice. Its h3 cell under hypercorn dials the aioquic ws origins on a separate port
+  band (`NAVI_WS_H3_PORTBAND`); under `NAVI_SERVER=vortex` the ws slice shares the
+  QUIC connection with the other four.
 - **An opt-in `Expect: 100-continue` gate for HTTP/1.1 uploads (`expectContinueMs`).**
   Setting `config.expectContinueMs` (ms; `0`, the default, disables it) makes the h1
   send path put `Expect: 100-continue` on the request head and wait that long for the
@@ -127,6 +141,47 @@ onward (pre-1.0, minor versions may include breaking changes).
   each chunk. The sync backend rejects an async producer at compile time (no event
   loop to await it). Its type lives at the backend layer (`AsyncBodyProducer`, like
   `BodySink`), since the `Future` type differs per backend (#367).
+- **An opt-in misbehaving-server chaos sidecar in the stress harness (`NAVI_CHAOS`)
+  (#384).** When set, `run.sh` starts a Python asyncio sidecar per cell that offers
+  only the cell's pinned protocol and misbehaves on demand, and the client attacks it
+  with a seeded schedule of fault modes alongside the normal verified soak, which keeps
+  running as a canary: `stall`, `slowbody`, `truncate`, `garbage`, `vanish`,
+  `zerowindow` (h2), `headerbomb`, `redirectloop`, plus port-selected
+  `vanish-on-accept` and `stall-on-accept`, each with an h1, h2 and h3 shape. Chaos
+  traffic uses separate `Navi` instances with tight timeouts so the canary's pools
+  never hold a chaos connection. Four invariants are asserted per cell and routed to
+  the FAILURES banner with greppable `CHAOS-FAIL(hang|pin|mode|fd|mem)` prefixes: no
+  crash or hang (every interaction is a typed error or a valid `Response` within a
+  watchdog), the protocol pin is never violated, no file-descriptor leak and no
+  memory leak across the cell. Strict modes assert an exact outcome class; tolerant
+  modes accept any typed navi error and tally the class. `NAVI_CHAOS` unset is
+  byte-identical to a pre-chaos run. A nightly `stress-chaos` workflow runs the full
+  rotation and a self-test that plants an FD leak to prove the assertion has teeth.
+- **The `requests` stress workload rotates realistic content types through `/echo`
+  (`NAVI_CONTENT_TYPES`, default `octet,text,json,form`) (#381).** The soak only ever
+  sent `application/octet-stream` repeat-strings, so navi's typed-body encoders were
+  never exercised under load and a byte-echo could not catch a serialization bug. A
+  shared deterministic payload catalog now covers binary, text (ASCII, UTF-8, 32 KiB),
+  JSON (six documents up to a 294 KB array, sent as a `JsonNode` so the typed encoder
+  is on the wire) and form pairs. The server canonicalises JSON and form echoes and the
+  client compares parsed trees and decoded pairs, so a byte-echo cannot make it pass.
+  Request compression applies to the octet and text kinds only; a `content-encoding` on
+  a typed body would misdescribe the plain bytes. Unknown tokens hard-fail at startup.
+- **A per-attempt timeout, `config.timeouts.attempt` (#375).** It bounds a single try
+  (connect plus that try's reads and its redirect hops) with an effective budget of
+  `min(attempt, remaining total)`, and complements the whole-request `total`. Unlike a
+  `total` expiry, which is terminal, an `attempt` expiry is retryable under the normal
+  policy, so a slow try is abandoned and retried against a fresh connection while
+  `total` still caps the request. `0` (the default) disables it. Enforced on every
+  client: cooperatively through the connection deadline on sync and batch, by an inner
+  guard around each attempt on asyncdispatch and chronos (the outer `total` guard stays
+  terminal), and per `fetch` through an `AbortSignal` on `navi/js`.
+- **Read-only cookie jar inspection: `client.cookies` (#374).** The jar can now be
+  enumerated for debugging on all four clients: `client.cookies` yields a
+  `StoredCookie` snapshot (name, value, domain, path, `secure`, `expires`) for every
+  cookie across every origin, and the jar gains `items`, `len` and `$`. Enumeration
+  reflects stored state as-is and does not prune expired cookies; `expires` reveals
+  staleness.
 
 ### Changed
 - **`sse()` now runs on the caller's client instead of a private one, so an SSE
@@ -1509,6 +1564,28 @@ onward (pre-1.0, minor versions may include breaking changes).
   rejects a reserved code only while a close frame would actually be sent, so
   mirroring a received `m.closeCode` back on teardown stays the promised idempotent
   no-op.
+- **HTTP/2 no longer sends DATA on a stream the peer has already finished, and the
+  connection window is no longer leaked by it (#380).** A connection-level
+  `WINDOW_UPDATE` used to flush every stream's windowed-out body bytes, including those
+  queued for a stream the server had reset or answered early, so DATA landed on closed
+  streams (RFC 9113 5.1 after a server RST, an 8.1 SHOULD violation after a clean early
+  response). That is also the trigger class for python-h2 bug 1210, where the server
+  leaks its connection receive window per swallowed frame until the connection stalls
+  dead. Closing the send side now drops the queued body and marks it closed; a stream
+  the server finished early with a clean response is cancelled with
+  `RST_STREAM(CANCEL)` like Go `net/http`, and a peer-reset stream is not RST'd back.
+- **The sync client's read timeout now fires on a TLS connection that completes the
+  handshake and then goes silent (#386).** `recvSome` waited for the raw socket to be
+  readable and then issued one blocking `SSL_read`. `select` reports readable the moment
+  any bytes land, including a TLS 1.3 `NewSessionTicket` or a partial record with no
+  application data, so OpenSSL consumed them and blocked on a fresh `recv` with
+  `SO_RCVTIMEO` cleared, wedging the thread until an external watchdog killed it. The
+  TLS read is now driven through `sslReadSome`, which arms `SO_RCVTIMEO` to the current
+  read budget around each `SSL_read`; a lapsed receive timeout surfaces as the read
+  `TimeoutError` once the budget is spent, never as a transient to spin on or as an EOF.
+  A genuine `close_notify` or syscall EOF is still a clean close. The plain (non-TLS)
+  path and h3, which was already bounded, are unchanged. The chaos harness's `stall`
+  modes are no longer skipped on sync.
 - **Keep-alive race: a request dropped before any response is now retried, following
   the same rule as Go `net/http` (RFC 9110 9.2.2).** A connection can be torn down by
   the server at any time -- an idle recycle, a GOAWAY-less close, or a freshly-opened
@@ -2058,7 +2135,8 @@ across four backends.
 - TLS certificates verified by default; HPACK bounds, negative `Content-Length`
   rejection, chunk-size bounds, and malformed-input rejection instead of crashes.
 
-[Unreleased]: https://github.com/cryo2010/nim-navi/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/cryo2010/nim-navi/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/cryo2010/nim-navi/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/cryo2010/nim-navi/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/cryo2010/nim-navi/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/cryo2010/nim-navi/compare/v0.7.0...v0.8.0
