@@ -381,9 +381,15 @@ async def m_headerbomb(writer, ib, params):
     # and the name overhead dominates). Slice to the cap as a hard belt-and-braces.
     target = min(max(n * size, 256 * 1024), HEADERBOMB_CAP)
     count = max(1, target // (max(size, 1) + 16))
+    # huffman=False: hpack's Huffman coder is pure Python and spends ~1 s of CPU on
+    # this ~1 MiB block, blocking the sidecar's single event loop long enough that
+    # concurrent chaos connects and redirectloop hops miss their 2-3 s client
+    # budgets (#476). Literal encoding is ~1 ms, and the block is the same size on
+    # the wire, so the client outcome is unchanged.
     enc = Encoder()
-    big = _headers_block(enc, [(":status", "200")] +
-                         [("x-bomb-%d" % i, "x" * size) for i in range(count)])
+    big = enc.encode([(":status", "200")] +
+                     [("x-bomb-%d" % i, "x" * size) for i in range(count)],
+                     huffman=False)
     if len(big) > HEADERBOMB_CAP:
         big = big[:HEADERBOMB_CAP]
     # First fragment in a HEADERS frame (no END_HEADERS: more coming).
