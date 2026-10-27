@@ -123,6 +123,24 @@ nimble add navi
   or vcpkg -- and put them on `PATH`. `std/net` also finds CA certificates there only
   by locating a file named `cacert.pem` beside the executable or on `PATH`; there is no
   system trust-store fallback.
+- **On macOS**, link OpenSSL at build time instead of letting Nim find it by name.
+  Nim's default by-name load resolves to Apple's LibreSSL from the dyld shared
+  cache (and mixes two libcrypto generations in one process), while Homebrew's
+  OpenSSL 3 is never considered: `/opt/homebrew/lib` is off dyld's search path on
+  Apple Silicon, and SIP strips `DYLD_*` under `nim c -r`. Install `openssl@3`
+  with Homebrew and put this in your app's `nim.cfg` (it is already set for this
+  repo; use `/usr/local/opt/openssl@3/lib` on Intel, or your prefix for MacPorts):
+  ```
+  @if macosx:
+    --define:"sslVersion=3"
+    --dynlibOverride:"ssl"
+    --dynlibOverride:"crypto"
+    --passL:"-L/opt/homebrew/opt/openssl@3/lib -lssl -lcrypto"
+  @end
+  ```
+  The binary then records the Homebrew path and needs no environment at run time.
+  HTTP/3 works the same way: `brew install libngtcp2 libnghttp3` and build with
+  `-d:naviHttp3`.
 - For `import navi/js`: nothing beyond Nim. Compile with `nim js` and run in a browser or on Node 18+ (which provides a global `fetch`); no `-d:ssl`, since the runtime handles TLS.
 
 ## Choosing a client

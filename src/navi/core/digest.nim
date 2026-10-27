@@ -13,9 +13,10 @@ import std/[strutils, random, times, tables, options]
 import checksums/md5, checksums/sha2
 export options
 
-# Prefer OpenSSL EVP (hardware SHA) when TLS is linked and libcrypto loads
-# (Linux); else the pure-Nim `checksums` above. Digest auth is low-volume (per-401
-# challenge), so this is a consistency/acceleration win, not a hot path.
+# Prefer OpenSSL EVP (hardware SHA) when TLS is linked and libcrypto resolves
+# (linked in, or by soname on Linux; see backend/evpdigest); else the pure-Nim
+# `checksums` above. Digest auth is low-volume (per-401 challenge), so this is a
+# consistency/acceleration win, not a hot path.
 when defined(ssl):
   import ../backend/evpdigest
 

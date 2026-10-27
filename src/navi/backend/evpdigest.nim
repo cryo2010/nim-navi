@@ -1,14 +1,21 @@
 ## One-shot OpenSSL EVP digests (MD5 / SHA-1 / SHA-256) as a *hardware*
 ## acceleration for the low-volume Digest-auth and WebSocket-accept hashes.
 ##
-## navi links libcrypto for TLS, so on Linux these route through the CPU's SHA
+## navi links libcrypto for TLS, so these can route through the CPU's SHA
 ## extensions (SHA-NI) via libcrypto instead of the pure-Nim `checksums`
-## fallback. The probe is **Linux-only and best-effort**: on macOS, loading
-## libcrypto by soname makes dyld abort the process ("loading libcrypto in an
-## unsafe way"), and the gain (a hash per 401 / per ws handshake) doesn't justify
-## platform hacks -- so everywhere except Linux, `evpAvailable()` is false and
-## callers keep using `checksums`. This is strictly an optimization, never a new
-## hard runtime dependency.
+## fallback. The probe is **best-effort** and finds libcrypto two ways:
+##
+## - `--dynlibOverride:crypto` (the macOS default from nim.cfg, or any static
+##   link): libcrypto is part of the process image, so the symbols come from
+##   `loadLib()`, a dlopen of the program itself. Any platform.
+## - otherwise, on Linux only, a dlopen of the standard sonames. Elsewhere the
+##   by-name route is off: on macOS the unversioned `libcrypto.dylib` is an Apple
+##   stub that aborts the process ("loading libcrypto in an unsafe way"), and the
+##   gain (a hash per 401 / per ws handshake) never justified platform hacks.
+##
+## When neither applies, `evpAvailable()` is false and callers keep using
+## `checksums`. This is strictly an optimization, never a new hard runtime
+## dependency.
 
 import std/dynlib
 
@@ -52,14 +59,21 @@ proc ensureLoaded() {.gcsafe.} =
   ## probe rather than caching the failure forever.
   {.cast(gcsafe).}:
     if state == lsLoaded: return
-    when defined(linux):
-      # Standard libcrypto sonames; the first that loads wins. On Linux loadLib of
-      # a missing name just returns nil (no abort), and libcrypto.so.3 is standard.
-      const names = ["libcrypto.so.3", "libcrypto.so.1.1", "libcrypto.so"]
+    const linked = compileOption("dynlibOverride", "crypto")
+    when linked or defined(linux):
       var lib: LibHandle
-      for name in names:
-        lib = loadLib(name)
-        if lib != nil: break
+      when linked:
+        # libcrypto is linked in: resolve from the process image. A by-name
+        # dlopen could miss it (macOS) or map a second copy beside it.
+        lib = loadLib()
+      else:
+        # Standard libcrypto sonames; the first that loads wins. On Linux loadLib
+        # of a missing name just returns nil (no abort), and libcrypto.so.3 is
+        # standard.
+        const names = ["libcrypto.so.3", "libcrypto.so.1.1", "libcrypto.so"]
+        for name in names:
+          lib = loadLib(name)
+          if lib != nil: break
       if lib == nil: return          # stays lsUnloaded -> retried next call
       ctxNew = cast[NewFn](lib.symAddr("EVP_MD_CTX_new"))
       ctxFree = cast[FreeFn](lib.symAddr("EVP_MD_CTX_free"))
@@ -76,7 +90,8 @@ proc ensureLoaded() {.gcsafe.} =
       # else: leave lsUnloaded so a partial resolution is retried next call
 
 proc evpAvailable*(): bool {.gcsafe.} =
-  ## True once libcrypto's EVP digest entry points are resolved (Linux only).
+  ## True once libcrypto's EVP digest entry points are resolved (a linked
+  ## libcrypto anywhere, or the system soname on Linux).
   ## Cheap after the first successful call. Callers gate on this and fall back
   ## to `checksums`; a probe that has never succeeded is retried each call.
   ensureLoaded()

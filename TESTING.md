@@ -87,6 +87,26 @@ nimble stress             # short smoke of all six stress workloads
 
 ---
 
+## macOS
+
+The whole default suite, the TLS paths and HTTP/3 run natively on macOS; nothing
+here needs Docker. `nim.cfg` links Homebrew's `openssl@3` (`--dynlibOverride`
+plus `-lssl -lcrypto`) rather than letting `std/openssl` dlopen a library by
+name, which on macOS finds Apple's LibreSSL and never Homebrew. So, with Homebrew:
+
+```sh
+brew install openssl@3                 # TLS (nim.cfg points at /opt/homebrew;
+                                       # Intel Macs: /usr/local/opt/openssl@3)
+brew install brotli zstd               # the br/zstd decompression tests
+brew install libngtcp2 libnghttp3      # only for -d:naviHttp3 builds
+checkmate                              # the default suite
+nim c -r -d:naviHttp3 examples/basics/https_get.nim   # a live h3 build
+```
+
+CI runs the same on `macos-latest` (the `macos` job in `ci.yml`): the suite,
+plus a `-d:naviHttp3` build of the entry modules against the Homebrew h3 stack,
+which is the one place the C++ driver meets clang rather than gcc.
+
 ## Windows
 
 CI runs a Windows leg (`.github/workflows/windows.yml`) alongside the Linux one,

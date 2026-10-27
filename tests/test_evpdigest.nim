@@ -1,7 +1,10 @@
-## EVP hardware-digest helper (#194). On Linux libcrypto loads and EVP is used;
-## everywhere else `evpAvailable()` is false and callers fall back to `checksums`.
-## This cross-checks EVP against `checksums` wherever EVP is live, so the two paths
-## are proven identical (the digest-auth and ws-accept vectors cover the fallback).
+## EVP hardware-digest helper (#194). Where libcrypto is linked in
+## (--dynlibOverride:crypto, the macOS default) or loads by soname (Linux), EVP is
+## used; everywhere else `evpAvailable()` is false and callers fall back to
+## `checksums`. This cross-checks EVP against `checksums` wherever EVP is live, so
+## the two paths are proven identical (the digest-auth and ws-accept vectors cover
+## the fallback), and it pins the probe to succeed in the builds that link
+## libcrypto, so a regression there cannot hide behind the silent fallback.
 
 import unittest
 import std/strutils
@@ -28,6 +31,13 @@ suite "EVP digests":
         check evpSha256Hex(s) == sha256Ref(s)
         check evpSha1Raw(s) == sha1RawRef(s)
     else:
-      # Non-Linux (or libcrypto unavailable): the digest-auth / ws-accept vectors
-      # in test_digest / test_ws exercise the checksums fallback instead.
+      # Not linked and not Linux (or libcrypto unavailable): the digest-auth /
+      # ws-accept vectors in test_digest / test_ws exercise the checksums
+      # fallback instead.
       check not evpAvailable()
+
+  # Only exists in the builds that link libcrypto in: checkmate fails a test that
+  # runs zero assertions, so a `skip()` elsewhere is not an option.
+  when compileOption("dynlibOverride", "crypto"):
+    test "EVP should be available wherever libcrypto is linked in":
+      check evpAvailable()

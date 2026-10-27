@@ -27,13 +27,24 @@ export api.TlsConfig
 # Link the h3 stack via pkg-config so the build follows wherever the libraries
 # are installed (the interop image exposes them via PKG_CONFIG_PATH). A
 # -d:naviHttp3 build requires ngtcp2, nghttp3, and OpenSSL >= 3.5 present.
-{.passC: "-std=c++20".}   # h3client.cpp is C++20 (std::span, RAII); Nim's -w hides
-                          # the "not valid for C" note this adds to the .c files.
 {.passC: "-I\"" & parentDir(currentSourcePath()) & "\"".}   # h3client.h (the NaviH3Tls struct)
 {.passC: gorge("pkg-config --cflags libngtcp2 libngtcp2_crypto_ossl libnghttp3 libssl").}
-{.passL: gorge("pkg-config --libs libngtcp2 libngtcp2_crypto_ossl libnghttp3 libssl libcrypto").}
-{.passL: "-lstdc++".}     # the C++ standard library, for the C++ driver
-{.compile: "h3client.cpp".}
+when compileOption("dynlibOverride", "ssl"):
+  # OpenSSL is linked by whoever set the override (nim.cfg on macOS: the Homebrew
+  # openssl@3 behind -lssl -lcrypto), so naming it again here would only earn a
+  # duplicate-library warning from ld; ngtcp2's crypto library finds the same
+  # image through its own install name.
+  {.passL: gorge("pkg-config --libs libngtcp2 libngtcp2_crypto_ossl libnghttp3").}
+else:
+  {.passL: gorge("pkg-config --libs libngtcp2 libngtcp2_crypto_ossl libnghttp3 libssl libcrypto").}
+when not defined(macosx):
+  # The C++ standard library, for the C++ driver. Apple's clang++ (which Nim
+  # links with once a .cpp is in the build) adds libc++ itself.
+  {.passL: "-lstdc++".}
+# h3client.cpp is C++20 (std::span, RAII). The flag is scoped to that one file: a
+# global passC reaches every generated .c file too, where gcc only notes "not
+# valid for C" but clang (macOS) refuses to compile at all.
+{.compile("h3client.cpp", "-std=c++20").}
 
 const naviHttp3MinOpenSsl* = "3.5.0"
   ## Minimum OpenSSL for the QUIC crypto binding (ngtcp2_crypto_ossl).

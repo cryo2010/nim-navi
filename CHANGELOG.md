@@ -7,6 +7,47 @@ onward (pre-1.0, minor versions may include breaking changes).
 
 ## [Unreleased]
 
+### Fixed
+- **macOS builds now link Homebrew's OpenSSL 3 instead of silently loading Apple's
+  LibreSSL.** `std/openssl` finds the library by name, and on macOS that name
+  pattern resolves into the dyld shared cache: `libssl.48` (over `libcrypto.46`)
+  for the libssl calls and `libcrypto.41` for navi's direct libcrypto calls, two
+  LibreSSL generations in one process, with Homebrew's `openssl@3` never
+  considered (`/opt/homebrew/lib` is off dyld's search path on Apple Silicon, and
+  SIP strips `DYLD_*` under `nim c -r`, so `-d:sslVersion=3` alone failed with
+  "could not load: libssl.3.dylib"). `nim.cfg` now sets `--dynlibOverride:ssl`,
+  `--dynlibOverride:crypto`, `-d:sslVersion=3` and `-lssl -lcrypto` from the
+  Homebrew prefix on macOS, so the binary records the OpenSSL 3 path and needs no
+  environment; the README carries the same block for consumers.
+- **HTTP/3 builds on macOS.** The `-std=c++20` flag for `h3client.cpp` was a
+  global `passC`, so it reached every generated C file; gcc only notes that, clang
+  refuses to compile. It is now scoped to the one C++ file via
+  `{.compile("h3client.cpp", "-std=c++20").}`. The h3 link no longer names
+  `-lstdc++` on macOS (clang++ adds libc++ itself) and, under
+  `--dynlibOverride:ssl`, no longer repeats `libssl libcrypto` from pkg-config,
+  so the build is warning-free. A `-d:naviHttp3` build against Homebrew's
+  `libngtcp2`/`libnghttp3` upgrades to HTTP/3 on `Alt-Svc` natively.
+- **Optional OpenSSL entry points resolve when the library is linked in.**
+  `openssl_ctx` looked up `SSL_set1_host`, `SSL_set_hostflags`, `SSL_get0_param`,
+  `X509_VERIFY_PARAM_set1_ip_asc` and `OPENSSL_sk_pop_free` by re-opening libssl
+  / libcrypto by name. Under `--dynlibOverride` that dlopen finds nothing on macOS
+  (a leaf name does not match the image dyld already mapped), so the pre-handshake
+  identity binding silently fell back to the post-handshake check and a PKCS#12 CA
+  stack leaked once. The lookup now goes through the process image (`loadLib()`)
+  whenever OpenSSL is linked.
+
+### Changed
+- **EVP hardware digests are no longer Linux-only.** `evpdigest` resolves
+  libcrypto from the process image wherever it is linked in
+  (`--dynlibOverride:crypto`, now the macOS default), and by soname on Linux as
+  before; the `checksums` fallback stays everywhere else. `test_evpdigest` pins
+  `evpAvailable()` to true in linked builds.
+
+### Added
+- **A `macos` CI job** (`ci.yml`, `macos-latest`): the default suite under the
+  linked Homebrew OpenSSL, plus a `-d:naviHttp3` build of the entry modules against
+  Homebrew's h3 stack, the one place the C++ driver meets clang rather than gcc.
+
 ## [0.11.0] - 2026-10-25
 
 ### Added
