@@ -64,11 +64,11 @@ jobs:
           nim-version: "2.2.10"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # openssl@3 ships in the runner image; nim.cfg links it (the macOS block:
-      # --dynlibOverride + -lssl -lcrypto from /opt/homebrew), which is the whole
-      # point of this job: std/openssl's by-name load would otherwise bind Apple's
-      # LibreSSL and never Homebrew. brotli/zstd feed the decompression tests;
-      # libngtcp2/libnghttp3 the h3 build below.
+      # openssl@3 ships in the runner image; config.nims finds it under
+      # /opt/homebrew and links it (--dynlibOverride + -lssl -lcrypto), which is
+      # the whole point of this job: std/openssl's by-name load would otherwise
+      # bind Apple's LibreSSL and never Homebrew. brotli/zstd feed the
+      # decompression tests; libngtcp2/libnghttp3 the h3 build below.
       - name: Install system libraries
         run: brew install openssl@3 brotli zstd libngtcp2 libnghttp3
 

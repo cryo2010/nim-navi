@@ -90,13 +90,17 @@ nimble stress             # short smoke of all six stress workloads
 ## macOS
 
 The whole default suite, the TLS paths and HTTP/3 run natively on macOS; nothing
-here needs Docker. `nim.cfg` links Homebrew's `openssl@3` (`--dynlibOverride`
+here needs Docker. `config.nims` links an installed OpenSSL 3 (`--dynlibOverride`
 plus `-lssl -lcrypto`) rather than letting `std/openssl` dlopen a library by
-name, which on macOS finds Apple's LibreSSL and never Homebrew. So, with Homebrew:
+name, which on macOS finds Apple's LibreSSL and never Homebrew. It probes
+`NAVI_OPENSSL_DIR`, then the Homebrew prefix for the CPU (`/opt/homebrew` on
+arm64, `/usr/local` on x86_64), then MacPorts (`/opt/local/lib`); with none of
+them present the build keeps the by-name load and prints a warning naming the
+install command. So, with Homebrew:
 
 ```sh
-brew install openssl@3                 # TLS (nim.cfg points at /opt/homebrew;
-                                       # Intel Macs: /usr/local/opt/openssl@3)
+brew install openssl@3                 # TLS; or set NAVI_OPENSSL_DIR to any
+                                       # directory holding libssl.3.dylib
 brew install brotli zstd               # the br/zstd decompression tests
 brew install libngtcp2 libnghttp3      # only for -d:naviHttp3 builds
 checkmate                              # the default suite

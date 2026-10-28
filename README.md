@@ -128,8 +128,8 @@ nimble add navi
   cache (and mixes two libcrypto generations in one process), while Homebrew's
   OpenSSL 3 is never considered: `/opt/homebrew/lib` is off dyld's search path on
   Apple Silicon, and SIP strips `DYLD_*` under `nim c -r`. Install `openssl@3`
-  with Homebrew and put this in your app's `nim.cfg` (it is already set for this
-  repo; use `/usr/local/opt/openssl@3/lib` on Intel, or your prefix for MacPorts):
+  with Homebrew and put this in your app's `nim.cfg` (use
+  `/usr/local/opt/openssl@3/lib` on Intel, or your prefix for MacPorts):
   ```
   @if macosx:
     --define:"sslVersion=3"
@@ -139,8 +139,11 @@ nimble add navi
   @end
   ```
   The binary then records the Homebrew path and needs no environment at run time.
-  HTTP/3 works the same way: `brew install libngtcp2 libnghttp3` and build with
-  `-d:naviHttp3`.
+  This repo's own `config.nims` does the same with a probe: it looks for
+  `libssl.3.dylib` under `NAVI_OPENSSL_DIR`, then the Homebrew prefix for the
+  CPU, then MacPorts, and keeps the by-name load (with a warning) when none is
+  there, so copy that instead if you want the fallback. HTTP/3 works the same
+  way: `brew install libngtcp2 libnghttp3` and build with `-d:naviHttp3`.
 - For `import navi/js`: nothing beyond Nim. Compile with `nim js` and run in a browser or on Node 18+ (which provides a global `fetch`); no `-d:ssl`, since the runtime handles TLS.
 
 ## Choosing a client

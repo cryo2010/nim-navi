@@ -15,10 +15,14 @@ onward (pre-1.0, minor versions may include breaking changes).
   LibreSSL generations in one process, with Homebrew's `openssl@3` never
   considered (`/opt/homebrew/lib` is off dyld's search path on Apple Silicon, and
   SIP strips `DYLD_*` under `nim c -r`, so `-d:sslVersion=3` alone failed with
-  "could not load: libssl.3.dylib"). `nim.cfg` now sets `--dynlibOverride:ssl`,
-  `--dynlibOverride:crypto`, `-d:sslVersion=3` and `-lssl -lcrypto` from the
-  Homebrew prefix on macOS, so the binary records the OpenSSL 3 path and needs no
-  environment; the README carries the same block for consumers.
+  "could not load: libssl.3.dylib"). A new `config.nims` probes for
+  `libssl.3.dylib` under `NAVI_OPENSSL_DIR`, then the Homebrew prefix for the CPU
+  (`/opt/homebrew` on arm64, `/usr/local` on x86_64), then MacPorts, and when
+  found sets `--dynlibOverride:ssl`, `--dynlibOverride:crypto`, `-d:sslVersion=3`
+  and `-lssl -lcrypto` from that directory, so the binary records the OpenSSL 3
+  path and needs no environment. A machine with none of them keeps the by-name
+  load it always had, plus a warning naming the install command, rather than
+  failing at link time. The README carries the plain block for consumers.
 - **HTTP/3 builds on macOS.** The `-std=c++20` flag for `h3client.cpp` was a
   global `passC`, so it reached every generated C file; gcc only notes that, clang
   refuses to compile. It is now scoped to the one C++ file via

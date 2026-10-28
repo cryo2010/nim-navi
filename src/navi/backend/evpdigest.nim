@@ -17,7 +17,11 @@
 ## `checksums`. This is strictly an optimization, never a new hard runtime
 ## dependency.
 
-import std/dynlib
+const evpProbe = compileOption("dynlibOverride", "crypto") or defined(linux)
+  ## Whether this build has a way to reach libcrypto at all (see above).
+
+when evpProbe:
+  import std/dynlib
 
 type
   MdFn = proc(): pointer {.cdecl, gcsafe, raises: [].}
@@ -59,10 +63,9 @@ proc ensureLoaded() {.gcsafe.} =
   ## probe rather than caching the failure forever.
   {.cast(gcsafe).}:
     if state == lsLoaded: return
-    const linked = compileOption("dynlibOverride", "crypto")
-    when linked or defined(linux):
+    when evpProbe:
       var lib: LibHandle
-      when linked:
+      when compileOption("dynlibOverride", "crypto"):
         # libcrypto is linked in: resolve from the process image. A by-name
         # dlopen could miss it (macOS) or map a second copy beside it.
         lib = loadLib()
