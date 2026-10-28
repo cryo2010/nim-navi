@@ -17,9 +17,10 @@ import std/[strutils, base64]
 import ../core/[url, headers]
 
 # SHA-1 for the accept hash: prefer OpenSSL EVP (hardware SHA) when TLS is linked
-# and libcrypto loads (Linux), else the pure-Nim `checksums`. One hash per
-# handshake, so this is for consistency, not throughput. `checksums/sha1` reaches
-# std/endians, which is native-only, so the js target uses navi's own small SHA-1.
+# and libcrypto resolves (linked in, or by soname on Linux; see backend/evpdigest),
+# else the pure-Nim `checksums`. One hash per handshake, so this is for
+# consistency, not throughput. `checksums/sha1` reaches std/endians, which is
+# native-only, so the js target uses navi's own small SHA-1.
 when defined(js):
   import ../private/sha1js
 else:

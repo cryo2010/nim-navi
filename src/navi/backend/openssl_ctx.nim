@@ -107,13 +107,25 @@ when defined(ssl):
     paramSet1IpAsc {.threadvar.}: Set1IpAscProc
     identityApiReady {.threadvar.}: bool
 
+  const tlsLinked = compileOption("dynlibOverride", "ssl") or
+                    compileOption("dynlibOverride", "crypto")
+    ## --dynlibOverride: OpenSSL is linked into the executable (the macOS default
+    ## from nim.cfg, or a static link) rather than dlopen'd by std/openssl.
+
   proc tlsLib(pattern: string): LibHandle {.raises: [].} =
-    ## The already-loaded libssl / libcrypto: `loadLibPattern` walks the same
-    ## name list std/openssl bound to, so it returns that same handle. Wrapped
-    ## because std/dynlib forward-declares `loadLib` without a raises annotation,
-    ## which infers `Exception` and the strict async paths reject (see `certDer`);
-    ## it only ever returns nil on failure.
-    try: loadLibPattern(pattern)
+    ## The already-loaded libssl / libcrypto. When std/openssl dlopen'd it,
+    ## `loadLibPattern` walks the same name list it bound to, so it returns that
+    ## same handle. When it is linked instead, the process image is the one place
+    ## the symbols are certain to be: a by-name dlopen then finds nothing (macOS,
+    ## where a leaf name does not match the Homebrew image dyld already mapped)
+    ## or a second copy of the library, so `loadLib()` (dlopen of the program
+    ## itself) is used in that build. Wrapped because std/dynlib forward-declares
+    ## `loadLib` without a raises annotation, which infers `Exception` and the
+    ## strict async paths reject (see `certDer`); it only ever returns nil on
+    ## failure.
+    try:
+      when tlsLinked: loadLib()
+      else: loadLibPattern(pattern)
     except Exception: nil
 
   proc tlsSym(lib: LibHandle, name: cstring): pointer {.raises: [].} =

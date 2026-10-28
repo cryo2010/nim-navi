@@ -53,6 +53,46 @@ jobs:
       - name: Run tests
         run: checkmate --loop=20 --loop-in-process --bail --nimflags:"--mm:${{ matrix.mm }}"
 
+  macos:
+    runs-on: macos-latest
+    name: tests (macOS, linked Homebrew OpenSSL 3)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: "2.2.10"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # openssl@3 ships in the runner image; config.nims finds it under
+      # /opt/homebrew and links it (--dynlibOverride + -lssl -lcrypto), which is
+      # the whole point of this job: std/openssl's by-name load would otherwise
+      # bind Apple's LibreSSL and never Homebrew. brotli/zstd feed the
+      # decompression tests; libngtcp2/libnghttp3 the h3 build below.
+      - name: Install system libraries
+        run: brew install openssl@3 brotli zstd libngtcp2 libnghttp3
+
+      - name: Install chronos
+        run: nimble install -y "chronos@>= 4.0.0"
+
+      - name: Install checksums
+        run: nimble install -y checksums
+
+      - name: Install checkmate
+        run: nimble install -y "https://github.com/cryo2010/nim-checkmate"
+
+      - name: Run tests
+        run: checkmate --bail
+
+      # A real build (not `nim check`): the h3 driver is C++ compiled by clang
+      # here, which refused the old global -std=c++20 that gcc only warned about.
+      - name: Build the h3 entries
+        run: |
+          for entry in navi navi/asyncdispatch navi/chronos; do
+            echo "== $entry (-d:naviHttp3) =="
+            nim c -d:naviHttp3 --hints:off -o:/tmp/h3_entry "src/$entry.nim"
+          done
+
   compile:
     runs-on: ubuntu-latest
     strategy:
